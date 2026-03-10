@@ -178,6 +178,9 @@ class UpdateScheduler:
                 day_of_month=org_day_of_month,
             )
 
+        # --- DDP-API jobs (Voatz/Brevo + Webflow CMS) ---
+        self._register_ddp_api_jobs()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -185,6 +188,60 @@ class UpdateScheduler:
             "Update scheduler started",
             openstates_sync_time=sync_time_str,
         )
+
+    def _register_ddp_api_jobs(self) -> None:
+        """Register jobs moved from DDP-API (Voatz/Brevo sync + Webflow CMS batch)."""
+        from ddp_sync.pipelines.voatz_brevo import run_sync_job, run_full_sync_job
+        from ddp_sync.pipelines.webflow_batch import (
+            run_webflow_fill_session_code,
+            run_webflow_fill_map_url,
+            run_webflow_bill_org_sync,
+            run_webflow_org_about_parse,
+            run_webflow_check_org_missing,
+            run_webflow_find_duplicates,
+        )
+
+        # Voatz -> Brevo user sync — every N minutes (default 30)
+        interval = self.settings.sync_interval_minutes
+        self.scheduler.add_job(
+            run_sync_job,
+            trigger=IntervalTrigger(minutes=interval),
+            id="voatz_user_sync",
+            name="Voatz -> Brevo user sync",
+            replace_existing=True,
+        )
+        logger.info("Voatz user sync scheduled", interval_minutes=interval)
+
+        # Voatz -> Brevo full-attribute sync — monthly 1st at 02:00 UTC
+        self.scheduler.add_job(
+            run_full_sync_job,
+            trigger=CronTrigger(day=1, hour=2),
+            id="voatz_full_sync",
+            name="Voatz -> Brevo full-attribute sync",
+            replace_existing=True,
+        )
+        logger.info("Voatz full-attribute sync scheduled (monthly, 1st at 02:00 UTC)")
+
+        # Webflow CMS batch jobs — weekly Monday at 03:00 UTC
+        webflow_trigger = CronTrigger(day_of_week="mon", hour=3)
+        webflow_jobs = [
+            ("webflow_fill_session_code", "Webflow: fill session-code", run_webflow_fill_session_code),
+            ("webflow_fill_map_url", "Webflow: fill map-url", run_webflow_fill_map_url),
+            ("webflow_bill_org_sync", "Webflow: bill-org reference sync", run_webflow_bill_org_sync),
+            ("webflow_org_about_parse", "Webflow: org about-field parse", run_webflow_org_about_parse),
+            ("webflow_check_org_missing", "Webflow: check org missing fields", run_webflow_check_org_missing),
+            ("webflow_find_duplicates", "Webflow: find duplicate bills", run_webflow_find_duplicates),
+        ]
+
+        for job_id, name, func in webflow_jobs:
+            self.scheduler.add_job(
+                func,
+                trigger=webflow_trigger,
+                id=job_id,
+                name=name,
+                replace_existing=True,
+            )
+        logger.info("Webflow CMS batch jobs scheduled (weekly, Mon 03:00 UTC)", count=len(webflow_jobs))
 
     def stop(self) -> None:
         """Stop the scheduler."""

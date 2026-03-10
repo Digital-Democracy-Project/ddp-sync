@@ -190,9 +190,11 @@ def create_app() -> FastAPI:
 
     from ddp_sync.api.routes.health import router as health_router
     from ddp_sync.api.routes.sync_unified import router as sync_router
+    from ddp_sync.api.routes.triggers import router as trigger_router
 
     app.include_router(health_router, prefix=API_PREFIX)
     app.include_router(sync_router, prefix=API_PREFIX)
+    app.include_router(trigger_router, prefix=API_PREFIX)
 
     return app
 
