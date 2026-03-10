@@ -826,3 +826,8 @@ class UpdateSchedulerFactory:
         if cls._instance and cls._instance.is_running:
             cls._instance.stop()
         cls._instance = None
+
+
+def get_scheduler() -> UpdateScheduler | None:
+    """Get the current scheduler instance, if any."""
+    return UpdateSchedulerFactory._instance

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ddp-sync"
@@ -16,11 +16,13 @@ dependencies = [
     "APScheduler>=3.10.4",
 
     # Vector store + embeddings
-    "pinecone-client>=3.0.0",
+    "pinecone>=5.0.0",
     "openai>=1.10.0",
+    "tenacity>=8.0.0",
 
     # Data extraction
     "pdfplumber>=0.10.0",
+    "PyPDF2>=3.0.0",
     "beautifulsoup4>=4.12.0",
     "tiktoken>=0.5.0",
 

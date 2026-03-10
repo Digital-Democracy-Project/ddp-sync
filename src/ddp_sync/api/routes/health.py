@@ -27,8 +27,8 @@ async def health():
     try:
         from ddp_sync.scheduler import get_scheduler
         scheduler = get_scheduler()
-        if scheduler and scheduler._scheduler.running:
-            jobs = scheduler._scheduler.get_jobs()
+        if scheduler and scheduler.scheduler.running:
+            jobs = scheduler.scheduler.get_jobs()
             next_run = min(
                 (j.next_run_time for j in jobs if j.next_run_time),
                 default=None,
@@ -71,11 +71,11 @@ async def schedule():
     try:
         from ddp_sync.scheduler import get_scheduler
         scheduler = get_scheduler()
-        if not scheduler or not scheduler._scheduler.running:
+        if not scheduler or not scheduler.scheduler.running:
             return {"status": "scheduler_not_running", "jobs": []}
 
         jobs = []
-        for job in scheduler._scheduler.get_jobs():
+        for job in scheduler.scheduler.get_jobs():
             jobs.append({
                 "id": job.id,
                 "name": job.name,

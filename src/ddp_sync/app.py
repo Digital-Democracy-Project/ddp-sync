@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
 
     # Start scheduler (unconditionally — single worker, no leader election)
     from ddp_sync.scheduler import UpdateScheduler, UpdateSchedulerFactory
-    scheduler = UpdateSchedulerFactory.create(settings)
+    scheduler = UpdateSchedulerFactory.get_instance(settings)
     scheduler.start()
     logger.info(
         "Scheduler started with %d jobs",
