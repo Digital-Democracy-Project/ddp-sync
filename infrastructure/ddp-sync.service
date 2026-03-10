@@ -1,0 +1,17 @@
+[Unit]
+Description=DDP Sync Service
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ddp-sync
+Environment=PATH=/home/ubuntu/ddp-sync/.venv/bin:/usr/bin
+ExecStart=/home/ubuntu/ddp-sync/.venv/bin/uvicorn ddp_sync.app:app --host 0.0.0.0 --port 8001 --workers 1
+Restart=on-failure
+RestartSec=10
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
