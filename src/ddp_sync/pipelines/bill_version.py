@@ -682,7 +682,7 @@ class BillVersionSyncService:
             webflow_id = bill.get("id", "")
             title = fields.get("name", "Unknown")
             openstates_url = fields.get("open-states-url-2", "")
-            session_year = fields.get("session-year", "")
+            session_year = str(fields.get("bill-session", ""))
             session_code = fields.get("session-code", "")
             jurisdiction_id = fields.get("jurisdiction", "")
             slug = fields.get("slug", "")

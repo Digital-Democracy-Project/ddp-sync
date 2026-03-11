@@ -1223,7 +1223,7 @@ class BillSyncService:
                    - id: Webflow item ID
                    - name: Bill title
                    - open-states-url-2: OpenStates URL
-                   - session-year: Session year
+                   - bill-session: Session year
                    - session-code: Session code
                    - jurisdiction: Jurisdiction reference
 
@@ -1274,7 +1274,7 @@ class BillSyncService:
             webflow_id = bill.get("id", "")
             title = fields.get("name", "Unknown")
             openstates_url = fields.get("open-states-url-2", "")
-            session_year = fields.get("session-year", "")
+            session_year = str(fields.get("bill-session", ""))
             session_code = fields.get("session-code", "")
             jurisdiction_id = fields.get("jurisdiction", "")
             slug = fields.get("slug", "")
