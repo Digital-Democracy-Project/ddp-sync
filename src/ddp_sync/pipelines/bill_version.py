@@ -704,8 +704,9 @@ class BillVersionSyncService:
                 )
                 continue
 
-            # Check if current session
-            if not sync_service.is_current_session(session_year, session_code, jurisdiction_code):
+            # Check if current session (async version checks OpenStates API
+            # for non-standard session identifiers like AZ "57th-2nd-regular")
+            if not await sync_service.is_current_session_async(session_year, session_code, jurisdiction_code):
                 result.skipped += 1
                 result.skipped_not_current += 1
                 logger.info(

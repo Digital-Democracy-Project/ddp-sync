@@ -1287,8 +1287,9 @@ class BillSyncService:
                 logger.debug(f"Skipping bill without OpenStates URL: {title}")
                 continue
 
-            # Check if current session (for daily sync)
-            if not self.is_current_session(session_year, session_code, jurisdiction_code):
+            # Check if current session (async version checks OpenStates API
+            # for non-standard session identifiers like AZ "57th-2nd-regular")
+            if not await self.is_current_session_async(session_year, session_code, jurisdiction_code):
                 logger.debug(f"Skipping non-current session bill: {title}")
                 continue
 
