@@ -47,6 +47,7 @@ All endpoints are prefixed with `/ddp-sync/v1`.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/trigger/bill-version-check` | Trigger daily bill version check (status updates) |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |

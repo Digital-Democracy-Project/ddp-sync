@@ -35,6 +35,23 @@ async def trigger_full_sync(token: str = Depends(api_key_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/trigger/bill-version-check")
+async def trigger_bill_version_check(token: str = Depends(api_key_auth)):
+    """Trigger the daily bill version check (status updates to Webflow CMS)."""
+    try:
+        from ddp_sync.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        if not scheduler:
+            raise HTTPException(status_code=503, detail="Scheduler not initialized")
+        result = await scheduler.trigger_openstates_sync(force_all=False)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bill version check trigger failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/trigger/webflow/{job_name}")
 async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth)):
     """Trigger a specific Webflow CMS batch job."""
