@@ -44,11 +44,18 @@ class VectorStoreService:
             settings: Application settings. Uses default if not provided.
         """
         self.settings = settings or get_settings()
-        self.pc = Pinecone(api_key=self.settings.pinecone_api_key)
+        self._pc = None
         self.index_name = self.settings.pinecone_index_name
         self.namespace = self.settings.pinecone_namespace
         self._index = None
         self.embedding_service = EmbeddingService(self.settings)
+
+    @property
+    def pc(self):
+        """Lazy Pinecone client — created on first use, not at import time."""
+        if self._pc is None:
+            self._pc = Pinecone(api_key=self.settings.pinecone_api_key)
+        return self._pc
 
     @property
     def index(self):

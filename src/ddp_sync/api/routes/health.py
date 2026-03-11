@@ -45,8 +45,8 @@ async def health():
     try:
         from ddp_sync.services.redis_store import get_redis_store
         store = get_redis_store()
-        if store._redis:
-            await store._redis.ping()
+        if store._client:
+            await store._client.ping()
             result["redis"] = "connected"
         else:
             result["redis"] = "not_connected"
@@ -55,10 +55,13 @@ async def health():
 
     # Pinecone
     try:
-        from ddp_sync.services.vector_store import VectorStoreService
-        vs = VectorStoreService(settings)
-        stats = vs.index.describe_index_stats()
-        result["pinecone"] = f"connected ({stats.total_vector_count} vectors)"
+        if settings.pinecone_api_key:
+            from ddp_sync.services.vector_store import VectorStoreService
+            vs = VectorStoreService(settings)
+            stats = vs.index.describe_index_stats()
+            result["pinecone"] = f"connected ({stats.total_vector_count} vectors)"
+        else:
+            result["pinecone"] = "not_configured"
     except Exception as e:
         result["pinecone"] = f"error: {e}"
 

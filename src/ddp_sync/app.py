@@ -85,10 +85,10 @@ async def _check_and_resume_stale_syncs(
 
     try:
         # Scan for running tasks
-        if not redis_store._redis:
+        if not redis_store._client:
             return
 
-        task_keys = await redis_store._redis.keys("ddp:sync:task:*")
+        task_keys = await redis_store._client.keys("ddp:sync:task:*")
 
         for key in task_keys:
             task_id_str = key.decode().split(":")[-1]
