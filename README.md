@@ -158,6 +158,32 @@ sudo journalctl -u ddp-sync --since "24 hours ago" -p err --no-pager
 
 **Workaround:** Use non-editable install: `pip install .` (requires reinstall after code changes). This is a known issue with `.pth` file processing in Python 3.13 + Homebrew.
 
+### Bills skipped as "not current session" (WA, MI, UT, AZ, MA)
+
+**Symptom:** Nightly bill version check logs "Skipping bill (not current session)" for certain states. Bills never receive status updates.
+
+**Root causes (all fixed 2026-03-11):**
+
+1. **Null `end_date` from OpenStates** (WA, UT) — `_check_live_sessions()` required both dates non-None. Fix: treat `end_date=None` with valid `start_date` as active.
+2. **Stale `end_date` for multi-year sessions** (MI) — Session `2025-2026` has `end_date=2025-12-31`. Fix: parse years from identifier and check if current year is in range.
+3. **Non-standard session identifiers** (AZ `57th-2nd-regular`, MA `194th`) — Regex `\d{4}` finds no year. Fix: switched to `is_current_session_async()` which queries OpenStates API directly.
+4. **Wrong Webflow field name** (all states) — Code read `session-year` (nonexistent). Actual field is `bill-session` (integer). Fix: `str(fields.get("bill-session", ""))`.
+
+**Files:** `services/legislative_calendar.py`, `pipelines/bill_version.py`, `pipelines/bill_sync.py`
+
+### Webflow CMS field name reference
+
+Key bill fields (actual Webflow API names):
+
+| Field | Type | Example | Notes |
+|-------|------|---------|-------|
+| `session-code` | string | `"2026"`, `"57th-2nd-regular"` | OpenStates session identifier |
+| `bill-session` | integer | `2026` | Calendar year — **NOT** `session-year` |
+| `open-states-url-2` | string | `https://openstates.org/az/bills/...` | Used for jurisdiction resolution |
+| `status` | string | `"Referred to committee"` | Written by version sync |
+| `status-date` | string | `"2026-01-20T00:00:00.000Z"` | Written by version sync |
+| `gov-url` | string | `https://www.azleg.gov/...` | Official bill text URL |
+
 ## Related Repositories
 
 - [DDP-API](https://github.com/Digital-Democracy-Project/ddp-api) — Auth gateway + API proxy
