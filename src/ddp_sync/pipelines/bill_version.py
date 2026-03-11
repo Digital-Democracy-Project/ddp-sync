@@ -181,15 +181,19 @@ class BillVersionSyncService:
         return False
 
     @staticmethod
-    def _extract_latest_action(bill_data: dict) -> tuple[str | None, str | None]:
-        """Extract the latest action description and date from OpenStates bill data.
+    def _extract_latest_action(bill_data: dict) -> tuple[str | None, str | None, str | None]:
+        """Extract the latest action description, date, and chamber from OpenStates bill data.
 
         OpenStates v3 API returns `latest_action_description` and
-        `latest_action_date` as top-level fields. The date is YYYY-MM-DD;
-        we convert it to ISO 8601 for Webflow's timestamp field type.
+        `latest_action_date` as top-level fields. The chamber is derived
+        from the last entry in the `actions` array, which includes an
+        `organization.name` field (e.g. "House", "Senate").
+
+        The date is YYYY-MM-DD; we convert it to ISO 8601 for Webflow's
+        timestamp field type.
 
         Returns:
-            (description, iso_date) tuple — either may be None
+            (description, iso_date, chamber) tuple — any may be None
         """
         description = bill_data.get("latest_action_description") or None
         action_date = bill_data.get("latest_action_date")
@@ -209,7 +213,17 @@ class BillVersionSyncService:
                 iso_date = action_date
         else:
             iso_date = None
-        return description, iso_date
+
+        # Extract chamber from the last action in the actions array.
+        # Each action has organization.name (e.g. "House", "Senate").
+        chamber = None
+        actions = bill_data.get("actions") or []
+        if actions:
+            last_action = actions[-1]
+            org = last_action.get("organization") or {}
+            chamber = org.get("name") or None
+
+        return description, iso_date, chamber
 
     @staticmethod
     def _dates_match(cms_date: str | None, openstates_date: str | None) -> bool:
@@ -231,14 +245,16 @@ class BillVersionSyncService:
         bill_title: str,
         new_status: str,
         status_date: str | None = None,
+        status_chamber: str | None = None,
     ) -> bool:
-        """Update the status and status-date fields for a bill in Webflow CMS.
+        """Update the status, status-date, and status-chamber fields for a bill in Webflow CMS.
 
         Args:
             webflow_id: Webflow item ID
             bill_title: For logging
             new_status: Latest action description from OpenStates
             status_date: ISO 8601 timestamp for the action date
+            status_chamber: Chamber where the latest action occurred (e.g. "House", "Senate")
 
         Returns:
             True on success, False on failure
@@ -251,6 +267,8 @@ class BillVersionSyncService:
             field_data: dict[str, str] = {"status": new_status}
             if status_date:
                 field_data["status-date"] = status_date
+            if status_chamber:
+                field_data["status-chamber"] = status_chamber
             return await lookup.update_bill_fields(
                 webflow_id,
                 field_data,
@@ -349,7 +367,7 @@ class BillVersionSyncService:
             # Text version unchanged — always update status/status-date
             # in Webflow CMS so the CMS stays current even when bill text
             # hasn't changed (e.g., committee vote, floor action).
-            latest_action, action_date = self._extract_latest_action(bill_data)
+            latest_action, action_date, action_chamber = self._extract_latest_action(bill_data)
             status_updated = False
             patch_skipped = False
 
@@ -357,9 +375,11 @@ class BillVersionSyncService:
                 skip_webflow = self._config.get("skip_webflow_update", False)
                 cms_status = fields.get("status", "")
                 cms_date = fields.get("status-date", "")
+                cms_chamber = fields.get("status-chamber", "")
                 status_matches = (
                     cms_status == latest_action
                     and self._dates_match(cms_date, action_date)
+                    and cms_chamber == (action_chamber or "")
                 )
                 if status_matches:
                     patch_skipped = True
@@ -370,7 +390,7 @@ class BillVersionSyncService:
                     )
                 elif not skip_webflow:
                     status_updated = await self._update_webflow_status(
-                        webflow_id, bill_title, latest_action, action_date,
+                        webflow_id, bill_title, latest_action, action_date, action_chamber,
                     )
                     if status_updated:
                         logger.info(
@@ -378,6 +398,7 @@ class BillVersionSyncService:
                             bill_title=bill_title,
                             new_status=latest_action,
                             status_date=action_date,
+                            status_chamber=action_chamber,
                         )
                     else:
                         logger.warning(
@@ -462,7 +483,7 @@ class BillVersionSyncService:
         webflow_updated = False
         status_updated = False
         patch_skipped = False
-        latest_action, action_date = self._extract_latest_action(bill_data)
+        latest_action, action_date, action_chamber = self._extract_latest_action(bill_data)
         if not latest_action:
             logger.warning(
                 "No latest_action from OpenStates for new version — status will be empty",
@@ -477,7 +498,7 @@ class BillVersionSyncService:
 
                 lookup = WebflowLookupService(self.settings)
                 scheduler_key = self.settings.webflow_scheduler_api_key
-                # Batch gov-url, status, and status-date into a single PATCH call
+                # Batch gov-url, status, status-date, and status-chamber into a single PATCH call
                 # Only include fields whose values actually differ from CMS
                 field_data: dict[str, str] = {}
                 if fields.get("gov-url") != text_url:
@@ -486,6 +507,8 @@ class BillVersionSyncService:
                     field_data["status"] = latest_action
                 if action_date and not self._dates_match(fields.get("status-date"), action_date):
                     field_data["status-date"] = action_date
+                if action_chamber and fields.get("status-chamber") != action_chamber:
+                    field_data["status-chamber"] = action_chamber
 
                 if not field_data:
                     patch_skipped = True

@@ -183,6 +183,7 @@ Key bill fields (actual Webflow API names):
 | `open-states-url-2` | string | `https://openstates.org/az/bills/...` | Used for jurisdiction resolution |
 | `status` | string | `"Referred to committee"` | Written by version sync |
 | `status-date` | string | `"2026-01-20T00:00:00.000Z"` | Written by version sync |
+| `status-chamber` | string | `"Senate"` | Chamber of latest action (e.g. "House", "Senate", "Office of the Governor") |
 | `gov-url` | string | `https://www.azleg.gov/...` | Official bill text URL |
 
 ## Related Repositories

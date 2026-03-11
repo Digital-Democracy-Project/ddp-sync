@@ -1,7 +1,7 @@
 """Webflow CMS write operations for sync pipelines.
 
 Provides:
-- update_bill_fields(): PATCH bill CMS fields (status, gov-url, status-date)
+- update_bill_fields(): PATCH bill CMS fields (status, gov-url, status-date, status-chamber)
 - update_bill_gov_url(): Thin wrapper for backward compat
 """
 
