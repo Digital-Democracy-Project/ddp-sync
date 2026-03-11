@@ -172,6 +172,16 @@ sudo journalctl -u ddp-sync --since "24 hours ago" -p err --no-pager
 
 **Files:** `services/legislative_calendar.py`, `pipelines/bill_version.py`, `pipelines/bill_sync.py`
 
+### Bill status stuck / not updating in Webflow CMS
+
+**Symptom:** Webflow CMS shows a stale `status` and `status-date` for a bill, even though the nightly bill version check runs successfully and OpenStates has newer actions.
+
+**Root cause (fixed 2026-03-11):** When a bill had no Redis version cache (first run, Redis flush, or newly added bill), `_is_newer_version()` returned `True`, routing the bill through the **new-version path** which requires full text re-ingestion into Pinecone before updating Webflow. If ingestion failed (Pinecone unavailable, PDF extraction error, etc.), the method returned early — **skipping the Webflow status update and Redis cache write**. On the next run the same failure repeated, leaving the bill permanently stale.
+
+**Fix:** The Webflow status update now runs regardless of whether text ingestion succeeds. The Redis cache is also written so the bill isn't stuck in a re-ingestion loop. A new `"partial"` result status tracks cases where status was updated but ingestion failed.
+
+**Files:** `pipelines/bill_version.py`
+
 ### Webflow CMS field name reference
 
 Key bill fields (actual Webflow API names):

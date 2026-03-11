@@ -32,7 +32,7 @@ class VersionCheckResult:
     webflow_id: str
     bill_title: str
     jurisdiction: str
-    status: str  # "updated", "unchanged", "no_versions", "error", "skipped"
+    status: str  # "updated", "unchanged", "partial", "no_versions", "error", "skipped"
     version_note: str = ""
     version_date: str = ""
     text_url: str = ""
@@ -452,6 +452,7 @@ class BillVersionSyncService:
         )
 
         chunks_created = 0
+        ingestion_error = None
         try:
             chunks_created = await self._ingest_bill_text(
                 webflow_id=webflow_id,
@@ -462,24 +463,17 @@ class BillVersionSyncService:
                 fields=fields,
             )
         except Exception as e:
+            ingestion_error = str(e)
             logger.error(
-                "Failed to ingest bill text",
+                "Failed to ingest bill text — continuing with Webflow status update",
                 webflow_id=webflow_id,
                 bill_title=bill_title,
-                error=str(e),
-            )
-            return VersionCheckResult(
-                webflow_id=webflow_id,
-                bill_title=bill_title,
-                jurisdiction=jurisdiction_code,
-                status="error",
-                version_note=latest_version.get("note", ""),
-                version_date=latest_version.get("date", ""),
-                text_url=text_url,
-                error=f"Ingestion failed: {e}",
+                error=ingestion_error,
             )
 
         # 7. Update Webflow fields (gov-url + status + status-date) in a single PATCH
+        # This runs regardless of ingestion success so that CMS status stays
+        # current even when text re-ingestion fails (e.g., Pinecone down, PDF error).
         webflow_updated = False
         status_updated = False
         patch_skipped = False
@@ -556,7 +550,7 @@ class BillVersionSyncService:
             webflow_id=webflow_id,
             bill_title=bill_title,
             jurisdiction=jurisdiction_code,
-            status="updated",
+            status="updated" if not ingestion_error else "partial",
             version_note=latest_version.get("note", ""),
             version_date=latest_version.get("date", ""),
             text_url=text_url,
@@ -564,6 +558,7 @@ class BillVersionSyncService:
             webflow_updated=webflow_updated,
             status_updated=status_updated,
             webflow_patch_skipped=patch_skipped,
+            error=f"Ingestion failed: {ingestion_error}" if ingestion_error else None,
         )
 
     async def _ingest_bill_text(
@@ -813,6 +808,22 @@ class BillVersionSyncService:
                         version=check_result.version_note,
                         status_updated=check_result.status_updated,
                         patch_skipped=check_result.webflow_patch_skipped,
+                    )
+                elif check_result.status == "partial":
+                    # Ingestion failed but Webflow status was still updated
+                    result.updated += 1
+                    if check_result.webflow_updated:
+                        result.webflow_updates += 1
+                    if check_result.status_updated:
+                        result.status_updates += 1
+                    if check_result.error:
+                        result.errors.append(f"{title}: {check_result.error}")
+                    logger.warning(
+                        "Bill ingestion failed but status updated",
+                        bill=title,
+                        webflow_id=webflow_id,
+                        status_updated=check_result.status_updated,
+                        error=check_result.error,
                     )
                 elif check_result.status == "no_versions":
                     result.no_versions += 1
