@@ -183,7 +183,7 @@ class FederalLegislatorCache:
         """
         logger.info("Refreshing federal legislator cache from OpenStates")
 
-        api_key = self.settings.openstates_api_key.get_secret_value()
+        api_key = self.settings.openstates_api_key
         if not api_key:
             return {"success": False, "error": "OpenStates API key not configured"}
 

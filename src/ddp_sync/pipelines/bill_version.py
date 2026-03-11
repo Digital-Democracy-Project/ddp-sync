@@ -247,7 +247,7 @@ class BillVersionSyncService:
             from ddp_sync.services.webflow_lookup import WebflowLookupService
 
             lookup = WebflowLookupService(self.settings)
-            scheduler_key = self.settings.webflow_scheduler_api_key.get_secret_value()
+            scheduler_key = self.settings.webflow_scheduler_api_key
             field_data: dict[str, str] = {"status": new_status}
             if status_date:
                 field_data["status-date"] = status_date
@@ -476,8 +476,7 @@ class BillVersionSyncService:
                 from ddp_sync.services.webflow_lookup import WebflowLookupService
 
                 lookup = WebflowLookupService(self.settings)
-                scheduler_key = self.settings.webflow_scheduler_api_key.get_secret_value()
-
+                scheduler_key = self.settings.webflow_scheduler_api_key
                 # Batch gov-url, status, and status-date into a single PATCH call
                 # Only include fields whose values actually differ from CMS
                 field_data: dict[str, str] = {}

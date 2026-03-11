@@ -44,7 +44,7 @@ class VectorStoreService:
             settings: Application settings. Uses default if not provided.
         """
         self.settings = settings or get_settings()
-        self.pc = Pinecone(api_key=self.settings.pinecone_api_key.get_secret_value())
+        self.pc = Pinecone(api_key=self.settings.pinecone_api_key)
         self.index_name = self.settings.pinecone_index_name
         self.namespace = self.settings.pinecone_namespace
         self._index = None

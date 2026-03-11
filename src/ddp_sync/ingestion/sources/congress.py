@@ -39,7 +39,7 @@ class CongressAPISource:
         """
         self.settings = settings or get_settings()
         self.metadata_extractor = metadata_extractor or MetadataExtractor()
-        self.api_key = self.settings.congress_api_key.get_secret_value()
+        self.api_key = self.settings.congress_api_key
 
     async def fetch(
         self,

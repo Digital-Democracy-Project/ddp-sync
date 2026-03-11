@@ -140,7 +140,7 @@ class OpenStatesSource:
         """
         self.settings = settings or get_settings()
         self.metadata_extractor = metadata_extractor or MetadataExtractor()
-        self.api_key = self.settings.openstates_api_key.get_secret_value()
+        self.api_key = self.settings.openstates_api_key
         # Cache for legislator lookups (openstates_id -> {name, slug})
         self._legislator_cache: dict[str, dict] = {}
 
@@ -313,7 +313,7 @@ class OpenStatesSource:
             logger.debug("No legislators collection ID configured, skipping legislator mapping")
             return
 
-        webflow_api_key = self.settings.webflow_votebot_api_key.get_secret_value()
+        webflow_api_key = self.settings.webflow_votebot_api_key
         if not webflow_api_key:
             logger.debug("No Webflow API key configured, skipping legislator mapping")
             return

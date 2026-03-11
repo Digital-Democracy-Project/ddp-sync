@@ -47,7 +47,8 @@ class SyncSettings:
     redis_url: str = "redis://localhost:6379/0"
 
     # Webflow
-    webflow_scheduler_api_key: str = ""
+    webflow_votebot_api_key: str = ""  # Read-only CMS key (CMS:read scope)
+    webflow_scheduler_api_key: str = ""  # Write-capable CMS key (CMS:write scope)
     webflow_api_token: str = ""
     webflow_site_id: str = ""
     webflow_bills_collection_id: str = ""
@@ -125,6 +126,7 @@ def _load_from_env() -> dict:
         "openstates_api_key": os.getenv("OPENSTATES_API_KEY", ""),
         "congress_api_key": os.getenv("CONGRESS_API_KEY", ""),
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),
         "webflow_api_token": os.getenv("WEBFLOW_API_TOKEN", ""),
         "webflow_site_id": os.getenv("WEBFLOW_SITE_ID", ""),

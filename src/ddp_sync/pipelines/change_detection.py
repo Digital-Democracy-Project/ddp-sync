@@ -97,7 +97,7 @@ class ChangeDetector:
     async def _check_congress_changes(self) -> bool:
         """Check Congress.gov for changes."""
         async with httpx.AsyncClient(timeout=30.0) as client:
-            api_key = self.settings.congress_api_key.get_secret_value()
+            api_key = self.settings.congress_api_key
             if not api_key:
                 return True  # Can't check without API key
 
@@ -133,7 +133,7 @@ class ChangeDetector:
     async def _check_openstates_changes(self) -> bool:
         """Check OpenStates for changes."""
         async with httpx.AsyncClient(timeout=30.0) as client:
-            api_key = self.settings.openstates_api_key.get_secret_value()
+            api_key = self.settings.openstates_api_key
             if not api_key:
                 return True
 

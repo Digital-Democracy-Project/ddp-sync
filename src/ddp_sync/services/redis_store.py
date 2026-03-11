@@ -1,14 +1,15 @@
-"""Redis client wrapper for cross-worker shared state and pub/sub.
+"""Redis client wrapper for shared state.
 
 Provides:
-- Thread-to-session mapping (Redis hash) for Slack handoff routing
-- Pub/sub for agent event delivery across uvicorn workers
+- Sync task state and heartbeat tracking
+- Sync checkpoint tracking for crash resume
+- Active jurisdiction tracking
+- Bill version cache (90-day TTL)
 - Graceful fallback: all methods no-op when Redis is unavailable
 """
 
-import asyncio
 import json
-from typing import Callable, Optional
+from typing import Optional
 
 import structlog
 
@@ -17,31 +18,25 @@ from ddp_sync.config import get_settings
 logger = structlog.get_logger()
 
 # Redis key constants
-THREAD_HASH_KEY = "votebot:threads"
-AGENT_EVENTS_CHANNEL = "votebot:agent_events"
-ACTIVE_JURISDICTIONS_KEY = "votebot:active_jurisdictions"
-SCHEDULER_LOCK_KEY = "votebot:scheduler:leader"
-SCHEDULER_LOCK_TTL = 300  # 5 minutes
-SYNC_CHECKPOINT_PREFIX = "votebot:sync:checkpoint:"
+ACTIVE_JURISDICTIONS_KEY = "ddp:active_jurisdictions"
+SYNC_CHECKPOINT_PREFIX = "ddp:sync:checkpoint:"
 SYNC_CHECKPOINT_TTL = 86400  # 24 hours
-BILL_VERSION_PREFIX = "votebot:bill_version:"
+BILL_VERSION_PREFIX = "ddp:bill_version:"
 BILL_VERSION_TTL = 86400 * 90  # 90 days
 
 
 class RedisStore:
-    """Thin wrapper around redis.asyncio for shared state + pub/sub."""
+    """Thin wrapper around redis.asyncio for shared state."""
 
     def __init__(self):
         self._client = None
-        self._pubsub = None
-        self._subscriber_task: Optional[asyncio.Task] = None
 
     @property
     def is_available(self) -> bool:
         return self._client is not None
 
     async def connect(self):
-        """Connect to Redis. Called from main.py lifespan startup."""
+        """Connect to Redis. Called from app.py lifespan startup."""
         try:
             import redis.asyncio as aioredis
 
@@ -52,32 +47,16 @@ class RedisStore:
             )
             # Verify connectivity
             await self._client.ping()
-            logger.info("Redis connected for cross-worker state", url=settings.redis_url)
+            logger.info("Redis connected", url=settings.redis_url)
         except Exception as e:
             logger.warning(
-                "Redis unavailable — falling back to in-memory state (single-worker only)",
+                "Redis unavailable — falling back to in-memory state",
                 error=str(e),
             )
             self._client = None
 
     async def disconnect(self):
-        """Disconnect from Redis. Called from main.py lifespan shutdown."""
-        if self._subscriber_task and not self._subscriber_task.done():
-            self._subscriber_task.cancel()
-            try:
-                await self._subscriber_task
-            except asyncio.CancelledError:
-                pass
-            self._subscriber_task = None
-
-        if self._pubsub:
-            try:
-                await self._pubsub.unsubscribe(AGENT_EVENTS_CHANNEL)
-                await self._pubsub.close()
-            except Exception:
-                pass
-            self._pubsub = None
-
+        """Disconnect from Redis. Called from app.py lifespan shutdown."""
         if self._client:
             try:
                 await self._client.close()
@@ -86,39 +65,9 @@ class RedisStore:
             self._client = None
             logger.info("Redis disconnected")
 
-    # -- Thread-to-session mapping (Redis hash) --
-
-    async def set_thread_mapping(self, thread_ts: str, session_id: str):
-        """Store thread_ts → session_id mapping in Redis."""
-        if not self._client:
-            return
-        try:
-            await self._client.hset(THREAD_HASH_KEY, thread_ts, session_id)
-        except Exception as e:
-            logger.error("Redis: failed to set thread mapping", error=str(e))
-
-    async def get_session_for_thread(self, thread_ts: str) -> Optional[str]:
-        """Look up session_id for a Slack thread_ts from Redis."""
-        if not self._client:
-            return None
-        try:
-            return await self._client.hget(THREAD_HASH_KEY, thread_ts)
-        except Exception as e:
-            logger.error("Redis: failed to get thread mapping", error=str(e))
-            return None
-
-    async def remove_thread_mapping(self, thread_ts: str):
-        """Remove a thread_ts mapping from Redis."""
-        if not self._client:
-            return
-        try:
-            await self._client.hdel(THREAD_HASH_KEY, thread_ts)
-        except Exception as e:
-            logger.error("Redis: failed to remove thread mapping", error=str(e))
-
     # -- Sync task storage --
 
-    SYNC_TASK_PREFIX = "votebot:sync:task:"
+    SYNC_TASK_PREFIX = "ddp:sync:task:"
     SYNC_TASK_TTL = 86400  # 24 hours
 
     async def set_sync_task(self, task_id: str, task_data: dict):
@@ -217,47 +166,6 @@ class RedisStore:
             logger.warning("Redis: failed to get active jurisdictions", error=str(e))
             return set()
 
-    # -- Scheduler leader election --
-
-    async def acquire_scheduler_lock(self, worker_id: str) -> bool:
-        """Try to become the scheduler leader. Returns True if lock acquired."""
-        if not self._client:
-            return True  # No Redis = single-worker mode, always lead
-        try:
-            acquired = await self._client.set(
-                SCHEDULER_LOCK_KEY, worker_id, nx=True, ex=SCHEDULER_LOCK_TTL
-            )
-            return bool(acquired)
-        except Exception as e:
-            logger.warning("Redis: failed to acquire scheduler lock", error=str(e))
-            return True  # Degrade gracefully: run scheduler anyway
-
-    async def refresh_scheduler_lock(self, worker_id: str) -> bool:
-        """Refresh the scheduler leader lock. Returns False if lock was lost."""
-        if not self._client:
-            return True
-        try:
-            # Only refresh if we still own the lock
-            current = await self._client.get(SCHEDULER_LOCK_KEY)
-            if current == worker_id:
-                await self._client.expire(SCHEDULER_LOCK_KEY, SCHEDULER_LOCK_TTL)
-                return True
-            return False
-        except Exception as e:
-            logger.warning("Redis: failed to refresh scheduler lock", error=str(e))
-            return True  # Keep running on error
-
-    async def release_scheduler_lock(self, worker_id: str):
-        """Release the scheduler leader lock if we still own it."""
-        if not self._client:
-            return
-        try:
-            current = await self._client.get(SCHEDULER_LOCK_KEY)
-            if current == worker_id:
-                await self._client.delete(SCHEDULER_LOCK_KEY)
-        except Exception as e:
-            logger.warning("Redis: failed to release scheduler lock", error=str(e))
-
     # -- Bill version tracking --
 
     async def set_bill_version(self, webflow_id: str, version_data: dict):
@@ -296,58 +204,6 @@ class RedisStore:
         except Exception as e:
             logger.error("Redis: failed to get bill version", webflow_id=webflow_id, error=str(e))
         return None
-
-    # -- Pub/sub for agent events --
-
-    async def publish_agent_event(self, event_type: str, session_id: str, payload: dict):
-        """Publish an agent event to all workers."""
-        if not self._client:
-            return
-        try:
-            event = json.dumps({
-                "event_type": event_type,
-                "session_id": session_id,
-                "payload": payload,
-            })
-            await self._client.publish(AGENT_EVENTS_CHANNEL, event)
-        except Exception as e:
-            logger.error("Redis: failed to publish agent event", error=str(e))
-
-    async def subscribe_agent_events(self, handler: Callable):
-        """Subscribe to agent events and dispatch to handler.
-
-        Starts a background task that listens for events and calls
-        handler(event_data: dict) for each one.
-        """
-        if not self._client:
-            return
-
-        # Don't start duplicate subscribers
-        if self._subscriber_task and not self._subscriber_task.done():
-            return
-
-        self._pubsub = self._client.pubsub()
-        await self._pubsub.subscribe(AGENT_EVENTS_CHANNEL)
-
-        async def _listen():
-            try:
-                async for message in self._pubsub.listen():
-                    if message["type"] != "message":
-                        continue
-                    try:
-                        event_data = json.loads(message["data"])
-                        await handler(event_data)
-                    except json.JSONDecodeError:
-                        logger.warning("Redis: invalid JSON in agent event")
-                    except Exception as e:
-                        logger.error("Redis: error handling agent event", error=str(e))
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error("Redis: pub/sub listener crashed", error=str(e))
-
-        self._subscriber_task = asyncio.create_task(_listen())
-        logger.info("Redis pub/sub subscriber started", channel=AGENT_EVENTS_CHANNEL)
 
 
 # Singleton

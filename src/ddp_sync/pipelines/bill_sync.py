@@ -121,7 +121,7 @@ class BillSyncService:
             config_path: Path to sync_schedule.yaml config file
         """
         self.settings = settings or get_settings()
-        self.api_key = self.settings.openstates_api_key.get_secret_value()
+        self.api_key = self.settings.openstates_api_key
         self.calendar = StateLegislativeCalendar()
         self.pipeline = IngestionPipeline(self.settings)
         self.config_path = config_path or DEFAULT_CONFIG_PATH
@@ -220,7 +220,7 @@ class BillSyncService:
             logger.warning("No legislators collection ID configured, skipping legislator mapping")
             return
 
-        webflow_api_key = self.settings.webflow_votebot_api_key.get_secret_value()
+        webflow_api_key = self.settings.webflow_votebot_api_key
         if not webflow_api_key:
             logger.warning("No Webflow API key configured, skipping legislator mapping")
             return
