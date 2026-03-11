@@ -18,8 +18,11 @@ from ddp_sync.services.legislative_calendar import StateLegislativeCalendar
 
 logger = structlog.get_logger()
 
-# Default config path
-DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "sync_schedule.yaml"
+# Default config path — try package-relative first (editable install),
+# then CWD-relative (non-editable install / systemd WorkingDirectory)
+_pkg_config = Path(__file__).parent.parent.parent / "config" / "sync_schedule.yaml"
+_cwd_config = Path.cwd() / "config" / "sync_schedule.yaml"
+DEFAULT_CONFIG_PATH = _pkg_config if _pkg_config.exists() else _cwd_config
 
 
 class UpdateScheduler:
