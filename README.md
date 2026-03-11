@@ -65,6 +65,8 @@ Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `o
 ```bash
 cd /home/ubuntu/ddp-sync
 git pull origin main
+source .venv/bin/activate
+pip install .
 sudo systemctl restart ddp-sync
 ```
 
@@ -103,17 +105,19 @@ sudo systemctl start ddp-sync
 # Clone and setup
 git clone git@github.com:Digital-Democracy-Project/ddp-sync.git
 cd ddp-sync
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install ".[dev]"
 
 # Copy env
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your API keys (see votebot/.env and DDP-API/.env for values)
 
 # Run
 uvicorn ddp_sync.app:app --host 0.0.0.0 --port 8001 --reload
 ```
+
+> **Note:** Use `pip install .` (non-editable) instead of `pip install -e .` if you encounter `.pth` file issues with Python 3.13 on macOS. Non-editable install requires re-running `pip install .` after code changes. The `config/sync_schedule.yaml` path resolves from either the package directory or CWD.
 
 ## Logs
 
@@ -128,8 +132,34 @@ sudo journalctl -u ddp-sync --since "04:00" --until "05:00" --no-pager
 sudo journalctl -u ddp-sync --since "24 hours ago" -p err --no-pager
 ```
 
+## Troubleshooting
+
+### Pinecone crash on startup
+
+**Symptom:** `PineconeConfigurationError` on startup when `PINECONE_API_KEY` is not set.
+
+**Fix (2026-03-11):** Pinecone client is now lazy-initialized on first use. The service starts without Pinecone credentials — health check reports `"pinecone": "not_configured"` instead of crashing.
+
+### Redis health check `_redis` attribute error
+
+**Symptom:** Health endpoint returns 500 with `'RedisStore' object has no attribute '_redis'`.
+
+**Fix (2026-03-11):** The `RedisStore` attribute is `_client`, not `_redis`. Fixed in `health.py` and `app.py` (zombie watchdog).
+
+### `sync_schedule.yaml` not found (non-editable install)
+
+**Symptom:** Scheduler starts with 0 jobs. Log shows config file not found.
+
+**Fix (2026-03-11):** `scheduler.py` now checks both the package-relative path and `Path.cwd() / "config" / "sync_schedule.yaml"`. Run `uvicorn` from the repo root directory so the CWD fallback resolves correctly.
+
+### Python 3.13 editable install fails on macOS
+
+**Symptom:** `pip install -e .` succeeds but `import ddp_sync` fails with `ModuleNotFoundError`.
+
+**Workaround:** Use non-editable install: `pip install .` (requires reinstall after code changes). This is a known issue with `.pth` file processing in Python 3.13 + Homebrew.
+
 ## Related Repositories
 
-- [DDP-API](https://github.com/VotingRightsBrigade/DDP-API) — Auth gateway + API proxy
-- [VoteBot](https://github.com/VotingRightsBrigade/votebot) — Chat/RAG service
+- [DDP-API](https://github.com/Digital-Democracy-Project/ddp-api) — Auth gateway + API proxy
+- [VoteBot](https://github.com/Digital-Democracy-Project/votebot) — Chat/RAG service
 - [FillWebflowFields](https://github.com/VotingRightsBrigade/FillWebflowFields) — Webflow CMS management package (`webflow_cms`)
