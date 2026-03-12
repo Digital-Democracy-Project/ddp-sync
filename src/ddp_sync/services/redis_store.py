@@ -23,6 +23,10 @@ SYNC_CHECKPOINT_PREFIX = "ddp:sync:checkpoint:"
 SYNC_CHECKPOINT_TTL = 86400  # 24 hours
 BILL_VERSION_PREFIX = "ddp:bill_version:"
 BILL_VERSION_TTL = 86400 * 90  # 90 days
+BILL_STATUS_PREFIX = "ddp:bill_status:"
+BILL_STATUS_TTL = 86400 * 90  # 90 days
+FLOW_STATUS_PREFIX = "ddp:flow:"
+FLOW_STATUS_TTL = 86400 * 7  # 7 days
 
 
 class RedisStore:
@@ -203,6 +207,84 @@ class RedisStore:
                 return json.loads(data)
         except Exception as e:
             logger.error("Redis: failed to get bill version", webflow_id=webflow_id, error=str(e))
+        return None
+
+    # -- Bill status cache (Flow 1: OpenStates → Webflow CMS) --
+
+    async def set_bill_status(self, webflow_id: str, status_data: dict):
+        """Cache the last-synced Webflow status fields for a bill.
+
+        Args:
+            webflow_id: Webflow item ID
+            status_data: Dict with status, status_date, status_chamber, gov_url, last_synced
+        """
+        if not self._client:
+            return
+        try:
+            await self._client.set(
+                f"{BILL_STATUS_PREFIX}{webflow_id}",
+                json.dumps(status_data),
+                ex=BILL_STATUS_TTL,
+            )
+        except Exception as e:
+            logger.error("Redis: failed to set bill status", webflow_id=webflow_id, error=str(e))
+
+    async def get_bill_status(self, webflow_id: str) -> dict | None:
+        """Get cached Webflow status fields for a bill.
+
+        Args:
+            webflow_id: Webflow item ID
+
+        Returns:
+            Dict with cached status fields or None
+        """
+        if not self._client:
+            return None
+        try:
+            data = await self._client.get(f"{BILL_STATUS_PREFIX}{webflow_id}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.error("Redis: failed to get bill status", webflow_id=webflow_id, error=str(e))
+        return None
+
+    # -- Flow run status tracking --
+
+    async def set_flow_status(self, flow_name: str, status_data: dict):
+        """Record a flow run's outcome.
+
+        Args:
+            flow_name: Flow identifier (e.g. 'daily_bill_sync', 'webflow_status')
+            status_data: Dict with started_at, completed_at, status, results, etc.
+        """
+        if not self._client:
+            return
+        try:
+            await self._client.set(
+                f"{FLOW_STATUS_PREFIX}{flow_name}",
+                json.dumps(status_data),
+                ex=FLOW_STATUS_TTL,
+            )
+        except Exception as e:
+            logger.error("Redis: failed to set flow status", flow_name=flow_name, error=str(e))
+
+    async def get_flow_status(self, flow_name: str) -> dict | None:
+        """Get last run status for a flow.
+
+        Args:
+            flow_name: Flow identifier
+
+        Returns:
+            Dict with flow run status or None
+        """
+        if not self._client:
+            return None
+        try:
+            data = await self._client.get(f"{FLOW_STATUS_PREFIX}{flow_name}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.error("Redis: failed to get flow status", flow_name=flow_name, error=str(e))
         return None
 
 

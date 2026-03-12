@@ -18,6 +18,7 @@ from ddp_sync.sync import (
     SyncIdentifier,
     SyncMode,
     SyncOptions,
+    SyncTarget,
     UnifiedSyncService,
 )
 
@@ -83,6 +84,14 @@ class UnifiedSyncRequest(BaseModel):
         default=0,
         ge=0,
         description="Maximum items to process (0 = unlimited)",
+    )
+    target: str = Field(
+        default="all",
+        description="Target data flow: all (default), webflow (CMS only), pinecone (vector store only)",
+    )
+    all_sessions: bool = Field(
+        default=False,
+        description="Bypass session/jurisdiction filters for backfill operations",
     )
     dry_run: bool = Field(
         default=False,
@@ -311,8 +320,19 @@ async def sync_unified(
                     detail=str(e),
                 )
 
+        # Parse target
+        try:
+            target = SyncTarget(request.target.lower())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid target: {request.target}. Valid targets: all, webflow, pinecone",
+            )
+
         # Build options
         options = SyncOptions(
+            target=target,
+            all_sessions=request.all_sessions,
             include_pdfs=request.include_pdfs,
             include_openstates=request.include_openstates,
             include_sponsored_bills=request.include_sponsored_bills,
@@ -332,6 +352,8 @@ async def sync_unified(
                 "last_heartbeat": datetime.now(timezone.utc).isoformat(),
                 "retry_count": 0,
                 "options": {
+                    "target": options.target.value,
+                    "all_sessions": options.all_sessions,
                     "include_pdfs": options.include_pdfs,
                     "include_openstates": options.include_openstates,
                     "include_sponsored_bills": options.include_sponsored_bills,

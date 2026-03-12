@@ -10,7 +10,7 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.pipeline import IngestionPipeline
 from ddp_sync.ingestion.sources.webflow import WebflowSource
 from ddp_sync.services.redis_store import get_redis_store
-from ddp_sync.sync.types import ContentType, SyncIdentifier, SyncMode, SyncOptions, SyncResult
+from ddp_sync.sync.types import ContentType, SyncIdentifier, SyncMode, SyncOptions, SyncResult, SyncTarget
 from ddp_sync.pipelines.bill_sync import BillSyncService
 
 logger = structlog.get_logger()
@@ -354,15 +354,43 @@ class BillHandler:
 
             redis_store = get_redis_store()
 
-            for item_idx, item in enumerate(raw_items):
-                webflow_id = item.get("id", "")
+            # Flow 3: Webflow CMS content → Pinecone (bill metadata, PDFs)
+            if options.target in (SyncTarget.ALL, SyncTarget.PINECONE):
+                for item_idx, item in enumerate(raw_items):
+                    webflow_id = item.get("id", "")
 
-                # Skip items already processed in previous run
-                if webflow_id and webflow_id in completed_ids:
-                    items_skipped += 1
-                    total_processed += 1
-                    total_successful += 1
-                    # Report progress for skipped items too
+                    # Skip items already processed in previous run
+                    if webflow_id and webflow_id in completed_ids:
+                        items_skipped += 1
+                        total_processed += 1
+                        total_successful += 1
+                        if options.progress_callback:
+                            await options.progress_callback(
+                                items_processed=total_processed,
+                                items_successful=total_successful,
+                                items_failed=total_processed - total_successful,
+                                chunks_created=total_chunks,
+                                errors=errors,
+                            )
+                        continue
+
+                    bill_docs = []
+                    async for doc in self.webflow._process_bill_item(
+                        item, include_pdfs=options.include_pdfs
+                    ):
+                        bill_docs.append(doc)
+
+                    if bill_docs:
+                        result = await self.pipeline.ingest_batch(bill_docs)
+                        total_processed += len(bill_docs)
+                        total_successful += result.documents_processed
+                        total_chunks += result.chunks_created
+                        errors.extend(result.errors)
+                        total_docs_collected += len(bill_docs)
+
+                    if options.task_id and webflow_id:
+                        await redis_store.add_sync_checkpoint(options.task_id, webflow_id)
+
                     if options.progress_callback:
                         await options.progress_callback(
                             items_processed=total_processed,
@@ -371,27 +399,27 @@ class BillHandler:
                             chunks_created=total_chunks,
                             errors=errors,
                         )
-                    continue
 
-                bill_docs = []
-                async for doc in self.webflow._process_bill_item(
-                    item, include_pdfs=options.include_pdfs
-                ):
-                    bill_docs.append(doc)
+                    del bill_docs
+                    gc.collect()
 
-                if bill_docs:
-                    result = await self.pipeline.ingest_batch(bill_docs)
-                    total_processed += len(bill_docs)
-                    total_successful += result.documents_processed
-                    total_chunks += result.chunks_created
-                    errors.extend(result.errors)
-                    total_docs_collected += len(bill_docs)
+                    if (item_idx + 1) % 10 == 0:
+                        logger.debug(
+                            "Batch sync progress",
+                            bills_processed=item_idx + 1,
+                            total_bills=len(raw_items),
+                            docs_collected=total_docs_collected,
+                            items_skipped=items_skipped,
+                        )
 
-                # Write checkpoint for this bill
-                if options.task_id and webflow_id:
-                    await redis_store.add_sync_checkpoint(options.task_id, webflow_id)
+                if items_skipped:
+                    logger.info(
+                        f"Resume: skipped {items_skipped} already-processed bills"
+                    )
+                logger.info(f"Processed {total_docs_collected} bill documents")
 
-                # Report progress after each bill
+            # Build heartbeat callback for long-running phases
+            async def _heartbeat():
                 if options.progress_callback:
                     await options.progress_callback(
                         items_processed=total_processed,
@@ -401,66 +429,55 @@ class BillHandler:
                         errors=errors,
                     )
 
-                # Reclaim PDF text, pdfplumber objects, embedding vectors
-                del bill_docs
-                gc.collect()
+            # Flow 2: OpenStates history/votes → Pinecone
+            if options.target in (SyncTarget.ALL, SyncTarget.PINECONE):
+                if options.include_openstates and raw_items:
+                    await _heartbeat()
+                    if options.all_sessions:
+                        os_result = await self.bill_sync.backload_all_bills(
+                            raw_items, heartbeat_callback=_heartbeat
+                        )
+                    else:
+                        os_result = await self.bill_sync.sync_current_session_bills(
+                            raw_items, heartbeat_callback=_heartbeat
+                        )
+                    total_chunks += os_result.chunks_created
+                    errors.extend(os_result.errors)
 
-                if (item_idx + 1) % 10 == 0:
-                    logger.debug(
-                        "Batch sync progress",
-                        bills_processed=item_idx + 1,
-                        total_bills=len(raw_items),
-                        docs_collected=total_docs_collected,
-                        items_skipped=items_skipped,
+            # Flow 1 + Flow 2 version check (shared fetch)
+            if options.target == SyncTarget.ALL:
+                if options.include_openstates and raw_items:
+                    from ddp_sync.pipelines.bill_version import BillVersionSyncService
+                    version_sync = BillVersionSyncService(self.settings)
+                    await _heartbeat()
+                    version_result = await version_sync.sync_bill_versions(
+                        raw_items, heartbeat_callback=_heartbeat
                     )
+                    total_chunks += version_result.chunks_created
+                    errors.extend(version_result.errors)
 
-            if items_skipped:
-                logger.info(
-                    f"Resume: skipped {items_skipped} already-processed bills"
-                )
-            logger.info(f"Processed {total_docs_collected} bill documents")
-
-            # Also sync OpenStates history for bills if enabled
-            # Use the already-filtered raw_items from above
-            if options.include_openstates and raw_items:
-                # Build heartbeat callback to keep zombie watchdog from
-                # detecting this task as stale during long-running phases
-                async def _heartbeat():
-                    if options.progress_callback:
-                        await options.progress_callback(
-                            items_processed=total_processed,
-                            items_successful=total_successful,
-                            items_failed=total_processed - total_successful,
-                            chunks_created=total_chunks,
-                            errors=errors,
+                    if version_result.status_updates > 0 or version_result.updated > 0:
+                        logger.info(
+                            "Bill version sync included in batch",
+                            version_checked=version_result.checked,
+                            version_updated=version_result.updated,
+                            status_updates=version_result.status_updates,
+                            webflow_updates=version_result.webflow_updates,
                         )
 
-                await _heartbeat()
-                os_result = await self.bill_sync.sync_current_session_bills(
-                    raw_items, heartbeat_callback=_heartbeat
-                )
-                total_chunks += os_result.chunks_created
-                errors.extend(os_result.errors)
-
-                await _heartbeat()
-
-                # Chain bill version check — updates gov-url, status, status-date in Webflow CMS
-                from ddp_sync.pipelines.bill_version import BillVersionSyncService
-                version_sync = BillVersionSyncService(self.settings)
-                version_result = await version_sync.sync_bill_versions(
-                    raw_items, heartbeat_callback=_heartbeat
-                )
-                total_chunks += version_result.chunks_created
-                errors.extend(version_result.errors)
-
-                if version_result.status_updates > 0 or version_result.updated > 0:
-                    logger.info(
-                        "Bill version sync included in batch",
-                        version_checked=version_result.checked,
-                        version_updated=version_result.updated,
-                        status_updates=version_result.status_updates,
-                        webflow_updates=version_result.webflow_updates,
+            elif options.target == SyncTarget.WEBFLOW:
+                # Flow 1 only: lightweight status sync
+                if raw_items:
+                    from ddp_sync.pipelines.bill_version import BillVersionSyncService
+                    version_sync = BillVersionSyncService(self.settings)
+                    await _heartbeat()
+                    status_result = await version_sync.sync_bill_statuses(
+                        raw_items,
+                        all_sessions=options.all_sessions,
+                        jurisdiction=options.jurisdiction,
+                        heartbeat_callback=_heartbeat,
                     )
+                    errors.extend(status_result.errors)
 
             duration = time.perf_counter() - start_time
             success = total_successful > 0

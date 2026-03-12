@@ -6,7 +6,10 @@ Unified data pipeline service for the Digital Democracy Project.
 
 DDP-Sync handles all scheduled and on-demand data sync operations:
 
-- **Bill version sync** (daily 04:00 UTC): OpenStates → Webflow CMS + Pinecone
+- **Daily bill sync** (04:00 UTC): Shared OpenStates fetch with independent write paths:
+  - Flow 1: OpenStates → Webflow CMS (status, status-date, status-chamber, gov-url)
+  - Flow 2: OpenStates → Pinecone (bill text re-ingestion on new versions)
+  - Either flow can be disabled independently in `sync_schedule.yaml`
 - **Legislator sync** (weekly Sun 06:00 UTC): OpenStates → Pinecone
 - **Organization sync** (monthly 1st 08:00 UTC): Webflow → Pinecone
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
@@ -43,14 +46,21 @@ All endpoints are prefixed with `/ddp-sync/v1`.
 | GET | `/sync/unified/status/{id}` | Poll task status |
 | POST | `/sync/unified/all` | Trigger sync for all content types |
 
+The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parameters:
+- `target`: `"all"` (default), `"webflow"` (CMS only), or `"pinecone"` (vector store only)
+- `all_sessions`: `true` to bypass session/jurisdiction filters for backfill
+
 ### Trigger Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/trigger/bill-version-check` | Trigger daily bill version check (status updates) |
+| POST | `/trigger/bill-version-check` | Trigger daily bill sync (Flow 1 + Flow 2) |
+| POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |
+
+`/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
 
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 
@@ -58,7 +68,7 @@ Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `o
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (scheduler, Redis, Pinecone) |
+| GET | `/health` | Health check (scheduler, Redis, Pinecone, flow status) |
 | GET | `/schedule` | Show all scheduled jobs and next run times |
 
 ## Deployment
@@ -146,10 +156,10 @@ Key bill fields (actual Webflow API names):
 | `session-code` | string | `"2026"`, `"57th-2nd-regular"` | OpenStates session identifier |
 | `bill-session` | integer | `2026` | Calendar year — **NOT** `session-year` |
 | `open-states-url-2` | string | `https://openstates.org/az/bills/...` | Used for jurisdiction resolution |
-| `status` | string | `"Referred to committee"` | Written by version sync |
-| `status-date` | string | `"2026-01-20T00:00:00.000Z"` | Written by version sync |
+| `status` | string | `"Referred to committee"` | Written by Flow 1 (OpenStates → Webflow) |
+| `status-date` | string | `"2026-01-20T00:00:00.000Z"` | Written by Flow 1 |
 | `status-chamber` | string | `"Senate"` | Chamber of latest action (e.g. "House", "Senate", "Office of the Governor") |
-| `gov-url` | string | `https://www.azleg.gov/...` | Official bill text URL |
+| `gov-url` | string | `https://www.azleg.gov/...` | Official bill text URL, written by Flow 1 |
 
 ## Related Repositories
 

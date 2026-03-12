@@ -53,6 +53,24 @@ async def health():
     except Exception as e:
         result["redis"] = f"error: {e}"
 
+    # Flow status (last run info for each data flow)
+    try:
+        from ddp_sync.services.redis_store import get_redis_store as _get_redis
+        _store = _get_redis()
+        flow_statuses = {}
+        for flow_name in ("daily_bill_sync", "webflow_status", "pinecone_ingestion"):
+            flow_data = await _store.get_flow_status(flow_name)
+            if flow_data:
+                flow_statuses[flow_name] = {
+                    "status": flow_data.get("status"),
+                    "completed_at": flow_data.get("completed_at"),
+                    "duration_seconds": flow_data.get("duration_seconds"),
+                }
+        if flow_statuses:
+            result["flows"] = flow_statuses
+    except Exception:
+        pass
+
     # Pinecone
     try:
         if settings.pinecone_api_key:

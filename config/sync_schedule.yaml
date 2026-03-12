@@ -18,8 +18,21 @@
 # - Fallback: Hardcoded heuristics in StateLegislativeCalendar (start pattern
 #   + duration in weeks for all 50 states)
 
-# Global settings
-sync_time_utc: "04:00"  # When to run daily bill version check (4 AM UTC = 11 PM EST)
+# Global settings (legacy — prefer bill_sync block below)
+sync_time_utc: "04:00"  # Fallback if bill_sync.sync_time_utc is not set
+
+# Daily bill sync — shared OpenStates fetch, independent write paths
+bill_sync:
+  sync_time_utc: "04:00"  # 4 AM UTC = 11 PM EST
+
+  # Flow 1: OpenStates → Webflow CMS (status, status-date, status-chamber, gov-url)
+  webflow_status:
+    enabled: true
+
+  # Flow 2: OpenStates → Pinecone (bill text re-ingestion on new versions)
+  version_check:
+    enabled: true
+    max_updates_per_run: 0  # 0 = unlimited
 
 # Federal Congress settings (not covered by StateLegislativeCalendar)
 US:

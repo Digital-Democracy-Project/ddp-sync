@@ -56,3 +56,34 @@ Known issues, past bugs, and their resolutions. Entries are grouped by subsystem
 **Fix:** The Webflow status update now runs regardless of whether text ingestion succeeds. The Redis cache is also written so the bill isn't stuck in a re-ingestion loop. A new `"partial"` result status tracks cases where status was updated but ingestion failed.
 
 **Files:** `pipelines/bill_version.py`
+
+---
+
+## Data Flow Decoupling (2026-03-11)
+
+### Background
+
+The Webflow CMS status sync (Flow 1) and Pinecone version check (Flow 2) were previously tangled in a single `check_and_update_bill()` method. This meant:
+- You couldn't update Webflow without risking a Pinecone re-ingestion
+- A Pinecone failure could stall CMS updates
+- No way to backfill historical bills to Webflow without triggering version checks
+
+### Architecture after decoupling
+
+`check_and_update_bill()` is now composed of two independent write paths:
+- `update_bill_status()` — Flow 1: extracts status, date, chamber, gov-url from OpenStates and PATCHes Webflow
+- `check_and_reingest_version()` — Flow 2: compares bill text version against Redis cache, re-ingests to Pinecone if newer
+
+Both share the same fetched OpenStates data (one API call per bill). Either can fail independently without blocking the other.
+
+### New API parameters
+
+- `target`: `"all"` (default), `"webflow"`, or `"pinecone"` — controls which write paths run
+- `all_sessions`: bypasses session/jurisdiction filters for backfill operations
+- `/trigger/bill-status-sync`: dedicated endpoint for Flow 1 only
+
+### Config changes
+
+`sync_schedule.yaml` now has a `bill_sync` block with `webflow_status.enabled` and `version_check.enabled` sub-configs. Either flow can be disabled independently. The old `sync_time_utc` and `bill_version_check` keys still work as fallbacks.
+
+**Files:** `sync/types.py`, `pipelines/bill_version.py`, `sync/handlers/bill.py`, `scheduler.py`, `api/routes/triggers.py`, `api/routes/sync_unified.py`, `services/redis_store.py`, `config/sync_schedule.yaml`

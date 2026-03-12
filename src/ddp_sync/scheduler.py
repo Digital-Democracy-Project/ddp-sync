@@ -86,16 +86,17 @@ class UpdateScheduler:
             logger.warning("Scheduler already running")
             return
 
-        # Parse sync time from config
-        sync_time_str = self._sync_config.get("sync_time_utc", "04:00")
+        # Parse sync time — prefer new bill_sync block, fall back to top-level
+        bill_sync_config = self._sync_config.get("bill_sync", {})
+        sync_time_str = bill_sync_config.get("sync_time_utc") or self._sync_config.get("sync_time_utc", "04:00")
         hour, minute = map(int, sync_time_str.split(":"))
 
-        # Add daily bill version check job
+        # Add daily bill sync job (shared fetch, independent write paths)
         self.scheduler.add_job(
-            self._run_openstates_sync,
+            self._run_daily_bill_sync,
             trigger=CronTrigger(hour=hour, minute=minute),
-            id="daily_bill_version_check",
-            name="Daily Bill Version Check",
+            id="daily_bill_sync",
+            name="Daily Bill Sync",
             replace_existing=True,
         )
 
@@ -428,54 +429,105 @@ class UpdateScheduler:
         logger.info(f"Fetched {len(bills)} bills from Webflow CMS")
         return bills
 
-    async def _run_openstates_sync(self) -> dict[str, Any]:
-        """
-        Run the daily bill version check.
+    async def _run_daily_bill_sync(self) -> dict[str, Any]:
+        """Daily bill sync: shared OpenStates fetch, independent write paths.
 
-        For each current-session bill, checks OpenStates for newer amended
-        versions (e.g., Engrossed, Enrolled). If a newer version is found,
-        re-ingests the bill text (PDF or HTML) into Pinecone and updates
-        the gov-url in Webflow CMS.
+        1. Fetches all current-session bills from Webflow CMS
+        2. For each bill, fetches latest data from OpenStates (one API call)
+        3. Routes the fetched data to enabled write paths:
+           - Flow 1: Update Webflow CMS status fields
+           - Flow 2: Check for new bill text version, re-ingest to Pinecone if needed
+        Each write path has independent error handling — a Flow 2 failure
+        does not prevent Flow 1 from succeeding for the same bill.
 
         Returns:
             Dict with sync results
         """
         from ddp_sync.pipelines.bill_version import BillVersionSyncService
+        from ddp_sync.services.redis_store import get_redis_store
 
         start_time = datetime.utcnow()
-        logger.info("Starting daily bill version check")
+
+        # Read flow config — prefer new bill_sync block, fall back to legacy
+        bill_sync_config = self._sync_config.get("bill_sync", {})
+        flow1_enabled = bill_sync_config.get("webflow_status", {}).get("enabled", True)
+        flow2_enabled = bill_sync_config.get("version_check", {}).get("enabled", True)
+
+        logger.info(
+            "Starting daily bill sync",
+            flow1_enabled=flow1_enabled,
+            flow2_enabled=flow2_enabled,
+        )
+
+        if not flow1_enabled and not flow2_enabled:
+            return {"success": True, "skipped": "all flows disabled"}
 
         try:
             version_sync = BillVersionSyncService(self.settings)
             bills = await self._fetch_webflow_bills()
 
-            result = await version_sync.sync_bill_versions(bills)
+            if flow1_enabled and flow2_enabled:
+                # Both flows: shared fetch via sync_bill_versions
+                # (internally calls update_bill_status + check_and_reingest_version)
+                result = await version_sync.sync_bill_versions(bills)
+            elif flow1_enabled:
+                # Flow 1 only: lightweight status sync
+                result = await version_sync.sync_bill_statuses(bills)
+            else:
+                # Flow 2 only: version check with Webflow writes disabled
+                # Temporarily set skip_webflow_update to suppress Flow 1
+                version_sync._config["skip_webflow_update"] = True
+                result = await version_sync.sync_bill_versions(bills)
 
             duration = (datetime.utcnow() - start_time).total_seconds()
 
             has_problems = result.failed > 0 or result.webflow_patch_failures > 0
             log_fn = logger.warning if has_problems else logger.info
             log_fn(
-                "Daily bill version check completed",
+                "Daily bill sync completed",
                 duration_seconds=round(duration, 1),
+                flow1_enabled=flow1_enabled,
+                flow2_enabled=flow2_enabled,
                 total_bills=result.total_bills,
                 checked=result.checked,
                 updated=result.updated,
                 unchanged=result.unchanged,
                 no_versions=result.no_versions,
                 skipped=result.skipped,
-                skipped_no_url=result.skipped_no_url,
-                skipped_not_current=result.skipped_not_current,
-                skipped_jurisdiction=result.skipped_jurisdiction,
                 failed=result.failed,
                 chunks_created=result.chunks_created,
                 webflow_updates=result.webflow_updates,
                 status_updates=result.status_updates,
                 webflow_skipped=result.webflow_skipped,
                 webflow_patch_failures=result.webflow_patch_failures,
-                no_latest_action=result.no_latest_action,
                 errors=result.errors[:10] if result.errors else [],
             )
+
+            # Record flow status in Redis
+            redis_store = get_redis_store()
+            await redis_store.set_flow_status("daily_bill_sync", {
+                "flow": "daily_bill_sync",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.utcnow().isoformat(),
+                "duration_seconds": round(duration, 1),
+                "status": "completed",
+                "flow1_enabled": flow1_enabled,
+                "flow2_enabled": flow2_enabled,
+                "bills_checked": result.checked,
+                "flow1_results": {
+                    "bills_updated": result.webflow_updates,
+                    "bills_skipped": result.webflow_skipped,
+                    "bills_failed": result.webflow_patch_failures,
+                },
+                "flow2_results": {
+                    "versions_checked": result.checked,
+                    "versions_reingested": result.updated,
+                    "bills_failed": result.failed,
+                    "chunks_created": result.chunks_created,
+                },
+                "errors": result.errors[:10] if result.errors else [],
+                "trigger": "scheduled",
+            })
 
             # Call callbacks
             for callback in self._update_callbacks:
@@ -489,6 +541,8 @@ class UpdateScheduler:
 
             return {
                 "success": True,
+                "flow1_enabled": flow1_enabled,
+                "flow2_enabled": flow2_enabled,
                 "duration_seconds": duration,
                 "total_bills": result.total_bills,
                 "checked": result.checked,
@@ -504,27 +558,49 @@ class UpdateScheduler:
             }
 
         except Exception as e:
-            logger.exception("Bill version check failed", error=str(e))
+            logger.exception("Daily bill sync failed", error=str(e))
+            # Record failure in Redis
+            try:
+                redis_store = get_redis_store()
+                await redis_store.set_flow_status("daily_bill_sync", {
+                    "flow": "daily_bill_sync",
+                    "started_at": start_time.isoformat(),
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "status": "failed",
+                    "error": str(e),
+                    "trigger": "scheduled",
+                })
+            except Exception:
+                pass
             return {
                 "success": False,
                 "error": str(e),
             }
 
-    async def trigger_openstates_sync(self, force_all: bool = False) -> dict[str, Any]:
-        """
-        Manually trigger a bill version check (or full backload).
+    async def trigger_openstates_sync(
+        self,
+        force_all: bool = False,
+        webflow_only: bool = False,
+    ) -> dict[str, Any]:
+        """Manually trigger a bill sync.
 
         Args:
-            force_all: If True, backload all bills via BillSyncService (ignores session filtering).
-                       If False, run the normal version check (session-aware).
+            force_all: If True, backload all bills (ignores session filtering).
+            webflow_only: If True, run Flow 1 only (status sync, no Pinecone).
 
         Returns:
             Dict with sync results
         """
-        logger.info("Manual bill sync triggered", force_all=force_all)
+        logger.info(
+            "Manual bill sync triggered",
+            force_all=force_all,
+            webflow_only=webflow_only,
+        )
+
+        if webflow_only:
+            return await self.trigger_bill_status_sync(all_sessions=force_all)
 
         if force_all:
-            # Use backload logic for all bills (full re-sync of history/votes)
             from ddp_sync.pipelines.bill_sync import BillSyncService
 
             sync_service = BillSyncService(self.settings)
@@ -541,7 +617,82 @@ class UpdateScheduler:
                 "errors": result.errors[:10] if result.errors else [],
             }
 
-        return await self._run_openstates_sync()
+        return await self._run_daily_bill_sync()
+
+    async def trigger_bill_status_sync(
+        self,
+        all_sessions: bool = False,
+        jurisdiction: str | None = None,
+    ) -> dict[str, Any]:
+        """Manually trigger Flow 1: OpenStates → Webflow CMS status sync.
+
+        Args:
+            all_sessions: Bypass session filters for backfill
+            jurisdiction: Filter to a single state code
+
+        Returns:
+            Dict with sync results
+        """
+        from ddp_sync.pipelines.bill_version import BillVersionSyncService
+        from ddp_sync.services.redis_store import get_redis_store
+
+        start_time = datetime.utcnow()
+        logger.info(
+            "Manual bill status sync triggered (Flow 1 only)",
+            all_sessions=all_sessions,
+            jurisdiction=jurisdiction,
+        )
+
+        try:
+            version_sync = BillVersionSyncService(self.settings)
+            bills = await self._fetch_webflow_bills()
+
+            result = await version_sync.sync_bill_statuses(
+                bills,
+                all_sessions=all_sessions,
+                jurisdiction=jurisdiction,
+            )
+
+            duration = (datetime.utcnow() - start_time).total_seconds()
+
+            # Record flow status in Redis
+            redis_store = get_redis_store()
+            await redis_store.set_flow_status("webflow_status", {
+                "flow": "webflow_status",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.utcnow().isoformat(),
+                "duration_seconds": round(duration, 1),
+                "status": "completed",
+                "all_sessions": all_sessions,
+                "jurisdiction": jurisdiction,
+                "bills_checked": result.checked,
+                "bills_updated": result.webflow_updates,
+                "bills_skipped": result.webflow_skipped,
+                "bills_failed": result.webflow_patch_failures,
+                "trigger": "manual",
+            })
+
+            return {
+                "success": True,
+                "mode": "webflow_status_sync",
+                "all_sessions": all_sessions,
+                "jurisdiction": jurisdiction,
+                "duration_seconds": duration,
+                "total_bills": result.total_bills,
+                "checked": result.checked,
+                "status_updates": result.status_updates,
+                "webflow_updates": result.webflow_updates,
+                "webflow_skipped": result.webflow_skipped,
+                "failed": result.failed,
+                "errors": result.errors[:10] if result.errors else [],
+            }
+
+        except Exception as e:
+            logger.exception("Bill status sync failed", error=str(e))
+            return {
+                "success": False,
+                "error": str(e),
+            }
 
     async def _run_legislator_bills_sync(self) -> dict[str, Any]:
         """

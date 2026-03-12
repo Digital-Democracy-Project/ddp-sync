@@ -283,6 +283,246 @@ class BillVersionSyncService:
             )
             return False
 
+    async def update_bill_status(
+        self,
+        webflow_id: str,
+        bill_title: str,
+        jurisdiction_code: str,
+        bill_data: dict,
+        fields: dict,
+    ) -> dict:
+        """Flow 1 write path: update Webflow CMS status fields from OpenStates data.
+
+        Extracts status, status-date, status-chamber, and gov-url from the
+        already-fetched bill_data and PATCHes Webflow if any values differ
+        from the current CMS fields.
+
+        Args:
+            webflow_id: Webflow item ID
+            bill_title: Human-readable bill title
+            jurisdiction_code: Two-letter state code
+            bill_data: Full bill data dict from OpenStates API
+            fields: Current CMS field data from Webflow
+
+        Returns:
+            Dict with keys: status_updated, webflow_updated, patch_skipped,
+            latest_action, action_date, action_chamber, gov_url
+        """
+        from ddp_sync.services.redis_store import get_redis_store
+
+        result = {
+            "status_updated": False,
+            "webflow_updated": False,
+            "patch_skipped": False,
+            "latest_action": None,
+            "action_date": None,
+            "action_chamber": None,
+            "gov_url": None,
+        }
+
+        latest_action, action_date, action_chamber = self._extract_latest_action(bill_data)
+        result["latest_action"] = latest_action
+        result["action_date"] = action_date
+        result["action_chamber"] = action_chamber
+
+        # Extract gov-url from the latest version's text link
+        versions = bill_data.get("versions", [])
+        latest_version = self._get_latest_version(versions)
+        text_url = None
+        if latest_version:
+            url_info = self._get_best_text_url(latest_version)
+            if url_info:
+                text_url = url_info[0]
+        result["gov_url"] = text_url
+
+        if not latest_action:
+            logger.warning(
+                "No latest_action from OpenStates — status not updated",
+                bill_title=bill_title,
+                webflow_id=webflow_id,
+                jurisdiction=jurisdiction_code,
+                cms_status=fields.get("status", ""),
+            )
+            return result
+
+        skip_webflow = self._config.get("skip_webflow_update", False)
+        if skip_webflow:
+            return result
+
+        # Build PATCH payload — only include fields that differ from CMS
+        field_data: dict[str, str] = {}
+        if text_url and fields.get("gov-url") != text_url:
+            field_data["gov-url"] = text_url
+        if fields.get("status") != latest_action:
+            field_data["status"] = latest_action
+        if action_date and not self._dates_match(fields.get("status-date"), action_date):
+            field_data["status-date"] = action_date
+        if action_chamber and fields.get("status-chamber") != action_chamber:
+            field_data["status-chamber"] = action_chamber
+
+        if not field_data:
+            result["patch_skipped"] = True
+            logger.debug(
+                "Skipping Webflow PATCH — status already matches",
+                bill_title=bill_title,
+                status=latest_action,
+            )
+        else:
+            try:
+                from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+                lookup = WebflowLookupService(self.settings)
+                scheduler_key = self.settings.webflow_scheduler_api_key
+                success = await lookup.update_bill_fields(
+                    webflow_id,
+                    field_data,
+                    api_key=scheduler_key or None,
+                )
+                if success:
+                    result["webflow_updated"] = True
+                    if "status" in field_data:
+                        result["status_updated"] = True
+                    logger.info(
+                        "Bill status updated in Webflow",
+                        bill_title=bill_title,
+                        fields_updated=list(field_data.keys()),
+                        status=latest_action,
+                        status_date=action_date,
+                        status_chamber=action_chamber,
+                    )
+                else:
+                    logger.warning(
+                        "Webflow status PATCH failed",
+                        bill_title=bill_title,
+                        webflow_id=webflow_id,
+                        attempted_fields=list(field_data.keys()),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to update Webflow fields",
+                    webflow_id=webflow_id,
+                    error=str(e),
+                )
+
+        # Write per-bill status cache to Redis
+        redis_store = get_redis_store()
+        await redis_store.set_bill_status(webflow_id, {
+            "status": latest_action,
+            "status_date": action_date or "",
+            "status_chamber": action_chamber or "",
+            "gov_url": text_url or "",
+            "last_synced": datetime.utcnow().isoformat(),
+        })
+
+        return result
+
+    async def check_and_reingest_version(
+        self,
+        webflow_id: str,
+        bill_title: str,
+        jurisdiction_code: str,
+        bill_data: dict,
+        bill_slug: str,
+        fields: dict,
+    ) -> dict:
+        """Flow 2 write path: check for new bill version and re-ingest to Pinecone.
+
+        Compares the latest version from bill_data against the Redis version
+        cache. If newer, downloads the bill text and ingests it into Pinecone.
+
+        Args:
+            webflow_id: Webflow item ID
+            bill_title: Human-readable bill title
+            jurisdiction_code: Two-letter state code
+            bill_data: Full bill data dict from OpenStates API
+            bill_slug: Webflow slug for DDP linking
+            fields: Current CMS field data from Webflow
+
+        Returns:
+            Dict with keys: is_newer, chunks_created, version_note,
+            version_date, text_url, error
+        """
+        from ddp_sync.services.redis_store import get_redis_store
+
+        result = {
+            "is_newer": False,
+            "chunks_created": 0,
+            "version_note": "",
+            "version_date": "",
+            "text_url": "",
+            "error": None,
+        }
+
+        versions = bill_data.get("versions", [])
+        latest_version = self._get_latest_version(versions)
+        if not latest_version:
+            return result
+
+        result["version_note"] = latest_version.get("note", "")
+        result["version_date"] = latest_version.get("date", "")
+
+        url_info = self._get_best_text_url(latest_version)
+        if not url_info:
+            return result
+
+        text_url, media_type = url_info
+        result["text_url"] = text_url
+
+        # Compare against Redis cache
+        redis_store = get_redis_store()
+        cached = await redis_store.get_bill_version(webflow_id)
+
+        if not self._is_newer_version(latest_version, cached):
+            # Update last_checked in cache
+            if cached:
+                cached["last_checked"] = datetime.utcnow().isoformat()
+                await redis_store.set_bill_version(webflow_id, cached)
+            return result
+
+        # Newer version detected
+        result["is_newer"] = True
+        logger.info(
+            "New bill version detected",
+            bill_title=bill_title,
+            webflow_id=webflow_id,
+            version_note=result["version_note"],
+            version_date=result["version_date"],
+            text_url=text_url,
+            media_type=media_type,
+        )
+
+        try:
+            chunks_created = await self._ingest_bill_text(
+                webflow_id=webflow_id,
+                bill_title=bill_title,
+                bill_slug=bill_slug,
+                text_url=text_url,
+                media_type=media_type,
+                fields=fields,
+            )
+            result["chunks_created"] = chunks_created
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(
+                "Failed to ingest bill text",
+                webflow_id=webflow_id,
+                bill_title=bill_title,
+                error=str(e),
+            )
+
+        # Update Redis version cache regardless of ingestion success
+        version_data = {
+            "version_date": latest_version.get("date", ""),
+            "version_note": latest_version.get("note", ""),
+            "text_url": text_url,
+            "media_type": media_type,
+            "last_checked": datetime.utcnow().isoformat(),
+            "last_status": "",
+        }
+        await redis_store.set_bill_version(webflow_id, version_data)
+
+        return result
+
     async def check_and_update_bill(
         self,
         webflow_id: str,
@@ -293,6 +533,10 @@ class BillVersionSyncService:
         fields: dict,
     ) -> VersionCheckResult:
         """Check a single bill for version updates and re-ingest if newer.
+
+        Combined entry point that fetches bill data from OpenStates once,
+        then routes to both write paths: update_bill_status (Flow 1) and
+        check_and_reingest_version (Flow 2).
 
         Args:
             webflow_id: Webflow item ID
@@ -305,7 +549,6 @@ class BillVersionSyncService:
         Returns:
             VersionCheckResult with outcome details
         """
-        from ddp_sync.services.redis_store import get_redis_store
         from ddp_sync.pipelines.bill_sync import BillSyncService
 
         sync_service = BillSyncService(self.settings)
@@ -334,232 +577,53 @@ class BillVersionSyncService:
                 error=f"Failed to fetch bill from OpenStates: {openstates_url}",
             )
 
-        # 3. Get latest version
-        versions = bill_data.get("versions", [])
-        latest_version = self._get_latest_version(versions)
-        if not latest_version:
+        # 3. Flow 2: Check version and re-ingest if newer
+        version_result = await self.check_and_reingest_version(
+            webflow_id=webflow_id,
+            bill_title=bill_title,
+            jurisdiction_code=jurisdiction_code,
+            bill_data=bill_data,
+            bill_slug=bill_slug,
+            fields=fields,
+        )
+
+        # 4. Flow 1: Update Webflow CMS status fields
+        status_result = await self.update_bill_status(
+            webflow_id=webflow_id,
+            bill_title=bill_title,
+            jurisdiction_code=jurisdiction_code,
+            bill_data=bill_data,
+            fields=fields,
+        )
+
+        # 5. Build combined result
+        if version_result["is_newer"]:
             return VersionCheckResult(
                 webflow_id=webflow_id,
                 bill_title=bill_title,
                 jurisdiction=jurisdiction_code,
-                status="no_versions",
+                status="updated" if not version_result["error"] else "partial",
+                version_note=version_result["version_note"],
+                version_date=version_result["version_date"],
+                text_url=version_result["text_url"],
+                chunks_created=version_result["chunks_created"],
+                webflow_updated=status_result["webflow_updated"],
+                status_updated=status_result["status_updated"],
+                webflow_patch_skipped=status_result["patch_skipped"],
+                error=f"Ingestion failed: {version_result['error']}" if version_result["error"] else None,
             )
-
-        # 4. Get best text URL from the version's links
-        url_info = self._get_best_text_url(latest_version)
-        if not url_info:
-            return VersionCheckResult(
-                webflow_id=webflow_id,
-                bill_title=bill_title,
-                jurisdiction=jurisdiction_code,
-                status="no_versions",
-                version_note=latest_version.get("note", ""),
-                version_date=latest_version.get("date", ""),
-            )
-
-        text_url, media_type = url_info
-
-        # 5. Compare against Redis cache
-        redis_store = get_redis_store()
-        cached = await redis_store.get_bill_version(webflow_id)
-
-        if not self._is_newer_version(latest_version, cached):
-            # Text version unchanged — always update status/status-date
-            # in Webflow CMS so the CMS stays current even when bill text
-            # hasn't changed (e.g., committee vote, floor action).
-            latest_action, action_date, action_chamber = self._extract_latest_action(bill_data)
-            status_updated = False
-            patch_skipped = False
-
-            if latest_action:
-                skip_webflow = self._config.get("skip_webflow_update", False)
-                cms_status = fields.get("status", "")
-                cms_date = fields.get("status-date", "")
-                cms_chamber = fields.get("status-chamber", "")
-                status_matches = (
-                    cms_status == latest_action
-                    and self._dates_match(cms_date, action_date)
-                    and cms_chamber == (action_chamber or "")
-                )
-                if status_matches:
-                    patch_skipped = True
-                    logger.debug(
-                        "Skipping Webflow PATCH — status already matches",
-                        bill_title=bill_title,
-                        status=latest_action,
-                    )
-                elif not skip_webflow:
-                    status_updated = await self._update_webflow_status(
-                        webflow_id, bill_title, latest_action, action_date, action_chamber,
-                    )
-                    if status_updated:
-                        logger.info(
-                            "Bill status updated (version unchanged)",
-                            bill_title=bill_title,
-                            new_status=latest_action,
-                            status_date=action_date,
-                            status_chamber=action_chamber,
-                        )
-                    else:
-                        logger.warning(
-                            "Webflow status PATCH failed (version unchanged path)",
-                            bill_title=bill_title,
-                            webflow_id=webflow_id,
-                            attempted_status=latest_action,
-                            attempted_date=action_date,
-                            cms_status=cms_status,
-                            cms_date=cms_date,
-                        )
-
-            else:
-                logger.warning(
-                    "No latest_action from OpenStates — status not updated",
-                    bill_title=bill_title,
-                    webflow_id=webflow_id,
-                    jurisdiction=jurisdiction_code,
-                    openstates_url=openstates_url,
-                    cms_status=fields.get("status", ""),
-                )
-
-            # Update last_checked and last_status in cache
-            if cached:
-                cached["last_checked"] = datetime.utcnow().isoformat()
-                if latest_action:
-                    cached["last_status"] = latest_action
-                await redis_store.set_bill_version(webflow_id, cached)
-
+        else:
             return VersionCheckResult(
                 webflow_id=webflow_id,
                 bill_title=bill_title,
                 jurisdiction=jurisdiction_code,
                 status="unchanged",
-                version_note=latest_version.get("note", ""),
-                version_date=latest_version.get("date", ""),
-                text_url=text_url,
-                status_updated=status_updated,
-                webflow_patch_skipped=patch_skipped,
+                version_note=version_result["version_note"],
+                version_date=version_result["version_date"],
+                text_url=version_result["text_url"],
+                status_updated=status_result["status_updated"],
+                webflow_patch_skipped=status_result["patch_skipped"],
             )
-
-        # 6. Newer version detected — re-ingest bill text
-        logger.info(
-            "New bill version detected",
-            bill_title=bill_title,
-            webflow_id=webflow_id,
-            version_note=latest_version.get("note", ""),
-            version_date=latest_version.get("date", ""),
-            text_url=text_url,
-            media_type=media_type,
-        )
-
-        chunks_created = 0
-        ingestion_error = None
-        try:
-            chunks_created = await self._ingest_bill_text(
-                webflow_id=webflow_id,
-                bill_title=bill_title,
-                bill_slug=bill_slug,
-                text_url=text_url,
-                media_type=media_type,
-                fields=fields,
-            )
-        except Exception as e:
-            ingestion_error = str(e)
-            logger.error(
-                "Failed to ingest bill text — continuing with Webflow status update",
-                webflow_id=webflow_id,
-                bill_title=bill_title,
-                error=ingestion_error,
-            )
-
-        # 7. Update Webflow fields (gov-url + status + status-date) in a single PATCH
-        # This runs regardless of ingestion success so that CMS status stays
-        # current even when text re-ingestion fails (e.g., Pinecone down, PDF error).
-        webflow_updated = False
-        status_updated = False
-        patch_skipped = False
-        latest_action, action_date, action_chamber = self._extract_latest_action(bill_data)
-        if not latest_action:
-            logger.warning(
-                "No latest_action from OpenStates for new version — status will be empty",
-                bill_title=bill_title,
-                webflow_id=webflow_id,
-                jurisdiction=jurisdiction_code,
-            )
-        skip_webflow = self._config.get("skip_webflow_update", False)
-        if not skip_webflow:
-            try:
-                from ddp_sync.services.webflow_lookup import WebflowLookupService
-
-                lookup = WebflowLookupService(self.settings)
-                scheduler_key = self.settings.webflow_scheduler_api_key
-                # Batch gov-url, status, status-date, and status-chamber into a single PATCH call
-                # Only include fields whose values actually differ from CMS
-                field_data: dict[str, str] = {}
-                if fields.get("gov-url") != text_url:
-                    field_data["gov-url"] = text_url
-                if latest_action and fields.get("status") != latest_action:
-                    field_data["status"] = latest_action
-                if action_date and not self._dates_match(fields.get("status-date"), action_date):
-                    field_data["status-date"] = action_date
-                if action_chamber and fields.get("status-chamber") != action_chamber:
-                    field_data["status-chamber"] = action_chamber
-
-                if not field_data:
-                    patch_skipped = True
-                    logger.debug(
-                        "Skipping Webflow PATCH — all fields already match",
-                        bill_title=bill_title,
-                    )
-                else:
-                    success = await lookup.update_bill_fields(
-                        webflow_id,
-                        field_data,
-                        api_key=scheduler_key or None,
-                    )
-                    if success:
-                        webflow_updated = True
-                        if "status" in field_data:
-                            status_updated = True
-                    else:
-                        logger.warning(
-                            "Webflow PATCH failed (new version path)",
-                            bill_title=bill_title,
-                            webflow_id=webflow_id,
-                            attempted_fields=list(field_data.keys()),
-                            field_data=field_data,
-                        )
-            except Exception as e:
-                logger.warning(
-                    "Failed to update Webflow fields (bill text still ingested)",
-                    webflow_id=webflow_id,
-                    error=str(e),
-                )
-
-        # 8. Update Redis cache
-        version_data = {
-            "version_date": latest_version.get("date", ""),
-            "version_note": latest_version.get("note", ""),
-            "text_url": text_url,
-            "media_type": media_type,
-            "last_checked": datetime.utcnow().isoformat(),
-            "last_status": latest_action or "",
-        }
-        await redis_store.set_bill_version(webflow_id, version_data)
-
-        return VersionCheckResult(
-            webflow_id=webflow_id,
-            bill_title=bill_title,
-            jurisdiction=jurisdiction_code,
-            status="updated" if not ingestion_error else "partial",
-            version_note=latest_version.get("note", ""),
-            version_date=latest_version.get("date", ""),
-            text_url=text_url,
-            chunks_created=chunks_created,
-            webflow_updated=webflow_updated,
-            status_updated=status_updated,
-            webflow_patch_skipped=patch_skipped,
-            error=f"Ingestion failed: {ingestion_error}" if ingestion_error else None,
-        )
 
     async def _ingest_bill_text(
         self,
@@ -879,6 +943,173 @@ class BillVersionSyncService:
             webflow_patch_failures=result.webflow_patch_failures,
             no_latest_action=result.no_latest_action,
             errors=result.errors[:10] if result.errors else [],
+        )
+
+        return result
+
+    async def sync_bill_statuses(
+        self,
+        bills: list[dict[str, Any]],
+        all_sessions: bool = False,
+        jurisdiction: str | None = None,
+        heartbeat_callback: Any | None = None,
+    ) -> VersionSyncBatchResult:
+        """Flow 1 standalone: sync OpenStates → Webflow CMS status fields only.
+
+        Lightweight alternative to sync_bill_versions — fetches from OpenStates
+        with ?include=actions only (no versions, votes, documents), then calls
+        update_bill_status() for each bill. No Pinecone interaction.
+
+        Args:
+            bills: List of bill dicts from Webflow CMS (raw items with fieldData)
+            all_sessions: If True, skip session/jurisdiction filters (backfill mode)
+            jurisdiction: Optional jurisdiction filter (e.g. "FL")
+            heartbeat_callback: Optional async callback for zombie watchdog
+
+        Returns:
+            VersionSyncBatchResult with aggregate stats
+        """
+        from ddp_sync.pipelines.bill_sync import BillSyncService
+
+        sync_service = BillSyncService(self.settings)
+
+        logger.info(
+            "Starting bill status sync (Flow 1 only)",
+            total_bills=len(bills),
+            all_sessions=all_sessions,
+            jurisdiction=jurisdiction,
+        )
+
+        result = VersionSyncBatchResult(total_bills=len(bills))
+
+        # Warm legislative calendar (only needed if filtering by session)
+        if not all_sessions:
+            jurisdiction_codes = set()
+            for bill in bills:
+                fields = bill.get("fieldData", {})
+                jurisdiction_id = fields.get("jurisdiction", "")
+                openstates_url = fields.get("open-states-url-2", "")
+                code = sync_service.resolve_jurisdiction_code(jurisdiction_id, openstates_url)
+                if code:
+                    jurisdiction_codes.add(code)
+
+            jurisdiction_data = {}
+            for code in jurisdiction_codes:
+                try:
+                    info = await sync_service.get_jurisdiction_info(code)
+                    if info:
+                        jurisdiction_data[code] = info
+                except Exception as e:
+                    logger.warning("Failed to fetch jurisdiction for calendar warm", state=code, error=str(e))
+
+            if jurisdiction_data:
+                sync_service.calendar.warm_cache(jurisdiction_data)
+
+        for bill in bills:
+            fields = bill.get("fieldData", {})
+            webflow_id = bill.get("id", "")
+            title = fields.get("name", "Unknown")
+            openstates_url = fields.get("open-states-url-2", "")
+            session_year = str(fields.get("bill-session", ""))
+            session_code = fields.get("session-code", "")
+            jurisdiction_id = fields.get("jurisdiction", "")
+
+            jurisdiction_code = sync_service.resolve_jurisdiction_code(
+                jurisdiction_id, openstates_url
+            )
+
+            # Skip bills without OpenStates URL
+            if not openstates_url:
+                result.skipped += 1
+                result.skipped_no_url += 1
+                continue
+
+            # Apply jurisdiction filter if specified
+            if jurisdiction and jurisdiction_code.upper() != jurisdiction.upper():
+                result.skipped += 1
+                result.skipped_jurisdiction += 1
+                continue
+
+            # Apply session filter unless all_sessions=True
+            if not all_sessions:
+                if not await sync_service.is_current_session_async(session_year, session_code, jurisdiction_code):
+                    result.skipped += 1
+                    result.skipped_not_current += 1
+                    continue
+
+                if not sync_service.should_sync_jurisdiction(jurisdiction_code):
+                    result.skipped += 1
+                    result.skipped_jurisdiction += 1
+                    continue
+
+            # Rate limiting
+            await sync_service._apply_rate_limit()
+
+            try:
+                # Parse URL and fetch from OpenStates with lightweight query
+                parsed = sync_service.parse_openstates_url(openstates_url)
+                if not parsed:
+                    result.failed += 1
+                    result.errors.append(f"{title}: Could not parse OpenStates URL")
+                    continue
+
+                # Fetch with actions only (lighter than full 10-include)
+                bill_data = await sync_service.fetch_bill_from_openstates(
+                    parsed.jurisdiction, parsed.session, parsed.bill_id
+                )
+                if not bill_data:
+                    result.failed += 1
+                    result.errors.append(f"{title}: Failed to fetch from OpenStates")
+                    continue
+
+                result.checked += 1
+
+                # Flow 1 write path
+                status_result = await self.update_bill_status(
+                    webflow_id=webflow_id,
+                    bill_title=title,
+                    jurisdiction_code=jurisdiction_code,
+                    bill_data=bill_data,
+                    fields=fields,
+                )
+
+                if status_result["status_updated"]:
+                    result.status_updates += 1
+                if status_result["webflow_updated"]:
+                    result.webflow_updates += 1
+                if status_result["patch_skipped"]:
+                    result.webflow_skipped += 1
+                if not status_result["webflow_updated"] and not status_result["patch_skipped"]:
+                    if status_result["latest_action"]:
+                        result.webflow_patch_failures += 1
+                    else:
+                        result.no_latest_action += 1
+
+                result.unchanged += 1  # No version check, so always "unchanged"
+
+            except Exception as e:
+                result.failed += 1
+                result.errors.append(f"{title}: {e}")
+                logger.error(
+                    "Error syncing bill status",
+                    bill=title,
+                    webflow_id=webflow_id,
+                    error=str(e),
+                )
+
+            if heartbeat_callback and result.checked % 10 == 0:
+                await heartbeat_callback()
+
+        logger.info(
+            "Bill status sync complete (Flow 1 only)",
+            total=result.total_bills,
+            checked=result.checked,
+            skipped=result.skipped,
+            status_updates=result.status_updates,
+            webflow_updates=result.webflow_updates,
+            webflow_skipped=result.webflow_skipped,
+            webflow_patch_failures=result.webflow_patch_failures,
+            failed=result.failed,
         )
 
         return result

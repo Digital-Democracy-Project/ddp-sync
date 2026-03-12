@@ -52,6 +52,38 @@ async def trigger_bill_version_check(token: str = Depends(api_key_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/trigger/bill-status-sync")
+async def trigger_bill_status_sync(
+    all_sessions: bool = False,
+    jurisdiction: str | None = None,
+    token: str = Depends(api_key_auth),
+):
+    """Sync OpenStates → Webflow CMS status fields only (no Pinecone).
+
+    Lightweight alternative to bill-version-check that only updates
+    status, status-date, status-chamber, and gov-url in Webflow CMS.
+
+    Query params:
+        all_sessions: Bypass session filters for backfill (default false)
+        jurisdiction: Filter to a single state code (e.g. FL)
+    """
+    try:
+        from ddp_sync.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        if not scheduler:
+            raise HTTPException(status_code=503, detail="Scheduler not initialized")
+        result = await scheduler.trigger_bill_status_sync(
+            all_sessions=all_sessions,
+            jurisdiction=jurisdiction,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bill status sync trigger failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/trigger/webflow/{job_name}")
 async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth)):
     """Trigger a specific Webflow CMS batch job."""

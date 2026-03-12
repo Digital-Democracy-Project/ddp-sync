@@ -9,7 +9,7 @@ from ddp_sync.sync.handlers import (
     WebpageHandler,
 )
 from ddp_sync.sync.service import UnifiedSyncService
-from ddp_sync.sync.types import ContentType, SyncIdentifier, SyncMode, SyncOptions, SyncResult
+from ddp_sync.sync.types import ContentType, SyncIdentifier, SyncMode, SyncOptions, SyncResult, SyncTarget
 
 __all__ = [
     # Service
@@ -20,6 +20,7 @@ __all__ = [
     "SyncIdentifier",
     "SyncOptions",
     "SyncResult",
+    "SyncTarget",
     # Handlers
     "ContentHandler",
     "BillHandler",

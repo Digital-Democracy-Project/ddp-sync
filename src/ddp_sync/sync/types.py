@@ -23,6 +23,20 @@ class SyncMode(str, Enum):
     BATCH = "batch"
 
 
+class SyncTarget(str, Enum):
+    """Target data flow for sync operations.
+
+    Controls which write paths execute after fetching source data:
+    - ALL: Both Webflow CMS and Pinecone (default, backward-compatible)
+    - WEBFLOW: Flow 1 only — OpenStates → Webflow CMS status fields
+    - PINECONE: Flow 2 + 3 only — OpenStates/Webflow → Pinecone
+    """
+
+    ALL = "all"
+    WEBFLOW = "webflow"
+    PINECONE = "pinecone"
+
+
 @dataclass
 class SyncIdentifier:
     """
@@ -80,6 +94,12 @@ class SyncOptions:
     - bill-votes: Per-bill vote records (synced during bill sync)
     - legislator-votes: Per-legislator voting history (synced with include_votes=True)
     """
+
+    # Target data flow (which write paths to execute)
+    target: SyncTarget = SyncTarget.ALL
+
+    # Bypass session/jurisdiction filters for backfill operations
+    all_sessions: bool = False
 
     # PDF processing for bills
     include_pdfs: bool = True
