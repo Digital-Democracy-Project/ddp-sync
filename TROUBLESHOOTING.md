@@ -87,3 +87,50 @@ Both share the same fetched OpenStates data (one API call per bill). Either can 
 `sync_schedule.yaml` now has a `bill_sync` block with `webflow_status.enabled` and `version_check.enabled` sub-configs. Either flow can be disabled independently. The old `sync_time_utc` and `bill_version_check` keys still work as fallbacks.
 
 **Files:** `sync/types.py`, `pipelines/bill_version.py`, `sync/handlers/bill.py`, `scheduler.py`, `api/routes/triggers.py`, `api/routes/sync_unified.py`, `services/redis_store.py`, `config/sync_schedule.yaml`
+
+---
+
+## Hourly Content Update Removed (2026-04-08)
+
+### Background
+
+An "Hourly Content Update" job polled OpenStates and Congress.gov for changes via the `/bills` list endpoint, then attempted generic ingestion into Pinecone. It had been silently failing on every run since deployment.
+
+### Root causes
+
+1. **Invalid OpenStates parameter** — Change detection sent `sort=updated_at` to `/bills`, which is not a valid OpenStates v3 parameter (422 Unprocessable Entity).
+2. **Missing required filter** — The ingestion fetch sent `/bills?per_page=50` with no jurisdiction or session filter, which OpenStates v3 requires (400 Bad Request).
+
+Both errors were caught and swallowed, so the job reported "executed successfully" in APScheduler while doing nothing. The daily bill sync (04:00 UTC) already covers this work using individual bill endpoints (`/bills/{jurisdiction}/{session}/{id}`), which work correctly.
+
+**Fix:** Removed the hourly job, its `_run_updates`/`_update_source`/`trigger_update` methods, the `ChangeDetector` class, and the orphaned `change_detection.py` module.
+
+**Files:** `scheduler.py`, `pipelines/change_detection.py` (deleted), `config/sync_schedule.yaml`
+
+---
+
+## Known Non-Critical Issues (observed 2026-04-08)
+
+### OpenStates 429 rate limiting during daily bill sync
+
+**Symptom:** During the 04:00 UTC bill sync, OpenStates returns 429 (Too Many Requests) on some bills. Observed 7 occurrences in a single run, mostly on US federal bills. Some required 2 retries (5s + 10s backoff). All eventually succeeded.
+
+**Cause:** The configured `delay_between_bills_ms: 500` is at the edge of OpenStates' 2 calls/sec tier. Network jitter can push requests over the limit.
+
+**Mitigation:** Retry logic handles this correctly. If 429s increase, bump `delay_between_bills_ms` to 600–700 in `sync_schedule.yaml`.
+
+### Brevo transient 503 on Federal org
+
+**Symptom:** Voatz→Brevo sync fails for the Federal org (~23,587 users) with `503 - upstream connect error or disconnect/reset before headers. reset reason: remote connection failure`.
+
+**Cause:** Transient Brevo API outage. The code correctly skips the org to avoid unreliable diffs. Observed once (13:28 UTC); subsequent runs succeeded.
+
+**Action:** Monitor. No fix needed unless it becomes a recurring pattern.
+
+### Congress API key logged in httpx output
+
+**Symptom:** httpx INFO logs include the full Congress.gov API key in request URLs (e.g., `api_key=9wdd73N...`).
+
+**Impact:** Low — Congress API keys are free and public. But it adds noise and is not best practice.
+
+**Potential fix:** Add a log filter to redact `api_key=` values from httpx output, or move the key to a request header instead of a query parameter.
