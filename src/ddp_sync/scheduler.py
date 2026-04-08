@@ -1,4 +1,4 @@
-"""Scheduler for content updates and OpenStates bill sync."""
+"""Scheduler for OpenStates bill sync and data pipeline jobs."""
 
 import asyncio
 from datetime import datetime, time
@@ -12,8 +12,6 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from ddp_sync.config import Settings, get_settings
-from ddp_sync.ingestion.pipeline import IngestionPipeline, IngestionResult
-from ddp_sync.pipelines.change_detection import ChangeDetector
 from ddp_sync.services.legislative_calendar import StateLegislativeCalendar
 
 logger = structlog.get_logger()
@@ -31,8 +29,9 @@ class UpdateScheduler:
 
     Handles:
     - Daily OpenStates bill sync (based on legislative calendar)
-    - Hourly polling for content changes
-    - Manual update triggers
+    - Legislator and organization syncs
+    - Voatz/Brevo user syncs
+    - Webflow CMS batch jobs
     - Graceful shutdown
     """
 
@@ -51,8 +50,6 @@ class UpdateScheduler:
         self.settings = settings or get_settings()
         self.config_path = config_path or DEFAULT_CONFIG_PATH
         self.scheduler = AsyncIOScheduler()
-        self.pipeline = IngestionPipeline(self.settings)
-        self.change_detector = ChangeDetector(self.settings)
         self.calendar = StateLegislativeCalendar()
         self._is_running = False
         self._update_callbacks: list[Callable] = []
@@ -97,15 +94,6 @@ class UpdateScheduler:
             trigger=CronTrigger(hour=hour, minute=minute),
             id="daily_bill_sync",
             name="Daily Bill Sync",
-            replace_existing=True,
-        )
-
-        # Add hourly content update job
-        self.scheduler.add_job(
-            self._run_updates,
-            trigger=IntervalTrigger(hours=1),
-            id="hourly_update",
-            name="Hourly Content Update",
             replace_existing=True,
         )
 
@@ -265,132 +253,6 @@ class UpdateScheduler:
             callback: Async function to call with update results
         """
         self._update_callbacks.append(callback)
-
-    async def trigger_update(
-        self,
-        sources: list[str] | None = None,
-        force: bool = False,
-    ) -> dict[str, IngestionResult]:
-        """
-        Manually trigger an update.
-
-        Args:
-            sources: Specific sources to update (None for all)
-            force: Force update even if no changes detected
-
-        Returns:
-            Dict mapping source names to results
-        """
-        logger.info(
-            "Manual update triggered",
-            sources=sources,
-            force=force,
-        )
-
-        return await self._run_updates(sources=sources, force=force)
-
-    async def _run_updates(
-        self,
-        sources: list[str] | None = None,
-        force: bool = False,
-    ) -> dict[str, IngestionResult]:
-        """
-        Run the update process.
-
-        Args:
-            sources: Specific sources to update
-            force: Force update even without changes
-
-        Returns:
-            Dict mapping source names to results
-        """
-        start_time = datetime.utcnow()
-        results: dict[str, IngestionResult] = {}
-
-        # Default to all sources if none specified
-        if sources is None:
-            sources = ["congress", "openstates"]
-
-        logger.info(
-            "Starting scheduled update",
-            sources=sources,
-            timestamp=start_time.isoformat(),
-        )
-
-        for source in sources:
-            try:
-                # Check for changes (unless forced)
-                if not force:
-                    has_changes = await self.change_detector.check_source(source)
-                    if not has_changes:
-                        logger.info(f"No changes detected for {source}, skipping")
-                        continue
-
-                # Run ingestion
-                result = await self._update_source(source)
-                results[source] = result
-
-                # Record successful update
-                if result.errors:
-                    logger.warning(
-                        f"Update completed with errors for {source}",
-                        errors=result.errors,
-                    )
-                else:
-                    await self.change_detector.mark_updated(source)
-
-            except Exception as e:
-                logger.exception(f"Failed to update {source}", error=str(e))
-                results[source] = IngestionResult(
-                    documents_processed=0,
-                    chunks_created=0,
-                    chunks_upserted=0,
-                    errors=[str(e)],
-                )
-
-        # Calculate duration
-        duration = (datetime.utcnow() - start_time).total_seconds()
-
-        logger.info(
-            "Scheduled update completed",
-            duration_seconds=duration,
-            sources_updated=list(results.keys()),
-        )
-
-        # Call callbacks
-        for callback in self._update_callbacks:
-            try:
-                if asyncio.iscoroutinefunction(callback):
-                    await callback(results)
-                else:
-                    callback(results)
-            except Exception as e:
-                logger.error("Update callback failed", error=str(e))
-
-        return results
-
-    async def _update_source(self, source: str) -> IngestionResult:
-        """
-        Update a specific source.
-
-        Args:
-            source: Source name to update
-
-        Returns:
-            IngestionResult with update stats
-        """
-        source_configs = {
-            "congress": {
-                "congress": 119,  # Current Congress
-                "limit": 50,
-            },
-            "openstates": {
-                "limit": 50,
-            },
-        }
-
-        config = source_configs.get(source, {})
-        return await self.pipeline.ingest_from_source(source, config)
 
     async def _fetch_webflow_bills(self) -> list[dict]:
         """Fetch all bill items from Webflow CMS via paginated API calls."""

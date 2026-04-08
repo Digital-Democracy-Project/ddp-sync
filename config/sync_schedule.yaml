@@ -10,7 +10,6 @@
 # - Bill versions:  Daily at 04:00 UTC (checks for newer amended versions, re-ingests if changed)
 # - Legislators:    Weekly on Sundays at 06:00 UTC
 # - Organizations:  Monthly on the 1st at 08:00 UTC
-# - Content poll:   Hourly (Congress/OpenStates change detection)
 #
 # Session Detection:
 # - Primary: Live session dates from OpenStates API (fetched via warm_cache()
