@@ -538,150 +538,6 @@ class BillSyncService:
         )
         return None
 
-    def format_bill_history_chunk(
-        self,
-        bill_data: dict[str, Any],
-        ddp_url: str | None = None,
-    ) -> str:
-        """
-        Format bill data into a text chunk for RAG.
-
-        Args:
-            bill_data: OpenStates bill response
-            ddp_url: Optional DDP URL for the bill page
-
-        Returns:
-            Formatted text chunk
-        """
-        parts = []
-
-        # Header
-        title = bill_data.get("title", "Unknown Bill")
-        identifier = bill_data.get("identifier", "Unknown")
-        jurisdiction = bill_data.get("jurisdiction", {})
-        jurisdiction_name = jurisdiction.get("name", "Unknown") if isinstance(jurisdiction, dict) else str(jurisdiction)
-
-        # Include DDP link if available
-        if ddp_url:
-            parts.append(f"## Legislative History: [{identifier}]({ddp_url})")
-            parts.append(f"**Title:** [{title}]({ddp_url})")
-        else:
-            parts.append(f"## Legislative History: {identifier}")
-            parts.append(f"**Title:** {title}")
-        parts.append(f"**Jurisdiction:** {jurisdiction_name}")
-
-        # Current Status
-        latest_action = bill_data.get("latest_action")
-        if latest_action:
-            action_date = latest_action.get("date", "Unknown date")
-            action_desc = latest_action.get("description", "Unknown action")
-            parts.append(f"\n### Current Status")
-            parts.append(f"**Latest Action ({action_date}):** {action_desc}")
-
-        # Sponsors (with DDP links when available)
-        sponsorships = bill_data.get("sponsorships", [])
-        if sponsorships:
-            parts.append(f"\n### Sponsors")
-            primary = [s for s in sponsorships if s.get("primary")]
-            secondary = [s for s in sponsorships if not s.get("primary")]
-
-            if primary:
-                primary_formatted = [self._format_sponsor_with_link(s) for s in primary]
-                parts.append(f"**Primary Sponsor(s):** {', '.join(primary_formatted)}")
-
-            if secondary:
-                secondary_formatted = [self._format_sponsor_with_link(s) for s in secondary[:30]]
-                if len(secondary) > 30:
-                    secondary_formatted.append(f"and {len(secondary) - 30} others")
-                parts.append(f"**Co-Sponsors:** {', '.join(secondary_formatted)}")
-
-        # Action History
-        actions = bill_data.get("actions", [])
-        if actions:
-            parts.append(f"\n### Action History")
-            # Sort by date descending (most recent first)
-            sorted_actions = sorted(
-                actions,
-                key=lambda x: x.get("date", ""),
-                reverse=True,
-            )
-            for action in sorted_actions[:20]:  # Limit to 20 actions
-                action_date = action.get("date", "Unknown")
-                action_desc = action.get("description", "Unknown")
-                org = action.get("organization", {})
-                org_name = org.get("name", "") if isinstance(org, dict) else ""
-
-                if org_name:
-                    parts.append(f"- **{action_date}** ({org_name}): {action_desc}")
-                else:
-                    parts.append(f"- **{action_date}**: {action_desc}")
-
-        # Votes
-        votes = bill_data.get("votes", [])
-        if votes:
-            parts.append(f"\n### Vote Results")
-            for vote in votes:
-                motion = vote.get("motion_text", "Vote")
-                result = vote.get("result", "Unknown")
-                vote_date = vote.get("start_date", "Unknown date")
-                org = vote.get("organization", {})
-                org_name = org.get("name", "Unknown") if isinstance(org, dict) else "Unknown"
-
-                # Count votes
-                counts = vote.get("counts", [])
-                yes_count = next((c.get("value", 0) for c in counts if c.get("option") == "yes"), 0)
-                no_count = next((c.get("value", 0) for c in counts if c.get("option") == "no"), 0)
-
-                parts.append(f"\n**{org_name} - {vote_date}**")
-                parts.append(f"Motion: {motion}")
-                parts.append(f"Result: **{result.upper()}** (Yes: {yes_count}, No: {no_count})")
-
-                # Individual votes (with DDP links when available)
-                individual_votes = vote.get("votes", [])
-                if individual_votes:
-                    # Group by vote option
-                    yes_voters = []
-                    no_voters = []
-                    other_voters = []
-
-                    for v in individual_votes:
-                        option = v.get("option", "").lower()
-                        voter_name = v.get("voter_name", "Unknown")
-
-                        # Extract person ID from nested voter object (OpenStates API structure)
-                        voter_obj = v.get("voter", {})
-                        person_id = ""
-                        if isinstance(voter_obj, dict):
-                            person_id = voter_obj.get("id", "")
-                            # Use full name from voter object if available
-                            if voter_obj.get("name"):
-                                voter_name = voter_obj.get("name")
-
-                        # Format with DDP link if available
-                        formatted = self._format_voter_with_link(person_id, voter_name)
-
-                        if option == "yes":
-                            yes_voters.append(formatted)
-                        elif option == "no":
-                            no_voters.append(formatted)
-                        else:
-                            other_voters.append(f"{formatted} ({option})")
-
-                    if yes_voters:
-                        parts.append(f"**Voted Yes:** {', '.join(yes_voters[:20])}")
-                        if len(yes_voters) > 20:
-                            parts.append(f"  ...and {len(yes_voters) - 20} others")
-                    if no_voters:
-                        parts.append(f"**Voted No:** {', '.join(no_voters[:20])}")
-                        if len(no_voters) > 20:
-                            parts.append(f"  ...and {len(no_voters) - 20} others")
-                    if other_voters:
-                        parts.append(f"**Other:** {', '.join(other_voters[:10])}")
-                        if len(other_voters) > 10:
-                            parts.append(f"  ...and {len(other_voters) - 10} others")
-
-        return "\n".join(parts)
-
     def format_bill_votes_chunk(
         self,
         bill_data: dict[str, Any],
@@ -978,39 +834,21 @@ class BillSyncService:
         # Build DDP URL if slug is available
         ddp_url = f"https://digitaldemocracyproject.org/bills/{bill_slug}" if bill_slug else None
 
-        # Format the history chunk
-        history_chunk = self.format_bill_history_chunk(bill_data, ddp_url=ddp_url)
-
-        # Extract metadata
+        # Extract metadata (shared with bill-votes ingestion below)
         extra_metadata = self.extract_metadata_from_openstates(bill_data, webflow_bill_id)
-        # Add slug for RAG retrieval filtering
         if bill_slug:
             extra_metadata["slug"] = bill_slug
 
-        # Create document for ingestion
         source_name = self._get_source_name(jurisdiction_name)
-        metadata = DocumentMetadata(
-            document_id=f"bill-history-{webflow_bill_id}",
-            document_type="bill-history",
-            source=source_name,
-            title=f"{bill_title} - Legislative History",
-            jurisdiction=jurisdiction_name,
-            bill_id=parsed.bill_id,
-            url=openstates_url,
-            extra=extra_metadata,
-        )
 
-        # Ingest the history document
+        # Ingest bill-votes document if votes exist.
+        # Note: bill-history docs were previously produced here too, but were removed
+        # in Fix F1 (PLAN-quick-action-buttons). Bill status / action history is now
+        # served exclusively by VoteBot's live OpenStates lookups via the bill_votes
+        # tool — Pinecone bill-history docs were producing stale status data and the
+        # data layer is the single source of truth (live OpenStates only).
         total_chunks = 0
         try:
-            result = await self.pipeline.ingest_document(
-                content=history_chunk,
-                metadata=metadata,
-                skip_duplicates=False,  # Always update
-            )
-            total_chunks += result.chunks_created
-
-            # Also create a dedicated votes document if votes exist
             votes_result_data = self.format_bill_votes_chunk(bill_data, ddp_url=ddp_url)
             if votes_result_data:
                 votes_chunk, votes_ids_metadata = votes_result_data

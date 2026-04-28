@@ -161,7 +161,9 @@ class BillHandler:
 
                 if result.success:
                     chunks_created += result.chunks_created
-                    document_ids.append(f"bill-history-{item_id}")
+                    # Note: bill-history-* doc IDs were tracked here previously but
+                    # are no longer produced (Fix F1 in PLAN-quick-action-buttons).
+                    # bill-votes-* doc IDs are tracked via the per-document path below.
                 else:
                     errors.append(f"OpenStates sync failed: {result.error}")
 
