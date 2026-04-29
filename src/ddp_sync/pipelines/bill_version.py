@@ -10,6 +10,7 @@ Replaces the daily bill-history/bill-votes sync with a targeted check:
 
 import asyncio
 import gc
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -510,7 +511,10 @@ class BillVersionSyncService:
                 error=str(e),
             )
 
-        # Update Redis version cache regardless of ingestion success
+        # Update Redis version cache regardless of ingestion success.
+        # bill_slug is stored alongside the version record so VoteBot's
+        # startup reconciliation can map webflow_id -> slug without an
+        # additional Webflow API call (see services/button_cache.py).
         version_data = {
             "version_date": latest_version.get("date", ""),
             "version_note": latest_version.get("note", ""),
@@ -518,8 +522,39 @@ class BillVersionSyncService:
             "media_type": media_type,
             "last_checked": datetime.utcnow().isoformat(),
             "last_status": "",
+            "bill_slug": bill_slug or "",
         }
         await redis_store.set_bill_version(webflow_id, version_data)
+
+        # Publish cache invalidation for VoteBot's button cache, but only if
+        # ingestion actually produced new chunks. Without that guard, a no-op
+        # version-check run would invalidate cached responses unnecessarily.
+        # Subscribers (votebot main.py) call ButtonCache.invalidate_bill(slug)
+        # so subsequent button taps regenerate from fresh Pinecone content.
+        # See plans/PLAN-quick-action-buttons.md (Phase 5 / Fix invalidation).
+        if result.get("chunks_created", 0) > 0 and bill_slug:
+            try:
+                payload = json.dumps({
+                    "slug": bill_slug,
+                    "reason": "bill_version_change",
+                    "version_note": latest_version.get("note", ""),
+                })
+                subscribers = await redis_store.publish(
+                    "votebot:cache:invalidate",
+                    payload,
+                )
+                logger.info(
+                    "Published button cache invalidation",
+                    slug=bill_slug,
+                    version_note=latest_version.get("note", ""),
+                    subscribers=subscribers,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to publish cache invalidation",
+                    slug=bill_slug,
+                    error=str(e),
+                )
 
         return result
 

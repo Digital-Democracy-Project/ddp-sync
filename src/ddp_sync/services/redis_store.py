@@ -69,6 +69,24 @@ class RedisStore:
             self._client = None
             logger.info("Redis disconnected")
 
+    # -- Pub/sub publish --
+
+    async def publish(self, channel: str, message: str) -> int:
+        """Publish a message on a Redis pub/sub channel.
+
+        Returns the number of subscribers that received the message (0 if Redis
+        is down or no subscribers). Failures are logged but never raised — pub/sub
+        delivery is fire-and-forget by design (subscribers handle missed events
+        via reconciliation on startup).
+        """
+        if not self._client:
+            return 0
+        try:
+            return int(await self._client.publish(channel, message))
+        except Exception as e:
+            logger.warning("Redis: publish failed", channel=channel, error=str(e))
+            return 0
+
     # -- Sync task storage --
 
     SYNC_TASK_PREFIX = "ddp:sync:task:"
