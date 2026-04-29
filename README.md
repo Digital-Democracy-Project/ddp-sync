@@ -29,6 +29,16 @@ nginx (:80/443)
 
 DDP-Sync is not exposed externally. All external traffic goes through DDP-API's catch-all proxy (`/votebot/sync/*`, `/votebot/trigger/*`).
 
+### Pub/sub events
+
+DDP-Sync publishes Redis pub/sub events that other services consume. Subscribers handle missed events via their own startup reconciliation; failures publishing are logged but never raised.
+
+| Channel | When | Payload | Consumer |
+|---|---|---|---|
+| `votebot:cache:invalidate` | After a successful bill text re-ingestion (`chunks_created > 0`) and `set_bill_version()` update | `{"slug": "...", "reason": "bill_version_change", "version_note": "..."}` | VoteBot's button-cache subscriber clears `votebot:button:{slug}:summary` and `votebot:button:{slug}:pros_cons`. See [PLAN-quick-action-buttons.md](https://github.com/Digital-Democracy-Project/votebot/blob/main/plans/PLAN-quick-action-buttons.md) Phase 5. |
+
+DDP-Sync also stores `bill_slug` alongside `last_checked` in the `ddp:bill_version:{webflow_id}` Redis record so VoteBot's startup reconciliation can map webflow_id → slug without an extra Webflow API call.
+
 ## Configuration
 
 - **Production**: AWS Secrets Manager (`ddp-sync/credentials`)
