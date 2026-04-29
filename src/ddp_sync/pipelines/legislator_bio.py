@@ -120,12 +120,24 @@ def split_email_field(value: Any) -> tuple[str | None, str | None]:
     members usually have a real email. URL-shaped values route to
     ``contact-form-url``; bare emails route to ``email``. At most one of
     the two is non-None.
+
+    Round-7 hardening: case-insensitive scheme matching plus ``mailto:``
+    handling. The bare `mailto:jane@x.gov` form unwraps to a real email,
+    not a contact-form URL. Whitespace is stripped. Anything else
+    URL-shaped (any scheme://) routes to contact-form-url.
     """
     if not value or not isinstance(value, str):
         return None, None
-    if value.startswith(("http://", "https://")):
-        return None, value
-    return value, None
+    stripped = value.strip()
+    if not stripped:
+        return None, None
+    lower = stripped.lower()
+    if lower.startswith("mailto:"):
+        # Strip the "mailto:" prefix; anything after is a real email
+        return stripped.split(":", 1)[1] or None, None
+    if lower.startswith(("http://", "https://")):
+        return None, stripped
+    return stripped, None
 
 
 # ---------- Options + report ----------

@@ -74,9 +74,12 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
+| POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |
 
 `/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
+
+`/trigger/legislator-bio-sync` accepts query params: `dry_run` (bool), `auto_create` (bool), `jurisdiction` (str — `us` for federal or state code), `target` (`all` / `webflow` / `pinecone`), `limit` (int), `historical_since` (YYYY-MM-DD), `audit_only` (`A` or `C`). Returns 503 + `Retry-After: 60` while the unitedstates dataset is still being parsed at app startup (~55s; pre-warm fires at startup).
 
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 

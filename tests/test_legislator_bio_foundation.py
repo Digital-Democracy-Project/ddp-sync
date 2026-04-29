@@ -273,6 +273,27 @@ def test_split_email_field_handles_empty():
     assert e is None and f is None
 
 
+def test_split_email_field_handles_uppercase_scheme():
+    """Round-7 hardening: case-insensitive scheme matching."""
+    e, f = split_email_field("HTTPS://senator.gov/contact")
+    assert e is None and f == "HTTPS://senator.gov/contact"
+
+
+def test_split_email_field_handles_mailto():
+    """Round-7 hardening: mailto: unwraps to a real email, not a URL."""
+    e, f = split_email_field("mailto:jane@flhouse.gov")
+    assert e == "jane@flhouse.gov" and f is None
+    e, f = split_email_field("MAILTO:jane@flhouse.gov")
+    assert e == "jane@flhouse.gov" and f is None
+
+
+def test_split_email_field_strips_whitespace():
+    e, f = split_email_field("  jane@flhouse.gov  ")
+    assert e == "jane@flhouse.gov" and f is None
+    e, f = split_email_field("   ")
+    assert e is None and f is None
+
+
 # ---------- WebflowLookupService schema cache ----------
 
 

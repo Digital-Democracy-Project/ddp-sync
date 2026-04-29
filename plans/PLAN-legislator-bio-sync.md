@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b + round-6 hardening implemented; foundation test suite (20 tests) landed. Six pm-review rounds folded in (rev 6).
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5 implemented (commits 2852a36, 24d058e, c555f38, ee74124, + forthcoming step-5 commit); 44-test suite landed. Seven pm-review rounds folded in (rev 7). Steps 6–9 still pending.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -83,10 +83,12 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 4a | `WebflowLookupService.iter_legislator_items()` | (forthcoming) | ✅ New paginated CMS reader that returns raw upstream dicts. Uses the read-scope key. Has 200-page safety valve. Used by the orchestrator to build the CMS index and to scan for auto-create candidates. |
 | 4b | App-startup pre-warm of congress-legislators YAML | (forthcoming) | ✅ `app.py::lifespan` fires `asyncio.create_task(source.warm_cache())` so trigger endpoints never cold-start (round-6 fix). The orchestrator awaits `warm_cache()` defensively (idempotent). |
 | 4c | Foundation test suite | (forthcoming) | ✅ `tests/test_legislator_bio_foundation.py` — 31 tests covering RateLimiter concurrency, RateLimitConfig fallback contract, OpenStates dict/string jurisdiction shapes, is_federal heuristic, extract_other_id non-dict guard, is_empty / should_write / split_email_field, schema-cache TTL + stale-reuse, fail-closed `_partition_payload`. All pass. |
-| 5 | `/trigger/legislator-bio-sync` endpoint | — | ⏳ Next. |
-| 6 | Audits A and C | — | ⏳ |
+| 5 | `/trigger/legislator-bio-sync` endpoint | (forthcoming) | ✅ FastAPI POST handler in `api/routes/triggers.py`. Query params: `dry_run`, `auto_create`, `jurisdiction`, `target`, `limit`, `historical_since`, `audit_only`. **Round-7 ALB-timeout safety gate**: returns 503 + `Retry-After: 60` when `app.state.congress_legislators._warmed` is False. Param validation (400 on bad target/audit_only/historical_since). Audit-only short-circuit returns `{audit, status: not_implemented}` until step 6 lands. Reuses pre-warmed source from app.state — no double-parse. |
+| 5a | `split_email_field` round-7 hardening | (forthcoming) | ✅ Case-insensitive scheme matching; `mailto:` unwraps to a real email; whitespace stripped. Three new tests pin the behavior. |
+| 5b | Endpoint test suite | (forthcoming) | ✅ `tests/test_trigger_legislator_bio_sync.py` — 10 tests covering: 503-on-not-warmed, 503 on missing app.state, 400 on invalid params (target/audit_only/historical_since), audit-only A/C short-circuits, happy-path orchestrator wiring + report serialization, default options, exception → 500. All 44 tests pass total. |
+| 6 | Audits A and C | — | ⏳ Next. Endpoint already accepts `audit_only=A|C` and returns the `not_implemented` stub. |
 | 7 | Run-summary alerting via Zapier | — | ⏳ |
-| 8 | Full test matrix (orchestrator + audits + endpoint) | — | ⏳ Foundation tests landed; orchestrator-level + audit tests come with steps 5-6. |
+| 8 | Orchestrator-level integration tests | — | ⏳ Foundation + endpoint tests landed; orchestrator-internal `run()` integration tests come with step 6 audits. |
 | 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
 
 **Round-5 fixes applied (in commit 24d058e):**
@@ -415,6 +417,8 @@ class LegislatorBioPipeline:
 
 **State→federal merge detection** (`_find_merge_candidate`): multi-signal scoring requiring ≥2 signals — `name_match` (last-name + first-initial), `birth_year_match`, `bioguide_match` (decisive — counts as score=2). Auto-create skips candidates with a flagged merge; the orchestrator surfaces them in `report.potential_merges` for editor review.
 
+**Phase 1 interim — 3 signals shipped (round-7 plan correction):** the original spec called for 5 signals (Jaro-Winkler full-name similarity ≥0.85; term-continuity within 2 years). Implementation ships the 3 listed above; the two deferred signals would require a new dependency (`jellyfish` or similar for Jaro-Winkler) plus the orchestrator carrying state-leg term-end data through the CMS index. False-positive rate measurement during the rollout dry-run will tell us whether the missing signals are needed for Phase 1 or can wait for Phase 2. **Editor communication note:** when the auto-create discovery first runs, surface a clear caveat in the dry-run report header that merge candidates are flagged from a 3-signal interim heuristic and may have higher false-positive rate than the eventual 5-signal version.
+
 Smoke-tested end-to-end with mocked sources: Rick Scott (federal current — 17 fields PATCH'd), Karen Bass (historical federal via bioguide fallback — 7 fields), state record (correctly orphaned).
 
 ### Webflow PATCH support — extend `WebflowLookupService`
@@ -664,6 +668,8 @@ POST /ddp-sync/v1/trigger/legislator-bio-sync
 | `jurisdiction` | str | (all configured) | Limit to one state code (e.g. `FL`, `us`) |
 | `target` | enum | `all` | `all` / `webflow` / `pinecone` |
 | `limit` | int | 0 | Cap items processed (0 = unlimited) |
+| `historical_since` | date (YYYY-MM-DD) | `2023-01-01` | Federal historical backfill cutoff |
+| `audit_only` | enum | none | `A` / `C` — skip the sync, return just the named audit report |
 
 **Returns:** `BioSyncReport` JSON.
 
@@ -671,6 +677,35 @@ POST /ddp-sync/v1/trigger/legislator-bio-sync
 - Pre-bulk-create dry run: editors run `?dry_run=true&jurisdiction=FL` before bulk-creating FL state-leg CMS entries to preview what would be PATCHed
 - On-demand backfill: `?jurisdiction=us&historical_since=2023-01-01` to pull post-2022 departed members
 - Single-state testing during rollout
+
+### ALB-timeout safety gate (round-7 fix)
+
+The orchestrator's first call awaits `congress.warm_cache()`, which on a cold container takes ~55s wall-clock (8.6 MB historical YAML parse, off-loop via `asyncio.to_thread`). The startup pre-warm (round-6 fix) usually finishes before any trigger arrives, but a request can race the pre-warm task on a freshly-scaled-up container.
+
+Mitigation: the trigger endpoint **gates on the warm flag** and returns **HTTP 503 with `Retry-After: 60`** when the cache is not yet warmed:
+
+```python
+@router.post("/trigger/legislator-bio-sync")
+async def trigger_legislator_bio_sync(request: Request, ...):
+    source = getattr(request.app.state, "congress_legislators", None)
+    if source is None or not source._warmed:
+        raise HTTPException(
+            status_code=503,
+            detail="Bio-sync source still warming up; retry in ~60s",
+            headers={"Retry-After": "60"},
+        )
+    # ... rest of handler
+```
+
+This is honest about the actual state and avoids a 30s ALB idle timeout on the cold-start path. The cost is a brief unavailability window (typically <60s after a deploy or fresh-container start). Acceptable trade-off for Phase 1; if the window becomes operationally annoying, Phase 2+ can persist the parsed object to disk for instant load.
+
+### Audit-only mode
+
+The `audit_only` query param skips the sync and returns just an audit report:
+- `audit_only=A`: federal join-key coverage (the orchestrator scans all federal CMS records and lists those missing both `openstatesid` and `bioguide-id`)
+- `audit_only=C`: pre-existing state CMS records lacking `openstatesid`, scoped by `jurisdiction` if provided
+
+Audit B is run separately (it's a post-bulk-import readiness check that doesn't fit the same shape — typically run from the editor toolchain).
 
 ---
 
@@ -830,10 +865,16 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
    c. ✅ `app.py::lifespan` pre-warms congress-legislators YAML at startup (round-6 fix) so trigger endpoints never cold-start
    d. ✅ `WebflowLookupService._get_field_slugs` — 1h TTL + stale-on-failure reuse with `metric=webflow.schema_stale_reuse` (round-6)
    e. ✅ `tests/test_legislator_bio_foundation.py` — 31 tests pinning rounds 3-6 fixes + live-data discoveries; all pass
-5. ⏳ Trigger endpoint with `dry_run` and `--audit-only` modes (Audits A and C as separate flags) — next
-6. ⏳ Audit A (federal join-key coverage) — editor remediation pass
+5. **Trigger endpoint — IMPLEMENTED:**
+   a. ✅ `POST /ddp-sync/v1/trigger/legislator-bio-sync` in `api/routes/triggers.py`
+   b. ✅ Round-7 ALB-timeout safety gate: 503 + `Retry-After: 60` when `app.state.congress_legislators._warmed` is False
+   c. ✅ Param validation, audit-only short-circuit (`A` / `C` returns `not_implemented` stub until step 6)
+   d. ✅ `split_email_field` round-7 hardening (case-insensitive scheme; `mailto:` unwrap; whitespace strip)
+   e. ✅ 10 endpoint tests in `tests/test_trigger_legislator_bio_sync.py`. Total suite: 44 tests, all pass.
+   f. ✅ README.md updated with the new trigger row + 503-on-warming note
+6. ⏳ Audit A (federal join-key coverage) and Audit C (pre-existing state CMS records lacking openstatesid) — next
 7. ⏳ Run-summary alerting via existing `push_alert_to_zapier()` pattern
-8. ⏳ Orchestrator-level + audit-level test coverage (foundation tests already in)
+8. ⏳ Orchestrator-internal `run()` integration tests
 9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record
 
 **Phase 2 — State coverage (target: 2–4 weeks after Phase 1)**

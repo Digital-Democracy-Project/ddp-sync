@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+from dataclasses import asdict
+from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ddp_sync.api.auth import api_key_auth
 
@@ -81,6 +83,138 @@ async def trigger_bill_status_sync(
         raise
     except Exception as e:
         logger.error(f"Bill status sync trigger failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/trigger/legislator-bio-sync")
+async def trigger_legislator_bio_sync(
+    request: Request,
+    dry_run: bool = False,
+    auto_create: bool | None = None,
+    jurisdiction: str | None = None,
+    target: str = "all",
+    limit: int = 0,
+    historical_since: str | None = None,
+    audit_only: str | None = None,
+    token: str = Depends(api_key_auth),
+):
+    """Trigger the legislator bio + contact sync.
+
+    See plans/PLAN-legislator-bio-sync.md for the full design. Phase 1
+    federal-only; state path is a clear stub.
+
+    Query params:
+        dry_run:          Preview the diff without writing.
+        auto_create:      Create drafts for upstream-only members. Defaults
+                          to the per-jurisdiction config (currently false).
+        jurisdiction:     Filter to one state code ("FL", "WA", ..., "us"
+                          for federal). Default: all configured.
+        target:           "all" / "webflow" / "pinecone".
+        limit:            Cap items processed. 0 = unlimited.
+        historical_since: Federal historical backfill cutoff (YYYY-MM-DD).
+                          Default: 2023-01-01.
+        audit_only:       Skip the sync and return just an audit report.
+                          Values: "A" (federal join-key coverage), "C"
+                          (pre-existing state CMS records lacking
+                          openstatesid). Audit B is run separately from
+                          the editor toolchain.
+
+    Returns: BioSyncReport JSON.
+
+    503 if the congress-legislators source isn't yet warmed at app
+    startup — retry in ~60s. Set Retry-After header.
+    """
+    # ALB-timeout safety gate (round-7 fix). The startup pre-warm task
+    # in app.py::lifespan usually finishes before any trigger arrives,
+    # but a request can race the pre-warm on a freshly-scaled-up
+    # container. Returning 503 with Retry-After is honest about the
+    # actual state and avoids a silent 30s ALB idle timeout on the cold
+    # path.
+    source = getattr(request.app.state, "congress_legislators", None)
+    if source is None or not source._warmed:
+        logger.warning(
+            "legislator-bio-sync trigger arrived before pre-warm complete; "
+            "returning 503 Retry-After=60"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Bio-sync source still warming up; retry in ~60s. "
+                "(8.6 MB historical YAML parse runs once at app startup.)"
+            ),
+            headers={"Retry-After": "60"},
+        )
+
+    # Validate target
+    if target not in ("all", "webflow", "pinecone"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid target '{target}'. Must be all/webflow/pinecone.",
+        )
+
+    # Audit-only short-circuits the sync. Step 6 will implement the
+    # actual audit functions; for now, return a stub-marked response.
+    if audit_only is not None:
+        if audit_only.upper() not in ("A", "C"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid audit_only='{audit_only}'. "
+                    "Use 'A' (federal join-key) or 'C' (pre-existing state)."
+                ),
+            )
+        return {
+            "audit": audit_only.upper(),
+            "status": "not_implemented",
+            "detail": (
+                "Audit functions land in step 6. The endpoint accepts the "
+                "param now so editors can wire up their tooling against the "
+                "final URL shape."
+            ),
+        }
+
+    # Parse historical_since
+    try:
+        if historical_since:
+            since = date.fromisoformat(historical_since)
+        else:
+            since = date(2023, 1, 1)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid historical_since '{historical_since}': {e}",
+        )
+
+    # Build options + run
+    from ddp_sync.pipelines.legislator_bio import (
+        BioSyncOptions,
+        LegislatorBioPipeline,
+    )
+
+    # auto_create defaults: currently always false until per-jurisdiction
+    # config wiring lands (step 7). Editors can flip explicitly via the
+    # query param.
+    effective_auto_create = bool(auto_create) if auto_create is not None else False
+
+    options = BioSyncOptions(
+        target=target,  # type: ignore[arg-type]
+        jurisdiction=jurisdiction,
+        auto_create=effective_auto_create,
+        dry_run=dry_run,
+        limit=limit,
+        historical_since=since,
+    )
+
+    try:
+        # Reuse the pre-warmed source from app.state so we don't pay
+        # the parse cost again.
+        pipeline = LegislatorBioPipeline(congress=source)
+        report = await pipeline.run(options)
+        return asdict(report)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("legislator-bio-sync trigger failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
