@@ -172,6 +172,11 @@ class OpenStatesPeopleClient:
     DEFAULT_TIMEOUT_SECONDS = 30.0
     DEFAULT_PER_PAGE = 50
     DEFAULT_MAX_RETRY_ATTEMPTS = 3
+    # Safety valve for paginated iteration. No real jurisdiction has more than
+    # a few hundred legislators (largest is US Congress at 535); if the API's
+    # pagination semantics change and ``max_page`` becomes unreliable, this
+    # cap prevents a runaway loop from exhausting the daily quota.
+    DEFAULT_MAX_PAGES = 200
 
     INCLUDE_PARAMS = (
         "other_names",
@@ -189,6 +194,7 @@ class OpenStatesPeopleClient:
         max_retry_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
         per_page: int = DEFAULT_PER_PAGE,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        max_pages: int = DEFAULT_MAX_PAGES,
     ):
         if not api_key:
             raise ValueError("api_key is required")
@@ -197,6 +203,7 @@ class OpenStatesPeopleClient:
         self.max_retry_attempts = max_retry_attempts
         self.per_page = per_page
         self.timeout_seconds = timeout_seconds
+        self.max_pages = max_pages
 
     # ---------- Public API ----------
 
@@ -239,9 +246,13 @@ class OpenStatesPeopleClient:
 
         Raises on any non-2xx (including 429-after-retries) — the orchestrator
         decides whether to skip the jurisdiction or abort the run.
+
+        A safety-valve cap (``self.max_pages``, default 200) prevents a
+        runaway loop if the upstream API's pagination semantics break
+        (round-6 defensive fix).
         """
         page = 1
-        while True:
+        while page <= self.max_pages:
             params: list[tuple[str, Any]] = [
                 ("jurisdiction", jurisdiction),
                 ("per_page", self.per_page),
@@ -262,6 +273,13 @@ class OpenStatesPeopleClient:
             if page >= max_page:
                 break
             page += 1
+        else:
+            logger.warning(
+                "iter_jurisdiction hit max_pages safety valve",
+                jurisdiction=jurisdiction,
+                max_pages=self.max_pages,
+                metric="openstates.iter_max_pages_hit",
+            )
 
     @staticmethod
     def extract_other_id(person: dict, scheme: str) -> str | None:
@@ -271,8 +289,15 @@ class OpenStatesPeopleClient:
         ``OpenStatesPerson.raw``. Used by bio-sync to crosswalk
         OpenStates federal members to their bioguide-id (and from there
         to the unitedstates dataset).
+
+        Defensively skips non-dict entries (round-6 fix). OpenStates has
+        historically returned bare strings in ``other_identifiers`` during
+        at least one upstream incident — guarding against that prevents
+        an AttributeError on .get().
         """
         for entry in (person.get("other_identifiers") or []):
+            if not isinstance(entry, dict):
+                continue
             if entry.get("scheme") == scheme:
                 return entry.get("identifier")
         return None

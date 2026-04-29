@@ -40,6 +40,21 @@ async def lifespan(app: FastAPI):
         len(scheduler.scheduler.get_jobs()),
     )
 
+    # Pre-warm the congress-legislators YAML cache so the first
+    # /trigger/legislator-bio-sync request doesn't pay a cold-start parse
+    # penalty (~55s for the 8.6 MB historical file). Fire-and-forget; the
+    # bio-sync orchestrator awaits warm_cache() defensively, which is
+    # idempotent and will be done by the time the first trigger fires.
+    # See PLAN-legislator-bio-sync.md round-6 fixes.
+    from ddp_sync.services.congress_legislators import (
+        CongressLegislatorsSource,
+    )
+    bio_sync_source = CongressLegislatorsSource()
+    app.state.congress_legislators = bio_sync_source
+    bio_warm_task = asyncio.create_task(
+        _prewarm_congress_legislators(bio_sync_source)
+    )
+
     # Start zombie watchdog (simplified — no leader gating)
     watchdog_task = asyncio.create_task(_zombie_sync_watchdog(redis_store))
 
@@ -47,13 +62,32 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     watchdog_task.cancel()
-    try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
+    bio_warm_task.cancel()
+    for t in (watchdog_task, bio_warm_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     scheduler.stop()
     await redis_store.disconnect()
     logger.info("DDP-Sync shutdown complete")
+
+
+async def _prewarm_congress_legislators(source) -> None:
+    """Background task to warm the congress-legislators YAML cache at startup.
+
+    Errors are logged but never raised — startup must succeed even if the
+    unitedstates.github.io endpoint is transiently down. The bio-sync
+    orchestrator will retry the warm on its next call.
+    """
+    try:
+        await source.warm_cache()
+        logger.info("Congress-legislators cache pre-warm complete")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Congress-legislators pre-warm failed; bio-sync will retry on demand",
+            extra={"error": str(e)},
+        )
 
 
 async def _zombie_sync_watchdog(redis_store):

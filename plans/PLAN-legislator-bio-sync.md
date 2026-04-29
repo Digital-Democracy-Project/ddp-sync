@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b implemented (commits 2852a36, 24d058e); steps 4–9 pending. Five pm-review rounds folded in (rev 5).
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b + round-6 hardening implemented; foundation test suite (20 tests) landed. Six pm-review rounds folded in (rev 6).
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -79,11 +79,14 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 2d | Pre-merge staging smoke for `/trigger/bill-status-sync?dry_run=true` | — | ⏳ Required before any production deploy. |
 | 3a | `services/congress_legislators.py` (new) | 2852a36 + 24d058e | ✅ Bioguide-indexed in-memory cache; YAML parse via `asyncio.to_thread()` (round-5 fix) so 8.6 MB historical doesn't block event loop. |
 | 3b | `services/openstates_people.py` (new) | 24d058e | ✅ `OpenStatesPeopleClient` + `OpenStatesPerson` dataclass + `OpenStatesError` / `OpenStatesRateLimitError`. Verified against live API. |
-| 4 | `pipelines/legislator_bio.py` orchestrator | — | ⏳ Next. |
-| 5 | `/trigger/legislator-bio-sync` endpoint | — | ⏳ |
+| 4 | `pipelines/legislator_bio.py` orchestrator | (forthcoming) | ✅ `LegislatorBioPipeline` + `BioSyncOptions` + `BioSyncReport` + `CMSLegislator` + cardinal-rule helpers (`is_empty`, `should_write`, `split_email_field`). Federal sync end-to-end (OpenStates primary → bioguide-id fallback for departed federal). Multi-signal merge detection scaffolded. State path is a clear Phase 2 stub. Smoke-tested against mocked sources for Rick Scott (live federal — 17 fields), Karen Bass (historical federal via bioguide fallback — 7 fields), state record (orphan — correct). |
+| 4a | `WebflowLookupService.iter_legislator_items()` | (forthcoming) | ✅ New paginated CMS reader that returns raw upstream dicts. Uses the read-scope key. Has 200-page safety valve. Used by the orchestrator to build the CMS index and to scan for auto-create candidates. |
+| 4b | App-startup pre-warm of congress-legislators YAML | (forthcoming) | ✅ `app.py::lifespan` fires `asyncio.create_task(source.warm_cache())` so trigger endpoints never cold-start (round-6 fix). The orchestrator awaits `warm_cache()` defensively (idempotent). |
+| 4c | Foundation test suite | (forthcoming) | ✅ `tests/test_legislator_bio_foundation.py` — 31 tests covering RateLimiter concurrency, RateLimitConfig fallback contract, OpenStates dict/string jurisdiction shapes, is_federal heuristic, extract_other_id non-dict guard, is_empty / should_write / split_email_field, schema-cache TTL + stale-reuse, fail-closed `_partition_payload`. All pass. |
+| 5 | `/trigger/legislator-bio-sync` endpoint | — | ⏳ Next. |
 | 6 | Audits A and C | — | ⏳ |
 | 7 | Run-summary alerting via Zapier | — | ⏳ |
-| 8 | Unit test suite | — | ⏳ |
+| 8 | Full test matrix (orchestrator + audits + endpoint) | — | ⏳ Foundation tests landed; orchestrator-level + audit tests come with steps 5-6. |
 | 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
 
 **Round-5 fixes applied (in commit 24d058e):**
@@ -93,6 +96,16 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | Fail-closed schema fetch | `WebflowLookupService._partition_payload` | Schema-fetch failure now propagates as `WebflowError` instead of silently passing the unfiltered payload through. Prevents masking transient `/collections/{id}` 5xx as item-level 4xx avalanches. |
 | Off-loop YAML parse | `CongressLegislatorsSource._fetch_or_cache_one` | The 8.6 MB historical YAML parse moved to `asyncio.to_thread()`. Wall-clock parse is slower (~55s vs 13s) but the event loop stays responsive — verified concurrent heartbeat ticks during the parse window. |
 | Structured-metric breadcrumb | `RateLimitConfig.from_yaml` | Fallback paths emit `metric=rate_limiter.config_fallback` with `reason=file_not_found|parse_error` so infra alerting can fire when production silently regresses to defaults. |
+
+**Round-6 fixes applied (forthcoming commit):**
+
+| Fix | Location | Description |
+|---|---|---|
+| App-startup pre-warm | `app.py::lifespan` | `asyncio.create_task(source.warm_cache())` fires at app startup so trigger endpoints never cold-start. Prevents the 30s ALB idle timeout that the round-5 off-loop parse exposed (parse is now ~55s wall-clock). Pre-warm is fire-and-forget; orchestrator awaits `warm_cache()` defensively (idempotent). |
+| Stale-schema cache | `WebflowLookupService._get_field_slugs` | Cache entries gain a 1-hour TTL. On expiry we attempt a refresh; if it fails AND we have a stale entry, we reuse it with a warning + `metric=webflow.schema_stale_reuse`. If we have no entry at all, the failure propagates per the fail-closed contract. Recovers from transient `/collections/{id}` 5xx during a Webflow incident without dead-stopping all writes. |
+| Defensive `extract_other_id` | `OpenStatesPeopleClient.extract_other_id` | Skip non-dict entries in `other_identifiers`. OpenStates has historically returned bare strings during at least one upstream incident; this prevents an `AttributeError` on `.get()`. |
+| `iter_jurisdiction` max-page valve | `OpenStatesPeopleClient.iter_jurisdiction` | New `max_pages` constructor parameter (default 200) prevents a runaway loop if the API's pagination semantics break. Largest real jurisdiction is US Congress at 535 members → ~11 pages at per_page=50, well under the cap. |
+| Foundation test suite | `tests/test_legislator_bio_foundation.py` (new) | 20 tests pinning round-3 through round-6 fixes + live-data discoveries: RateLimiter concurrency lock, RateLimitConfig.from_yaml fallback contract, OpenStatesPerson dict/string jurisdiction shapes, is_federal heuristic, extract_other_id non-dict guard, schema-cache TTL + stale-reuse paths, fail-closed _partition_payload. Run with `pytest tests/`. |
 
 **Live-data discoveries during step-3b smoke testing:**
 

@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from dataclasses import dataclass, field
+from typing import AsyncIterator
 
 import httpx
 import structlog
@@ -36,6 +38,14 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.services.rate_limiter import RateLimitConfig, RateLimiter
 
 logger = structlog.get_logger()
+
+
+# How long a successfully-fetched collection schema stays "fresh" before we
+# attempt a refresh. On refresh failure we reuse the stale cached value as
+# long as we have one (round-6 fix). 1 hour gives editors near-instant
+# pickup of new fields after they're added in Webflow Designer, while
+# providing protection against transient /collections/{id} 5xx incidents.
+SCHEMA_CACHE_TTL_SECONDS = 60 * 60
 
 
 # ---------- Error types & result objects ----------
@@ -143,8 +153,13 @@ class WebflowLookupService:
                 delay_between_requests_ms=0,  # rely on requests_per_minute
             )
         )
-        # Cache of {collection_id -> set of known field slugs}
-        self._field_slug_cache: dict[str, set[str]] = {}
+        # Cache of {collection_id -> (timestamp, set of known field slugs)}.
+        # On expiry we attempt a refresh; if the refresh fails AND we have a
+        # stale entry, we reuse it (round-6 fix: a transient 503 on
+        # /collections/{id} during a Webflow incident must not dead-stop
+        # every legislator PATCH). If the refresh fails AND we have nothing,
+        # the WebflowError propagates per the fail-closed contract.
+        self._field_slug_cache: dict[str, tuple[float, set[str]]] = {}
 
     # ---------- Shared HTTP helpers ----------
 
@@ -212,19 +227,45 @@ class WebflowLookupService:
         headers: dict,
         collection_id: str,
     ) -> set[str]:
-        """Return the set of field slugs in a collection. Cached per id.
+        """Return the set of field slugs in a collection.
 
-        Used to filter PATCH/POST payloads to only include known fields,
-        supporting incremental schema rollout — sync code can reference new
-        fields before editors create them in Webflow without breaking the
-        whole sync.
+        Cached per collection_id with a TTL (default 1 hour). On TTL expiry
+        we try to refresh; on refresh failure we reuse the stale entry if
+        available (round-6 fix) so a transient `/collections/{id}` 5xx
+        during a Webflow incident doesn't dead-stop every legislator PATCH.
+        Only when we have NO cached entry at all does a fetch failure
+        propagate as WebflowError.
         """
-        if collection_id in self._field_slug_cache:
-            return self._field_slug_cache[collection_id]
+        cached = self._field_slug_cache.get(collection_id)
+        if cached and (time.time() - cached[0]) < SCHEMA_CACHE_TTL_SECONDS:
+            return cached[1]
+
         url = f"{self.BASE_URL}/collections/{collection_id}"
         await self._limiter.apply()
-        resp = await client.get(url, headers=headers)
+        try:
+            resp = await client.get(url, headers=headers)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if cached is not None:
+                logger.warning(
+                    "Schema refresh transport error — reusing stale cache",
+                    collection_id=collection_id,
+                    error=str(e),
+                    metric="webflow.schema_stale_reuse",
+                )
+                return cached[1]
+            raise WebflowError(
+                f"Failed to fetch collection schema (no cache available): "
+                f"{collection_id} — {e}"
+            ) from e
         if resp.status_code != 200:
+            if cached is not None:
+                logger.warning(
+                    "Schema refresh non-200 — reusing stale cache",
+                    collection_id=collection_id,
+                    status_code=resp.status_code,
+                    metric="webflow.schema_stale_reuse",
+                )
+                return cached[1]
             raise WebflowError(
                 f"Failed to fetch collection schema: {collection_id}",
                 response=resp,
@@ -233,7 +274,7 @@ class WebflowLookupService:
         slugs = {
             f.get("slug") for f in data.get("fields", []) if f.get("slug")
         }
-        self._field_slug_cache[collection_id] = slugs
+        self._field_slug_cache[collection_id] = (time.time(), slugs)
         logger.info(
             "Cached Webflow collection field slugs",
             collection_id=collection_id,
@@ -250,6 +291,77 @@ class WebflowLookupService:
         kept = {k: v for k, v in field_data.items() if k in known_slugs}
         dropped = set(field_data.keys()) - set(kept.keys())
         return kept, dropped
+
+    # ---------- Read API ----------
+
+    async def iter_legislator_items(
+        self,
+        *,
+        per_page: int = 100,
+        max_pages: int = 200,
+    ) -> AsyncIterator[dict]:
+        """Iterate every Legislators CMS item as a raw upstream dict.
+
+        Each yielded value is the full ``items`` element from the v2 API:
+        ``{"id": "...", "fieldData": {...}, "isDraft": bool, ...}``.
+        Use this when the orchestrator needs to diff against the current
+        CMS state (which is most callers).
+
+        Pagination is capped at ``max_pages`` as a safety valve.
+
+        Raises:
+            WebflowError: any non-2xx response (including persistent 429 via
+              the retry budget on the underlying limiter — though list reads
+              don't go through the 429-aware helper today).
+        """
+        if not self.legislators_collection_id:
+            raise WebflowError(
+                "legislators_collection_id is not configured"
+            )
+        url = (
+            f"{self.BASE_URL}/collections/{self.legislators_collection_id}/items"
+        )
+        # Read scope is enough; prefer the votebot key if available (it's
+        # typically the read-scoped key). Fall back to the scheduler key.
+        key = (
+            self.settings.webflow_votebot_api_key
+            or self.settings.webflow_scheduler_api_key
+        )
+        if not key:
+            raise WebflowError("No Webflow API key available")
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "accept": "application/json",
+        }
+
+        offset = 0
+        page = 0
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            while page < max_pages:
+                await self._limiter.apply()
+                resp = await client.get(
+                    url,
+                    headers=headers,
+                    params={"limit": per_page, "offset": offset},
+                )
+                if resp.status_code != 200:
+                    raise WebflowError(
+                        f"Webflow legislator read failed: status="
+                        f"{resp.status_code}",
+                        response=resp,
+                    )
+                data = resp.json()
+                items = data.get("items") or []
+                if not items:
+                    return
+                for item in items:
+                    yield item
+                pagination = data.get("pagination") or {}
+                total = pagination.get("total", 0)
+                offset += len(items)
+                if offset >= total or len(items) < per_page:
+                    return
+                page += 1
 
     # ---------- Bill methods (legacy bool contract) ----------
 
