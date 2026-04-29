@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, + forthcoming round-8 data-model commit); 64-test suite landed. Eight pm-review rounds folded in (rev 9). Steps 7–9 still pending.
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6, 7 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, + forthcoming step-7 commit); 77-test suite landed. Nine pm-review rounds folded in (rev 10). Steps 8–9 still pending.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -88,8 +88,9 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 5b | Endpoint test suite | (forthcoming) | ✅ `tests/test_trigger_legislator_bio_sync.py` — 10 tests covering: 503-on-not-warmed, 503 on missing app.state, 400 on invalid params, audit-only short-circuits, happy-path wiring, default options, exception → 500. |
 | 6 | Audits A and C | (forthcoming) | ✅ `audit_federal_join_keys()` (Audit A — federal records lacking both join keys) and `audit_state_join_keys(jurisdiction=None)` (Audit C — state records lacking openstatesid, optional state filter) implemented as methods on `LegislatorBioPipeline`. New `AuditReport` + `AuditEntry` dataclasses. Trigger endpoint's `audit_only=A\|C` no longer stubs — runs the real audit and returns the report. Both audits wrap WebflowError as `aborted=True` with `abort_reason` rather than raising, so editors get a partial report. New `state_code()` helper on `CMSLegislator` (looks at `state-code` then `state` fields). |
 | 6a | Audit test suite | (forthcoming) | ✅ 8 audit tests: A flags only federal-with-no-keys, A skips state, A doesn't flag records with one key, A handles empty federal set; C flags state-no-openstatesid, C filters by jurisdiction (case-insensitive), C scans all states when no jurisdiction; A aborts gracefully on WebflowError. Plus 4 endpoint integration tests for the audit-only paths. Total suite: **55 tests, all pass.** |
-| 7 | Run-summary alerting via Zapier | — | ⏳ Next. |
-| 8 | Orchestrator-level integration tests | — | ⏳ Foundation + endpoint + audit tests landed; orchestrator-internal `run()` integration tests still pending. |
+| 7 | Run-summary alerting via Zapier | (forthcoming) | ✅ `push_bio_sync_alert(webhook_url, report)` mirrors the existing `voatz_brevo.push_alert_to_zapier` pattern. Wired into `LegislatorBioPipeline.run()` via `try/finally` so the alert fires on **every non-dry-run completion including aborts**. Payload includes `on_failure` (errors>0 OR aborted) and `on_large_changes` (patched+created > 100) threshold flags for Zapier-side routing. Round-9 follow-ups bundled: jurisdiction cache gains 1h TTL + stale-on-empty-refresh reuse + `metric=webflow.jurisdiction_mapping_empty` breadcrumb. |
+| 7a | Alerting + cache test suite | (forthcoming) | ✅ 6 alert-function tests (no-webhook, 200 OK with payload assertions, aborted-run flag, on_large_changes threshold, non-2xx, exception); 4 `run()` integration tests (fires on non-dry-run, skipped on dry-run, fires even on aborted, skipped when no webhook); 3 cache tests (TTL, stale-reuse on empty, empty-mapping breadcrumb). **Total suite: 77 tests, all pass.** |
+| 8 | Orchestrator-internal `run()` integration tests | — | ⏳ Foundation + endpoint + audit + alert tests landed; the only remaining gap is a single full-pass `run()` integration test exercising the orchestrator end-to-end. |
 | 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
 
 **Round-5 fixes applied (in commit 24d058e):**
@@ -895,8 +896,13 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
    d. ✅ `AuditReport` + `AuditEntry` dataclasses. New `CMSLegislator.state_code()` helper.
    e. ✅ Trigger endpoint `audit_only` runs the real audit (replaced the not-implemented stub)
    f. ✅ 8 audit-function tests + 4 endpoint integration tests. **Total suite: 55 tests, all pass.**
-7. ⏳ Run-summary alerting via existing `push_alert_to_zapier()` pattern — next
-8. ⏳ Orchestrator-internal `run()` integration tests
+7. **Run-summary alerting via Zapier — IMPLEMENTED:**
+   a. ✅ `push_bio_sync_alert(webhook_url, report)` in `pipelines/legislator_bio.py`. Mirrors the existing `voatz_brevo.push_alert_to_zapier` pattern (sync `requests`, 30s timeout, never raises).
+   b. ✅ Wired into `LegislatorBioPipeline.run()` via `try/finally` so the alert fires on **every non-dry-run completion including aborts** (the case editors most need to know about).
+   c. ✅ Payload includes `on_failure` (errors > 0 OR aborted) and `on_large_changes` (patched + created > 100) threshold flags for Zapier-side routing.
+   d. ✅ Round-9 follow-ups bundled: jurisdiction cache gains 1h TTL + stale-on-empty-refresh reuse + `metric=webflow.jurisdiction_mapping_empty` breadcrumb. Tests pin all three.
+   e. ✅ 13 new tests; **total suite: 77 tests, all pass**.
+8. ⏳ Orchestrator-internal `run()` integration tests — next (foundation + endpoint + audit + alert tests landed; remaining gap is a single full-pass run() test)
 9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record
 
 **Phase 2 — State coverage (target: 2–4 weeks after Phase 1)**

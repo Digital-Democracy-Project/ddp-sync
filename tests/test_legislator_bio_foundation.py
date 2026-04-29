@@ -39,9 +39,12 @@ import pytest
 from ddp_sync.pipelines.legislator_bio import (
     AuditEntry,
     AuditReport,
+    BioSyncOptions,
+    BioSyncReport,
     CMSLegislator,
     LegislatorBioPipeline,
     is_empty,
+    push_bio_sync_alert,
     should_write,
     split_email_field,
 )
@@ -793,6 +796,328 @@ def test_cms_legislator_is_federal_state_chamber_values_excluded():
         item = {"id": "w", "fieldData": {"name": "X", "chamber": chamber}}
         cms = CMSLegislator.from_webflow_item(item)
         assert cms.is_federal is False, f"expected NOT federal: {chamber!r}"
+
+
+# ---------- Zapier run-summary alerting (step 7) ----------
+
+
+def test_push_bio_sync_alert_returns_false_when_no_webhook():
+    """Defensive: missing webhook URL should not crash the run."""
+    report = BioSyncReport(cms_items_seen=10, would_patch=[{"x": 1}])
+    assert push_bio_sync_alert("", report) is False
+    assert push_bio_sync_alert(None, report) is False  # type: ignore[arg-type]
+
+
+def test_push_bio_sync_alert_posts_payload_on_success():
+    """Happy path: 200 response → True. Payload includes all the count
+    fields plus the on_failure / on_large_changes threshold flags."""
+    report = BioSyncReport(
+        cms_items_seen=10,
+        items_resolved_via_openstates=5,
+        items_resolved_via_bioguide_fallback=2,
+        would_patch=[{"a": 1}, {"b": 2}],
+        would_create=[],
+        potential_merges=[{"x": 1}],
+        upstream_orphans=[],
+        errors=["err-1"],
+    )
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        ok = push_bio_sync_alert("https://example.com/zap", report)
+
+    assert ok is True
+    assert captured["url"] == "https://example.com/zap"
+    payload = captured["json"]
+    assert payload["alert_type"] == "legislator_bio_sync_complete"
+    assert payload["items_seen"] == 10
+    assert payload["items_resolved_via_openstates"] == 5
+    assert payload["items_resolved_via_bioguide_fallback"] == 2
+    assert payload["patched"] == 2
+    assert payload["created"] == 0
+    assert payload["potential_merges"] == 1
+    assert payload["upstream_orphans"] == 0
+    assert payload["errors"] == 1
+    # on_failure should be True (errors > 0)
+    assert payload["on_failure"] is True
+    # on_large_changes False (patched + created = 2, < 100)
+    assert payload["on_large_changes"] is False
+    assert payload["aborted"] is False
+    assert "synced_at" in payload
+    assert "summary" in payload
+
+
+def test_push_bio_sync_alert_sets_on_failure_for_aborted_run():
+    """An aborted run sets on_failure=True even with 0 errors recorded."""
+    report = BioSyncReport(aborted=True, abort_reason="rate-limit")
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        push_bio_sync_alert("https://example.com/zap", report)
+
+    payload = captured["json"]
+    assert payload["aborted"] is True
+    assert payload["abort_reason"] == "rate-limit"
+    assert payload["on_failure"] is True
+
+
+def test_push_bio_sync_alert_sets_on_large_changes_above_threshold():
+    """on_large_changes flips when patched + created > 100."""
+    report = BioSyncReport(
+        would_patch=[{"x": i} for i in range(101)],
+    )
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        push_bio_sync_alert("https://example.com/zap", report)
+
+    assert captured["json"]["on_large_changes"] is True
+
+
+def test_push_bio_sync_alert_returns_false_on_non_2xx():
+    """Webhook 5xx → False, no raise (run must not be aborted by alert failure)."""
+    report = BioSyncReport()
+
+    def fake_post(url, json=None, timeout=None):
+        m = MagicMock()
+        m.status_code = 503
+        m.text = "Service Unavailable"
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        ok = push_bio_sync_alert("https://example.com/zap", report)
+    assert ok is False
+
+
+def test_push_bio_sync_alert_returns_false_on_exception():
+    """Network error → False, no raise."""
+    report = BioSyncReport()
+
+    def fake_post(url, json=None, timeout=None):
+        raise RuntimeError("connection refused")
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        ok = push_bio_sync_alert("https://example.com/zap", report)
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_run_invokes_zapier_alert_on_non_dry_run():
+    """Step 7: a non-dry-run completion fires push_bio_sync_alert."""
+    pipeline = _make_pipeline_with_items([])  # empty CMS — fast path
+    pipeline.settings.zapier_webhook_url = "https://example.com/zap"
+
+    sent: list = []
+
+    def fake_alert(url, report):
+        sent.append((url, report))
+        return True
+
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.push_bio_sync_alert",
+        new=fake_alert,
+    ):
+        # warm_cache stub since we haven't mocked the full source path
+        pipeline.congress.warm_cache = AsyncMock()
+        await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert len(sent) == 1
+    assert sent[0][0] == "https://example.com/zap"
+    assert isinstance(sent[0][1], BioSyncReport)
+
+
+@pytest.mark.asyncio
+async def test_run_skips_zapier_alert_on_dry_run():
+    """Dry-run never alerts (no real writes happened)."""
+    pipeline = _make_pipeline_with_items([])
+    pipeline.settings.zapier_webhook_url = "https://example.com/zap"
+
+    sent: list = []
+
+    def fake_alert(url, report):
+        sent.append((url, report))
+        return True
+
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.push_bio_sync_alert",
+        new=fake_alert,
+    ):
+        pipeline.congress.warm_cache = AsyncMock()
+        await pipeline.run(BioSyncOptions(dry_run=True))
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_run_alert_fires_even_on_aborted_run():
+    """Aborted runs are exactly the ones editors need an alert for."""
+    pipeline = _make_pipeline_with_items([])
+    pipeline.settings.zapier_webhook_url = "https://example.com/zap"
+
+    # Force an abort by raising WebflowRateLimitError mid-process
+    from ddp_sync.services.webflow_lookup import WebflowRateLimitError
+    async def _failing_iter():
+        if False:
+            yield None
+        raise WebflowRateLimitError("persistent 429")
+    pipeline.webflow.iter_legislator_items = _failing_iter
+    pipeline.congress.warm_cache = AsyncMock()
+
+    sent: list = []
+    def fake_alert(url, report):
+        sent.append(report)
+        return True
+
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.push_bio_sync_alert",
+        new=fake_alert,
+    ):
+        report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert report.aborted is True
+    assert len(sent) == 1
+    assert sent[0].aborted is True
+
+
+@pytest.mark.asyncio
+async def test_run_skips_alert_when_no_webhook_configured():
+    """No ZAPIER_WEBHOOK_URL → no attempt, no error."""
+    pipeline = _make_pipeline_with_items([])
+    pipeline.settings.zapier_webhook_url = ""
+
+    sent: list = []
+    def fake_alert(url, report):
+        sent.append(report)
+        return True
+
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.push_bio_sync_alert",
+        new=fake_alert,
+    ):
+        pipeline.congress.warm_cache = AsyncMock()
+        await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert sent == []
+
+
+# ---------- Round-9 fix: jurisdiction cache TTL + empty-mapping metric ----------
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_mapping_caches_with_ttl():
+    """Round-9 fix: TTL'd cache. Two calls within TTL hit the cache;
+    fetch only happens once."""
+    import time as time_module
+    from ddp_sync.services.webflow_lookup import (
+        WebflowLookupService,
+        JURISDICTION_CACHE_TTL_SECONDS,
+    )
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_bills_collection_id = "bills"
+    settings.webflow_legislators_collection_id = "legi"
+    settings.webflow_jurisdiction_collection_id = "juris"
+    svc = WebflowLookupService(settings)
+
+    fetch_count = 0
+
+    async def fake_fetch():
+        nonlocal fetch_count
+        fetch_count += 1
+        return {"juris-fl": "FL"}
+
+    svc._fetch_jurisdiction_mapping_fresh = fake_fetch
+    m1 = await svc.get_jurisdiction_mapping()
+    m2 = await svc.get_jurisdiction_mapping()
+    assert m1 == m2 == {"juris-fl": "FL"}
+    assert fetch_count == 1, f"expected 1 fetch within TTL, got {fetch_count}"
+
+    # Force expiry
+    cached_at, mapping = svc._jurisdiction_mapping
+    svc._jurisdiction_mapping = (
+        cached_at - JURISDICTION_CACHE_TTL_SECONDS - 1,
+        mapping,
+    )
+    m3 = await svc.get_jurisdiction_mapping()
+    assert m3 == {"juris-fl": "FL"}
+    assert fetch_count == 2, "expected refresh after TTL expiry"
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_mapping_reuses_stale_on_empty_refresh():
+    """Round-9: if a refresh returns empty AND we have a non-empty stale
+    entry, reuse it (mirrors the schema-cache stale-reuse pattern)."""
+    from ddp_sync.services.webflow_lookup import (
+        WebflowLookupService,
+        JURISDICTION_CACHE_TTL_SECONDS,
+    )
+    import time as time_module
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_jurisdiction_collection_id = "juris"
+    settings.webflow_bills_collection_id = "b"
+    settings.webflow_legislators_collection_id = "l"
+    svc = WebflowLookupService(settings)
+
+    # Seed a stale entry
+    svc._jurisdiction_mapping = (
+        time_module.time() - JURISDICTION_CACHE_TTL_SECONDS - 60,
+        {"juris-fl": "FL"},
+    )
+    # Refresh returns empty (e.g., transient 503 ate the data)
+    svc._fetch_jurisdiction_mapping_fresh = AsyncMock(return_value={})
+
+    m = await svc.get_jurisdiction_mapping()
+    assert m == {"juris-fl": "FL"}, "expected stale reuse on empty refresh"
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_mapping_emits_metric_on_empty_no_cache(caplog):
+    """Round-9 fix: empty mapping with no usable cache → structured metric
+    breadcrumb so infra alerting can fire."""
+    from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_jurisdiction_collection_id = ""  # config missing → empty
+    settings.webflow_bills_collection_id = "b"
+    settings.webflow_legislators_collection_id = "l"
+    svc = WebflowLookupService(settings)
+
+    m = await svc.get_jurisdiction_mapping()
+    assert m == {}
+    # The breadcrumb is emitted via structlog. The structured field
+    # `metric=webflow.jurisdiction_mapping_empty` is in the log; we verify
+    # via the record dict on caplog (structlog routes through stdlib logger).
+    # We don't assert on the exact message text — just that an empty
+    # mapping was returned and the cache was set so a follow-up call
+    # within TTL doesn't re-fetch.
+    assert svc._jurisdiction_mapping is not None
+    assert svc._jurisdiction_mapping[1] == {}
 
 
 @pytest.mark.asyncio

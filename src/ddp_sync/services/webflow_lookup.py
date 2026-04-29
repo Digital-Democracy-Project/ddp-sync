@@ -47,6 +47,13 @@ logger = structlog.get_logger()
 # providing protection against transient /collections/{id} 5xx incidents.
 SCHEMA_CACHE_TTL_SECONDS = 60 * 60
 
+# Same TTL semantics applied to the Jurisdictions CMS collection mapping
+# (round-9 fix). Editors rarely add new jurisdiction entries, but a 1-hour
+# refresh window lets a long-running worker pick up additions (e.g. DC,
+# territories) without a process restart. On refresh failure we reuse a
+# stale non-empty mapping with a structured metric breadcrumb.
+JURISDICTION_CACHE_TTL_SECONDS = 60 * 60
+
 
 # ---------- Error types & result objects ----------
 
@@ -160,12 +167,13 @@ class WebflowLookupService:
         # every legislator PATCH). If the refresh fails AND we have nothing,
         # the WebflowError propagates per the fail-closed contract.
         self._field_slug_cache: dict[str, tuple[float, set[str]]] = {}
-        # Cache of {jurisdiction_ref_id -> two-letter state code}. Populated
-        # lazily by get_jurisdiction_mapping() on first call. Empty until
-        # then. The Jurisdictions CMS collection rarely changes, so this is
-        # cached for the lifetime of the service instance — restart picks
-        # up edits.
-        self._jurisdiction_mapping: dict[str, str] | None = None
+        # Cache of (timestamp, {jurisdiction_ref_id -> two-letter state code}).
+        # Populated lazily on the first ``get_jurisdiction_mapping()`` call.
+        # 1-hour TTL (round-9 fix) — editors rarely add new jurisdiction
+        # entries but new states/territories arriving mid-run shouldn't
+        # require a process restart. On refresh failure with a stale
+        # non-empty entry, we reuse it with a structured-metric breadcrumb.
+        self._jurisdiction_mapping: tuple[float, dict[str, str]] | None = None
 
     # ---------- Shared HTTP helpers ----------
 
@@ -303,34 +311,67 @@ class WebflowLookupService:
     async def get_jurisdiction_mapping(self) -> dict[str, str]:
         """Return ``{jurisdiction_ref_id: two-letter-state-code}``.
 
-        Fetches the Jurisdictions CMS collection once and caches the result
-        on the service instance. The mapping is the data-model bridge from
-        Legislators' multi-reference ``jurisdiction`` field to the flat
-        state code that audits and the orchestrator need.
+        Fetches the Jurisdictions CMS collection and caches the result on
+        the service instance with a 1-hour TTL (round-9 fix). On expiry we
+        attempt a refresh; if it fails AND we have a non-empty stale entry,
+        we reuse it with a ``metric=webflow.jurisdiction_stale_reuse``
+        breadcrumb. If the fresh fetch returns empty AND we have no usable
+        cache, we emit ``metric=webflow.jurisdiction_mapping_empty`` so
+        infra alerting can surface the silent-degraded state.
 
-        Returns an empty dict if ``webflow_jurisdiction_collection_id`` is
-        unset or the fetch fails — callers should treat this as "no
-        resolution available" (Audit C with a jurisdiction filter will see
-        all records as unresolved and flag/skip them per its rules).
+        The mapping is the data-model bridge from Legislators' multi-
+        reference ``jurisdiction`` field to the flat state code that
+        audits and the orchestrator need.
+
+        Never raises — callers always get a dict (possibly empty).
         """
-        if self._jurisdiction_mapping is not None:
-            return self._jurisdiction_mapping
+        cached = self._jurisdiction_mapping
+        if cached and (time.time() - cached[0]) < JURISDICTION_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        fresh = await self._fetch_jurisdiction_mapping_fresh()
+        if fresh:
+            self._jurisdiction_mapping = (time.time(), fresh)
+            logger.info(
+                "Built jurisdiction mapping",
+                entries=len(fresh),
+            )
+            return fresh
+
+        # Fresh fetch returned empty
+        if cached and cached[1]:
+            logger.warning(
+                "Jurisdiction refresh returned empty; reusing stale cache",
+                metric="webflow.jurisdiction_stale_reuse",
+                stale_age_seconds=round(time.time() - cached[0], 1),
+            )
+            return cached[1]
+
+        # No usable cache — emit metric breadcrumb so infra alerts can fire
+        logger.warning(
+            "Jurisdiction mapping is empty; "
+            "audits and state-code resolution are disabled",
+            metric="webflow.jurisdiction_mapping_empty",
+        )
+        self._jurisdiction_mapping = (time.time(), {})
+        return {}
+
+    async def _fetch_jurisdiction_mapping_fresh(self) -> dict[str, str]:
+        """Single-pass fetch of the Jurisdictions collection.
+
+        Returns the mapping (possibly empty on config-missing or HTTP
+        errors). Never raises — caller decides whether empty means
+        "use stale" or "alert".
+        """
         coll = self.settings.webflow_jurisdiction_collection_id
         if not coll:
-            logger.warning(
-                "WEBFLOW_JURISDICTION_COLLECTION_ID is not set; "
-                "jurisdiction resolution disabled",
-            )
-            self._jurisdiction_mapping = {}
-            return self._jurisdiction_mapping
+            return {}
         key = (
             self.settings.webflow_votebot_api_key
             or self.settings.webflow_scheduler_api_key
         )
         if not key:
-            logger.warning("No Webflow API key; jurisdiction resolution disabled")
-            self._jurisdiction_mapping = {}
-            return self._jurisdiction_mapping
+            return {}
         headers = {
             "Authorization": f"Bearer {key}",
             "accept": "application/json",
@@ -341,7 +382,7 @@ class WebflowLookupService:
                 offset = 0
                 page_size = 100
                 page = 0
-                max_pages = 50  # Jurisdictions is small (50 states + US)
+                max_pages = 50  # Jurisdictions is small (50 states + US + DC + territories)
                 while page < max_pages:
                     await self._limiter.apply()
                     resp = await client.get(
@@ -351,7 +392,8 @@ class WebflowLookupService:
                     )
                     if resp.status_code != 200:
                         logger.warning(
-                            "Jurisdictions fetch returned non-200; partial mapping",
+                            "Jurisdictions fetch returned non-200; "
+                            "partial mapping",
                             status_code=resp.status_code,
                         )
                         break
@@ -362,9 +404,6 @@ class WebflowLookupService:
                     for item in items:
                         item_id = item.get("id") or ""
                         fields = item.get("fieldData") or {}
-                        # Try common field names (matches WebflowSource pattern).
-                        # The 2-char-name fallback handles older data where
-                        # only the display name is set.
                         candidate = (
                             fields.get("state-code")
                             or fields.get("code")
@@ -380,16 +419,11 @@ class WebflowLookupService:
                     if offset >= total or len(items) < page_size:
                         break
                     page += 1
-        except Exception as e:  # noqa: BLE001 — never raise from this call
+        except Exception as e:  # noqa: BLE001 — never raise
             logger.warning(
                 "Jurisdiction mapping fetch failed; returning partial",
                 error=str(e),
             )
-        self._jurisdiction_mapping = mapping
-        logger.info(
-            "Built jurisdiction mapping",
-            entries=len(mapping),
-        )
         return mapping
 
     @staticmethod

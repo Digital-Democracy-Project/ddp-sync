@@ -33,10 +33,12 @@ Error handling:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Iterable, Literal
 
+import requests
 import structlog
 
 from ddp_sync.config import Settings, get_settings
@@ -109,6 +111,95 @@ def should_write(
     if field_name in locked_fields:
         return False
     return True
+
+
+# ---------- Run-summary alerting (step 7) ----------
+
+
+def push_bio_sync_alert(webhook_url: str, report: "BioSyncReport") -> bool:
+    """POST a legislator-bio-sync run summary to the configured Zapier webhook.
+
+    Mirrors ``pipelines/voatz_brevo.py::push_alert_to_zapier`` — sync HTTP
+    via the ``requests`` library (Zapier is fire-and-forget; latency
+    doesn't matter), 30s timeout, never raises (returns ``bool``).
+
+    Bio sync becomes the first consumer of the scaffolded ``notifications:``
+    block in ``sync_schedule.yaml`` (PLAN run-summary alerting section).
+    Threshold-based escalation routing is handled Zapier-side based on
+    the ``escalate`` and ``aborted`` flags in the payload.
+
+    Caller is responsible for skipping this on dry-runs (no real writes
+    happened, so no editor-facing alert needed).
+    """
+    if not webhook_url:
+        logger.error(
+            "No Zapier webhook URL configured for bio-sync alert",
+            metric="legislator_bio_sync.alert_skipped",
+            reason="no_webhook_url",
+        )
+        return False
+
+    patched = len(report.would_patch)
+    created = len(report.would_create)
+    merges = len(report.potential_merges)
+    orphans = len(report.upstream_orphans)
+    errors = len(report.errors)
+
+    # Threshold flags Zapier can route on. on_failure and on_large_changes
+    # mirror the names in sync_schedule.yaml::notifications.
+    on_failure = errors > 0 or report.aborted
+    on_large_changes = (patched + created) > 100
+
+    payload = {
+        "alert_type": "legislator_bio_sync_complete",
+        "summary": (
+            f"items_seen={report.cms_items_seen} "
+            f"patched={patched} created={created} "
+            f"merges={merges} orphans={orphans} errors={errors}"
+        ),
+        "items_seen": report.cms_items_seen,
+        "items_resolved_via_openstates": (
+            report.items_resolved_via_openstates
+        ),
+        "items_resolved_via_bioguide_fallback": (
+            report.items_resolved_via_bioguide_fallback
+        ),
+        "patched": patched,
+        "created": created,
+        "potential_merges": merges,
+        "upstream_orphans": orphans,
+        "errors": errors,
+        "aborted": report.aborted,
+        "abort_reason": report.abort_reason,
+        "on_failure": on_failure,
+        "on_large_changes": on_large_changes,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=30)
+        if 200 <= response.status_code < 300:
+            logger.info(
+                "bio-sync Zapier alert sent",
+                patched=patched,
+                created=created,
+                errors=errors,
+                aborted=report.aborted,
+            )
+            return True
+        logger.error(
+            "Zapier webhook returned non-2xx",
+            status_code=response.status_code,
+            response=response.text[:200],
+            metric="legislator_bio_sync.alert_failed",
+        )
+    except Exception as e:  # noqa: BLE001 — never raise from this helper
+        logger.error(
+            "Zapier webhook error",
+            error=str(e),
+            metric="legislator_bio_sync.alert_failed",
+        )
+    return False
 
 
 # ---------- Federal `email` URL detection ----------
@@ -352,41 +443,70 @@ class LegislatorBioPipeline:
         await self.congress.warm_cache()
 
         try:
-            await self._process_cms_records(options, report)
-        except (WebflowRateLimitError, OpenStatesRateLimitError) as e:
-            report.aborted = True
-            report.abort_reason = f"Rate-limit error aborted run: {e}"
-            logger.error(
-                "Bio sync aborted on rate limit",
-                error=str(e),
-                processed=report.cms_items_seen,
-            )
-            return report
-
-        if options.auto_create:
             try:
-                await self._discover_and_create(options, report)
+                await self._process_cms_records(options, report)
             except (WebflowRateLimitError, OpenStatesRateLimitError) as e:
                 report.aborted = True
-                report.abort_reason = (
-                    f"Rate-limit error during auto-create: {e}"
-                )
+                report.abort_reason = f"Rate-limit error aborted run: {e}"
                 logger.error(
-                    "Bio sync auto-create aborted",
+                    "Bio sync aborted on rate limit",
                     error=str(e),
+                    processed=report.cms_items_seen,
                 )
                 return report
 
-        logger.info(
-            "Legislator bio sync complete",
-            seen=report.cms_items_seen,
-            patched=len(report.would_patch),
-            created=len(report.would_create),
-            merges=len(report.potential_merges),
-            orphans=len(report.upstream_orphans),
-            errors=len(report.errors),
-        )
-        return report
+            if options.auto_create:
+                try:
+                    await self._discover_and_create(options, report)
+                except (
+                    WebflowRateLimitError, OpenStatesRateLimitError
+                ) as e:
+                    report.aborted = True
+                    report.abort_reason = (
+                        f"Rate-limit error during auto-create: {e}"
+                    )
+                    logger.error(
+                        "Bio sync auto-create aborted",
+                        error=str(e),
+                    )
+                    return report
+
+            logger.info(
+                "Legislator bio sync complete",
+                seen=report.cms_items_seen,
+                patched=len(report.would_patch),
+                created=len(report.would_create),
+                merges=len(report.potential_merges),
+                orphans=len(report.upstream_orphans),
+                errors=len(report.errors),
+            )
+            return report
+        finally:
+            # Step 7 — post run-summary alert to Zapier on every non-dry-run
+            # completion (including aborts — those are exactly what editors
+            # need to know about). Skipped for dry-runs since no real writes
+            # happened. Run the sync HTTP call off the event loop via
+            # asyncio.to_thread; webhook is fire-and-forget so we don't
+            # block the caller on it.
+            if not options.dry_run:
+                webhook = getattr(self.settings, "zapier_webhook_url", "")
+                if webhook:
+                    try:
+                        await asyncio.to_thread(
+                            push_bio_sync_alert, webhook, report
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # push_bio_sync_alert never raises, but defend
+                        # against asyncio.to_thread surprises so we don't
+                        # mask a real error from the run.
+                        logger.error(
+                            "Zapier alert task crashed",
+                            error=str(e),
+                        )
+                else:
+                    logger.info(
+                        "Skipping Zapier alert; ZAPIER_WEBHOOK_URL not set",
+                    )
 
     # ---------- Processing ----------
 
