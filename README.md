@@ -38,7 +38,11 @@ Config is loaded once at startup. Source priority: Secrets Manager → `.env` �
 
 ## API
 
-All endpoints are prefixed with `/ddp-sync/v1`.
+All endpoints are prefixed with `/ddp-sync/v1` (set in `src/ddp_sync/app.py` as `API_PREFIX`). The paths in the tables below are **relative to that prefix** — combine them when calling the service.
+
+For example, the unified sync endpoint:
+- **From localhost on EC2**: `http://localhost:8001/ddp-sync/v1/sync/unified`
+- **From the public proxy** (DDP-API strips its own `/votebot/sync/` prefix and forwards): `https://api.digitaldemocracyproject.org/votebot/sync/unified`
 
 ### Sync Endpoints
 
