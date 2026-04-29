@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Draft for review
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b implemented (commits 2852a36, 24d058e); steps 4–9 pending. Five pm-review rounds folded in (rev 5).
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -46,20 +46,59 @@ Enrich the existing Webflow **Legislators** CMS collection with biographical, co
 
 Repo audit (2026-04-29) confirms these components already exist; Phase 1 extends them rather than creating parallel implementations.
 
-| Component | Location | What it provides | What we extend |
+| Component | Location | What it provides | Status |
 |---|---|---|---|
-| `WebflowLookupService` | `services/webflow_lookup.py` | Webflow PATCH (despite the "Lookup" name — it's the write service). Used by `pipelines/bill_version.py` Flow 1. Has API-key fallback (`webflow_scheduler_api_key` → `webflow_votebot_api_key`). | Add: 429/Retry-After handling, in-process rate-limiter (shared across pipelines in the same worker), `update_legislator_fields()`, `create_legislator_draft()`, field-existence tolerance for incremental schema rollout. Consider renaming to `WebflowWriteService` in a follow-up. |
-| `RateLimitConfig` + `_apply_rate_limit()` | `pipelines/legislator_sync.py` (also duplicated in `bill_sync.py`) | Sleep-based rate limiter for OpenStates calls; loads from `rate_limit:` config block | Reuse via import (not copy). Document the existing 2-pipeline duplication as an opportunistic follow-up refactor — not blocking for bio sync. |
-| `push_alert_to_zapier()` | `pipelines/voatz_brevo.py` | Posts run summary to a configured Zapier webhook | Reuse for bio-sync run summaries. Pattern is the established alerting mechanism for this repo; introducing Sentry/CloudWatch would be a separate initiative. |
-| `ZAPIER_WEBHOOK_URL` | `config.py` + `.env.example` | Already configured | No change |
-| `dry_run` semantics | `sync/types.py::SyncOptions`, `api/routes/sync_unified.py` | Standard pattern across the repo | Bio sync follows the same convention |
-| `sync_schedule.yaml` `notifications:` block | `config/sync_schedule.yaml` | Declared but **never wired** (marked "future use" — `on_failure`, `on_large_changes`) | Phase 1 does not wire it; uses the Zapier pattern matching `voatz_brevo`. Can be unified later as a repo-wide initiative. |
+| `WebflowLookupService` | `services/webflow_lookup.py` | Webflow PATCH (despite the "Lookup" name — it's the write service). Used by `pipelines/bill_version.py` Flow 1. Has API-key fallback (`webflow_scheduler_api_key` → `webflow_votebot_api_key`). | ✅ EXTENDED (commit 2852a36): added rate-limiter, 429/Retry-After + WebflowRateLimitError, `update_legislator_fields()`, `create_legislator_draft()`, field-existence tolerance via cached schema lookup. Rename to `WebflowWriteService` deferred. |
+| `RateLimitConfig` + `_apply_rate_limit()` | inline in `pipelines/legislator_sync.py` and `pipelines/bill_sync.py` | Sleep-based rate limiter for OpenStates calls; loads from `rate_limit:` config block. Was duplicated. | ✅ EXTRACTED (commit 2852a36) to `services/rate_limiter.py`. Both pipelines migrated. New module adds `asyncio.Lock`-guarded `apply()` (concurrency safe) and `enforced_sleeps` observability counter. |
+| `push_alert_to_zapier()` | `pipelines/voatz_brevo.py` | Posts run summary to a configured Zapier webhook | ⏳ TO REUSE in bio-sync run summaries (step 7). Pattern is the established alerting mechanism for this repo. |
+| `ZAPIER_WEBHOOK_URL` | `config.py` + `.env.example` | Already configured | No change. |
+| `dry_run` semantics | `sync/types.py::SyncOptions`, `api/routes/sync_unified.py` | Standard pattern across the repo | Bio sync follows the same convention. |
+| `sync_schedule.yaml` `notifications:` block | `config/sync_schedule.yaml` | Declared but **never wired** ("future use" — `on_failure`, `on_large_changes`) | ⏳ Bio sync becomes the first consumer in step 7. |
 
-**What does NOT exist yet (real gaps to build):**
-- Webflow rate-limiter / 429 handling (currently `WebflowLookupService` is raw `httpx.patch` with 15s timeout)
-- Cross-process / Redis-backed rate coordination (single-worker is fine for now)
-- Sentry / CloudWatch metrics / on-call escalation (out of scope for this plan)
-- Durable PATCH-diff archive (only Redis 30-day TTL planned for Phase 1)
+**What does NOT exist yet (gaps still to build):**
+- Cross-process / Redis-backed rate coordination — deferred to Phase 2+ when multi-worker becomes a need (single-worker assumption documented).
+- Sentry / CloudWatch metrics / on-call escalation — out of scope for this plan; structured-metric breadcrumbs added to `RateLimitConfig.from_yaml` so a future infra-level alerting layer can pick them up.
+- Durable PATCH-diff archive — Phase 1 keeps Redis 30-day TTL only; S3 + run-id-range deferred to Phase 2+.
+
+**What's been built (commit refs):** see "Implementation status" below.
+
+---
+
+## Implementation status (as of 2026-04-29)
+
+Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still pending.
+
+| Phase 1 step | Module / artifact | Commit | Status |
+|---|---|---|---|
+| 1a | `services/rate_limiter.py` (new) | 2852a36 | ✅ Concurrency-safe via `asyncio.Lock`; structured-metric breadcrumb on fallback (round-5 fix); `from_yaml` never raises. |
+| 1b | `pipelines/legislator_sync.py` (migrated) | 2852a36 | ✅ Imports from shared module; `_apply_rate_limit` retained as thin alias. |
+| 1c | `pipelines/bill_sync.py` (migrated) | 2852a36 | ✅ Same migration shape as legislator_sync. |
+| 2a | Error types + result dataclasses | 2852a36 | ✅ `WebflowError`, `WebflowRateLimitError`, `WebflowPatchResult`, `WebflowCreateResult`. |
+| 2b | `WebflowLookupService` extension | 2852a36 + 24d058e | ✅ Shared limiter, `_send_with_backoff`, `update_legislator_fields()`, `create_legislator_draft()`, fail-closed schema partition (round-5 fix). |
+| 2c | `update_bill_fields` migration | 2852a36 | ✅ Kept legacy bool contract; routes through new helpers internally. No caller migration needed. |
+| 2d | Pre-merge staging smoke for `/trigger/bill-status-sync?dry_run=true` | — | ⏳ Required before any production deploy. |
+| 3a | `services/congress_legislators.py` (new) | 2852a36 + 24d058e | ✅ Bioguide-indexed in-memory cache; YAML parse via `asyncio.to_thread()` (round-5 fix) so 8.6 MB historical doesn't block event loop. |
+| 3b | `services/openstates_people.py` (new) | 24d058e | ✅ `OpenStatesPeopleClient` + `OpenStatesPerson` dataclass + `OpenStatesError` / `OpenStatesRateLimitError`. Verified against live API. |
+| 4 | `pipelines/legislator_bio.py` orchestrator | — | ⏳ Next. |
+| 5 | `/trigger/legislator-bio-sync` endpoint | — | ⏳ |
+| 6 | Audits A and C | — | ⏳ |
+| 7 | Run-summary alerting via Zapier | — | ⏳ |
+| 8 | Unit test suite | — | ⏳ |
+| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
+
+**Round-5 fixes applied (in commit 24d058e):**
+
+| Fix | Location | Description |
+|---|---|---|
+| Fail-closed schema fetch | `WebflowLookupService._partition_payload` | Schema-fetch failure now propagates as `WebflowError` instead of silently passing the unfiltered payload through. Prevents masking transient `/collections/{id}` 5xx as item-level 4xx avalanches. |
+| Off-loop YAML parse | `CongressLegislatorsSource._fetch_or_cache_one` | The 8.6 MB historical YAML parse moved to `asyncio.to_thread()`. Wall-clock parse is slower (~55s vs 13s) but the event loop stays responsive — verified concurrent heartbeat ticks during the parse window. |
+| Structured-metric breadcrumb | `RateLimitConfig.from_yaml` | Fallback paths emit `metric=rate_limiter.config_fallback` with `reason=file_not_found|parse_error` so infra alerting can fire when production silently regresses to defaults. |
+
+**Live-data discoveries during step-3b smoke testing:**
+
+- OpenStates returns `jurisdiction` as a **dict** (`{"name": "...", "id": "...", "classification": "..."}`), not a flat string. `OpenStatesPerson.from_api()` accepts both shapes for safety.
+- Federal members' `current_role.division_id` contains `/state:XX` because they represent specific states. Naive division-id check would mis-classify them as state. `is_federal` uses `jurisdiction_name == "United States"` instead.
+- These are documented in the `services/openstates_people.py` `is_federal` docstring and reflected in the "New code modules → openstates_people" section below.
 
 ---
 
