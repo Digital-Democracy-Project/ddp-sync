@@ -8,29 +8,16 @@ from typing import Any
 
 import httpx
 import structlog
-import yaml
 
 from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata
 from ddp_sync.ingestion.pipeline import IngestionPipeline
+from ddp_sync.services.rate_limiter import RateLimitConfig, RateLimiter
 
 logger = structlog.get_logger()
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent.parent / "config" / "sync_schedule.yaml"
-
-
-@dataclass
-class RateLimitConfig:
-    """Rate limiting configuration for OpenStates API.
-
-    Defaults aligned with upgraded API tier: 30,000 calls/day, 2 calls/second.
-    """
-
-    requests_per_minute: int = 120  # 2 calls/second
-    delay_between_requests_ms: int = 500  # 500ms minimum between requests
-    max_retry_attempts: int = 3
-    retry_backoff_seconds: int = 5
 
 
 @dataclass
@@ -117,33 +104,10 @@ class LegislatorSyncService:
         self.api_key = self.settings.openstates_api_key
         self.pipeline = IngestionPipeline(self.settings)
         self.config_path = config_path or DEFAULT_CONFIG_PATH
-        self.rate_limit = self._load_rate_limit_config()
-        self._last_request_time: float = 0
+        self.rate_limit = RateLimitConfig.from_yaml(self.config_path)
+        self.rate_limiter = RateLimiter(self.rate_limit)
         # Cache for bill slug lookups (webflow_bill_id -> {name, slug, identifier})
         self._bill_cache: dict[str, dict] = {}
-
-    def _load_rate_limit_config(self) -> RateLimitConfig:
-        """Load rate limit configuration from YAML file."""
-        if not self.config_path.exists():
-            logger.warning(f"Sync config not found at {self.config_path}, using defaults")
-            return RateLimitConfig()
-
-        try:
-            with open(self.config_path) as f:
-                config = yaml.safe_load(f) or {}
-
-            rate_limit = config.get("rate_limit", {})
-            retry = config.get("retry", {})
-
-            return RateLimitConfig(
-                requests_per_minute=rate_limit.get("requests_per_minute", 60),
-                delay_between_requests_ms=rate_limit.get("delay_between_bills_ms", 100),
-                max_retry_attempts=retry.get("max_attempts", 3),
-                retry_backoff_seconds=retry.get("backoff_seconds", 5),
-            )
-        except Exception as e:
-            logger.error(f"Failed to load rate limit config: {e}")
-            return RateLimitConfig()
 
     def _get_source_name(self, jurisdiction: str) -> str:
         """
@@ -244,27 +208,13 @@ class LegislatorSyncService:
             )
 
     async def _apply_rate_limit(self) -> None:
-        """Apply rate limiting by sleeping if needed."""
-        import time
+        """Backwards-compatible alias for self.rate_limiter.apply().
 
-        # Calculate minimum delay between requests
-        min_delay_seconds = self.rate_limit.delay_between_requests_ms / 1000.0
-
-        # Also respect requests_per_minute limit
-        per_request_delay = 60.0 / self.rate_limit.requests_per_minute
-        min_delay_seconds = max(min_delay_seconds, per_request_delay)
-
-        # Calculate time since last request
-        current_time = time.time()
-        elapsed = current_time - self._last_request_time
-
-        # Sleep if we need to wait
-        if elapsed < min_delay_seconds and self._last_request_time > 0:
-            sleep_time = min_delay_seconds - elapsed
-            logger.debug(f"Rate limiting: sleeping for {sleep_time:.2f}s")
-            await asyncio.sleep(sleep_time)
-
-        self._last_request_time = time.time()
+        Kept so internal call sites within this module don't need a sweeping
+        rename in the same PR as the rate-limiter extraction. Prefer
+        self.rate_limiter.apply() in new code.
+        """
+        await self.rate_limiter.apply()
 
     async def _get_sponsor_name(self, person_id: str) -> str | None:
         """
