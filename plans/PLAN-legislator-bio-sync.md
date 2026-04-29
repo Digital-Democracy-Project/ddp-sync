@@ -358,65 +358,64 @@ class OpenStatesPeopleClient:
 
 Verified against the live API (4 smoke tests with the dev key): Rick Scott returns with full ID set + `is_federal=True`; nonexistent ID returns None; `extract_other_id` static helper works; `iter_jurisdiction("fl")` yields state legislators paginated.
 
-### `src/ddp_sync/pipelines/legislator_bio.py`
+### `src/ddp_sync/pipelines/legislator_bio.py` — IMPLEMENTED (commit c555f38)
 
-Orchestrator. For each CMS legislator:
-1. Look up upstream record (OpenStates first; bioguide-id fallback for federal historical).
-2. Build the field payload (merging unitedstates + OpenStates data).
-3. Diff against current CMS state — only PATCH **changed** fields.
-4. Auto-create gated by config; auto-created entries always land as `isDraft: true`.
+Orchestrator. For each CMS legislator: look up upstream (OpenStates first; bioguide-id fallback for federal historical), build a field payload via the source-precedence matrix, diff against the current CMS state via `should_write()` / `is_empty()`, PATCH (or append to dry-run report). Optional auto-create discovers upstream-only members and either creates drafts or flags potential merges.
+
+State legislator handling is a clear Phase 2 stub (logged + skipped, not silent no-op).
+
+**Module-level helpers** (cardinal-rule logic — see `Field precedence & overwrite policy` section):
+- `is_empty(value)` — recognizes the `EMPTY_VALUES` sentinels, whitespace-only strings, and empty containers. Container-safe (lists/dicts checked structurally before the membership test, since they'd be unhashable). Numeric zero intentionally preserved.
+- `should_write(field_name, cms_value, upstream_value, *, locked_fields=())` — applies the cardinal rule plus locked-fields opt-out.
+- `split_email_field(value)` → `(email, contact_form_url)` — URL-shaped values route to `contact-form-url`; bare emails to `email`.
+
+**Public API:**
 
 ```python
 @dataclass
 class BioSyncOptions:
     target: Literal["all", "webflow", "pinecone"] = "all"
-    jurisdiction: str | None = None       # None = all configured
+    jurisdiction: str | None = None        # None = all configured. "us" for federal.
     auto_create: bool = False
     dry_run: bool = False
-    limit: int = 0                         # 0 = unlimited
+    limit: int = 0
     historical_since: date = date(2023, 1, 1)
+    locked_fields: tuple[str, ...] = ()
+
 
 @dataclass
 class BioSyncReport:
-    cms_items_seen: int
-    would_patch: list[dict]                # [{webflow_id, name, changed_fields}]
+    cms_items_seen: int = 0
+    items_resolved_via_openstates: int = 0
+    items_resolved_via_bioguide_fallback: int = 0
+    would_patch: list[dict]
     would_create: list[dict]
-    potential_merges: list[dict]           # state→federal transition candidates
-    upstream_orphans: list[dict]           # in CMS but not found upstream
+    potential_merges: list[dict]
+    upstream_orphans: list[dict]
     errors: list[str]
+    aborted: bool = False
+    abort_reason: str | None = None
+
 
 class LegislatorBioPipeline:
+    def __init__(self, *, settings=None, webflow=None, congress=None,
+                 openstates=None, openstates_rate_limiter=None): ...
+
     async def run(self, options: BioSyncOptions) -> BioSyncReport:
-        # 1. Build CMS index (one Webflow read pass)
-        cms_index = await self._build_cms_index()
-
-        # 2. Warm source caches
-        await self.congress.warm_cache()
-
-        # 3. For each CMS item: resolve upstream → diff → write
-        for cms_item in cms_index:
-            upstream = await self._resolve_upstream(cms_item)
-            if not upstream:
-                report.upstream_orphans.append(cms_item.summary())
-                continue
-            payload = self._build_payload(cms_item, upstream)
-            changed = self._diff_fields(cms_item, payload)
-            if not changed:
-                continue
-            if options.dry_run:
-                report.would_patch.append({
-                    "webflow_id": cms_item.id, "name": cms_item.name,
-                    "changed_fields": list(changed),
-                })
-            else:
-                await self.webflow.patch_legislator(cms_item.id, changed)
-
-        # 4. Optional: discover upstream-only legislators (for auto-create)
+        await self.congress.warm_cache()           # idempotent; pre-warmed at startup
+        await self._process_cms_records(options, report)
         if options.auto_create:
-            await self._discover_and_create_drafts(cms_index, options, report)
-
+            await self._discover_and_create(options, report)
         return report
 ```
+
+**Error-handling contract:** rate-limit errors (`WebflowRateLimitError`, `OpenStatesRateLimitError`) abort the run cleanly — `report.aborted=True`, `abort_reason` set, partial state returned. Per-record `WebflowError` / `OpenStatesError` append to `report.errors` with `f"{slug}: {type(e).__name__}: {e}"` and the run continues. Unhandled exceptions are caught at the per-record boundary, logged via `logger.exception`, and added to `errors[]`.
+
+**Federal payload builder** (`_build_federal_payload`) implements the source-precedence matrix from the PLAN: unitedstates wins for federal-specific fields (term span, capitol office, social, cross-source IDs, photo URL derived from bioguide); OpenStates fills any gaps (capitol office fallback when unitedstates is missing it; email/contact-form-url routing via `split_email_field`).
+
+**State→federal merge detection** (`_find_merge_candidate`): multi-signal scoring requiring ≥2 signals — `name_match` (last-name + first-initial), `birth_year_match`, `bioguide_match` (decisive — counts as score=2). Auto-create skips candidates with a flagged merge; the orchestrator surfaces them in `report.potential_merges` for editor review.
+
+Smoke-tested end-to-end with mocked sources: Rick Scott (federal current — 17 fields PATCH'd), Karen Bass (historical federal via bioguide fallback — 7 fields), state record (correctly orphaned).
 
 ### Webflow PATCH support — extend `WebflowLookupService`
 
@@ -824,13 +823,18 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
    d. Pre-merge smoke: `/trigger/bill-status-sync?dry_run=true` against staging — TODO before deploy
 3. **New modules — IMPLEMENTED:**
    a. ✅ `services/congress_legislators.py` — bioguide-indexed in-memory cache; YAML parse via `asyncio.to_thread()` (round-5 fix) so 8.6 MB historical file doesn't block event loop
-   b. ✅ `services/openstates_people.py` — async client + `OpenStatesPerson` dataclass; uses shared `RateLimiter`; full `Retry-After` honoring; 404 returns None; persistent 429 raises `OpenStatesRateLimitError`
-4. `pipelines/legislator_bio.py` orchestrator using `should_write()` + `is_empty()`
-5. Trigger endpoint with `dry_run` and `--audit-only` modes (Audits A and C as separate flags)
-6. Audit A (federal join-key coverage) — editor remediation pass
-7. Run-summary alerting via existing `push_alert_to_zapier()` pattern
-8. Unit test suite (full matrix above) + synthetic merge-detection validation
-9. Dry-run against 5 federal members → 1 live PATCH on low-stakes record
+   b. ✅ `services/openstates_people.py` — async client + `OpenStatesPerson` dataclass; uses shared `RateLimiter`; full `Retry-After` honoring; 404 returns None; persistent 429 raises `OpenStatesRateLimitError`; `extract_other_id` skips non-dict entries (round-6 defensive); `iter_jurisdiction` has `max_pages=200` safety valve (round-6)
+4. **Orchestrator + supporting pieces — IMPLEMENTED (commit c555f38):**
+   a. ✅ `pipelines/legislator_bio.py` — `LegislatorBioPipeline`, `BioSyncOptions`, `BioSyncReport`, `CMSLegislator`. Module-level `is_empty` / `should_write` / `split_email_field`. Federal end-to-end. State path is a clear Phase 2 stub.
+   b. ✅ `WebflowLookupService.iter_legislator_items()` — paginated CMS read iterator (read scope, 200-page safety valve)
+   c. ✅ `app.py::lifespan` pre-warms congress-legislators YAML at startup (round-6 fix) so trigger endpoints never cold-start
+   d. ✅ `WebflowLookupService._get_field_slugs` — 1h TTL + stale-on-failure reuse with `metric=webflow.schema_stale_reuse` (round-6)
+   e. ✅ `tests/test_legislator_bio_foundation.py` — 31 tests pinning rounds 3-6 fixes + live-data discoveries; all pass
+5. ⏳ Trigger endpoint with `dry_run` and `--audit-only` modes (Audits A and C as separate flags) — next
+6. ⏳ Audit A (federal join-key coverage) — editor remediation pass
+7. ⏳ Run-summary alerting via existing `push_alert_to_zapier()` pattern
+8. ⏳ Orchestrator-level + audit-level test coverage (foundation tests already in)
+9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record
 
 **Phase 2 — State coverage (target: 2–4 weeks after Phase 1)**
 1. Extend orchestrator to handle 7 active jurisdictions
