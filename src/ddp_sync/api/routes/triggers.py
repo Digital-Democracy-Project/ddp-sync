@@ -152,10 +152,10 @@ async def trigger_legislator_bio_sync(
             detail=f"Invalid target '{target}'. Must be all/webflow/pinecone.",
         )
 
-    # Audit-only short-circuits the sync. Step 6 will implement the
-    # actual audit functions; for now, return a stub-marked response.
+    # Audit-only short-circuits the sync (step 6: Audits A and C).
     if audit_only is not None:
-        if audit_only.upper() not in ("A", "C"):
+        audit_code = audit_only.upper()
+        if audit_code not in ("A", "C"):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -163,15 +163,21 @@ async def trigger_legislator_bio_sync(
                     "Use 'A' (federal join-key) or 'C' (pre-existing state)."
                 ),
             )
-        return {
-            "audit": audit_only.upper(),
-            "status": "not_implemented",
-            "detail": (
-                "Audit functions land in step 6. The endpoint accepts the "
-                "param now so editors can wire up their tooling against the "
-                "final URL shape."
-            ),
-        }
+        from ddp_sync.pipelines.legislator_bio import LegislatorBioPipeline
+        try:
+            pipeline = LegislatorBioPipeline(congress=source)
+            if audit_code == "A":
+                report = await pipeline.audit_federal_join_keys()
+            else:  # "C"
+                report = await pipeline.audit_state_join_keys(
+                    jurisdiction=jurisdiction,
+                )
+            return asdict(report)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("legislator-bio-sync audit failed")
+            raise HTTPException(status_code=500, detail=str(e))
 
     # Parse historical_since
     try:

@@ -37,6 +37,10 @@ import httpx
 import pytest
 
 from ddp_sync.pipelines.legislator_bio import (
+    AuditEntry,
+    AuditReport,
+    CMSLegislator,
+    LegislatorBioPipeline,
     is_empty,
     should_write,
     split_email_field,
@@ -415,3 +419,210 @@ async def test_partition_payload_drops_unknown_fields_when_schema_known():
         )
     assert kept == {"twitter-handle": "X", "bioguide-id": "Z"}
     assert dropped == {"made-up-field"}
+
+
+# ---------- Audit A and Audit C (step 6) ----------
+
+
+def _cms_item(
+    *,
+    item_id: str,
+    name: str = "Test",
+    chamber: str = "Senate",
+    openstatesid: str | None = None,
+    bioguide_id: str | None = None,
+    state_code: str | None = None,
+    extra_fields: dict | None = None,
+) -> dict:
+    """Build a fake Webflow Legislators item for audit-input fixtures."""
+    fields: dict = {
+        "name": name,
+        "slug": name.lower().replace(" ", "-"),
+        "chamber": chamber,
+    }
+    if openstatesid:
+        fields["openstatesid"] = openstatesid
+    if bioguide_id:
+        fields["bioguide-id"] = bioguide_id
+    if state_code:
+        fields["state-code"] = state_code
+    if extra_fields:
+        fields.update(extra_fields)
+    return {"id": item_id, "fieldData": fields}
+
+
+def _make_pipeline_with_items(items: list[dict]) -> LegislatorBioPipeline:
+    """Build a pipeline whose webflow.iter_legislator_items yields ``items``."""
+    async def _iter():
+        for item in items:
+            yield item
+
+    webflow = MagicMock()
+    webflow.iter_legislator_items = _iter
+    congress = MagicMock()
+    openstates = MagicMock()
+    settings = MagicMock()
+    settings.openstates_api_key = "k"
+    return LegislatorBioPipeline(
+        settings=settings,
+        webflow=webflow,
+        congress=congress,
+        openstates=openstates,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_a_finds_federal_records_missing_both_keys():
+    """Federal records lacking BOTH openstatesid and bioguide-id are flagged."""
+    items = [
+        _cms_item(item_id="w-1", name="No keys",
+                  chamber="Senate"),
+        _cms_item(item_id="w-2", name="Has openstates",
+                  chamber="House", openstatesid="ocd-person/x"),
+        _cms_item(item_id="w-3", name="Has bioguide",
+                  chamber="Senate", bioguide_id="X001"),
+        _cms_item(item_id="w-4", name="Has both",
+                  chamber="House", openstatesid="ocd-person/y",
+                  bioguide_id="Y001"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_federal_join_keys()
+    assert report.audit_name == "A"
+    assert report.total_scanned == 4
+    assert report.flagged_count == 1
+    assert report.flagged[0].webflow_id == "w-1"
+    assert report.flagged[0].name == "No keys"
+
+
+@pytest.mark.asyncio
+async def test_audit_a_skips_state_records():
+    """Audit A scans only federal records (chamber Senate/House)."""
+    items = [
+        _cms_item(item_id="w-1", name="Fed",
+                  chamber="Senate"),
+        _cms_item(item_id="w-2", name="State no key",
+                  chamber="lower"),  # state — should be ignored
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_federal_join_keys()
+    assert report.total_scanned == 1
+    assert report.flagged_count == 1
+    assert report.flagged[0].webflow_id == "w-1"
+
+
+@pytest.mark.asyncio
+async def test_audit_a_does_not_flag_records_with_one_key():
+    """Either openstatesid OR bioguide-id is sufficient to satisfy Audit A."""
+    items = [
+        _cms_item(item_id="w-1", name="A", chamber="Senate",
+                  openstatesid="ocd-person/x"),
+        _cms_item(item_id="w-2", name="B", chamber="Senate",
+                  bioguide_id="X001"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_federal_join_keys()
+    assert report.flagged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_a_returns_empty_when_no_federal_records():
+    """A clean repo with only state legislators is a valid scan, not a failure."""
+    items = [
+        _cms_item(item_id="w-1", chamber="lower"),
+        _cms_item(item_id="w-2", chamber="upper"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_federal_join_keys()
+    assert report.audit_name == "A"
+    assert report.total_scanned == 0
+    assert report.flagged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_c_finds_state_records_missing_openstatesid():
+    """State records lacking openstatesid are flagged. Federal records ignored."""
+    items = [
+        _cms_item(item_id="w-1", name="State no key",
+                  chamber="lower", state_code="FL"),
+        _cms_item(item_id="w-2", name="State has key",
+                  chamber="lower", state_code="FL",
+                  openstatesid="ocd-person/x"),
+        _cms_item(item_id="w-3", name="Fed no key",
+                  chamber="Senate"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys()
+    assert report.audit_name == "C"
+    assert report.total_scanned == 2  # federal record skipped
+    assert report.flagged_count == 1
+    assert report.flagged[0].webflow_id == "w-1"
+    assert report.flagged[0].state_code == "FL"
+
+
+@pytest.mark.asyncio
+async def test_audit_c_filters_by_jurisdiction():
+    """When jurisdiction is provided, only records in that state are scanned."""
+    items = [
+        _cms_item(item_id="w-1", name="FL no key",
+                  chamber="lower", state_code="FL"),
+        _cms_item(item_id="w-2", name="VA no key",
+                  chamber="lower", state_code="VA"),
+        _cms_item(item_id="w-3", name="MA has key",
+                  chamber="lower", state_code="MA",
+                  openstatesid="ocd-person/x"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys(jurisdiction="FL")
+    assert report.jurisdiction == "FL"
+    assert report.total_scanned == 1  # only FL record
+    assert report.flagged_count == 1
+    assert report.flagged[0].webflow_id == "w-1"
+
+
+@pytest.mark.asyncio
+async def test_audit_c_jurisdiction_is_case_insensitive():
+    items = [
+        _cms_item(item_id="w-1", chamber="lower", state_code="FL"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys(jurisdiction="fl")
+    assert report.jurisdiction == "FL"
+    assert report.flagged_count == 1
+
+
+@pytest.mark.asyncio
+async def test_audit_c_includes_all_states_when_no_jurisdiction():
+    items = [
+        _cms_item(item_id="w-1", chamber="lower", state_code="FL"),
+        _cms_item(item_id="w-2", chamber="lower", state_code="VA"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys()
+    assert report.jurisdiction is None
+    assert report.flagged_count == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_a_aborts_gracefully_on_webflow_error():
+    """A WebflowError mid-scan is captured into the report rather than raised."""
+    from ddp_sync.services.webflow_lookup import WebflowError
+
+    async def _failing_iter():
+        yield _cms_item(item_id="w-1", chamber="Senate",
+                        openstatesid="ocd-person/x")
+        raise WebflowError("upstream 503")
+
+    webflow = MagicMock()
+    webflow.iter_legislator_items = _failing_iter
+    settings = MagicMock()
+    settings.openstates_api_key = "k"
+    pipeline = LegislatorBioPipeline(
+        settings=settings,
+        webflow=webflow,
+        congress=MagicMock(),
+        openstates=MagicMock(),
+    )
+    report = await pipeline.audit_federal_join_keys()
+    assert report.aborted is True
+    assert "WebflowError" in (report.abort_reason or "")
+    assert report.total_scanned == 1  # got at least one before the error

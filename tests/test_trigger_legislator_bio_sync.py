@@ -102,23 +102,101 @@ def test_invalid_historical_since_rejected_as_400():
     assert resp.status_code == 400
 
 
-def test_audit_only_a_returns_not_implemented_stub():
-    """Audit functions land in step 6; endpoint param accepted now."""
+def test_audit_only_a_runs_audit_and_returns_report():
+    """Step 6: audit_only=A invokes audit_federal_join_keys and returns the report."""
     app = _make_app(warmed=True)
     client = TestClient(app)
-    resp = client.post("/trigger/legislator-bio-sync?audit_only=A")
+
+    from ddp_sync.pipelines.legislator_bio import AuditEntry, AuditReport
+    fake_report = AuditReport(
+        audit_name="A",
+        total_scanned=535,
+        flagged_count=2,
+        flagged=[
+            AuditEntry(webflow_id="w-1", slug="missing-1", name="Missing One",
+                       chamber="Senate"),
+            AuditEntry(webflow_id="w-2", slug="missing-2", name="Missing Two",
+                       chamber="House"),
+        ],
+    )
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.audit_federal_join_keys = AsyncMock(return_value=fake_report)
+        instance.audit_state_join_keys = AsyncMock()  # should NOT be called
+        resp = client.post("/trigger/legislator-bio-sync?audit_only=A")
+
     assert resp.status_code == 200
     body = resp.json()
-    assert body["audit"] == "A"
-    assert body["status"] == "not_implemented"
+    assert body["audit_name"] == "A"
+    assert body["total_scanned"] == 535
+    assert body["flagged_count"] == 2
+    assert len(body["flagged"]) == 2
+    assert body["flagged"][0]["webflow_id"] == "w-1"
+    instance.audit_federal_join_keys.assert_awaited_once()
+    instance.audit_state_join_keys.assert_not_called()
 
 
-def test_audit_only_c_returns_not_implemented_stub():
+def test_audit_only_c_runs_audit_and_passes_jurisdiction():
+    """audit_only=C with jurisdiction filters by that state code."""
     app = _make_app(warmed=True)
     client = TestClient(app)
-    resp = client.post("/trigger/legislator-bio-sync?audit_only=c")
+
+    from ddp_sync.pipelines.legislator_bio import AuditReport
+    fake_report = AuditReport(
+        audit_name="C",
+        total_scanned=160,
+        flagged_count=3,
+        jurisdiction="FL",
+    )
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.audit_state_join_keys = AsyncMock(return_value=fake_report)
+        resp = client.post(
+            "/trigger/legislator-bio-sync?audit_only=c&jurisdiction=FL"
+        )
+
     assert resp.status_code == 200
-    assert resp.json()["audit"] == "C"
+    body = resp.json()
+    assert body["audit_name"] == "C"
+    assert body["jurisdiction"] == "FL"
+    assert body["flagged_count"] == 3
+    instance.audit_state_join_keys.assert_awaited_once_with(jurisdiction="FL")
+
+
+def test_audit_only_c_with_no_jurisdiction_passes_none():
+    app = _make_app(warmed=True)
+    client = TestClient(app)
+    from ddp_sync.pipelines.legislator_bio import AuditReport
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.audit_state_join_keys = AsyncMock(
+            return_value=AuditReport(audit_name="C", total_scanned=0, flagged_count=0)
+        )
+        resp = client.post("/trigger/legislator-bio-sync?audit_only=C")
+    assert resp.status_code == 200
+    instance.audit_state_join_keys.assert_awaited_once_with(jurisdiction=None)
+
+
+def test_audit_only_exception_returns_500():
+    """Unhandled exception during audit → HTTP 500 with detail."""
+    app = _make_app(warmed=True)
+    client = TestClient(app)
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.audit_federal_join_keys = AsyncMock(
+            side_effect=RuntimeError("audit broke")
+        )
+        resp = client.post("/trigger/legislator-bio-sync?audit_only=A")
+    assert resp.status_code == 500
+    assert "audit broke" in resp.json()["detail"]
 
 
 def test_happy_path_invokes_orchestrator_and_returns_report():

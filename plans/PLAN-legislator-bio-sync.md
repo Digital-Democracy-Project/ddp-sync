@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5 implemented (commits 2852a36, 24d058e, c555f38, ee74124, + forthcoming step-5 commit); 44-test suite landed. Seven pm-review rounds folded in (rev 7). Steps 6–9 still pending.
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, + forthcoming step-6 commit); 55-test suite landed. Seven pm-review rounds folded in (rev 8). Steps 7–9 still pending.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -85,10 +85,11 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 4c | Foundation test suite | (forthcoming) | ✅ `tests/test_legislator_bio_foundation.py` — 31 tests covering RateLimiter concurrency, RateLimitConfig fallback contract, OpenStates dict/string jurisdiction shapes, is_federal heuristic, extract_other_id non-dict guard, is_empty / should_write / split_email_field, schema-cache TTL + stale-reuse, fail-closed `_partition_payload`. All pass. |
 | 5 | `/trigger/legislator-bio-sync` endpoint | (forthcoming) | ✅ FastAPI POST handler in `api/routes/triggers.py`. Query params: `dry_run`, `auto_create`, `jurisdiction`, `target`, `limit`, `historical_since`, `audit_only`. **Round-7 ALB-timeout safety gate**: returns 503 + `Retry-After: 60` when `app.state.congress_legislators._warmed` is False. Param validation (400 on bad target/audit_only/historical_since). Audit-only short-circuit returns `{audit, status: not_implemented}` until step 6 lands. Reuses pre-warmed source from app.state — no double-parse. |
 | 5a | `split_email_field` round-7 hardening | (forthcoming) | ✅ Case-insensitive scheme matching; `mailto:` unwraps to a real email; whitespace stripped. Three new tests pin the behavior. |
-| 5b | Endpoint test suite | (forthcoming) | ✅ `tests/test_trigger_legislator_bio_sync.py` — 10 tests covering: 503-on-not-warmed, 503 on missing app.state, 400 on invalid params (target/audit_only/historical_since), audit-only A/C short-circuits, happy-path orchestrator wiring + report serialization, default options, exception → 500. All 44 tests pass total. |
-| 6 | Audits A and C | — | ⏳ Next. Endpoint already accepts `audit_only=A|C` and returns the `not_implemented` stub. |
-| 7 | Run-summary alerting via Zapier | — | ⏳ |
-| 8 | Orchestrator-level integration tests | — | ⏳ Foundation + endpoint tests landed; orchestrator-internal `run()` integration tests come with step 6 audits. |
+| 5b | Endpoint test suite | (forthcoming) | ✅ `tests/test_trigger_legislator_bio_sync.py` — 10 tests covering: 503-on-not-warmed, 503 on missing app.state, 400 on invalid params, audit-only short-circuits, happy-path wiring, default options, exception → 500. |
+| 6 | Audits A and C | (forthcoming) | ✅ `audit_federal_join_keys()` (Audit A — federal records lacking both join keys) and `audit_state_join_keys(jurisdiction=None)` (Audit C — state records lacking openstatesid, optional state filter) implemented as methods on `LegislatorBioPipeline`. New `AuditReport` + `AuditEntry` dataclasses. Trigger endpoint's `audit_only=A\|C` no longer stubs — runs the real audit and returns the report. Both audits wrap WebflowError as `aborted=True` with `abort_reason` rather than raising, so editors get a partial report. New `state_code()` helper on `CMSLegislator` (looks at `state-code` then `state` fields). |
+| 6a | Audit test suite | (forthcoming) | ✅ 8 audit tests: A flags only federal-with-no-keys, A skips state, A doesn't flag records with one key, A handles empty federal set; C flags state-no-openstatesid, C filters by jurisdiction (case-insensitive), C scans all states when no jurisdiction; A aborts gracefully on WebflowError. Plus 4 endpoint integration tests for the audit-only paths. Total suite: **55 tests, all pass.** |
+| 7 | Run-summary alerting via Zapier | — | ⏳ Next. |
+| 8 | Orchestrator-level integration tests | — | ⏳ Foundation + endpoint + audit tests landed; orchestrator-internal `run()` integration tests still pending. |
 | 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
 
 **Round-5 fixes applied (in commit 24d058e):**
@@ -868,12 +869,18 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
 5. **Trigger endpoint — IMPLEMENTED:**
    a. ✅ `POST /ddp-sync/v1/trigger/legislator-bio-sync` in `api/routes/triggers.py`
    b. ✅ Round-7 ALB-timeout safety gate: 503 + `Retry-After: 60` when `app.state.congress_legislators._warmed` is False
-   c. ✅ Param validation, audit-only short-circuit (`A` / `C` returns `not_implemented` stub until step 6)
+   c. ✅ Param validation; `audit_only=A|C` short-circuit
    d. ✅ `split_email_field` round-7 hardening (case-insensitive scheme; `mailto:` unwrap; whitespace strip)
-   e. ✅ 10 endpoint tests in `tests/test_trigger_legislator_bio_sync.py`. Total suite: 44 tests, all pass.
+   e. ✅ 10 endpoint tests in `tests/test_trigger_legislator_bio_sync.py`
    f. ✅ README.md updated with the new trigger row + 503-on-warming note
-6. ⏳ Audit A (federal join-key coverage) and Audit C (pre-existing state CMS records lacking openstatesid) — next
-7. ⏳ Run-summary alerting via existing `push_alert_to_zapier()` pattern
+6. **Audits A and C — IMPLEMENTED:**
+   a. ✅ `LegislatorBioPipeline.audit_federal_join_keys()` (Audit A) — surfaces federal CMS records lacking BOTH `openstatesid` and `bioguide-id`
+   b. ✅ `LegislatorBioPipeline.audit_state_join_keys(jurisdiction=None)` (Audit C) — surfaces state records lacking `openstatesid`; case-insensitive jurisdiction filter
+   c. ✅ Both audits wrap WebflowError as `aborted=True` with `abort_reason` (partial report rather than raising)
+   d. ✅ `AuditReport` + `AuditEntry` dataclasses. New `CMSLegislator.state_code()` helper.
+   e. ✅ Trigger endpoint `audit_only` runs the real audit (replaced the not-implemented stub)
+   f. ✅ 8 audit-function tests + 4 endpoint integration tests. **Total suite: 55 tests, all pass.**
+7. ⏳ Run-summary alerting via existing `push_alert_to_zapier()` pattern — next
 8. ⏳ Orchestrator-internal `run()` integration tests
 9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record
 

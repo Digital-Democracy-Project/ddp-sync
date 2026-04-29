@@ -205,6 +205,55 @@ class CMSLegislator:
             raw_item=item,
         )
 
+    def state_code(self) -> str | None:
+        """Best-effort extraction of the state code from the CMS fields.
+
+        Looks at the explicit ``state-code`` field first (the new one added
+        per the Webflow schema in plans/webflow-legislator-fields.md), then
+        falls back to a generic ``state`` field. Returns the upper-cased
+        two-letter code or None if nothing is populated. Phase 2 may add a
+        dedicated state-code-from-jurisdiction-ref resolver.
+        """
+        for key in ("state-code", "state"):
+            v = self.raw_fields.get(key)
+            if v and isinstance(v, str) and len(v.strip()) >= 2:
+                return v.strip().upper()
+        return None
+
+
+# ---------- Audit reports (step 6) ----------
+
+
+@dataclass
+class AuditEntry:
+    """A single CMS record flagged by an audit run."""
+
+    webflow_id: str
+    slug: str
+    name: str
+    chamber: str | None = None
+    state_code: str | None = None
+    openstates_id: str | None = None
+    bioguide_id: str | None = None
+
+
+@dataclass
+class AuditReport:
+    """Outcome of a single audit run.
+
+    ``audit_name`` is one of "A" (federal join-key coverage) or
+    "C" (pre-existing state records lacking openstatesid). Audit B (post-
+    bulk-import duplicate detection) runs from the editor toolchain.
+    """
+
+    audit_name: str
+    total_scanned: int
+    flagged_count: int
+    flagged: list[AuditEntry] = field(default_factory=list)
+    jurisdiction: str | None = None
+    aborted: bool = False
+    abort_reason: str | None = None
+
 
 # ---------- Pipeline ----------
 
@@ -719,6 +768,126 @@ class LegislatorBioPipeline:
                 best = cms
                 best_signals = signals
         return best, best_signals
+
+    # ---------- Audits (step 6) ----------
+
+    async def audit_federal_join_keys(self) -> AuditReport:
+        """Audit A — Federal join-key coverage.
+
+        Surfaces every federal CMS record that lacks BOTH ``openstatesid``
+        and ``bioguide-id``. Without at least one of these the orchestrator
+        cannot resolve the upstream record (a name-based lookup has known
+        false-positive risk and is intentionally not used).
+
+        **Action on findings:** editors manually populate ``bioguide-id``
+        (preferred — stable across re-elections) before auto-create is
+        enabled. Single-pass remediation.
+
+        Wraps any WebflowError as ``aborted=True`` so the endpoint can
+        return a partial report rather than raising.
+        """
+        flagged: list[AuditEntry] = []
+        total = 0
+        try:
+            async for item in self.webflow.iter_legislator_items():
+                cms = CMSLegislator.from_webflow_item(item)
+                if not cms.is_federal:
+                    continue
+                total += 1
+                if not cms.openstates_id and not cms.bioguide_id:
+                    flagged.append(
+                        AuditEntry(
+                            webflow_id=cms.webflow_id,
+                            slug=cms.slug,
+                            name=cms.name,
+                            chamber=(
+                                cms.raw_fields.get("chamber") or None
+                            ),
+                            state_code=cms.state_code(),
+                            openstates_id=None,
+                            bioguide_id=None,
+                        )
+                    )
+        except WebflowError as e:
+            return AuditReport(
+                audit_name="A",
+                total_scanned=total,
+                flagged_count=len(flagged),
+                flagged=flagged,
+                aborted=True,
+                abort_reason=f"{type(e).__name__}: {e}",
+            )
+        return AuditReport(
+            audit_name="A",
+            total_scanned=total,
+            flagged_count=len(flagged),
+            flagged=flagged,
+        )
+
+    async def audit_state_join_keys(
+        self,
+        jurisdiction: str | None = None,
+    ) -> AuditReport:
+        """Audit C — Pre-existing state CMS records lacking ``openstatesid``.
+
+        Catches the case Audit B misses: state CMS records that already
+        existed before the bulk-create push and never had their
+        ``openstatesid`` populated. Without this audit, auto-create could
+        silently duplicate a pre-existing record by creating a new draft
+        for the same person.
+
+        ``jurisdiction`` filters to a single state code (e.g. "FL"); when
+        omitted, all non-federal records are scanned.
+
+        **Action on findings:** editors populate ``openstatesid`` (preferred)
+        or mark the record with the future ``bio-sync-locked`` field
+        (Phase 2) before per-jurisdiction auto-create is enabled.
+
+        Wraps any WebflowError as ``aborted=True``.
+        """
+        flagged: list[AuditEntry] = []
+        total = 0
+        wanted = jurisdiction.strip().upper() if jurisdiction else None
+        try:
+            async for item in self.webflow.iter_legislator_items():
+                cms = CMSLegislator.from_webflow_item(item)
+                if cms.is_federal:
+                    continue
+                state = cms.state_code()
+                if wanted and state != wanted:
+                    continue
+                total += 1
+                if not cms.openstates_id:
+                    flagged.append(
+                        AuditEntry(
+                            webflow_id=cms.webflow_id,
+                            slug=cms.slug,
+                            name=cms.name,
+                            chamber=(
+                                cms.raw_fields.get("chamber") or None
+                            ),
+                            state_code=state,
+                            openstates_id=None,
+                            bioguide_id=cms.bioguide_id,
+                        )
+                    )
+        except WebflowError as e:
+            return AuditReport(
+                audit_name="C",
+                total_scanned=total,
+                flagged_count=len(flagged),
+                flagged=flagged,
+                jurisdiction=wanted,
+                aborted=True,
+                abort_reason=f"{type(e).__name__}: {e}",
+            )
+        return AuditReport(
+            audit_name="C",
+            total_scanned=total,
+            flagged_count=len(flagged),
+            flagged=flagged,
+            jurisdiction=wanted,
+        )
 
     # ---------- Helpers ----------
 
