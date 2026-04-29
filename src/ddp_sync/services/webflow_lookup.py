@@ -514,19 +514,19 @@ class WebflowLookupService:
         field_data: dict,
         collection_id: str,
     ) -> tuple[dict, set[str]]:
-        """Try to filter ``field_data`` against the collection schema.
+        """Filter ``field_data`` against the collection schema.
 
-        On schema-fetch failure, fall back to passing everything through so
-        a transient error doesn't manifest as silent field drops. Webflow
-        itself will surface unknown fields as a 4xx in that case.
+        Fails closed on schema-fetch failure (round-5 fix): a transient 5xx
+        on `/collections/{id}` propagates as `WebflowError` rather than
+        silently passing the unfiltered payload through. Reasoning: if the
+        schema is unreachable we cannot guarantee the payload is safe;
+        better to surface the upstream issue in `BioSyncReport.errors` and
+        let the next run retry than to risk every PATCH 4xx-ing on unknown
+        slugs and masking the root cause.
+
+        The schema-fetch result is cached on the service instance, so once
+        it succeeds for a collection, subsequent partitions reuse the
+        cached set without an extra HTTP call.
         """
-        try:
-            known = await self._get_field_slugs(client, headers, collection_id)
-        except WebflowError as e:
-            logger.warning(
-                "Field-slug schema fetch failed; passing payload as-is",
-                collection_id=collection_id,
-                error=str(e),
-            )
-            return field_data, set()
+        known = await self._get_field_slugs(client, headers, collection_id)
         return self._filter_known_fields(field_data, known)

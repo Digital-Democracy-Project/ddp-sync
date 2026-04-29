@@ -18,6 +18,7 @@ See ``plans/PLAN-legislator-bio-sync.md`` for the broader design.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -185,14 +186,14 @@ class CongressLegislatorsSource:
         cache_path = self.cache_dir / filename
         if self._cache_is_fresh(cache_path):
             logger.debug("congress-legislators cache hit", file=filename)
-            return self._read_yaml(cache_path)
+            return await asyncio.to_thread(self._read_yaml, cache_path)
 
         url = f"{self.BASE_URL}/{filename}"
         logger.info("Fetching congress-legislators YAML", url=url)
         resp = await client.get(url)
         resp.raise_for_status()
         cache_path.write_bytes(resp.content)
-        return self._read_yaml(cache_path)
+        return await asyncio.to_thread(self._read_yaml, cache_path)
 
     def _cache_is_fresh(self, cache_path: Path) -> bool:
         if not cache_path.exists():
@@ -202,6 +203,9 @@ class CongressLegislatorsSource:
 
     @staticmethod
     def _read_yaml(path: Path) -> list:
+        """Synchronous YAML parse — wrapped via asyncio.to_thread() at call
+        sites so the 8.6 MB historical file (~13s parse) does not block
+        the event loop. See PLAN-legislator-bio-sync.md round-5 fixes."""
         with open(path) as f:
             data = yaml.safe_load(f)
         return data or []

@@ -256,31 +256,55 @@ class CongressLegislator:
     social: dict     # {twitter, facebook, instagram, youtube, ...}
 ```
 
-### `src/ddp_sync/services/openstates_people.py`
+### `src/ddp_sync/services/openstates_people.py` — IMPLEMENTED
 
-Thin async client. Key responsibility: extract crosswalk IDs from `other_identifiers`. Reuses the existing `RateLimitConfig` + retry logic from `pipelines/legislator_sync.py`.
+Async client over OpenStates v3 `/people`. Takes a shared `RateLimiter` so bio-sync can coordinate its OpenStates budget with future pipelines. Distinguishes 404 (returns None — bioguide-id fallback signal) from hard failures (raises `OpenStatesRateLimitError` on persistent 429, `OpenStatesError` on other non-2xx).
 
 ```python
+class OpenStatesError(Exception): ...
+class OpenStatesRateLimitError(OpenStatesError): ...
+
+@dataclass
+class OpenStatesPerson:
+    openstates_id: str       # ocd-person/...
+    name: str
+    family_name, given_name, party, gender, birth_date, death_date
+    email, image, biography
+    jurisdiction_name: str | None    # "United States" for federal, state name otherwise
+    current_role: dict
+    other_identifiers, other_names, links, sources, offices: list[dict]
+    raw: dict                # full upstream record
+
+    def get_other_id(self, scheme: str) -> str | None: ...
+    @property
+    def chamber(self) -> str | None: ...      # upper / lower
+    @property
+    def district(self) -> str | None: ...
+    @property
+    def is_federal(self) -> bool:
+        """True iff jurisdiction_name == 'United States'.
+        Probe-confirmed: federal members' division_id contains /state:XX
+        because they represent specific states — naive division-id check
+        would mis-classify them as state."""
+
 class OpenStatesPeopleClient:
-    BASE = "https://v3.openstates.org"
+    BASE_URL = "https://v3.openstates.org"
+    INCLUDE_PARAMS = ("other_names", "other_identifiers", "links", "sources", "offices")
 
-    def __init__(self, api_key: str, rate_limit: RateLimitConfig): ...
+    def __init__(self, api_key, rate_limiter, *, max_retry_attempts=3, per_page=50): ...
 
-    async def fetch_by_id(self, openstates_id: str) -> OpenStatesPerson | None: ...
+    async def fetch_by_id(self, openstates_id) -> OpenStatesPerson | None:
+        """Returns parsed record on 2xx, None on 404. Raises on persistent 429
+        or other non-2xx."""
 
-    async def iter_jurisdiction(
-        self, jurisdiction: str
-    ) -> AsyncIterator[OpenStatesPerson]:
-        """Paginated list of all current members in a jurisdiction."""
+    async def iter_jurisdiction(self, jurisdiction) -> AsyncIterator[OpenStatesPerson]:
+        """Paginated /people?jurisdiction=X. Always passes the full include set."""
 
     @staticmethod
-    def extract_other_id(person: dict, scheme: str) -> str | None:
-        """Pull a specific identifier from `other_identifiers` by scheme."""
-        for entry in person.get("other_identifiers") or []:
-            if entry.get("scheme") == scheme:
-                return entry.get("identifier")
-        return None
+    def extract_other_id(person: dict, scheme: str) -> str | None: ...
 ```
+
+Verified against the live API (4 smoke tests with the dev key): Rick Scott returns with full ID set + `is_federal=True`; nonexistent ID returns None; `extract_other_id` static helper works; `iter_jurisdiction("fl")` yields state legislators paginated.
 
 ### `src/ddp_sync/pipelines/legislator_bio.py`
 
@@ -746,9 +770,9 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
    b. ✅ `WebflowLookupService` extended with shared `RateLimiter` (≤60 req/min), `_patch_with_backoff()` / `_post_with_backoff()` (Retry-After honoring + WebflowRateLimitError on persistent 429), `update_legislator_fields()`, `create_legislator_draft()`, field-existence tolerance via cached collection-schema lookup
    c. ✅ `update_bill_fields()` keeps its legacy `bool` contract — routes through `_patch_with_backoff` internally so it inherits rate-limiting and 429 retry without forcing a caller migration. See "Backwards compatibility" section.
    d. Pre-merge smoke: `/trigger/bill-status-sync?dry_run=true` against staging — TODO before deploy
-3. **New modules (after foundation lands):**
-   a. `services/congress_legislators.py` — bioguide-indexed in-memory cache + tests
-   b. `services/openstates_people.py` — uses shared `RateLimiter`; full `Retry-After` honoring
+3. **New modules — IMPLEMENTED:**
+   a. ✅ `services/congress_legislators.py` — bioguide-indexed in-memory cache; YAML parse via `asyncio.to_thread()` (round-5 fix) so 8.6 MB historical file doesn't block event loop
+   b. ✅ `services/openstates_people.py` — async client + `OpenStatesPerson` dataclass; uses shared `RateLimiter`; full `Retry-After` honoring; 404 returns None; persistent 429 raises `OpenStatesRateLimitError`
 4. `pipelines/legislator_bio.py` orchestrator using `should_write()` + `is_empty()`
 5. Trigger endpoint with `dry_run` and `--audit-only` modes (Audits A and C as separate flags)
 6. Audit A (federal join-key coverage) — editor remediation pass

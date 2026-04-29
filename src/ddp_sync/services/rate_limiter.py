@@ -49,8 +49,13 @@ class RateLimitConfig:
         change to raise without auditing all callers.
         """
         if not config_path.exists():
+            # Structured fallback metric — infra alerting can filter on
+            # `metric=rate_limiter.config_fallback` to fire when production
+            # silently regresses to the unmonitored defaults.
             logger.warning(
                 "Rate-limit config not found, using defaults",
+                metric="rate_limiter.config_fallback",
+                reason="file_not_found",
                 config_path=str(config_path),
             )
             return cls()
@@ -69,7 +74,12 @@ class RateLimitConfig:
                 retry_backoff_seconds=retry.get("backoff_seconds", 5),
             )
         except Exception as e:
-            logger.error("Failed to load rate-limit config", error=str(e))
+            logger.error(
+                "Failed to load rate-limit config",
+                metric="rate_limiter.config_fallback",
+                reason="parse_error",
+                error=str(e),
+            )
             return cls()
 
 
