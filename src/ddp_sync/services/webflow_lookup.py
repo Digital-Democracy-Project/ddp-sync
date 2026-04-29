@@ -160,6 +160,12 @@ class WebflowLookupService:
         # every legislator PATCH). If the refresh fails AND we have nothing,
         # the WebflowError propagates per the fail-closed contract.
         self._field_slug_cache: dict[str, tuple[float, set[str]]] = {}
+        # Cache of {jurisdiction_ref_id -> two-letter state code}. Populated
+        # lazily by get_jurisdiction_mapping() on first call. Empty until
+        # then. The Jurisdictions CMS collection rarely changes, so this is
+        # cached for the lifetime of the service instance — restart picks
+        # up edits.
+        self._jurisdiction_mapping: dict[str, str] | None = None
 
     # ---------- Shared HTTP helpers ----------
 
@@ -291,6 +297,160 @@ class WebflowLookupService:
         kept = {k: v for k, v in field_data.items() if k in known_slugs}
         dropped = set(field_data.keys()) - set(kept.keys())
         return kept, dropped
+
+    # ---------- Jurisdiction-mapping cache ----------
+
+    async def get_jurisdiction_mapping(self) -> dict[str, str]:
+        """Return ``{jurisdiction_ref_id: two-letter-state-code}``.
+
+        Fetches the Jurisdictions CMS collection once and caches the result
+        on the service instance. The mapping is the data-model bridge from
+        Legislators' multi-reference ``jurisdiction`` field to the flat
+        state code that audits and the orchestrator need.
+
+        Returns an empty dict if ``webflow_jurisdiction_collection_id`` is
+        unset or the fetch fails — callers should treat this as "no
+        resolution available" (Audit C with a jurisdiction filter will see
+        all records as unresolved and flag/skip them per its rules).
+        """
+        if self._jurisdiction_mapping is not None:
+            return self._jurisdiction_mapping
+        coll = self.settings.webflow_jurisdiction_collection_id
+        if not coll:
+            logger.warning(
+                "WEBFLOW_JURISDICTION_COLLECTION_ID is not set; "
+                "jurisdiction resolution disabled",
+            )
+            self._jurisdiction_mapping = {}
+            return self._jurisdiction_mapping
+        key = (
+            self.settings.webflow_votebot_api_key
+            or self.settings.webflow_scheduler_api_key
+        )
+        if not key:
+            logger.warning("No Webflow API key; jurisdiction resolution disabled")
+            self._jurisdiction_mapping = {}
+            return self._jurisdiction_mapping
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "accept": "application/json",
+        }
+        mapping: dict[str, str] = {}
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                offset = 0
+                page_size = 100
+                page = 0
+                max_pages = 50  # Jurisdictions is small (50 states + US)
+                while page < max_pages:
+                    await self._limiter.apply()
+                    resp = await client.get(
+                        f"{self.BASE_URL}/collections/{coll}/items",
+                        headers=headers,
+                        params={"limit": page_size, "offset": offset},
+                    )
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Jurisdictions fetch returned non-200; partial mapping",
+                            status_code=resp.status_code,
+                        )
+                        break
+                    data = resp.json()
+                    items = data.get("items") or []
+                    if not items:
+                        break
+                    for item in items:
+                        item_id = item.get("id") or ""
+                        fields = item.get("fieldData") or {}
+                        # Try common field names (matches WebflowSource pattern).
+                        # The 2-char-name fallback handles older data where
+                        # only the display name is set.
+                        candidate = (
+                            fields.get("state-code")
+                            or fields.get("code")
+                            or fields.get("abbreviation")
+                            or (fields.get("name") or "")[:2]
+                        )
+                        normalized = self._normalize_state_code(candidate)
+                        if item_id and normalized:
+                            mapping[item_id] = normalized
+                    pagination = data.get("pagination") or {}
+                    total = pagination.get("total", 0)
+                    offset += len(items)
+                    if offset >= total or len(items) < page_size:
+                        break
+                    page += 1
+        except Exception as e:  # noqa: BLE001 — never raise from this call
+            logger.warning(
+                "Jurisdiction mapping fetch failed; returning partial",
+                error=str(e),
+            )
+        self._jurisdiction_mapping = mapping
+        logger.info(
+            "Built jurisdiction mapping",
+            entries=len(mapping),
+        )
+        return mapping
+
+    @staticmethod
+    def _normalize_state_code(value) -> str | None:
+        """Coerce ``value`` to exactly two uppercase ASCII letters or None.
+
+        Round-8 reviewer fix: previous logic accepted ≥2 chars which let
+        full state names (e.g. "Florida" → "FL"... but also "FLORIDA"
+        in the worst case) leak through and break exact-match jurisdiction
+        filters. Only true 2-letter codes pass this gate.
+        """
+        if not value or not isinstance(value, str):
+            return None
+        cleaned = value.strip().upper()
+        if len(cleaned) != 2:
+            return None
+        if not cleaned.isalpha():
+            return None
+        return cleaned
+
+    @staticmethod
+    def resolve_jurisdiction_ref(
+        ref,
+        mapping: dict[str, str],
+    ) -> str | None:
+        """Resolve a Legislators ``jurisdiction`` field value to a state code.
+
+        Accepts the upstream shapes seen in the wild:
+        - None / "" — unset (returns None)
+        - list[str] — multi-reference field. First non-empty element wins.
+        - str — single ref ID OR an already-2-letter state code.
+
+        Returns a normalized two-letter state code or None if the ref
+        cannot be resolved. **Returns None for federal/US-Congress
+        jurisdiction** — the orchestrator detects federal members via the
+        ``chamber`` heuristic and doesn't need this method's output.
+        """
+        if not ref:
+            return None
+        if isinstance(ref, list):
+            for r in ref:
+                resolved = WebflowLookupService.resolve_jurisdiction_ref(
+                    r, mapping
+                )
+                if resolved:
+                    return resolved
+            return None
+        if not isinstance(ref, str):
+            return None
+        # Already a 2-letter code?
+        direct = WebflowLookupService._normalize_state_code(ref)
+        if direct and direct != "US":
+            return direct
+        # Otherwise assume it's a ref ID and look it up
+        mapped = mapping.get(ref)
+        if not mapped:
+            return None
+        normalized = WebflowLookupService._normalize_state_code(mapped)
+        if normalized == "US":
+            return None
+        return normalized
 
     # ---------- Read API ----------
 

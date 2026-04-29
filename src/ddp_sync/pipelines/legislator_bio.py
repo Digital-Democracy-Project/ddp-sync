@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import structlog
 
@@ -171,13 +171,38 @@ class BioSyncReport:
 # ---------- CMS index helpers ----------
 
 
+# Federal-detection chamber values. Includes a few hand-typed variants
+# observed/anticipated in the production CMS. Matched case-insensitively
+# in CMSLegislator.from_webflow_item.
+_FEDERAL_CHAMBER_VALUES: frozenset[str] = frozenset({
+    "senate",
+    "house",
+    "us senate",
+    "u.s. senate",
+    "us house",
+    "u.s. house",
+    "house of representatives",
+    "u.s. house of representatives",
+    "us house of representatives",
+    "congress",
+    "us congress",
+    "u.s. congress",
+})
+
+
 @dataclass
 class CMSLegislator:
     """Convenience wrapper around a Webflow Legislators item.
 
     Captures the join keys and any field values the orchestrator needs to
-    diff against. The full upstream item is preserved as ``raw`` for any
-    downstream code that needs other fields.
+    diff against. The full upstream item is preserved as ``raw_item`` for
+    any downstream code that needs other fields.
+
+    ``state_code`` is precomputed at construction time from the
+    Legislators' ``jurisdiction`` multi-reference field, resolved via the
+    optional ``jurisdiction_resolver`` callable. The resolver is built
+    once per orchestrator/audit run from the Jurisdictions CMS collection
+    (see ``WebflowLookupService.get_jurisdiction_mapping``).
     """
 
     webflow_id: str
@@ -186,14 +211,46 @@ class CMSLegislator:
     openstates_id: str | None
     bioguide_id: str | None
     is_federal: bool
+    state_code: str | None
     raw_fields: dict
     raw_item: dict
 
     @classmethod
-    def from_webflow_item(cls, item: dict) -> "CMSLegislator":
+    def from_webflow_item(
+        cls,
+        item: dict,
+        *,
+        jurisdiction_resolver: Callable[[Any], str | None] | None = None,
+    ) -> "CMSLegislator":
+        """Build a CMSLegislator from a raw Webflow CMS item.
+
+        ``jurisdiction_resolver(value)`` should accept the upstream
+        ``jurisdiction`` field (None, ref-id string, list of ref-ids, or
+        already-2-letter code) and return a normalized two-letter state
+        code or None for federal/unresolvable. Use
+        ``WebflowLookupService.resolve_jurisdiction_ref`` partial-applied
+        to the cached mapping.
+
+        When ``jurisdiction_resolver`` is None the state_code is None —
+        the data model is reference-based and no flat fallback is
+        attempted (round-8 fix). Audit C without a resolver will see
+        every record as having no state code, which is the safer
+        behavior than silent false-negatives.
+        """
         fields = item.get("fieldData") or {}
-        chamber = (fields.get("chamber") or "").lower()
-        is_federal = chamber in {"senate", "house", "us senate", "us house"}
+        chamber_raw = (fields.get("chamber") or "")
+        chamber_norm = chamber_raw.strip().lower()
+        is_federal = chamber_norm in _FEDERAL_CHAMBER_VALUES
+        state_code: str | None = None
+        if jurisdiction_resolver is not None:
+            try:
+                state_code = jurisdiction_resolver(fields.get("jurisdiction"))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "jurisdiction_resolver raised; treating as unresolved",
+                    error=str(e),
+                )
+                state_code = None
         return cls(
             webflow_id=item.get("id") or "",
             slug=fields.get("slug") or "",
@@ -201,24 +258,10 @@ class CMSLegislator:
             openstates_id=(fields.get("openstatesid") or None),
             bioguide_id=(fields.get("bioguide-id") or None),
             is_federal=is_federal,
+            state_code=state_code,
             raw_fields=fields,
             raw_item=item,
         )
-
-    def state_code(self) -> str | None:
-        """Best-effort extraction of the state code from the CMS fields.
-
-        Looks at the explicit ``state-code`` field first (the new one added
-        per the Webflow schema in plans/webflow-legislator-fields.md), then
-        falls back to a generic ``state`` field. Returns the upper-cased
-        two-letter code or None if nothing is populated. Phase 2 may add a
-        dedicated state-code-from-jurisdiction-ref resolver.
-        """
-        for key in ("state-code", "state"):
-            v = self.raw_fields.get(key)
-            if v and isinstance(v, str) and len(v.strip()) >= 2:
-                return v.strip().upper()
-        return None
 
 
 # ---------- Audit reports (step 6) ----------
@@ -353,8 +396,11 @@ class LegislatorBioPipeline:
         report: BioSyncReport,
     ) -> None:
         """Iterate every Legislators CMS item and apply the sync logic."""
+        resolver = await self._build_jurisdiction_resolver()
         async for item in self.webflow.iter_legislator_items():
-            cms = CMSLegislator.from_webflow_item(item)
+            cms = CMSLegislator.from_webflow_item(
+                item, jurisdiction_resolver=resolver,
+            )
             report.cms_items_seen += 1
 
             # Honor jurisdiction filter
@@ -648,14 +694,16 @@ class LegislatorBioPipeline:
         # Index existing CMS entries by bioguide-id for O(1) membership check.
         cms_bioguides: set[str] = set()
         cms_index: dict[str, list[CMSLegislator]] = {}  # by state code
+        resolver = await self._build_jurisdiction_resolver()
         async for item in self.webflow.iter_legislator_items():
-            cms = CMSLegislator.from_webflow_item(item)
+            cms = CMSLegislator.from_webflow_item(
+                item, jurisdiction_resolver=resolver,
+            )
             if cms.bioguide_id:
                 cms_bioguides.add(cms.bioguide_id)
             # State-keyed index for merge candidate scan
-            state = (cms.raw_fields.get("state-code") or "").upper() or None
-            if state:
-                cms_index.setdefault(state, []).append(cms)
+            if cms.state_code:
+                cms_index.setdefault(cms.state_code, []).append(cms)
 
         async for legislator in self.congress.iter_current():
             if legislator.bioguide_id in cms_bioguides:
@@ -698,6 +746,7 @@ class LegislatorBioPipeline:
                     openstates_id=None,
                     bioguide_id=legislator.bioguide_id,
                     is_federal=True,
+                    state_code=None,
                     raw_fields={},
                     raw_item={},
                 ),
@@ -769,6 +818,29 @@ class LegislatorBioPipeline:
                 best_signals = signals
         return best, best_signals
 
+    # ---------- Jurisdiction resolver ----------
+
+    async def _build_jurisdiction_resolver(
+        self,
+    ) -> Callable[[Any], str | None]:
+        """Return a callable that resolves a ``jurisdiction`` field value
+        (ref-id, list-of-ref-ids, or already-2-letter code) to a
+        normalized two-letter state code or None.
+
+        The Jurisdictions CMS collection is fetched once per
+        WebflowLookupService instance and cached. Calling this method
+        again on the same pipeline returns a resolver bound to the same
+        cached mapping.
+        """
+        mapping = await self.webflow.get_jurisdiction_mapping()
+
+        def resolve(value: Any) -> str | None:
+            return WebflowLookupService.resolve_jurisdiction_ref(
+                value, mapping
+            )
+
+        return resolve
+
     # ---------- Audits (step 6) ----------
 
     async def audit_federal_join_keys(self) -> AuditReport:
@@ -788,9 +860,12 @@ class LegislatorBioPipeline:
         """
         flagged: list[AuditEntry] = []
         total = 0
+        resolver = await self._build_jurisdiction_resolver()
         try:
             async for item in self.webflow.iter_legislator_items():
-                cms = CMSLegislator.from_webflow_item(item)
+                cms = CMSLegislator.from_webflow_item(
+                    item, jurisdiction_resolver=resolver,
+                )
                 if not cms.is_federal:
                     continue
                 total += 1
@@ -803,7 +878,7 @@ class LegislatorBioPipeline:
                             chamber=(
                                 cms.raw_fields.get("chamber") or None
                             ),
-                            state_code=cms.state_code(),
+                            state_code=cms.state_code,
                             openstates_id=None,
                             bioguide_id=None,
                         )
@@ -847,14 +922,16 @@ class LegislatorBioPipeline:
         """
         flagged: list[AuditEntry] = []
         total = 0
-        wanted = jurisdiction.strip().upper() if jurisdiction else None
+        wanted = WebflowLookupService._normalize_state_code(jurisdiction) if jurisdiction else None
+        resolver = await self._build_jurisdiction_resolver()
         try:
             async for item in self.webflow.iter_legislator_items():
-                cms = CMSLegislator.from_webflow_item(item)
+                cms = CMSLegislator.from_webflow_item(
+                    item, jurisdiction_resolver=resolver,
+                )
                 if cms.is_federal:
                     continue
-                state = cms.state_code()
-                if wanted and state != wanted:
+                if wanted and cms.state_code != wanted:
                     continue
                 total += 1
                 if not cms.openstates_id:
@@ -866,7 +943,7 @@ class LegislatorBioPipeline:
                             chamber=(
                                 cms.raw_fields.get("chamber") or None
                             ),
-                            state_code=state,
+                            state_code=cms.state_code,
                             openstates_id=None,
                             bioguide_id=cms.bioguide_id,
                         )
@@ -893,16 +970,13 @@ class LegislatorBioPipeline:
 
     @staticmethod
     def _matches_jurisdiction(cms: CMSLegislator, jurisdiction: str) -> bool:
-        """Filter CMS records by jurisdiction option ('us' or state code)."""
-        wanted = (jurisdiction or "").lower()
-        if wanted == "us":
+        """Filter CMS records by jurisdiction option ('us' or state code).
+
+        Compares against the precomputed ``cms.state_code`` (resolved
+        from the Jurisdictions multi-reference field). State-code
+        comparison is exact-uppercase; "us"/"US" matches federal records.
+        """
+        wanted = (jurisdiction or "").strip().upper()
+        if wanted == "US":
             return cms.is_federal
-        # State match — the orchestrator's CMS reader doesn't currently
-        # populate a normalized state code, so this is a heuristic over the
-        # raw fields. Phase 2 may add an explicit state-code field.
-        state = (
-            cms.raw_fields.get("state-code")
-            or cms.raw_fields.get("state")
-            or ""
-        ).lower()
-        return state == wanted
+        return cms.state_code == wanted

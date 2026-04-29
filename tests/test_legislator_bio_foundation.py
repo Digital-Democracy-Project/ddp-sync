@@ -431,10 +431,15 @@ def _cms_item(
     chamber: str = "Senate",
     openstatesid: str | None = None,
     bioguide_id: str | None = None,
-    state_code: str | None = None,
+    jurisdiction_ref: str | list | None = None,
     extra_fields: dict | None = None,
 ) -> dict:
-    """Build a fake Webflow Legislators item for audit-input fixtures."""
+    """Build a fake Webflow Legislators item for audit-input fixtures.
+
+    ``jurisdiction_ref`` simulates the Webflow multi-reference shape:
+    pass a list of ref-ids (typical Webflow shape), a single ref-id
+    string, or None for unset.
+    """
     fields: dict = {
         "name": name,
         "slug": name.lower().replace(" ", "-"),
@@ -444,21 +449,50 @@ def _cms_item(
         fields["openstatesid"] = openstatesid
     if bioguide_id:
         fields["bioguide-id"] = bioguide_id
-    if state_code:
-        fields["state-code"] = state_code
+    if jurisdiction_ref is not None:
+        fields["jurisdiction"] = jurisdiction_ref
     if extra_fields:
         fields.update(extra_fields)
     return {"id": item_id, "fieldData": fields}
 
 
-def _make_pipeline_with_items(items: list[dict]) -> LegislatorBioPipeline:
-    """Build a pipeline whose webflow.iter_legislator_items yields ``items``."""
+# Default jurisdiction ref-id mapping for tests.
+# {ref_id -> 2-letter state code} matches the production data model:
+# Legislators have a multi-reference jurisdiction field; the orchestrator
+# resolves ref-ids via WebflowLookupService.get_jurisdiction_mapping().
+_TEST_JURIS_MAPPING = {
+    "juris-fl": "FL",
+    "juris-va": "VA",
+    "juris-wa": "WA",
+    "juris-ma": "MA",
+    "juris-az": "AZ",
+    "juris-mi": "MI",
+    "juris-ut": "UT",
+    "juris-us": "US",   # federal — resolver normalizes to None
+}
+
+
+def _make_pipeline_with_items(
+    items: list[dict],
+    *,
+    jurisdiction_mapping: dict[str, str] | None = None,
+) -> LegislatorBioPipeline:
+    """Build a pipeline whose webflow.iter_legislator_items yields ``items``.
+
+    The pipeline's jurisdiction resolver uses ``jurisdiction_mapping``
+    (defaults to the standard test mapping above). This matches the
+    production code path: the orchestrator builds a resolver from the
+    Jurisdictions CMS collection and passes it to CMSLegislator.from_webflow_item.
+    """
+    mapping = jurisdiction_mapping if jurisdiction_mapping is not None else _TEST_JURIS_MAPPING
+
     async def _iter():
         for item in items:
             yield item
 
     webflow = MagicMock()
     webflow.iter_legislator_items = _iter
+    webflow.get_jurisdiction_mapping = AsyncMock(return_value=mapping)
     congress = MagicMock()
     openstates = MagicMock()
     settings = MagicMock()
@@ -540,15 +574,20 @@ async def test_audit_a_returns_empty_when_no_federal_records():
 
 @pytest.mark.asyncio
 async def test_audit_c_finds_state_records_missing_openstatesid():
-    """State records lacking openstatesid are flagged. Federal records ignored."""
+    """State records lacking openstatesid are flagged. Federal records ignored.
+
+    Uses the production data model: jurisdiction is a multi-reference field
+    holding a list of ref-ids; the orchestrator resolves via
+    WebflowLookupService.get_jurisdiction_mapping().
+    """
     items = [
         _cms_item(item_id="w-1", name="State no key",
-                  chamber="lower", state_code="FL"),
+                  chamber="lower", jurisdiction_ref=["juris-fl"]),
         _cms_item(item_id="w-2", name="State has key",
-                  chamber="lower", state_code="FL",
+                  chamber="lower", jurisdiction_ref=["juris-fl"],
                   openstatesid="ocd-person/x"),
         _cms_item(item_id="w-3", name="Fed no key",
-                  chamber="Senate"),
+                  chamber="Senate", jurisdiction_ref=["juris-us"]),
     ]
     pipeline = _make_pipeline_with_items(items)
     report = await pipeline.audit_state_join_keys()
@@ -564,11 +603,11 @@ async def test_audit_c_filters_by_jurisdiction():
     """When jurisdiction is provided, only records in that state are scanned."""
     items = [
         _cms_item(item_id="w-1", name="FL no key",
-                  chamber="lower", state_code="FL"),
+                  chamber="lower", jurisdiction_ref=["juris-fl"]),
         _cms_item(item_id="w-2", name="VA no key",
-                  chamber="lower", state_code="VA"),
+                  chamber="lower", jurisdiction_ref=["juris-va"]),
         _cms_item(item_id="w-3", name="MA has key",
-                  chamber="lower", state_code="MA",
+                  chamber="lower", jurisdiction_ref=["juris-ma"],
                   openstatesid="ocd-person/x"),
     ]
     pipeline = _make_pipeline_with_items(items)
@@ -582,7 +621,8 @@ async def test_audit_c_filters_by_jurisdiction():
 @pytest.mark.asyncio
 async def test_audit_c_jurisdiction_is_case_insensitive():
     items = [
-        _cms_item(item_id="w-1", chamber="lower", state_code="FL"),
+        _cms_item(item_id="w-1", chamber="lower",
+                  jurisdiction_ref=["juris-fl"]),
     ]
     pipeline = _make_pipeline_with_items(items)
     report = await pipeline.audit_state_join_keys(jurisdiction="fl")
@@ -593,13 +633,166 @@ async def test_audit_c_jurisdiction_is_case_insensitive():
 @pytest.mark.asyncio
 async def test_audit_c_includes_all_states_when_no_jurisdiction():
     items = [
-        _cms_item(item_id="w-1", chamber="lower", state_code="FL"),
-        _cms_item(item_id="w-2", chamber="lower", state_code="VA"),
+        _cms_item(item_id="w-1", chamber="lower",
+                  jurisdiction_ref=["juris-fl"]),
+        _cms_item(item_id="w-2", chamber="lower",
+                  jurisdiction_ref=["juris-va"]),
     ]
     pipeline = _make_pipeline_with_items(items)
     report = await pipeline.audit_state_join_keys()
     assert report.jurisdiction is None
     assert report.flagged_count == 2
+
+
+@pytest.mark.asyncio
+async def test_audit_c_skips_records_with_unresolvable_jurisdiction_when_filtered():
+    """Round-8 fix: a record whose jurisdiction ref doesn't resolve must NOT
+    silently match a jurisdiction filter. With state_code=None and
+    jurisdiction='FL', the record is excluded from the scan (and would be
+    surfaced if the editor ran the audit with no filter)."""
+    items = [
+        _cms_item(item_id="w-1", chamber="lower",
+                  jurisdiction_ref=["unknown-ref-id"]),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys(jurisdiction="FL")
+    assert report.total_scanned == 0
+    assert report.flagged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_c_unresolvable_jurisdiction_visible_when_unfiltered():
+    """Same record, no jurisdiction filter → IS counted and flagged
+    (still missing openstatesid, regardless of state)."""
+    items = [
+        _cms_item(item_id="w-1", chamber="lower",
+                  jurisdiction_ref=["unknown-ref-id"]),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_state_join_keys()
+    assert report.total_scanned == 1
+    assert report.flagged_count == 1
+    assert report.flagged[0].state_code is None  # unresolvable
+
+
+# ---------- Jurisdiction resolution + chamber matching (round-8 fixes) ----------
+
+
+def test_normalize_state_code_clamps_to_two_letters():
+    """Round-8 fix: only true 2-letter codes pass; full state names rejected."""
+    from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+    n = WebflowLookupService._normalize_state_code
+    assert n("FL") == "FL"
+    assert n("fl") == "FL"
+    assert n("  fl  ") == "FL"
+    # Full state name → rejected (was the round-8 silent-false-negative bug)
+    assert n("Florida") is None
+    # Single char or numeric → rejected
+    assert n("F") is None
+    assert n("12") is None
+    # Empty / non-string → None
+    assert n(None) is None
+    assert n("") is None
+    assert n(["FL"]) is None
+
+
+def test_resolve_jurisdiction_ref_handles_all_upstream_shapes():
+    """Multi-reference shape (list), single ref-id, already-2-letter, None."""
+    from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+    mapping = {"juris-fl": "FL", "juris-us": "US"}
+    r = WebflowLookupService.resolve_jurisdiction_ref
+
+    # Standard multi-reference shape from Webflow
+    assert r(["juris-fl"], mapping) == "FL"
+    # Multi-ref with first non-empty winning
+    assert r(["juris-fl", "juris-us"], mapping) == "FL"
+    # Single string ref-id (no list wrapper)
+    assert r("juris-fl", mapping) == "FL"
+    # Already-2-letter code (legacy / pre-resolved value)
+    assert r("WA", mapping) == "WA"
+    # US/federal → returns None (orchestrator detects federal via chamber)
+    assert r(["juris-us"], mapping) is None
+    assert r("US", mapping) is None
+    # Unset / missing
+    assert r(None, mapping) is None
+    assert r("", mapping) is None
+    assert r([], mapping) is None
+    # Unknown ref-id → None (not silently "US")
+    assert r(["unknown"], mapping) is None
+    assert r("unknown-ref", mapping) is None
+
+
+def test_cms_legislator_state_code_via_resolver():
+    """state_code is precomputed at construction from the jurisdiction resolver."""
+    from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+    mapping = {"juris-fl": "FL"}
+    def resolver(v):
+        return WebflowLookupService.resolve_jurisdiction_ref(v, mapping)
+
+    item = {
+        "id": "w-1",
+        "fieldData": {
+            "name": "Adam",
+            "chamber": "lower",
+            "jurisdiction": ["juris-fl"],
+        },
+    }
+    cms = CMSLegislator.from_webflow_item(item, jurisdiction_resolver=resolver)
+    assert cms.state_code == "FL"
+    assert cms.is_federal is False
+
+
+def test_cms_legislator_state_code_none_without_resolver():
+    """No resolver → state_code is None even if a flat field is set.
+
+    Round-8 fix dropped the legacy flat-field fallback. The data model is
+    reference-based; the resolver is the single source of truth."""
+    item = {
+        "id": "w-1",
+        "fieldData": {
+            "name": "Test",
+            "chamber": "lower",
+            "state-code": "FL",  # legacy flat field — IGNORED without resolver
+            "jurisdiction": ["juris-fl"],
+        },
+    }
+    cms = CMSLegislator.from_webflow_item(item)  # no resolver
+    assert cms.state_code is None
+
+
+def test_cms_legislator_resolver_exception_treated_as_unresolved():
+    """A resolver that raises must not fail the whole construction."""
+    def bad_resolver(v):
+        raise RuntimeError("resolver broke")
+
+    item = {
+        "id": "w-1",
+        "fieldData": {"name": "Test", "chamber": "lower", "jurisdiction": ["x"]},
+    }
+    cms = CMSLegislator.from_webflow_item(item, jurisdiction_resolver=bad_resolver)
+    assert cms.state_code is None
+
+
+def test_cms_legislator_is_federal_chamber_variants():
+    """Round-8 fix: chamber heuristic accepts common variants."""
+    for chamber in [
+        "Senate", "House", "US Senate", "U.S. Senate",
+        "US House", "U.S. House", "House of Representatives",
+        "U.S. House of Representatives", "Congress", "U.S. Congress",
+    ]:
+        item = {"id": "w", "fieldData": {"name": "X", "chamber": chamber}}
+        cms = CMSLegislator.from_webflow_item(item)
+        assert cms.is_federal is True, f"expected federal: {chamber!r}"
+
+
+def test_cms_legislator_is_federal_state_chamber_values_excluded():
+    for chamber in ["lower", "upper", "Lower", "UPPER", "Assembly"]:
+        item = {"id": "w", "fieldData": {"name": "X", "chamber": chamber}}
+        cms = CMSLegislator.from_webflow_item(item)
+        assert cms.is_federal is False, f"expected NOT federal: {chamber!r}"
 
 
 @pytest.mark.asyncio
@@ -614,6 +807,7 @@ async def test_audit_a_aborts_gracefully_on_webflow_error():
 
     webflow = MagicMock()
     webflow.iter_legislator_items = _failing_iter
+    webflow.get_jurisdiction_mapping = AsyncMock(return_value={})
     settings = MagicMock()
     settings.openstates_api_key = "k"
     pipeline = LegislatorBioPipeline(

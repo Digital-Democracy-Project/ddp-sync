@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, + forthcoming step-6 commit); 55-test suite landed. Seven pm-review rounds folded in (rev 8). Steps 7–9 still pending.
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, + forthcoming round-8 data-model commit); 64-test suite landed. Eight pm-review rounds folded in (rev 9). Steps 7–9 still pending.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -115,6 +115,21 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 - OpenStates returns `jurisdiction` as a **dict** (`{"name": "...", "id": "...", "classification": "..."}`), not a flat string. `OpenStatesPerson.from_api()` accepts both shapes for safety.
 - Federal members' `current_role.division_id` contains `/state:XX` because they represent specific states. Naive division-id check would mis-classify them as state. `is_federal` uses `jurisdiction_name == "United States"` instead.
 - These are documented in the `services/openstates_people.py` `is_federal` docstring and reflected in the "New code modules → openstates_people" section below.
+
+**Round-8 fixes + data-model correction (forthcoming commit):**
+
+The round-8 reviewer flagged silent-false-negative risk in Audit C's jurisdiction filter. User clarified the actual data model: **legislators in the Webflow CMS are mapped against a separate Jurisdiction CMS collection via a multi-reference field**. There is no flat `state-code` or `state` field on the Legislators collection. The audit code was looking at flat fields that don't exist in production.
+
+| Fix | Location | Description |
+|---|---|---|
+| Jurisdiction-mapping cache | `WebflowLookupService.get_jurisdiction_mapping()` (new) | Fetches the Jurisdictions CMS collection once and returns `{ref_id → 2-letter state code}`. Cached on the service instance for the lifetime of the process. Empty dict on missing collection-id config or fetch failure. Uses the existing `_jurisdiction_cache` pattern from `WebflowSource` (ingestion-side) — same field-name probing (`state-code`, `code`, `abbreviation`, name-prefix). |
+| State-code clamping | `WebflowLookupService._normalize_state_code()` (new static) | Coerces value to **exactly two uppercase ASCII letters or None** (was previously ≥2 chars, which let "Florida" → "FLORIDA" leak through and break exact-match jurisdiction filters). |
+| Resolver helper | `WebflowLookupService.resolve_jurisdiction_ref()` (new static) | Accepts None / list[str] (multi-reference) / single ref-id / already-2-letter code. Returns normalized 2-letter code or None. **US/federal jurisdiction returns None** because the orchestrator detects federal members via the chamber heuristic. |
+| `CMSLegislator.state_code` precomputed | `pipelines/legislator_bio.py` | Was a method that read flat fields. Now a `state_code` field on the dataclass, populated at `from_webflow_item()` time via the optional `jurisdiction_resolver` callable. **No flat-field fallback** — the data model is reference-based. |
+| Pipeline jurisdiction resolver | `LegislatorBioPipeline._build_jurisdiction_resolver()` (new) | Builds the resolver once at the start of `audit_*` and `_process_cms_records` / `_discover_and_create`. Jurisdictions collection is fetched once per pipeline lifetime (cached in WebflowLookupService). |
+| `is_federal` chamber variants | `_FEDERAL_CHAMBER_VALUES` constant | Round-8 low-severity #4: previous heuristic missed `"U.S. Senate"`, `"House of Representatives"`, `"Congress"`, etc. Now matches a frozenset of common variants case-insensitively after `.strip()`. |
+| Audit C unresolvable-jurisdiction handling | `audit_state_join_keys()` | When the resolver returns None (unknown ref-id, missing jurisdiction, or "US"), `state_code=None`. With a jurisdiction filter set, those records are excluded; with no filter, they are scanned and flagged if missing `openstatesid`. **Tests pin both behaviors** so editors know which audit-only mode surfaces unresolvable records. |
+| Test fixtures updated | `tests/test_legislator_bio_foundation.py` | `_cms_item` now takes a `jurisdiction_ref` (list or string ref-id) matching the production multi-reference shape. `_make_pipeline_with_items` mocks `webflow.get_jurisdiction_mapping`. **9 new tests added; total suite: 64 tests, all pass.** |
 
 ---
 
