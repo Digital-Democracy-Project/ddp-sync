@@ -178,3 +178,47 @@ The alert is wired in a `try/finally`, so it fires even on aborted runs (rate-li
 **Cause:** The 21 new Webflow Legislator fields (per `plans/webflow-legislator-fields.md`) are added via the Designer; if a field hasn't been added yet, the bio sync detects this via the cached collection schema (1h TTL) and silently skips that field rather than failing the whole record. The check is intentional — partial schema rollout shouldn't block the sync.
 
 **Action:** Confirm the field exists in the Webflow Designer with the slug listed in `webflow-legislator-fields.md`. After the field is added, the schema cache will refresh on the next call (1h max).
+
+### Audit A returns `total_scanned: 0`
+
+**Symptom:** `POST /trigger/legislator-bio-sync?audit_only=A` returns `total_scanned: 0` even though the CMS has federal records.
+
+**Cause (resolved 2026-04-30):** Initial code read federal/state classification from a flat `chamber: str` field that doesn't exist in production. Live CMS uses a multi-reference `seat` field → Seats CMS (4 items: `us-house`, `us-senate`, `state-house`, `state-senate`). Fixed in commit f235665.
+
+**Action:** Confirm you're running ddp-sync at f235665 or later (`git log --oneline | grep f235665`). If yes and `total_scanned` is still 0, check that the Legislators records actually have their `seat` ref populated.
+
+### Bio-sync HTTP 400 on every PATCH (atomic-payload rejection)
+
+**Symptom:** `errors[]` in the run report shows every record failing with `Webflow PATCH failed: status=400`. No data was actually written.
+
+**Cause:** Webflow PATCH is atomic — a single field validation failure rejects the entire payload, even fields that would otherwise validate. So if one field's value is wrong type (e.g. a plain slug sent to a Link/URL-typed field), every PATCH attempt across every record fails the same way.
+
+**Diagnostic:** Since commit 350b0d6, `WebflowError`'s string representation includes the response body. Re-run and look at `errors[]` — the body will have something like `"param":"<field-slug>","description":"<reason>"`.
+
+**Common causes:**
+- Field is URL/Link-typed but value is a bare slug or number (fix: construct a canonical URL in the orchestrator, e.g. commit 1c23eb2 for ballotpedia-slug + govtrack-id)
+- Field is Date-typed but value is `"2025-01-03"` not `"2025-01-03T00:00:00.000Z"`
+- Field is Number-typed but value is a string
+
+**Action:** Check the 400 body for the offending field, then either: (a) change the field type in Webflow Designer to match what the sync sends, or (b) update the orchestrator to construct the value the field expects.
+
+### State-leg records show as `upstream_orphans` on every run
+
+**Symptom:** Same set of state-leg slugs (e.g. `dean-black-fl0015`) appears in `upstream_orphans[]` on every bio-sync run.
+
+**Cause (Phase 1 design limitation, expected):** OpenStates drops state legislators when they leave office; the bio sync's bioguide fallback is federal-only. Pre-existing state CMS records with stale `openstates_id` will continue to show as orphans until either an editor archives them in the CMS, or Phase 2 adds a `bio-sync-locked` field that editors can toggle to mark "manually historical, expected orphan".
+
+**Action:** Phase 1 — informational only; no automated handling. Phase 2 — add the lock field; tracked in `plans/PLAN-legislator-bio-sync.md` "Carry-overs into Phase 2".
+
+### Zapier Slack template renders empty placeholders or literal Mustache syntax
+
+**Symptom:** The bio-sync Slack alert renders as the voatz-brevo template (with empty `Voters Added` placeholders), or shows literal `{{#on_failure}}` text.
+
+**Cause:** Zapier's Slack action only supports flat `{{field}}` interpolation, not Mustache section conditionals. Both bio-sync and voatz-brevo POST to the same `ZAPIER_WEBHOOK_URL` by design and route via the `alert_type` field in the payload (`user_sync_complete` vs `legislator_bio_sync_complete`).
+
+**Fix (commit 8653d24):** Bio-sync payload now includes pre-formatted `failure_warning` and `large_changes_warning` strings (empty when no warning, descriptive text when active). Drop them in the Slack template unconditionally.
+
+**Action:**
+1. Add a Zapier "Paths" step on the webhook trigger; branch on `alert_type`.
+2. Path A (`user_sync_complete`) → existing voatz-brevo Slack template.
+3. Path B (`legislator_bio_sync_complete`) → new bio-sync Slack template using fields like `{{summary}}`, `{{patched}}`, `{{errors}}`, `{{failure_warning}}`, `{{large_changes_warning}}`.

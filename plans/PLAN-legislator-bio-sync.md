@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 code-complete. Steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, d4efa66); 97-test suite landed. Fifteen pm-review rounds folded in; round-15 verdict `approve` / `ship`. Step 9 in progress — first live Audit A run (2026-04-30) surfaced a data-model mismatch: the spec assumed a flat `chamber: str` field on Legislators, but production uses a multi-reference `seat` field → Seats CMS (4 items, slugs `us-house`/`us-senate`/`state-house`/`state-senate`). Fixed by replacing `_FEDERAL_CHAMBER_VALUES` with `_FEDERAL_SEAT_REF_IDS` (hardcoded ref-IDs of the 2 federal seats; Seats CMS is small + semantically fixed so a runtime fetch isn't worth the complexity). See "Seat-resolver fix (round-16, 2026-04-30)" below.
+**Status:** ✅ **Phase 1 federal sync SHIPPED 2026-04-30.** All 32 FL federal delegation records live-PATCHed cleanly against the production Webflow CMS (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, d4efa66, f235665, 350b0d6, 1c23eb2, 8653d24); 97-test suite landed. Fifteen pm-review rounds + three step-9 production-discovery iterations (chamber→seat data-model correction, URL-typed ID field construction, Zapier Mustache→pre-formatted strings). Run summary: `cms_items_seen=224, items_resolved_via_openstates=221, items_resolved_via_bioguide_fallback=0, patched=32, errors=[], aborted=false`. **Outstanding:** 3 state-leg orphans (Phase-2 input — see "Step-9 production rollout findings" below); editor visual verification of patched records; scheduler enable + ramp.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -92,7 +92,7 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 7a | Alerting + cache test suite | 4427dd3 + c492891 + round-11 | ✅ 6 alert-function tests; 4 `run()` integration tests; 4 cache tests (TTL, stale-reuse on empty, empty-mapping breadcrumb, lock-serializes-concurrent-refresh); 2 round-10 tests (threshold-tunable, success-metric-emitted); **2 round-11 tests** (no-hot-loop on sustained failure, lock-serializes-failing-fetch with 10 concurrent callers). **Total suite: 82 tests, all pass.** |
 | 8 | Orchestrator-internal `run()` integration tests | a0d2300 + 0209c4c + round-14 | ✅ `tests/test_legislator_bio_orchestrator.py` — 13 integration tests covering full-pass `run()` flows: federal happy path, bioguide-fallback (Karen Bass), state Phase-2 stub, dry-run, per-record error, rate-limit abort with alert, jurisdiction filter, lock-release-on-raising-fetch, locked_fields exclusion, large_changes_threshold end-to-end, mixed-success PATCHes. **Round-14 additions:** (12) mass-blank-prevention — upstream None on populated CMS field → field NOT in PATCH (verifies both layers of defense: payload-build None-strip + diff-time `is_empty` check); (13) `==` threshold edge-case — at exactly threshold, `on_large_changes=False` (strict-`>` semantics pinned). `_build_pipeline()` fixture uses `MagicMock(spec=...)` on service mocks. |
 | 8a | Round-12/13/14 polish bundled into step 8 | a0d2300 + 0209c4c + round-14 | ✅ Doc-comment on `get_jurisdiction_mapping`; lock-release contract test; locked_fields/threshold/mixed-success/mass-blank/equals-threshold integration tests; `MagicMock(spec=...)` on service mocks; threshold test imports `DEFAULT_LARGE_CHANGES_THRESHOLD` constant rather than hardcoding (round-14 fix to allow ops to tune without breaking tests). |
-| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ Last step — operational, requires production deploy + Webflow API token + editor sign-off. **Pre-flight (local) ✅:** 95 tests green; trigger endpoint exposes `dry_run`, `limit`, `jurisdiction`, `audit_only`, `auto_create`, `historical_since`; `DEFAULT_LARGE_CHANGES_THRESHOLD=100` exposed; imports clean. Remaining steps run against the deployed environment per the runbook below. |
+| 9 | Dry-run + 1 live PATCH on low-stakes record | f235665 + 350b0d6 + 1c23eb2 + 8653d24 | ✅ **Shipped 2026-04-30.** Pre-flight clean. Live execution surfaced three production-discovery iterations (each addressed atomically): (a) chamber→seat data-model correction, (b) URL-typed ID field construction, (c) Zapier Mustache→pre-formatted warning strings. First live PATCH on Mike Haridopolos succeeded; full FL delegation run (32 records) PATCHed cleanly with `errors: []`. See "Step-9 production rollout findings" below for the journey + carry-overs. |
 
 **Round-5 fixes applied (in commit 24d058e):**
 
@@ -152,6 +152,64 @@ The fix mirrors the round-8 jurisdiction-resolver shape but is much simpler beca
 | Tests | `tests/test_legislator_bio_foundation.py` | Replaced `test_cms_legislator_is_federal_chamber_variants` + `test_cms_legislator_is_federal_state_chamber_values_excluded` with `test_cms_legislator_is_federal_via_seat_ref_id` + `test_cms_legislator_state_seat_refs_not_federal` + `test_cms_legislator_seat_field_accepts_string_or_list_or_none` + `test_cms_legislator_seat_slugs_resolves_known_ref_ids`. **97 tests pass.** |
 
 **Tradeoffs accepted:** if the Seats CMS items are ever deleted and re-created, their item IDs will change and `_FEDERAL_SEAT_REF_IDS` will need a one-line update. This is a much rarer event than the jurisdiction list growing (US has 50 states + DC + 5 territories — actively edited). For a 4-item, semantically-fixed collection, the runtime fetch overhead + cache layer + new env var aren't justified.
+
+---
+
+## Step-9 production rollout findings (2026-04-30)
+
+Phase 1 went live tonight. The PLAN/code passed 15 pm-review rounds and a 97-test suite, but the journey from "ready to deploy" to "shipped" surfaced three production-only realities — none caught by tests because they each depended on the live Webflow schema or live Zapier behavior. Documented here so future syncs starting from a planning doc don't re-walk them.
+
+**Iteration 1 — `chamber` field doesn't exist (commit f235665):**
+- **Symptom:** First Audit A run returned `total_scanned: 0` despite the CMS having 32+ federal records.
+- **Cause:** PLAN assumed a flat `chamber: str` field on Legislators. Production has a multi-reference `seat` field → Seats CMS (4 items: `us-house`, `us-senate`, `state-house`, `state-senate`).
+- **Fix:** Replaced `_FEDERAL_CHAMBER_VALUES` with `_FEDERAL_SEAT_REF_IDS` (frozenset of 2 federal Seats item IDs). Renamed `AuditEntry.chamber` → `AuditEntry.seat: list[str]`. Test fixture's `chamber=` kwarg translates to seat ref-IDs, so existing test cases didn't need rewriting.
+- **Generalizable lesson:** PLAN documents drift from production CMS schemas. Always confirm field slugs/types/shapes against live data before writing CMS-touching code. Don't assume what "Do NOT touch" lists in editor checklists actually exist.
+
+**Iteration 2 — URL-typed ID fields rejected plain slugs (commits 350b0d6 + 1c23eb2):**
+- **Symptom:** First live PATCH on 5 records all failed with `HTTP 400 — "Expected value to be a valid URL string: 'Mike Haridopolos'"`.
+- **Cause:** Editor created `ballotpedia-slug` and `govtrack-id` as Link/URL field types, even though the editor checklist said Plain text. We were sending bare slugs/numeric IDs. Webflow PATCH is **atomic** — a single field validation failure rejects the entire payload, even fields that would otherwise validate. So one URL-typed ID field broke ALL the records' PATCHes.
+- **Layered diagnostic gap:** `WebflowError`'s `__str__` was only emitting the status code, not the response body. Body was captured as `error_detail` attribute but never surfaced. **Fix (commit 350b0d6):** include `error_detail` in the exception's str representation so it shows up in API responses + logs.
+- **Fix (commit 1c23eb2):** construct canonical URLs in the orchestrator: `https://ballotpedia.org/{slug.replace(' ', '_')}` (the unitedstates YAML occasionally writes the value with spaces, e.g. Mike Haridopolos's freshman entry) and `https://www.govtrack.us/congress/members/{id}`. Per-field decision; we know which fields are URL-typed in production now (confirmed list: `openstates-id`, `ballotpedia-slug`, `govtrack-id`, `contact-form-url`, `official-website`, `photo-source-url`).
+- **Generalizable lesson:** Webflow PATCH atomicity means one field-type mismatch surfaces all-or-nothing. Diagnostic iteration is normal — each iteration may surface the next mismatch.
+
+**Iteration 3 — Zapier doesn't support Mustache section conditionals (commit 8653d24):**
+- **Symptom:** Slack message rendered with literal `{{#on_failure}}...{{/on_failure}}` text or empty-line placeholders.
+- **Cause:** Zapier's Slack action only does flat `{{field}}` interpolation; Mustache section syntax (`{{#flag}}`) is not supported.
+- **Fix:** Pre-format two warning strings in the bio-sync payload — `failure_warning` and `large_changes_warning` — set to descriptive text or empty string based on the flags. Slack template drops them in unconditionally; empty strings collapse the line.
+- **Generalizable lesson:** Don't push template logic into Zapier; pre-format strings at the source where you already have all the context. Keeps Zapier zaps as dumb interpolators.
+
+**Production run summary:**
+```
+cms_items_seen: 224
+items_resolved_via_openstates: 221
+items_resolved_via_bioguide_fallback: 0
+patched: 32 (full FL federal delegation)
+created: 0
+potential_merges: 0
+upstream_orphans: 3
+errors: []
+aborted: false
+```
+- 192 state records resolved via OpenStates and correctly skipped via Phase-2 stub
+- 32 federal records all PATCHed cleanly (every `dropped_fields: []`, no field-existence misses)
+- Mike Haridopolos's second-pass diff was just `term-end` + `term-start` (he was fully patched on his solo single-record run earlier — confirms cardinal rule preserves work between runs and only churns genuinely-changed upstream values)
+
+**Carry-overs into Phase 2:**
+
+| Item | What | Where to handle |
+|---|---|---|
+| 3 state-leg orphans | `dean-black-fl0015`, `dave-smith-fl0038`, `david-silvers-fl0089` — populated `openstates_id` but upstream returned None. Almost certainly former FL state legislators OpenStates dropped. No bioguide fallback (federal-only). Will appear as orphans on every run. | Phase 2: add `bio-sync-locked` field or "manually-marked-historical" flag editors can toggle so these are treated as orphan-by-design, not orphan-by-stale-id. |
+| Editor verification | Spot-check the 32 patched records visually in Webflow Designer. | Operator task. |
+| Scheduler enable | `legislator_bio_sync.enabled: true` in `sync_schedule.yaml` after editor sign-off + monitoring window. | Operator task once verification passes. |
+| Phase 2 state-leg sync | Replace the Phase-2 stub in `_sync_one_record` with the real state-leg path. | New work; PLAN already scopes this in §Phasing. |
+| Editor checklist drift | `webflow-legislator-fields.md` had `ballotpedia-slug` + `govtrack-id` typed as Plain text; production was URL. Doc updated; could be worth a check on the other 19 fields' actual types. | If a Phase-2 schema audit endpoint is built, surface this comparison automatically. |
+
+**What worked well (validates the PLAN's design):**
+- Per-record error isolation: when iteration 2 broke 5 records' PATCHes, the orchestrator captured each as a separate error and continued — the run wasn't aborted, and we got 5 error bodies in one shot, not just the first one before giving up.
+- Cardinal rule (don't blank populated fields): Mike Haridopolos's second-pass diff was much shorter than his first pass; only fields that genuinely changed upstream were sent. No churn on stable fields.
+- Schema-cache field-existence tolerance: `dropped_fields: []` on every record means the cache is fetching the live schema and not silently dropping fields. If a field hadn't been added in Webflow, it would appear in `dropped_fields` and the operator would know.
+- ALB-timeout safety gate (503 + Retry-After 60): kicked in correctly after the first deploy; user retried and pre-warm completion log appeared.
+- Atomic data-model correction: the chamber→seat fix was a single commit (f235665) that mirrored the round-8 jurisdiction-resolver pattern. Test fixtures absorbed the change via a translation table, so no test-by-test rewrite was needed.
 
 ---
 

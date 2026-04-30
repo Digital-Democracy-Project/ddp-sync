@@ -81,7 +81,11 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 
 `/trigger/legislator-bio-sync` accepts query params: `dry_run` (bool), `auto_create` (bool), `jurisdiction` (str — `us` for federal or state code), `target` (`all` / `webflow` / `pinecone`), `limit` (int), `historical_since` (YYYY-MM-DD), `audit_only` (`A` or `C`). Returns 503 + `Retry-After: 60` while the unitedstates dataset is still being parsed at app startup (~55s; pre-warm fires at startup).
 
-After non-dry-run completion (including aborted runs) the bio sync POSTs a summary to the Zapier webhook configured via the `ZAPIER_WEBHOOK_URL` env var (same setting used by the Voatz→Brevo sync). Payload includes `on_failure` and `on_large_changes` boolean flags so Zapier-side filters can route to higher-priority channels. Set `ZAPIER_WEBHOOK_URL=` (empty) to disable alerts without removing the variable.
+After non-dry-run completion (including aborted runs) the bio sync POSTs a summary to the Zapier webhook configured via the `ZAPIER_WEBHOOK_URL` env var (same setting used by the Voatz→Brevo sync). Both alerts share the webhook and route via the top-level `alert_type` field — `user_sync_complete` for Voatz→Brevo, `legislator_bio_sync_complete` for bio-sync. Bio-sync payload includes `on_failure` and `on_large_changes` boolean flags + pre-formatted `failure_warning` and `large_changes_warning` strings (empty when not applicable, populated text otherwise — Zapier doesn't support Mustache conditionals, so flatten at the source). Set `ZAPIER_WEBHOOK_URL=` (empty) to disable alerts without removing the variable.
+
+The bio sync uses a multi-reference `seat` field on Legislators CMS records to determine federal vs state classification (refs into a Seats CMS with 4 items: `us-house`, `us-senate`, `state-house`, `state-senate`). The two federal seat ref-IDs are hardcoded in `pipelines/legislator_bio.py::_FEDERAL_SEAT_REF_IDS`. If the Seats CMS items are ever recreated, that constant needs a one-line update.
+
+Phase 1 federal-only sync was shipped 2026-04-30 against the FL congressional delegation (32 records). Manual-trigger only until Audit B passes and the scheduler is explicitly enabled (`legislator_bio_sync.enabled: true` in `config/sync_schedule.yaml`).
 
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 
