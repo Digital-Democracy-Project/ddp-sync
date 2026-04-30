@@ -325,7 +325,10 @@ async def test_run_federal_via_openstates_full_flow():
     assert fields["wikidata-id"] == "Q123"
     assert fields["birth-year"] == 1952
     assert fields["twitter-handle"] == "SenRickScott"
-    assert fields["term-start"] == "2023-01-03"
+    # term-start coerced to Webflow Date format to prevent ChurnPATCH
+    # (Webflow Date fields store as ISO-datetime; date-only would diff
+    # against stored value on every run).
+    assert fields["term-start"] == "2023-01-03T00:00:00.000Z"
     # Federal email-as-URL routed to contact-form-url
     assert fields.get("contact-form-url") == "https://www.rickscott.senate.gov/contact/contact"
     assert "email" not in fields  # bare email field stays empty for federal
@@ -374,8 +377,8 @@ async def test_run_federal_bioguide_fallback_for_departed_member():
     # so it's correctly deduped out of the PATCH per the cardinal rule.
     # The genuinely-new fields from the federal record:
     assert fields["birth-year"] == 1953
-    assert fields["term-start"] == "2011-01-05"
-    assert fields["term-end"] == "2023-01-03"
+    assert fields["term-start"] == "2011-01-05T00:00:00.000Z"
+    assert fields["term-end"] == "2023-01-03T00:00:00.000Z"
     assert fields["gender"] == "M"
 
 
@@ -661,7 +664,7 @@ async def test_run_locked_fields_excluded_from_patch():
     # Other federal fields still get patched (verifies the lock is
     # surgical, not a wholesale skip)
     assert fields.get("wikidata-id") == "Q123"
-    assert fields.get("term-start") == "2023-01-03"
+    assert fields.get("term-start") == "2023-01-03T00:00:00.000Z"
 
 
 def _build_n_federal_records(n: int):
@@ -926,3 +929,69 @@ async def test_run_does_not_blank_populated_cms_field_with_empty_upstream():
     # Other federal fields ARE present (confirms processing happened)
     assert fields.get("wikidata-id") == "Q123"
     assert fields.get("opensecrets-id") == "N00012345"
+
+
+@pytest.mark.asyncio
+async def test_run_no_churn_on_term_dates_when_cms_already_has_iso_datetime():
+    """ChurnPATCH prevention: if a previous run wrote term-start /
+    term-end as Webflow's ISO-datetime format (the storage shape), a
+    second run should NOT re-PATCH those fields just because the
+    upstream YAML reports the same date in date-only form.
+
+    Background: production rollout (2026-04-30) exposed that all 32 FL
+    federal records were re-PATCHing term-start + term-end on every run
+    after the first successful write. Cause: unitedstates YAML stores
+    `"2025-01-03"` (date-only) but Webflow Date fields round-trip as
+    `"2025-01-03T00:00:00.000Z"`. should_write's plain `==` comparison
+    saw a diff every run. Fix: orchestrator coerces the upstream
+    date-only string to Webflow's storage format BEFORE the diff.
+    """
+    cms = [_cms(
+        item_id="wf-1",
+        name="Already Patched",
+        chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+        extra_fields={
+            # CMS already has term dates in Webflow's ISO-datetime
+            # storage shape from a previous successful PATCH.
+            "term-start": "2023-01-03T00:00:00.000Z",
+            "term-end":   "2029-01-03T00:00:00.000Z",
+        },
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/x",
+        chamber="upper",
+        bioguide="X001",
+        is_federal=True,
+    )
+    # Upstream YAML reports the same dates in date-only form (the
+    # canonical unitedstates shape).
+    fed = _fed(
+        bioguide="X001",
+        term_start="2023-01-03",
+        term_end="2029-01-03",
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+        patch_recorder=patches,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert report.aborted is False
+    # If churn-prevention works, term-start + term-end should NOT
+    # appear in any patch payload (other fields might if they differ).
+    if patches:
+        _, fields = patches[0]
+        assert "term-start" not in fields, (
+            f"ChurnPATCH: term-start was re-PATCHed despite matching "
+            f"upstream date. fields={fields}"
+        )
+        assert "term-end" not in fields, (
+            f"ChurnPATCH: term-end was re-PATCHed despite matching "
+            f"upstream date. fields={fields}"
+        )

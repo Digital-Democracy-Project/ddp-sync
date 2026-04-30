@@ -801,8 +801,12 @@ class LegislatorBioPipeline:
 
         # Term span
         if federal is not None and federal.terms:
-            payload["term-start"] = federal.first_term.get("start")
-            payload["term-end"] = federal.latest_term.get("end")
+            payload["term-start"] = self._date_to_webflow_iso(
+                federal.first_term.get("start")
+            )
+            payload["term-end"] = self._date_to_webflow_iso(
+                federal.latest_term.get("end")
+            )
             payload["seniority-rank"] = federal.latest_term.get("state_rank")
 
         # Capitol office, phone, contact form, official website
@@ -863,6 +867,29 @@ class LegislatorBioPipeline:
             return int(value[:4])
         except ValueError:
             return None
+
+    @staticmethod
+    def _date_to_webflow_iso(value: Any) -> str | None:
+        """Coerce a date-only string (YYYY-MM-DD) into Webflow's Date-field
+        storage format (``YYYY-MM-DDT00:00:00.000Z``).
+
+        Webflow Date fields round-trip as full ISO 8601 with milliseconds +
+        Z suffix. The unitedstates YAML stores term dates as date-only
+        strings; without coercion, ``should_write`` sees the date-only
+        upstream value as different from the ISO-datetime CMS value on
+        every run and re-PATCHes — a ChurnPATCH that hot-loops the
+        Webflow rate limiter on every scheduled run.
+        """
+        if not value or not isinstance(value, str):
+            return None
+        s = value.strip()
+        if not s:
+            return None
+        if "T" in s:
+            # Already datetime-shaped; assume the upstream knows what it's
+            # doing and pass through.
+            return s
+        return f"{s}T00:00:00.000Z"
 
     @staticmethod
     def _first_office(
