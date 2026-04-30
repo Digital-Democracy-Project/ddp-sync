@@ -62,6 +62,14 @@ _DEFAULT_JURIS_MAPPING = {
 }
 
 
+_TEST_SEAT_REFS = {
+    "Senate": ["66316e0956dc73af879134b4"],   # us-senate (federal)
+    "House": ["66316e20ae88354aed5df702"],    # us-house (federal)
+    "upper": ["655288ef928edb12830673e8"],    # state-senate
+    "lower": ["655288ef928edb1283067463"],    # state-house
+}
+
+
 def _cms(
     *,
     item_id: str,
@@ -75,7 +83,7 @@ def _cms(
     fields: dict[str, Any] = {
         "name": name,
         "slug": name.lower().replace(" ", "-"),
-        "chamber": chamber,
+        "seat": _TEST_SEAT_REFS.get(chamber, []),
     }
     if openstatesid:
         fields["openstatesid"] = openstatesid

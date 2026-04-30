@@ -12,9 +12,9 @@ The sync writes to the new fields below. These existing fields stay untouched:
 
 - `name`, `slug`
 - `openstatesid` — primary join key for the sync
-- `jurisdiction` (reference)
+- `jurisdiction` (multi-reference → Jurisdictions CMS)
+- `seat` (multi-reference → Seats CMS; drives federal/state classification — Seats CMS slugs `us-house`/`us-senate` are federal, `state-house`/`state-senate` are state)
 - `party-2` (or `party`)
-- `chamber`
 - `district`
 - `email`
 - `image`

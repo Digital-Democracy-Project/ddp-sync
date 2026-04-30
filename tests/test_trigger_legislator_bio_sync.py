@@ -114,9 +114,9 @@ def test_audit_only_a_runs_audit_and_returns_report():
         flagged_count=2,
         flagged=[
             AuditEntry(webflow_id="w-1", slug="missing-1", name="Missing One",
-                       chamber="Senate"),
+                       seat=["us-senate"]),
             AuditEntry(webflow_id="w-2", slug="missing-2", name="Missing Two",
-                       chamber="House"),
+                       seat=["us-house"]),
         ],
     )
     with patch(

@@ -285,23 +285,41 @@ class BioSyncReport:
 # ---------- CMS index helpers ----------
 
 
-# Federal-detection chamber values. Includes a few hand-typed variants
-# observed/anticipated in the production CMS. Matched case-insensitively
-# in CMSLegislator.from_webflow_item.
-_FEDERAL_CHAMBER_VALUES: frozenset[str] = frozenset({
-    "senate",
-    "house",
-    "us senate",
-    "u.s. senate",
-    "us house",
-    "u.s. house",
-    "house of representatives",
-    "u.s. house of representatives",
-    "us house of representatives",
-    "congress",
-    "us congress",
-    "u.s. congress",
+# Federal-detection: Legislators have a multi-reference `seat` field
+# pointing to the Seats CMS collection (4 items: U.S. House, U.S. Senate,
+# State House, State Senate). We hardcode the federal ref-IDs rather than
+# fetching the Seats collection at runtime — the collection is small and
+# semantically fixed (every US state is bicameral except Nebraska's
+# unicameral state senate). If item IDs ever change, update this constant.
+#
+# The full ref-ID → slug mapping is exposed via _SEAT_REF_TO_SLUG so the
+# audit reports can surface a human-readable seat slug per record.
+_SEAT_REF_TO_SLUG: dict[str, str] = {
+    "66316e20ae88354aed5df702": "us-house",
+    "66316e0956dc73af879134b4": "us-senate",
+    "655288ef928edb1283067463": "state-house",
+    "655288ef928edb12830673e8": "state-senate",
+}
+_FEDERAL_SEAT_REF_IDS: frozenset[str] = frozenset({
+    "66316e20ae88354aed5df702",  # us-house
+    "66316e0956dc73af879134b4",  # us-senate
 })
+
+
+def _normalize_seat_refs(value: Any) -> list[str]:
+    """Normalize the upstream ``seat`` field into a list of ref-ID strings.
+
+    Multi-reference fields in Webflow's v2 API typically return a list of
+    item-id strings, but we accept None / single-string / list shapes
+    defensively.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str) and v]
+    return []
 
 
 @dataclass
@@ -326,8 +344,22 @@ class CMSLegislator:
     bioguide_id: str | None
     is_federal: bool
     state_code: str | None
+    seat_refs: list[str]
     raw_fields: dict
     raw_item: dict
+
+    @property
+    def seat_slugs(self) -> list[str]:
+        """Resolve seat ref-IDs to their kebab-case slugs.
+
+        Unknown ref-IDs are dropped silently; this is purely a display aid
+        for audit reports.
+        """
+        return [
+            _SEAT_REF_TO_SLUG[r]
+            for r in self.seat_refs
+            if r in _SEAT_REF_TO_SLUG
+        ]
 
     @classmethod
     def from_webflow_item(
@@ -350,11 +382,15 @@ class CMSLegislator:
         attempted (round-8 fix). Audit C without a resolver will see
         every record as having no state code, which is the safer
         behavior than silent false-negatives.
+
+        Federal/state classification reads the multi-reference ``seat``
+        field and matches each ref-ID against ``_FEDERAL_SEAT_REF_IDS``.
+        Records with no seat assigned have ``is_federal=False`` and will
+        be treated as state by the orchestrator (and skipped by Audit A).
         """
         fields = item.get("fieldData") or {}
-        chamber_raw = (fields.get("chamber") or "")
-        chamber_norm = chamber_raw.strip().lower()
-        is_federal = chamber_norm in _FEDERAL_CHAMBER_VALUES
+        seat_refs = _normalize_seat_refs(fields.get("seat"))
+        is_federal = any(r in _FEDERAL_SEAT_REF_IDS for r in seat_refs)
         state_code: str | None = None
         if jurisdiction_resolver is not None:
             try:
@@ -373,6 +409,7 @@ class CMSLegislator:
             bioguide_id=(fields.get("bioguide-id") or None),
             is_federal=is_federal,
             state_code=state_code,
+            seat_refs=seat_refs,
             raw_fields=fields,
             raw_item=item,
         )
@@ -383,12 +420,18 @@ class CMSLegislator:
 
 @dataclass
 class AuditEntry:
-    """A single CMS record flagged by an audit run."""
+    """A single CMS record flagged by an audit run.
+
+    ``seat`` is a list of kebab-case slugs from the Seats CMS (e.g.
+    ``["us-senate"]``) — empty when the record has no seat assigned.
+    Using slugs keeps audit reports stable even if the Seats CMS display
+    text gets re-cased or punctuation-normalized.
+    """
 
     webflow_id: str
     slug: str
     name: str
-    chamber: str | None = None
+    seat: list[str] = field(default_factory=list)
     state_code: str | None = None
     openstates_id: str | None = None
     bioguide_id: str | None = None
@@ -1018,9 +1061,7 @@ class LegislatorBioPipeline:
                             webflow_id=cms.webflow_id,
                             slug=cms.slug,
                             name=cms.name,
-                            chamber=(
-                                cms.raw_fields.get("chamber") or None
-                            ),
+                            seat=cms.seat_slugs,
                             state_code=cms.state_code,
                             openstates_id=None,
                             bioguide_id=None,
@@ -1083,9 +1124,7 @@ class LegislatorBioPipeline:
                             webflow_id=cms.webflow_id,
                             slug=cms.slug,
                             name=cms.name,
-                            chamber=(
-                                cms.raw_fields.get("chamber") or None
-                            ),
+                            seat=cms.seat_slugs,
                             state_code=cms.state_code,
                             openstates_id=None,
                             bioguide_id=cms.bioguide_id,

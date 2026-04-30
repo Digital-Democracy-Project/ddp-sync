@@ -427,6 +427,14 @@ async def test_partition_payload_drops_unknown_fields_when_schema_known():
 # ---------- Audit A and Audit C (step 6) ----------
 
 
+_TEST_SEAT_REFS = {
+    "Senate": ["66316e0956dc73af879134b4"],   # us-senate
+    "House": ["66316e20ae88354aed5df702"],    # us-house
+    "upper": ["655288ef928edb12830673e8"],    # state-senate
+    "lower": ["655288ef928edb1283067463"],    # state-house
+}
+
+
 def _cms_item(
     *,
     item_id: str,
@@ -439,6 +447,11 @@ def _cms_item(
 ) -> dict:
     """Build a fake Webflow Legislators item for audit-input fixtures.
 
+    ``chamber`` is a convenience kwarg translated to the production
+    multi-reference ``seat`` field via ``_TEST_SEAT_REFS``. "Senate"/"House"
+    map to federal seat ref-IDs; "upper"/"lower" map to state. Pass
+    something not in the table for an empty-seat record.
+
     ``jurisdiction_ref`` simulates the Webflow multi-reference shape:
     pass a list of ref-ids (typical Webflow shape), a single ref-id
     string, or None for unset.
@@ -446,7 +459,7 @@ def _cms_item(
     fields: dict = {
         "name": name,
         "slug": name.lower().replace(" ", "-"),
-        "chamber": chamber,
+        "seat": _TEST_SEAT_REFS.get(chamber, []),
     }
     if openstatesid:
         fields["openstatesid"] = openstatesid
@@ -779,23 +792,64 @@ def test_cms_legislator_resolver_exception_treated_as_unresolved():
     assert cms.state_code is None
 
 
-def test_cms_legislator_is_federal_chamber_variants():
-    """Round-8 fix: chamber heuristic accepts common variants."""
-    for chamber in [
-        "Senate", "House", "US Senate", "U.S. Senate",
-        "US House", "U.S. House", "House of Representatives",
-        "U.S. House of Representatives", "Congress", "U.S. Congress",
-    ]:
-        item = {"id": "w", "fieldData": {"name": "X", "chamber": chamber}}
+def test_cms_legislator_is_federal_via_seat_ref_id():
+    """is_federal matches the multi-reference `seat` field against the
+    hardcoded federal seat ref-IDs (us-house, us-senate)."""
+    federal_refs = [
+        "66316e20ae88354aed5df702",   # us-house
+        "66316e0956dc73af879134b4",   # us-senate
+    ]
+    for ref in federal_refs:
+        item = {"id": "w", "fieldData": {"name": "X", "seat": [ref]}}
         cms = CMSLegislator.from_webflow_item(item)
-        assert cms.is_federal is True, f"expected federal: {chamber!r}"
+        assert cms.is_federal is True, f"expected federal: {ref}"
 
 
-def test_cms_legislator_is_federal_state_chamber_values_excluded():
-    for chamber in ["lower", "upper", "Lower", "UPPER", "Assembly"]:
-        item = {"id": "w", "fieldData": {"name": "X", "chamber": chamber}}
+def test_cms_legislator_state_seat_refs_not_federal():
+    state_refs = [
+        "655288ef928edb1283067463",   # state-house
+        "655288ef928edb12830673e8",   # state-senate
+    ]
+    for ref in state_refs:
+        item = {"id": "w", "fieldData": {"name": "X", "seat": [ref]}}
         cms = CMSLegislator.from_webflow_item(item)
-        assert cms.is_federal is False, f"expected NOT federal: {chamber!r}"
+        assert cms.is_federal is False, f"expected NOT federal: {ref}"
+
+
+def test_cms_legislator_seat_field_accepts_string_or_list_or_none():
+    """Defensive: Webflow's API typically returns a list, but accept
+    None and bare-string shapes to avoid crashes on schema variations."""
+    fed_ref = "66316e0956dc73af879134b4"
+
+    item_list = {"id": "w", "fieldData": {"name": "X", "seat": [fed_ref]}}
+    assert CMSLegislator.from_webflow_item(item_list).is_federal is True
+
+    item_str = {"id": "w", "fieldData": {"name": "X", "seat": fed_ref}}
+    assert CMSLegislator.from_webflow_item(item_str).is_federal is True
+
+    item_none = {"id": "w", "fieldData": {"name": "X", "seat": None}}
+    cms = CMSLegislator.from_webflow_item(item_none)
+    assert cms.is_federal is False
+    assert cms.seat_refs == []
+
+    item_missing = {"id": "w", "fieldData": {"name": "X"}}
+    assert CMSLegislator.from_webflow_item(item_missing).is_federal is False
+
+
+def test_cms_legislator_seat_slugs_resolves_known_ref_ids():
+    """seat_slugs is a display aid for audit reports."""
+    item = {
+        "id": "w",
+        "fieldData": {
+            "name": "X",
+            "seat": [
+                "66316e0956dc73af879134b4",   # us-senate
+                "deadbeef-unknown-ref",        # silently dropped
+            ],
+        },
+    }
+    cms = CMSLegislator.from_webflow_item(item)
+    assert cms.seat_slugs == ["us-senate"]
 
 
 # ---------- Zapier run-summary alerting (step 7) ----------

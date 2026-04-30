@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 code-complete. Steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, d4efa66); 95-test suite landed. Fifteen pm-review rounds folded in; round-15 verdict `approve` / `ship`. Step 9 (pre-flight ✅; live execution gated on production deploy + editor sign-off) remaining — see runbook in §Rollout sequence.
+**Status:** Phase 1 code-complete. Steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, d4efa66); 97-test suite landed. Fifteen pm-review rounds folded in; round-15 verdict `approve` / `ship`. Step 9 in progress — first live Audit A run (2026-04-30) surfaced a data-model mismatch: the spec assumed a flat `chamber: str` field on Legislators, but production uses a multi-reference `seat` field → Seats CMS (4 items, slugs `us-house`/`us-senate`/`state-house`/`state-senate`). Fixed by replacing `_FEDERAL_CHAMBER_VALUES` with `_FEDERAL_SEAT_REF_IDS` (hardcoded ref-IDs of the 2 federal seats; Seats CMS is small + semantically fixed so a runtime fetch isn't worth the complexity). See "Seat-resolver fix (round-16, 2026-04-30)" below.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -129,9 +129,29 @@ The round-8 reviewer flagged silent-false-negative risk in Audit C's jurisdictio
 | Resolver helper | `WebflowLookupService.resolve_jurisdiction_ref()` (new static) | Accepts None / list[str] (multi-reference) / single ref-id / already-2-letter code. Returns normalized 2-letter code or None. **US/federal jurisdiction returns None** because the orchestrator detects federal members via the chamber heuristic. |
 | `CMSLegislator.state_code` precomputed | `pipelines/legislator_bio.py` | Was a method that read flat fields. Now a `state_code` field on the dataclass, populated at `from_webflow_item()` time via the optional `jurisdiction_resolver` callable. **No flat-field fallback** — the data model is reference-based. |
 | Pipeline jurisdiction resolver | `LegislatorBioPipeline._build_jurisdiction_resolver()` (new) | Builds the resolver once at the start of `audit_*` and `_process_cms_records` / `_discover_and_create`. Jurisdictions collection is fetched once per pipeline lifetime (cached in WebflowLookupService). |
-| `is_federal` chamber variants | `_FEDERAL_CHAMBER_VALUES` constant | Round-8 low-severity #4: previous heuristic missed `"U.S. Senate"`, `"House of Representatives"`, `"Congress"`, etc. Now matches a frozenset of common variants case-insensitively after `.strip()`. |
+| `is_federal` chamber variants | `_FEDERAL_CHAMBER_VALUES` constant (superseded 2026-04-30; see seat-resolver fix below) | Round-8 low-severity #4: previous heuristic missed `"U.S. Senate"`, `"House of Representatives"`, `"Congress"`, etc. Originally matched a frozenset of common variants case-insensitively after `.strip()`. **Replaced** in the seat-resolver fix because production has no flat `chamber` field at all — federal/state classification lives on a multi-reference `seat` field. |
 | Audit C unresolvable-jurisdiction handling | `audit_state_join_keys()` | When the resolver returns None (unknown ref-id, missing jurisdiction, or "US"), `state_code=None`. With a jurisdiction filter set, those records are excluded; with no filter, they are scanned and flagged if missing `openstatesid`. **Tests pin both behaviors** so editors know which audit-only mode surfaces unresolvable records. |
 | Test fixtures updated | `tests/test_legislator_bio_foundation.py` | `_cms_item` now takes a `jurisdiction_ref` (list or string ref-id) matching the production multi-reference shape. `_make_pipeline_with_items` mocks `webflow.get_jurisdiction_mapping`. **9 new tests added; total suite: 64 tests, all pass.** |
+
+**Seat-resolver fix (round-16, 2026-04-30):**
+
+First live Audit A run on production returned `total_scanned: 0`. Investigation: every CMS record's `chamber` field was empty, so `is_federal` was False on every record, and Audit A skipped them all. User clarified the actual data model: there is **no flat `chamber` field on Legislators**. Federal/state classification lives on a multi-reference field called `seat` pointing at a separate **Seats CMS collection** (collection ID `655288ef928edb1283067286`) with exactly four items, slugs `us-house`, `us-senate`, `state-house`, `state-senate`.
+
+The fix mirrors the round-8 jurisdiction-resolver shape but is much simpler because the Seats collection is small and semantically fixed (every US state is bicameral except Nebraska's unicameral state senate, which still classifies as state). Hardcoding the federal seat ref-IDs avoids a per-run Webflow fetch + cache layer for a 4-item collection.
+
+| Fix | Location | Description |
+|---|---|---|
+| Federal seat ref-ID set | `_FEDERAL_SEAT_REF_IDS` constant (`pipelines/legislator_bio.py`) | Frozenset of the two federal Seats CMS item IDs (us-house, us-senate). Replaces `_FEDERAL_CHAMBER_VALUES`. |
+| Seat-slug display map | `_SEAT_REF_TO_SLUG` constant | All 4 ref-ID → slug pairs. Used by `CMSLegislator.seat_slugs` so audit reports surface a stable, readable slug. |
+| Seat-shape normalizer | `_normalize_seat_refs()` helper | Accepts `None` / single-string / list[str], returns `list[str]`. Defensive against API shape variations. |
+| `CMSLegislator.seat_refs` field | `pipelines/legislator_bio.py` | New dataclass field. `is_federal = any(r in _FEDERAL_SEAT_REF_IDS for r in seat_refs)`. The chamber-string read is gone; only the multi-reference `seat` field is consulted. |
+| `CMSLegislator.seat_slugs` property | `pipelines/legislator_bio.py` | Maps `seat_refs` → kebab-case slugs via `_SEAT_REF_TO_SLUG`. Drops unknown refs silently. |
+| `AuditEntry.chamber` → `AuditEntry.seat: list[str]` | `pipelines/legislator_bio.py` + `tests/test_trigger_legislator_bio_sync.py` | AuditEntry's flagged-record summary now carries a slug list (e.g. `["us-senate"]`) instead of a chamber string. Both audits populate from `cms.seat_slugs`. |
+| Test fixture compat shim | `_TEST_SEAT_REFS` in both test files | The `_cms_item` / `_cms` helpers' `chamber=` kwarg ("Senate"/"House"/"upper"/"lower") is translated to the appropriate seat ref-ID list. Existing tests didn't need rewriting. |
+| Editor checklist updated | `plans/webflow-legislator-fields.md` | "Do NOT touch" list: dropped `chamber`, added `seat` (multi-ref → Seats) with the federal/state slug semantics documented. |
+| Tests | `tests/test_legislator_bio_foundation.py` | Replaced `test_cms_legislator_is_federal_chamber_variants` + `test_cms_legislator_is_federal_state_chamber_values_excluded` with `test_cms_legislator_is_federal_via_seat_ref_id` + `test_cms_legislator_state_seat_refs_not_federal` + `test_cms_legislator_seat_field_accepts_string_or_list_or_none` + `test_cms_legislator_seat_slugs_resolves_known_ref_ids`. **97 tests pass.** |
+
+**Tradeoffs accepted:** if the Seats CMS items are ever deleted and re-created, their item IDs will change and `_FEDERAL_SEAT_REF_IDS` will need a one-line update. This is a much rarer event than the jurisdiction list growing (US has 50 states + DC + 5 territories — actively edited). For a 4-item, semantically-fixed collection, the runtime fetch overhead + cache layer + new env var aren't justified.
 
 ---
 
