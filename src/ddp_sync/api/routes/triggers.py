@@ -114,10 +114,10 @@ async def trigger_legislator_bio_sync(
         historical_since: Federal historical backfill cutoff (YYYY-MM-DD).
                           Default: 2023-01-01.
         audit_only:       Skip the sync and return just an audit report.
-                          Values: "A" (federal join-key coverage), "C"
-                          (pre-existing state CMS records lacking
-                          openstatesid). Audit B is run separately from
-                          the editor toolchain.
+                          Values: "A" (federal join-key coverage),
+                          "B" (bulk-import readiness — every record has
+                          openstatesid + no duplicates), "C" (pre-existing
+                          state CMS records lacking openstatesid).
 
     Returns: BioSyncReport JSON.
 
@@ -152,15 +152,18 @@ async def trigger_legislator_bio_sync(
             detail=f"Invalid target '{target}'. Must be all/webflow/pinecone.",
         )
 
-    # Audit-only short-circuits the sync (step 6: Audits A and C).
+    # Audit-only short-circuits the sync (step 6: Audits A and C; Audit B
+    # added before scheduler enable).
     if audit_only is not None:
         audit_code = audit_only.upper()
-        if audit_code not in ("A", "C"):
+        if audit_code not in ("A", "B", "C"):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Invalid audit_only='{audit_only}'. "
-                    "Use 'A' (federal join-key) or 'C' (pre-existing state)."
+                    f"Invalid audit_only='{audit_only}'. Use 'A' (federal "
+                    "join-key), 'B' (bulk-import readiness — no missing or "
+                    "duplicate openstatesid), or 'C' (pre-existing state "
+                    "lacking openstatesid)."
                 ),
             )
         from ddp_sync.pipelines.legislator_bio import LegislatorBioPipeline
@@ -168,6 +171,8 @@ async def trigger_legislator_bio_sync(
             pipeline = LegislatorBioPipeline(congress=source)
             if audit_code == "A":
                 report = await pipeline.audit_federal_join_keys()
+            elif audit_code == "B":
+                report = await pipeline.audit_bulk_import_readiness()
             else:  # "C"
                 report = await pipeline.audit_state_join_keys(
                     jurisdiction=jurisdiction,

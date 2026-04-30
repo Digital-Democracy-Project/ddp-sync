@@ -34,7 +34,7 @@ Error handling:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Iterable, Literal
 
@@ -441,6 +441,10 @@ class AuditEntry:
     ``["us-senate"]``) — empty when the record has no seat assigned.
     Using slugs keeps audit reports stable even if the Seats CMS display
     text gets re-cased or punctuation-normalized.
+
+    ``reason`` is set by Audit B to distinguish the two failure classes
+    (``missing_openstatesid`` vs ``duplicate_openstatesid:<id>``).
+    Audits A and C leave it unset.
     """
 
     webflow_id: str
@@ -450,6 +454,7 @@ class AuditEntry:
     state_code: str | None = None
     openstates_id: str | None = None
     bioguide_id: str | None = None
+    reason: str | None = None
 
 
 @dataclass
@@ -1174,6 +1179,86 @@ class LegislatorBioPipeline:
             flagged_count=len(flagged),
             flagged=flagged,
             jurisdiction=wanted,
+        )
+
+    async def audit_bulk_import_readiness(self) -> AuditReport:
+        """Audit B — Bulk-import readiness.
+
+        Run before enabling the bio-sync scheduler. Surfaces two failure
+        classes that would break a scheduled sync:
+
+        1. **Records missing ``openstatesid``** — the bulk-create flow is
+           supposed to populate it on every new record. Missing values
+           mean the editor toolchain skipped some, OR the records are
+           pre-existing entries Audit C should also catch. Flagged with
+           ``reason="missing_openstatesid"``.
+
+        2. **Duplicate ``openstatesid``** — two or more CMS records share
+           the same OpenStates id. The bulk-create flow silently created
+           a second draft for someone who already had a CMS entry. Each
+           offending record is flagged with
+           ``reason="duplicate_openstatesid:<the-shared-id>"`` so editors
+           can group them in the report.
+
+        Federal records get the same checks (the strict bulk-import rule
+        is "every record has openstatesid", with bioguide-id as an
+        additional join key, not an alternative).
+
+        Wraps any WebflowError as ``aborted=True``.
+        """
+        flagged: list[AuditEntry] = []
+        total = 0
+        # ref_id → list of records (for duplicate detection in second pass)
+        by_openstates_id: dict[str, list[AuditEntry]] = {}
+        resolver = await self._build_jurisdiction_resolver()
+        try:
+            async for item in self.webflow.iter_legislator_items():
+                cms = CMSLegislator.from_webflow_item(
+                    item, jurisdiction_resolver=resolver,
+                )
+                total += 1
+                entry = AuditEntry(
+                    webflow_id=cms.webflow_id,
+                    slug=cms.slug,
+                    name=cms.name,
+                    seat=cms.seat_slugs,
+                    state_code=cms.state_code,
+                    openstates_id=cms.openstates_id,
+                    bioguide_id=cms.bioguide_id,
+                )
+                if not cms.openstates_id:
+                    flagged.append(
+                        replace(entry, reason="missing_openstatesid")
+                    )
+                    continue
+                by_openstates_id.setdefault(cms.openstates_id, []).append(
+                    entry
+                )
+        except WebflowError as e:
+            return AuditReport(
+                audit_name="B",
+                total_scanned=total,
+                flagged_count=len(flagged),
+                flagged=flagged,
+                aborted=True,
+                abort_reason=f"{type(e).__name__}: {e}",
+            )
+
+        # Second pass: surface every record that shares an openstatesid
+        # with another. Each entry's reason carries the conflicting id so
+        # editors can group them.
+        for os_id, entries in by_openstates_id.items():
+            if len(entries) > 1:
+                for e in entries:
+                    flagged.append(
+                        replace(e, reason=f"duplicate_openstatesid:{os_id}")
+                    )
+
+        return AuditReport(
+            audit_name="B",
+            total_scanned=total,
+            flagged_count=len(flagged),
+            flagged=flagged,
         )
 
     # ---------- Helpers ----------

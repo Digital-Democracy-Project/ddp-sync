@@ -801,7 +801,7 @@ The `audit_only` query param skips the sync and returns just an audit report:
 - `audit_only=A`: federal join-key coverage (the orchestrator scans all federal CMS records and lists those missing both `openstatesid` and `bioguide-id`)
 - `audit_only=C`: pre-existing state CMS records lacking `openstatesid`, scoped by `jurisdiction` if provided
 
-Audit B is run separately (it's a post-bulk-import readiness check that doesn't fit the same shape — typically run from the editor toolchain).
+**Audit B** was originally scoped as "editor toolchain only" but moved into ddp-sync's trigger endpoint (2026-04-30, post-Phase-1-ship) so the scheduler can be unblocked without standing up a separate toolchain. Same shape as A and C: `POST /trigger/legislator-bio-sync?audit_only=B` returns an `AuditReport`. See `LegislatorBioPipeline.audit_bulk_import_readiness`.
 
 ---
 

@@ -694,6 +694,136 @@ async def test_audit_c_unresolvable_jurisdiction_visible_when_unfiltered():
 # ---------- Jurisdiction resolution + chamber matching (round-8 fixes) ----------
 
 
+@pytest.mark.asyncio
+async def test_audit_b_clean_population_returns_no_flags():
+    """Every record has a unique openstatesid → 0 flags."""
+    items = [
+        _cms_item(item_id="w-1", name="A", chamber="Senate",
+                  openstatesid="ocd-person/a"),
+        _cms_item(item_id="w-2", name="B", chamber="House",
+                  openstatesid="ocd-person/b"),
+        _cms_item(item_id="w-3", name="C", chamber="lower",
+                  openstatesid="ocd-person/c",
+                  jurisdiction_ref=["juris-fl"]),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.audit_name == "B"
+    assert report.total_scanned == 3
+    assert report.flagged_count == 0
+    assert report.flagged == []
+    assert report.aborted is False
+
+
+@pytest.mark.asyncio
+async def test_audit_b_flags_records_missing_openstatesid():
+    """Audit B is strict — bioguide-id alone is not enough; openstatesid
+    must be set on every record post-bulk-import."""
+    items = [
+        _cms_item(item_id="w-1", name="No openstatesid",
+                  chamber="Senate", bioguide_id="X001"),
+        _cms_item(item_id="w-2", name="Has it",
+                  chamber="House", openstatesid="ocd-person/x"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.flagged_count == 1
+    assert report.flagged[0].webflow_id == "w-1"
+    assert report.flagged[0].reason == "missing_openstatesid"
+
+
+@pytest.mark.asyncio
+async def test_audit_b_flags_duplicate_openstatesid():
+    """Two records sharing an openstatesid → both flagged with the same
+    duplicate reason carrying the conflicting id."""
+    items = [
+        _cms_item(item_id="w-1", name="First", chamber="lower",
+                  openstatesid="ocd-person/dup",
+                  jurisdiction_ref=["juris-fl"]),
+        _cms_item(item_id="w-2", name="Second", chamber="lower",
+                  openstatesid="ocd-person/dup",
+                  jurisdiction_ref=["juris-fl"]),
+        _cms_item(item_id="w-3", name="Unique", chamber="upper",
+                  openstatesid="ocd-person/uniq",
+                  jurisdiction_ref=["juris-fl"]),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.flagged_count == 2
+    flagged_ids = {e.webflow_id for e in report.flagged}
+    assert flagged_ids == {"w-1", "w-2"}
+    for e in report.flagged:
+        assert e.reason == "duplicate_openstatesid:ocd-person/dup"
+
+
+@pytest.mark.asyncio
+async def test_audit_b_surfaces_both_missing_and_duplicate_in_one_pass():
+    """A single run reports both classes of failure together."""
+    items = [
+        _cms_item(item_id="w-1", name="Missing", chamber="Senate"),
+        _cms_item(item_id="w-2", name="Dup A", chamber="House",
+                  openstatesid="ocd-person/dup"),
+        _cms_item(item_id="w-3", name="Dup B", chamber="House",
+                  openstatesid="ocd-person/dup"),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.flagged_count == 3
+    reasons = sorted(e.reason or "" for e in report.flagged)
+    assert reasons == [
+        "duplicate_openstatesid:ocd-person/dup",
+        "duplicate_openstatesid:ocd-person/dup",
+        "missing_openstatesid",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_audit_b_three_way_duplicate_flags_all_three():
+    """When three records share an openstatesid, every record is surfaced."""
+    items = [
+        _cms_item(item_id="w-1", name="A", chamber="lower",
+                  openstatesid="ocd-person/triple",
+                  jurisdiction_ref=["juris-fl"]),
+        _cms_item(item_id="w-2", name="B", chamber="lower",
+                  openstatesid="ocd-person/triple",
+                  jurisdiction_ref=["juris-fl"]),
+        _cms_item(item_id="w-3", name="C", chamber="lower",
+                  openstatesid="ocd-person/triple",
+                  jurisdiction_ref=["juris-fl"]),
+    ]
+    pipeline = _make_pipeline_with_items(items)
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.flagged_count == 3
+    assert all(
+        e.reason == "duplicate_openstatesid:ocd-person/triple"
+        for e in report.flagged
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_b_aborts_gracefully_on_webflow_error():
+    """WebflowError mid-iteration → partial report with aborted=True."""
+    async def _raising_iter():
+        yield _cms_item(item_id="w-1", chamber="Senate",
+                        openstatesid="ocd-person/a")
+        from ddp_sync.services.webflow_lookup import WebflowError
+        raise WebflowError("simulated")
+
+    webflow = MagicMock()
+    webflow.iter_legislator_items = _raising_iter
+    webflow.get_jurisdiction_mapping = AsyncMock(return_value=_TEST_JURIS_MAPPING)
+    settings = MagicMock(); settings.openstates_api_key = "k"
+    pipeline = LegislatorBioPipeline(
+        settings=settings, webflow=webflow,
+        congress=MagicMock(), openstates=MagicMock(),
+    )
+    report = await pipeline.audit_bulk_import_readiness()
+    assert report.audit_name == "B"
+    assert report.aborted is True
+    assert report.abort_reason and "WebflowError" in report.abort_reason
+    assert report.total_scanned == 1
+
+
 def test_normalize_state_code_clamps_to_two_letters():
     """Round-8 fix: only true 2-letter codes pass; full state names rejected."""
     from ddp_sync.services.webflow_lookup import WebflowLookupService

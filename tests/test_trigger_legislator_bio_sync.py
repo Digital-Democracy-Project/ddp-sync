@@ -183,6 +183,50 @@ def test_audit_only_c_with_no_jurisdiction_passes_none():
     instance.audit_state_join_keys.assert_awaited_once_with(jurisdiction=None)
 
 
+def test_audit_only_b_runs_audit_and_returns_report():
+    """audit_only=B invokes audit_bulk_import_readiness and returns the report.
+    Audit B is not jurisdiction-filtered (it's a global cross-record check)."""
+    app = _make_app(warmed=True)
+    client = TestClient(app)
+
+    from ddp_sync.pipelines.legislator_bio import AuditEntry, AuditReport
+    fake_report = AuditReport(
+        audit_name="B",
+        total_scanned=224,
+        flagged_count=2,
+        flagged=[
+            AuditEntry(webflow_id="w-1", slug="dup-a", name="Dup A",
+                       openstates_id="ocd-person/dup",
+                       reason="duplicate_openstatesid:ocd-person/dup"),
+            AuditEntry(webflow_id="w-2", slug="dup-b", name="Dup B",
+                       openstates_id="ocd-person/dup",
+                       reason="duplicate_openstatesid:ocd-person/dup"),
+        ],
+    )
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.audit_bulk_import_readiness = AsyncMock(return_value=fake_report)
+        instance.audit_federal_join_keys = AsyncMock()  # should NOT be called
+        instance.audit_state_join_keys = AsyncMock()    # should NOT be called
+        resp = client.post("/trigger/legislator-bio-sync?audit_only=B")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["audit_name"] == "B"
+    assert body["total_scanned"] == 224
+    assert body["flagged_count"] == 2
+    assert len(body["flagged"]) == 2
+    assert all(
+        e["reason"] == "duplicate_openstatesid:ocd-person/dup"
+        for e in body["flagged"]
+    )
+    instance.audit_bulk_import_readiness.assert_awaited_once_with()
+    instance.audit_federal_join_keys.assert_not_awaited()
+    instance.audit_state_join_keys.assert_not_awaited()
+
+
 def test_audit_only_exception_returns_500():
     """Unhandled exception during audit → HTTP 500 with detail."""
     app = _make_app(warmed=True)
