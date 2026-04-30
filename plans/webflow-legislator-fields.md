@@ -11,16 +11,18 @@ All new fields are **optional** so existing CMS items aren't blocked.
 The sync writes to the new fields below. These existing fields stay untouched:
 
 - `name`, `slug`
-- `openstatesid` — primary join key for the sync
-- `jurisdiction` (multi-reference → Jurisdictions CMS)
-- `seat` (multi-reference → Seats CMS; drives federal/state classification — Seats CMS slugs `us-house`/`us-senate` are federal, `state-house`/`state-senate` are state)
-- `party-2` (or `party`)
-- `district`
-- `email`
-- `image`
-- `score`
-- `post-body`
-- `description`
+- `openstatesid` (PlainText, no hyphen) — primary join key for the sync
+- `jurisdiction` (Reference → Jurisdictions CMS)
+- `seat` (Reference → Seats CMS; drives federal/state classification — Seats CMS slugs `us-house`/`us-senate` are federal, `state-house`/`state-senate` are state)
+- `party-2`
+- `district` (Number)
+- `legislator-image` (Image upload — not the URL field; sync uses `photo-source-url` instead)
+- `score` (Number)
+- `post-body` (RichText)
+- `bills` (MultiReference → Bills CMS — populated by other syncs)
+- `session-years-3` (MultiReference)
+
+Note: there is no flat `email` or `description` or `chamber` field on the live Legislators CMS — these were earlier doc assumptions that didn't match production. The actual schema is the one above. Email writes go to `office-email` (added 2026-04-30).
 
 ---
 
@@ -58,8 +60,9 @@ State legislator records will leave these blank — OpenStates' `other_identifie
 | District Phone | `phone-district` | Phone | State legislators often have only one office, populated in whichever fits |
 | District Office Address | `office-address-district` | Plain text (multi-line) | |
 | Contact Form URL | `contact-form-url` | Link | Federal members usually populate this **instead of** email |
-
-The existing `email` field stays — sync populates it for state legislators (real `@government.gov` email) but typically leaves it blank for federal members (whose "email" upstream is actually a contact-form URL → routed to `contact-form-url`).
+| Office Email | `office-email` | Email | Real `@government.gov` address for state legs; usually blank for federal (whose "email" upstream is actually a contact-form URL → routed to `contact-form-url`). Sync lowercases before sending (Webflow Email field type lowercases on storage). |
+| Campaign Email | `campaign-email` | Email | Editor-managed; sync has no upstream source. |
+| OpenStates URL | `open-states-url` | Link | OpenStates profile URL (e.g. `https://openstates.org/person/<slug>`). Sync strips trailing slash before sending (Webflow URL field strips on storage). |
 
 ### Web & social
 

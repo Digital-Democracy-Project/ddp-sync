@@ -340,7 +340,7 @@ async def test_run_federal_via_openstates_full_flow():
     assert fields["term-start"] == "2023-01-03T00:00:00.000Z"
     # Federal email-as-URL routed to contact-form-url
     assert fields.get("contact-form-url") == "https://www.rickscott.senate.gov/contact/contact"
-    assert "email" not in fields  # bare email field stays empty for federal
+    assert "office-email" not in fields  # federal email-as-URL routes to contact-form-url, not office-email
     # ballotpedia-slug and govtrack-id are URL-typed fields in the live
     # Webflow CMS; the orchestrator constructs canonical URLs (and
     # normalizes ballotpedia value's spaces → underscores).
@@ -470,7 +470,7 @@ async def test_run_state_legislator_full_flow():
     # State-sourced fields are populated
     assert fields["birth-year"] == 1972
     assert fields["gender"] == "F"
-    assert fields["email"] == "jane@myfloridahouse.gov"
+    assert fields["office-email"] == "jane@myfloridahouse.gov"
     assert fields["phone-capitol"] == "850-555-0100"
     assert fields["office-address-capitol"] == (
         "402 House Office Building, Tallahassee, FL"
@@ -528,7 +528,7 @@ async def test_run_state_legislator_email_url_routes_to_contact_form_url():
     assert report.errors == []
     _, fields = patches[0]
     assert fields["contact-form-url"] == "https://www.flhouse.gov/contact/form"
-    assert "email" not in fields
+    assert "office-email" not in fields
 
 
 @pytest.mark.asyncio
@@ -598,7 +598,7 @@ async def test_run_state_legislator_with_openstates_url_writes_openstates_id():
     _, fields = patches[0]
     # Trailing slash stripped to match Webflow's URL-field storage
     # format and prevent ChurnPATCH (post-Phase-2.5 fix).
-    assert fields["openstates-id"] == "https://openstates.org/person/jane-state-x"
+    assert fields["open-states-url"] == "https://openstates.org/person/jane-state-x"
 
 
 @pytest.mark.asyncio
@@ -631,7 +631,7 @@ async def test_run_state_legislator_email_lowercased_to_match_webflow_storage():
     _, fields = patches[0]
     # Lowercase before sending; the cardinal-rule diff matches Webflow's
     # stored form on the next run.
-    assert fields["email"] == "senator.smith@flsenate.gov"
+    assert fields["office-email"] == "senator.smith@flsenate.gov"
 
 
 @pytest.mark.asyncio
@@ -644,7 +644,7 @@ async def test_run_state_legislator_email_lowercase_no_churn_on_rerun():
         openstatesid="ocd-person/fl-stable",
         jurisdiction_ref=["juris-fl"],
         extra_fields={
-            "email": "stable.rep@flhouse.gov",  # already lowercase in CMS
+            "office-email": "stable.rep@flhouse.gov",  # already lowercase in CMS
         },
     )]
     os_record = _os_person(
@@ -664,8 +664,8 @@ async def test_run_state_legislator_email_lowercase_no_churn_on_rerun():
     assert report.errors == []
     if patches:
         _, fields = patches[0]
-        assert "email" not in fields, (
-            f"ChurnPATCH: email was re-PATCHed despite CMS already having "
+        assert "office-email" not in fields, (
+            f"ChurnPATCH: office-email was re-PATCHed despite CMS already having "
             f"the lowercased form. fields={fields}"
         )
 
@@ -682,7 +682,7 @@ async def test_run_state_legislator_openstates_url_no_churn_when_cms_has_no_trai
         jurisdiction_ref=["juris-fl"],
         extra_fields={
             # CMS already has the no-slash form from a previous run.
-            "openstates-id": "https://openstates.org/person/jane-x",
+            "open-states-url": "https://openstates.org/person/jane-x",
         },
     )]
     os_record = _os_person(
@@ -703,8 +703,8 @@ async def test_run_state_legislator_openstates_url_no_churn_when_cms_has_no_trai
     assert report.errors == []
     if patches:
         _, fields = patches[0]
-        assert "openstates-id" not in fields, (
-            f"ChurnPATCH: openstates-id re-PATCHed despite CMS having "
+        assert "open-states-url" not in fields, (
+            f"ChurnPATCH: open-states-url re-PATCHed despite CMS having "
             f"the slug-stripped form. fields={fields}"
         )
 

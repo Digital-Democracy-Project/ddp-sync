@@ -256,6 +256,21 @@ Ran `scripts/probe_openstates_state_legs.py` against 10 FL state legislators. Ou
 - **Rollback playbook** — added to §Rollback procedure with per-record vs mass-revert distinction; `--undo-last-run` capability listed as backlog.
 - **Editor sign-off acceptance criteria** — table in §Rollout sequence with field-by-field expectations + sample-size threshold.
 
+### Schema-mismatch fix: email + openstates-id field slugs (2026-04-30)
+
+After the post-Phase-2.5 ChurnPATCH fix went live, a read-only Webflow probe (`scripts/probe_webflow_legislators.py`) revealed two fields that the bio sync was writing to but the live schema didn't have:
+
+- **`email`** — bio sync wrote to `payload["email"]` for 192 state legs every run. The Legislators CMS schema has no `email` field. Schema-cache filter silently dropped the value before send. Live read-back showed 0/192 state records had any email surfaced.
+- **`openstates-id`** — Phase-2.5 wrote to `payload["openstates-id"]` for all 224 records. The schema only has `openstatesid` (PlainText, no hyphen — the join key) and not a separate `openstates-id` URL field. Same silent drop.
+
+**Fix:** the user added three new fields to the live CMS — `office-email` (Email type), `campaign-email` (Email type, editor-managed only), and `open-states-url` (Link type). Bio sync code now writes to:
+- `office-email` instead of `email` (Webflow Email type lowercases on storage; we already lowercase before sending)
+- `open-states-url` instead of `openstates-id` (URL field strips trailing slash; we already strip)
+
+Bio sync does NOT write to `campaign-email` (no upstream source).
+
+**Generalized lesson — the schema-cache "graceful degradation" tradeoff:** the cache silently drops unknown fields so partial schema rollouts don't break the sync. Same mechanism makes "writing to a wrong slug" hard to diagnose — no errors surface, fields just stay empty. Mitigation: when adding a new write target, include a verifiable-success step (read back the field after first live PATCH; or surface `dropped_fields` in the run summary). Backlog item: enable a `strict_schema=true` BioSyncOptions flag that raises when any payload field is dropped, so we can run it once after each new write target ships.
+
 ### Post-Phase-2.5 ChurnPATCH fixes (2026-04-30)
 
 First post-Phase-2.5 production dry-run revealed two more storage-format-vs-payload mismatches:
