@@ -116,17 +116,35 @@ def should_write(
 # ---------- Run-summary alerting (step 7) ----------
 
 
-def push_bio_sync_alert(webhook_url: str, report: "BioSyncReport") -> bool:
+# Default threshold for the on_large_changes escalation flag in the Zapier
+# payload (round-10 fix: was a magic number embedded inline). Editors can
+# tune this by passing ``large_changes_threshold=`` to push_bio_sync_alert.
+# Phase 2 may move this to ``sync_schedule.yaml::notifications`` for runtime
+# tuning without a code change; for Phase 1 the named constant is the
+# single source of truth.
+DEFAULT_LARGE_CHANGES_THRESHOLD = 100
+
+
+def push_bio_sync_alert(
+    webhook_url: str,
+    report: "BioSyncReport",
+    *,
+    large_changes_threshold: int = DEFAULT_LARGE_CHANGES_THRESHOLD,
+) -> bool:
     """POST a legislator-bio-sync run summary to the configured Zapier webhook.
 
     Mirrors ``pipelines/voatz_brevo.py::push_alert_to_zapier`` — sync HTTP
     via the ``requests`` library (Zapier is fire-and-forget; latency
     doesn't matter), 30s timeout, never raises (returns ``bool``).
 
+    The webhook URL comes from ``settings.zapier_webhook_url`` which the
+    config layer populates from the ``ZAPIER_WEBHOOK_URL`` env var (same
+    wiring used by ``voatz_brevo.run_sync_job``).
+
     Bio sync becomes the first consumer of the scaffolded ``notifications:``
     block in ``sync_schedule.yaml`` (PLAN run-summary alerting section).
     Threshold-based escalation routing is handled Zapier-side based on
-    the ``escalate`` and ``aborted`` flags in the payload.
+    the ``on_failure`` and ``on_large_changes`` flags in the payload.
 
     Caller is responsible for skipping this on dry-runs (no real writes
     happened, so no editor-facing alert needed).
@@ -148,7 +166,7 @@ def push_bio_sync_alert(webhook_url: str, report: "BioSyncReport") -> bool:
     # Threshold flags Zapier can route on. on_failure and on_large_changes
     # mirror the names in sync_schedule.yaml::notifications.
     on_failure = errors > 0 or report.aborted
-    on_large_changes = (patched + created) > 100
+    on_large_changes = (patched + created) > large_changes_threshold
 
     payload = {
         "alert_type": "legislator_bio_sync_complete",
@@ -173,14 +191,19 @@ def push_bio_sync_alert(webhook_url: str, report: "BioSyncReport") -> bool:
         "abort_reason": report.abort_reason,
         "on_failure": on_failure,
         "on_large_changes": on_large_changes,
+        "large_changes_threshold": large_changes_threshold,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=30)
         if 200 <= response.status_code < 300:
+            # Round-10 fix: positive-confirm metric for SLA dashboards.
+            # alert_skipped + alert_failed metrics already cover the
+            # negative paths; this closes the observability gap.
             logger.info(
                 "bio-sync Zapier alert sent",
+                metric="legislator_bio_sync.alert_sent",
                 patched=patched,
                 created=created,
                 errors=errors,

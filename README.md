@@ -81,6 +81,8 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 
 `/trigger/legislator-bio-sync` accepts query params: `dry_run` (bool), `auto_create` (bool), `jurisdiction` (str — `us` for federal or state code), `target` (`all` / `webflow` / `pinecone`), `limit` (int), `historical_since` (YYYY-MM-DD), `audit_only` (`A` or `C`). Returns 503 + `Retry-After: 60` while the unitedstates dataset is still being parsed at app startup (~55s; pre-warm fires at startup).
 
+After non-dry-run completion (including aborted runs) the bio sync POSTs a summary to the Zapier webhook configured via the `ZAPIER_WEBHOOK_URL` env var (same setting used by the Voatz→Brevo sync). Payload includes `on_failure` and `on_large_changes` boolean flags so Zapier-side filters can route to higher-priority channels. Set `ZAPIER_WEBHOOK_URL=` (empty) to disable alerts without removing the variable.
+
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 
 ### Health / Schedule

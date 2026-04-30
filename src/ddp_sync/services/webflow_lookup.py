@@ -174,6 +174,12 @@ class WebflowLookupService:
         # require a process restart. On refresh failure with a stale
         # non-empty entry, we reuse it with a structured-metric breadcrumb.
         self._jurisdiction_mapping: tuple[float, dict[str, str]] | None = None
+        # Lock around the refresh path (round-10 fix). Concurrent coroutines
+        # hitting get_jurisdiction_mapping() just after TTL expiry would
+        # otherwise each fire a fresh fetch. Single-worker safe today, but
+        # the lock matches the schema-cache pattern and protects against
+        # future high-parallelism callers.
+        self._jurisdiction_refresh_lock = asyncio.Lock()
 
     # ---------- Shared HTTP helpers ----------
 
@@ -319,9 +325,10 @@ class WebflowLookupService:
         cache, we emit ``metric=webflow.jurisdiction_mapping_empty`` so
         infra alerting can surface the silent-degraded state.
 
-        The mapping is the data-model bridge from Legislators' multi-
-        reference ``jurisdiction`` field to the flat state code that
-        audits and the orchestrator need.
+        The refresh path is guarded by an ``asyncio.Lock`` (round-10 fix)
+        so concurrent coroutines arriving just after TTL expiry don't each
+        fire a fresh fetch. Single-worker safe today; the lock protects
+        against future high-parallelism callers.
 
         Never raises — callers always get a dict (possibly empty).
         """
@@ -329,32 +336,41 @@ class WebflowLookupService:
         if cached and (time.time() - cached[0]) < JURISDICTION_CACHE_TTL_SECONDS:
             return cached[1]
 
-        fresh = await self._fetch_jurisdiction_mapping_fresh()
-        if fresh:
-            self._jurisdiction_mapping = (time.time(), fresh)
-            logger.info(
-                "Built jurisdiction mapping",
-                entries=len(fresh),
-            )
-            return fresh
+        async with self._jurisdiction_refresh_lock:
+            # Re-check inside the lock — a concurrent caller may have
+            # refreshed while we were waiting.
+            cached = self._jurisdiction_mapping
+            if cached and (
+                time.time() - cached[0]
+            ) < JURISDICTION_CACHE_TTL_SECONDS:
+                return cached[1]
 
-        # Fresh fetch returned empty
-        if cached and cached[1]:
+            fresh = await self._fetch_jurisdiction_mapping_fresh()
+            if fresh:
+                self._jurisdiction_mapping = (time.time(), fresh)
+                logger.info(
+                    "Built jurisdiction mapping",
+                    entries=len(fresh),
+                )
+                return fresh
+
+            # Fresh fetch returned empty
+            if cached and cached[1]:
+                logger.warning(
+                    "Jurisdiction refresh returned empty; reusing stale cache",
+                    metric="webflow.jurisdiction_stale_reuse",
+                    stale_age_seconds=round(time.time() - cached[0], 1),
+                )
+                return cached[1]
+
+            # No usable cache — emit metric breadcrumb so infra alerts can fire
             logger.warning(
-                "Jurisdiction refresh returned empty; reusing stale cache",
-                metric="webflow.jurisdiction_stale_reuse",
-                stale_age_seconds=round(time.time() - cached[0], 1),
+                "Jurisdiction mapping is empty; "
+                "audits and state-code resolution are disabled",
+                metric="webflow.jurisdiction_mapping_empty",
             )
-            return cached[1]
-
-        # No usable cache — emit metric breadcrumb so infra alerts can fire
-        logger.warning(
-            "Jurisdiction mapping is empty; "
-            "audits and state-code resolution are disabled",
-            metric="webflow.jurisdiction_mapping_empty",
-        )
-        self._jurisdiction_mapping = (time.time(), {})
-        return {}
+            self._jurisdiction_mapping = (time.time(), {})
+            return {}
 
     async def _fetch_jurisdiction_mapping_fresh(self) -> dict[str, str]:
         """Single-pass fetch of the Jurisdictions collection.

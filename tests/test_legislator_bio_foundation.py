@@ -875,7 +875,7 @@ def test_push_bio_sync_alert_sets_on_failure_for_aborted_run():
 
 
 def test_push_bio_sync_alert_sets_on_large_changes_above_threshold():
-    """on_large_changes flips when patched + created > 100."""
+    """on_large_changes flips when patched + created > default threshold (100)."""
     report = BioSyncReport(
         would_patch=[{"x": i} for i in range(101)],
     )
@@ -891,6 +891,62 @@ def test_push_bio_sync_alert_sets_on_large_changes_above_threshold():
         push_bio_sync_alert("https://example.com/zap", report)
 
     assert captured["json"]["on_large_changes"] is True
+    # Round-10 fix: threshold is now in payload for Zapier-side routing
+    assert captured["json"]["large_changes_threshold"] == 100
+
+
+def test_push_bio_sync_alert_threshold_is_tunable():
+    """Round-10 fix: threshold extracted to a named constant + parameter.
+
+    Editors can override the default 100 via the ``large_changes_threshold``
+    keyword argument; this is the single-source-of-truth wiring point if
+    Phase 2 moves the threshold into sync_schedule.yaml.
+    """
+    report = BioSyncReport(would_patch=[{"x": i} for i in range(50)])
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock(); m.status_code = 200; return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        # 50 patches > 25 threshold → on_large_changes True
+        push_bio_sync_alert(
+            "https://example.com/zap", report,
+            large_changes_threshold=25,
+        )
+    assert captured["json"]["on_large_changes"] is True
+    assert captured["json"]["large_changes_threshold"] == 25
+
+
+def test_push_bio_sync_alert_emits_success_metric():
+    """Round-10 fix: positive-confirm metric on successful POST.
+
+    Closes the observability gap — operators can build SLA dashboards on
+    metric=legislator_bio_sync.alert_sent.
+    """
+    report = BioSyncReport()
+    sent_log_records: list = []
+
+    def fake_post(url, json=None, timeout=None):
+        m = MagicMock(); m.status_code = 200; return m
+
+    # Capture the structlog event to verify the metric tag
+    captured_events: list = []
+    real_logger = MagicMock()
+    real_logger.info = lambda msg, **kw: captured_events.append(("info", msg, kw))
+    real_logger.error = lambda msg, **kw: captured_events.append(("error", msg, kw))
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post), \
+         patch("ddp_sync.pipelines.legislator_bio.logger", new=real_logger):
+        ok = push_bio_sync_alert("https://example.com/zap", report)
+
+    assert ok is True
+    info_events = [(m, kw) for level, m, kw in captured_events if level == "info"]
+    assert any(
+        kw.get("metric") == "legislator_bio_sync.alert_sent"
+        for _, kw in info_events
+    ), f"expected alert_sent metric in log events, got {info_events}"
 
 
 def test_push_bio_sync_alert_returns_false_on_non_2xx():
@@ -1092,6 +1148,51 @@ async def test_jurisdiction_mapping_reuses_stale_on_empty_refresh():
 
     m = await svc.get_jurisdiction_mapping()
     assert m == {"juris-fl": "FL"}, "expected stale reuse on empty refresh"
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_mapping_refresh_is_lock_serialized():
+    """Round-10 fix: concurrent callers arriving just after TTL expiry must
+    not each fire a fresh fetch. The asyncio.Lock around the refresh path
+    serializes them; only one fetch happens per expiry window.
+    """
+    from ddp_sync.services.webflow_lookup import WebflowLookupService
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_jurisdiction_collection_id = "juris"
+    settings.webflow_bills_collection_id = "b"
+    settings.webflow_legislators_collection_id = "l"
+    svc = WebflowLookupService(settings)
+
+    # Fake fetch that takes some real time so concurrency races are visible
+    fetch_count = 0
+    fetch_in_progress = 0
+    max_concurrent = 0
+
+    async def slow_fetch():
+        nonlocal fetch_count, fetch_in_progress, max_concurrent
+        fetch_in_progress += 1
+        max_concurrent = max(max_concurrent, fetch_in_progress)
+        await asyncio.sleep(0.05)  # simulate HTTP latency
+        fetch_in_progress -= 1
+        fetch_count += 1
+        return {"juris-fl": "FL"}
+
+    svc._fetch_jurisdiction_mapping_fresh = slow_fetch
+
+    # Fire 5 concurrent calls — without the lock all 5 would race the fetch
+    results = await asyncio.gather(
+        *[svc.get_jurisdiction_mapping() for _ in range(5)]
+    )
+    assert all(r == {"juris-fl": "FL"} for r in results)
+    assert fetch_count == 1, (
+        f"expected exactly 1 fetch under lock, got {fetch_count}"
+    )
+    assert max_concurrent == 1, (
+        f"expected serialized refreshes, got {max_concurrent} concurrent"
+    )
 
 
 @pytest.mark.asyncio
