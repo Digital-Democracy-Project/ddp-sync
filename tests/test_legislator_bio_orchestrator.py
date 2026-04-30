@@ -194,8 +194,17 @@ def _build_pipeline(
     webhook_url: str = "",
     patch_recorder: list | None = None,
     patch_error: Exception | None = None,
+    patch_func=None,  # round-13: callable override for mixed-success cases
 ):
-    """Wire up a fully-mocked LegislatorBioPipeline for run() tests."""
+    """Wire up a fully-mocked LegislatorBioPipeline for run() tests.
+
+    ``MagicMock(spec=...)`` is used on the service mocks so attribute access
+    for methods that don't exist on the real class raises (round-13 fix —
+    catches signature drift between the test fixture and production code).
+    """
+    from ddp_sync.services.congress_legislators import CongressLegislatorsSource
+    from ddp_sync.services.openstates_people import OpenStatesPeopleClient
+
     openstates_responses = openstates_responses or {}
     openstates_errors = openstates_errors or {}
     federal_records = federal_records or {}
@@ -208,11 +217,15 @@ def _build_pipeline(
         for item in cms_items:
             yield item
 
-    webflow = MagicMock()
+    # spec= catches drift if iter_legislator_items / get_jurisdiction_mapping /
+    # update_legislator_fields ever get renamed or dropped on the real class.
+    webflow = MagicMock(spec=WebflowLookupService)
     webflow.iter_legislator_items = fake_iter
     webflow.get_jurisdiction_mapping = AsyncMock(return_value=jurisdiction_mapping)
 
-    if patch_error is not None:
+    if patch_func is not None:
+        webflow.update_legislator_fields = patch_func
+    elif patch_error is not None:
         webflow.update_legislator_fields = AsyncMock(side_effect=patch_error)
     else:
         async def fake_patch(webflow_id, fields, *, publish=True, api_key=None):
@@ -225,10 +238,10 @@ def _build_pipeline(
         if osid in openstates_errors:
             raise openstates_errors[osid]
         return openstates_responses.get(osid)
-    openstates = MagicMock()
+    openstates = MagicMock(spec=OpenStatesPeopleClient)
     openstates.fetch_by_id = AsyncMock(side_effect=fake_fetch_by_id)
 
-    congress = MagicMock()
+    congress = MagicMock(spec=CongressLegislatorsSource)
     congress.warm_cache = AsyncMock()
     async def fake_get_by_bioguide(bg):
         return federal_records.get(bg)
@@ -573,3 +586,201 @@ async def test_jurisdiction_cache_lock_releases_when_fetch_raises():
     # confirms the lock released.
     result = await svc.get_jurisdiction_mapping()
     assert result == {"juris-fl": "FL"}
+
+
+# ---------- Round-13 follow-ups: safety-valve integration coverage ----------
+
+
+@pytest.mark.asyncio
+async def test_run_locked_fields_excluded_from_patch():
+    """Round-13 fix: the locked_fields option flows through run() to the
+    diff and excludes the named fields from the PATCH even when upstream
+    has different values. Pins the editor opt-out contract — the cardinal
+    rule's ``LOCKED_FIELDS`` skip applied via ``BioSyncOptions.locked_fields``
+    rather than a global config.
+    """
+    cms = [_cms(
+        item_id="wf-1",
+        chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/x",
+        chamber="upper",
+        bioguide="X001",
+        is_federal=True,
+    )
+    fed = _fed(
+        bioguide="X001",
+        birthday="1960-01-01",
+        twitter="LockedTwitter",
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+        patch_recorder=patches,
+    )
+
+    # Lock birth-year and twitter-handle. Upstream HAS them (1960 and
+    # LockedTwitter), but they should be excluded from the PATCH.
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False,
+        locked_fields=("birth-year", "twitter-handle"),
+    ))
+
+    assert report.aborted is False
+    assert len(patches) == 1
+    _, fields = patches[0]
+    # Locked fields excluded
+    assert "birth-year" not in fields, (
+        "birth-year was in locked_fields but appeared in PATCH payload"
+    )
+    assert "twitter-handle" not in fields, (
+        "twitter-handle was in locked_fields but appeared in PATCH payload"
+    )
+    # Other federal fields still get patched (verifies the lock is
+    # surgical, not a wholesale skip)
+    assert fields.get("wikidata-id") == "Q123"
+    assert fields.get("term-start") == "2023-01-03"
+
+
+@pytest.mark.asyncio
+async def test_run_large_changes_alert_fires_when_threshold_exceeded():
+    """Round-13 fix: a run() that PATCHes more than DEFAULT_LARGE_CHANGES_THRESHOLD
+    records correctly fires the Zapier alert with on_large_changes=True.
+
+    Exercises the full chain run() → push_bio_sync_alert → requests.post,
+    so the actual default threshold (100) is in play. 101 records is a
+    deliberate just-over-threshold setup; the test would fail if the
+    threshold logic compared <= rather than >, or if the alert payload
+    dropped the flag.
+    """
+    # 101 federal records — just over the default threshold of 100
+    cms = [
+        _cms(
+            item_id=f"wf-{i}",
+            name=f"Senator {i}",
+            chamber="Senate",
+            openstatesid=f"ocd-person/sen-{i}",
+            jurisdiction_ref=["juris-us"],
+        )
+        for i in range(101)
+    ]
+    os_responses = {
+        f"ocd-person/sen-{i}": _os_person(
+            openstates_id=f"ocd-person/sen-{i}",
+            chamber="upper",
+            bioguide=f"S{i:06d}",
+            is_federal=True,
+        )
+        for i in range(101)
+    }
+    federal_records = {
+        f"S{i:06d}": _fed(bioguide=f"S{i:06d}", first=f"Sen{i}", last="X")
+        for i in range(101)
+    }
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses=os_responses,
+        federal_records=federal_records,
+        webhook_url="https://example.com/zap",
+    )
+
+    # Capture the actual Zapier payload via requests.post (the real
+    # push_bio_sync_alert serializes through this).
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert report.aborted is False
+    assert len(report.would_patch) == 101
+    # The Zapier alert was fired with on_large_changes=True
+    assert "json" in captured, "Zapier alert was not POSTed"
+    payload = captured["json"]
+    assert payload["patched"] == 101
+    assert payload["on_large_changes"] is True, (
+        f"expected on_large_changes=True for 101 patches > threshold 100, "
+        f"got payload={payload}"
+    )
+    assert payload["large_changes_threshold"] == 100  # default in payload
+
+
+@pytest.mark.asyncio
+async def test_run_mixed_success_patches_records_per_record_results():
+    """Round-13 fix: a run with some successful PATCHes and some failed
+    PATCHes correctly records 2 successes + 1 error. Prior error tests
+    forced ALL PATCHes to fail; this is the more realistic production
+    scenario where Webflow returns 422/4xx on a specific bad record but
+    succeeds on the others.
+    """
+    cms = [
+        _cms(item_id="wf-good", name="Good Record", chamber="Senate",
+             openstatesid="ocd-person/good", jurisdiction_ref=["juris-us"]),
+        _cms(item_id="wf-bad", name="Bad Record", chamber="Senate",
+             openstatesid="ocd-person/bad", jurisdiction_ref=["juris-us"]),
+        _cms(item_id="wf-also-good", name="Also Good", chamber="Senate",
+             openstatesid="ocd-person/also-good", jurisdiction_ref=["juris-us"]),
+    ]
+    os_responses = {
+        "ocd-person/good": _os_person(
+            openstates_id="ocd-person/good", chamber="upper",
+            bioguide="G001", is_federal=True),
+        "ocd-person/bad": _os_person(
+            openstates_id="ocd-person/bad", chamber="upper",
+            bioguide="B001", is_federal=True),
+        "ocd-person/also-good": _os_person(
+            openstates_id="ocd-person/also-good", chamber="upper",
+            bioguide="GG001", is_federal=True),
+    }
+    feds = {
+        "G001": _fed(bioguide="G001"),
+        "B001": _fed(bioguide="B001"),
+        "GG001": _fed(bioguide="GG001"),
+    }
+
+    # Selective patch: 2xx for the good ones, WebflowError for the bad one.
+    patch_calls: list = []
+
+    async def selective_patch(webflow_id, fields, *, publish=True, api_key=None):
+        patch_calls.append(webflow_id)
+        if webflow_id == "wf-bad":
+            raise WebflowError("422 unprocessable on this record")
+        return WebflowPatchResult(success=True, webflow_id=webflow_id)
+
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses=os_responses,
+        federal_records=feds,
+        patch_func=selective_patch,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    # All 3 attempted
+    assert len(patch_calls) == 3, (
+        f"expected 3 PATCH attempts, got {patch_calls}"
+    )
+    # Per-record errors don't abort the run
+    assert report.aborted is False
+    # 2 successful → 2 entries in would_patch
+    assert len(report.would_patch) == 2
+    succeeded = {p["webflow_id"] for p in report.would_patch}
+    assert succeeded == {"wf-good", "wf-also-good"}
+    # 1 error recorded — the orchestrator formats per-record errors as
+    # f"{slug or webflow_id}: {type(e).__name__}: {e}"
+    assert len(report.errors) == 1
+    err = report.errors[0]
+    assert "WebflowError" in err
+    assert "422" in err
+    assert "bad-record" in err  # slug derived from "Bad Record"
