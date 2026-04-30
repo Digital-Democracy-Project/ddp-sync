@@ -356,11 +356,19 @@ class WebflowLookupService:
 
             # Fresh fetch returned empty
             if cached and cached[1]:
+                # Round-11 fix: bump the timestamp so we don't re-fire the
+                # fetch on every subsequent call during a sustained Webflow
+                # outage. We still retry once per TTL window — the cache
+                # never grows older than TTL relative to "last attempt" —
+                # so editors who fix the underlying issue see updates within
+                # an hour, rather than holding stale data indefinitely OR
+                # hammering the Webflow endpoint on every call.
                 logger.warning(
                     "Jurisdiction refresh returned empty; reusing stale cache",
                     metric="webflow.jurisdiction_stale_reuse",
                     stale_age_seconds=round(time.time() - cached[0], 1),
                 )
+                self._jurisdiction_mapping = (time.time(), cached[1])
                 return cached[1]
 
             # No usable cache — emit metric breadcrumb so infra alerts can fire

@@ -1151,6 +1151,116 @@ async def test_jurisdiction_mapping_reuses_stale_on_empty_refresh():
 
 
 @pytest.mark.asyncio
+async def test_jurisdiction_mapping_does_not_hot_loop_on_sustained_failure():
+    """Round-11 fix: the stale-reuse path must update the cache timestamp
+    so subsequent callers don't re-fire the failing fetch on every call.
+
+    Bug: previously, a sustained Webflow /collections/{id} outage would
+    cause every call after TTL expiry to acquire the lock, fire a failing
+    fetch, fall back to stale, return — but the entry's timestamp stayed
+    expired so the next call did the same thing. Effectively dropped the
+    1-hour TTL gate during outages.
+    """
+    from ddp_sync.services.webflow_lookup import (
+        WebflowLookupService,
+        JURISDICTION_CACHE_TTL_SECONDS,
+    )
+    import time as time_module
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_jurisdiction_collection_id = "juris"
+    settings.webflow_bills_collection_id = "b"
+    settings.webflow_legislators_collection_id = "l"
+    svc = WebflowLookupService(settings)
+
+    # Seed a stale entry far past TTL
+    svc._jurisdiction_mapping = (
+        time_module.time() - JURISDICTION_CACHE_TTL_SECONDS - 60,
+        {"juris-fl": "FL"},
+    )
+
+    # Refresh keeps returning empty (simulates extended Webflow outage)
+    fetch_count = 0
+
+    async def failing_fetch():
+        nonlocal fetch_count
+        fetch_count += 1
+        return {}
+
+    svc._fetch_jurisdiction_mapping_fresh = failing_fetch
+
+    # First call: triggers refresh → empty → falls back to stale
+    m1 = await svc.get_jurisdiction_mapping()
+    assert m1 == {"juris-fl": "FL"}
+    assert fetch_count == 1
+
+    # Subsequent calls within the new TTL window: should NOT re-fetch.
+    # Without the round-11 fix, fetch_count would climb on every call.
+    for _ in range(5):
+        m = await svc.get_jurisdiction_mapping()
+        assert m == {"juris-fl": "FL"}
+    assert fetch_count == 1, (
+        f"hot-loop: expected 1 fetch, got {fetch_count} — "
+        f"timestamp not bumped on stale-reuse path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_mapping_lock_serializes_failing_fetch():
+    """Strengthens the round-10 concurrency test: simulates a fetch that
+    raises during the refresh, with 10 concurrent callers, to verify the
+    lock holds even when the fetch path errors. Round-11 reviewer asked
+    for negative-path coverage on the lock."""
+    from ddp_sync.services.webflow_lookup import (
+        WebflowLookupService,
+        JURISDICTION_CACHE_TTL_SECONDS,
+    )
+    import time as time_module
+
+    settings = MagicMock()
+    settings.webflow_scheduler_api_key = "sched"
+    settings.webflow_votebot_api_key = "votebot"
+    settings.webflow_jurisdiction_collection_id = "juris"
+    settings.webflow_bills_collection_id = "b"
+    settings.webflow_legislators_collection_id = "l"
+    svc = WebflowLookupService(settings)
+
+    # Seed a stale entry so callers fall back to it after the failing fetch
+    svc._jurisdiction_mapping = (
+        time_module.time() - JURISDICTION_CACHE_TTL_SECONDS - 60,
+        {"juris-fl": "FL"},
+    )
+
+    fetch_count = 0
+    fetch_in_progress = 0
+    max_concurrent = 0
+
+    async def slow_failing_fetch():
+        nonlocal fetch_count, fetch_in_progress, max_concurrent
+        fetch_in_progress += 1
+        max_concurrent = max(max_concurrent, fetch_in_progress)
+        await asyncio.sleep(0.05)
+        fetch_in_progress -= 1
+        fetch_count += 1
+        return {}  # simulates an outage that returns nothing
+
+    svc._fetch_jurisdiction_mapping_fresh = slow_failing_fetch
+
+    # Fire 10 concurrent calls — without the lock all 10 would race the fetch
+    results = await asyncio.gather(
+        *[svc.get_jurisdiction_mapping() for _ in range(10)]
+    )
+    assert all(r == {"juris-fl": "FL"} for r in results)
+    assert fetch_count == 1, (
+        f"expected exactly 1 fetch under lock even on failure path, "
+        f"got {fetch_count}"
+    )
+    assert max_concurrent == 1
+
+
+@pytest.mark.asyncio
 async def test_jurisdiction_mapping_refresh_is_lock_serialized():
     """Round-10 fix: concurrent callers arriving just after TTL expiry must
     not each fire a fresh fetch. The asyncio.Lock around the refresh path
