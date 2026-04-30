@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ddp_sync.pipelines.legislator_bio import (
+    DEFAULT_LARGE_CHANGES_THRESHOLD,
     BioSyncOptions,
     BioSyncReport,
     LegislatorBioPipeline,
@@ -69,6 +70,7 @@ def _cms(
     openstatesid: str | None = None,
     bioguide_id: str | None = None,
     jurisdiction_ref: list | str | None = None,
+    extra_fields: dict | None = None,
 ) -> dict:
     fields: dict[str, Any] = {
         "name": name,
@@ -81,6 +83,8 @@ def _cms(
         fields["bioguide-id"] = bioguide_id
     if jurisdiction_ref is not None:
         fields["jurisdiction"] = jurisdiction_ref
+    if extra_fields:
+        fields.update(extra_fields)
     return {"id": item_id, "fieldData": fields}
 
 
@@ -647,18 +651,9 @@ async def test_run_locked_fields_excluded_from_patch():
     assert fields.get("term-start") == "2023-01-03"
 
 
-@pytest.mark.asyncio
-async def test_run_large_changes_alert_fires_when_threshold_exceeded():
-    """Round-13 fix: a run() that PATCHes more than DEFAULT_LARGE_CHANGES_THRESHOLD
-    records correctly fires the Zapier alert with on_large_changes=True.
-
-    Exercises the full chain run() → push_bio_sync_alert → requests.post,
-    so the actual default threshold (100) is in play. 101 records is a
-    deliberate just-over-threshold setup; the test would fail if the
-    threshold logic compared <= rather than >, or if the alert payload
-    dropped the flag.
-    """
-    # 101 federal records — just over the default threshold of 100
+def _build_n_federal_records(n: int):
+    """Helper for threshold tests — generates ``n`` federal CMS records
+    with matching OpenStates and congress-legislators responses."""
     cms = [
         _cms(
             item_id=f"wf-{i}",
@@ -667,7 +662,7 @@ async def test_run_large_changes_alert_fires_when_threshold_exceeded():
             openstatesid=f"ocd-person/sen-{i}",
             jurisdiction_ref=["juris-us"],
         )
-        for i in range(101)
+        for i in range(n)
     ]
     os_responses = {
         f"ocd-person/sen-{i}": _os_person(
@@ -676,12 +671,29 @@ async def test_run_large_changes_alert_fires_when_threshold_exceeded():
             bioguide=f"S{i:06d}",
             is_federal=True,
         )
-        for i in range(101)
+        for i in range(n)
     }
     federal_records = {
         f"S{i:06d}": _fed(bioguide=f"S{i:06d}", first=f"Sen{i}", last="X")
-        for i in range(101)
+        for i in range(n)
     }
+    return cms, os_responses, federal_records
+
+
+@pytest.mark.asyncio
+async def test_run_large_changes_alert_fires_when_threshold_exceeded():
+    """Round-13 fix: a run() that PATCHes more than
+    DEFAULT_LARGE_CHANGES_THRESHOLD records correctly fires the Zapier
+    alert with on_large_changes=True.
+
+    Exercises the full chain run() → push_bio_sync_alert → requests.post,
+    so the actual default threshold is in play. ``THRESHOLD + 1`` records
+    is a deliberate just-over-threshold setup. Round-14 fix: the test
+    imports ``DEFAULT_LARGE_CHANGES_THRESHOLD`` rather than hard-coding
+    100, so ops can tune the constant without breaking this test.
+    """
+    n = DEFAULT_LARGE_CHANGES_THRESHOLD + 1
+    cms, os_responses, federal_records = _build_n_federal_records(n)
     pipeline = _build_pipeline(
         cms_items=cms,
         openstates_responses=os_responses,
@@ -704,16 +716,54 @@ async def test_run_large_changes_alert_fires_when_threshold_exceeded():
         report = await pipeline.run(BioSyncOptions(dry_run=False))
 
     assert report.aborted is False
-    assert len(report.would_patch) == 101
+    assert len(report.would_patch) == n
     # The Zapier alert was fired with on_large_changes=True
     assert "json" in captured, "Zapier alert was not POSTed"
     payload = captured["json"]
-    assert payload["patched"] == 101
+    assert payload["patched"] == n
     assert payload["on_large_changes"] is True, (
-        f"expected on_large_changes=True for 101 patches > threshold 100, "
-        f"got payload={payload}"
+        f"expected on_large_changes=True for {n} patches > threshold "
+        f"{DEFAULT_LARGE_CHANGES_THRESHOLD}, got payload={payload}"
     )
-    assert payload["large_changes_threshold"] == 100  # default in payload
+    assert payload["large_changes_threshold"] == DEFAULT_LARGE_CHANGES_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_run_large_changes_alert_does_not_fire_at_exact_threshold():
+    """Round-14 fix: pin the strict-``>`` semantics. At exactly
+    ``DEFAULT_LARGE_CHANGES_THRESHOLD`` records, ``on_large_changes`` is
+    ``False`` — the alert flag fires only when count > threshold, not
+    >=. Documents the boundary case so a future refactor can't silently
+    flip the comparison.
+    """
+    n = DEFAULT_LARGE_CHANGES_THRESHOLD  # exactly at threshold
+    cms, os_responses, federal_records = _build_n_federal_records(n)
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses=os_responses,
+        federal_records=federal_records,
+        webhook_url="https://example.com/zap",
+    )
+
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert len(report.would_patch) == n
+    payload = captured["json"]
+    assert payload["patched"] == n
+    # The boundary case: == threshold, NOT > threshold → flag stays False
+    assert payload["on_large_changes"] is False, (
+        f"expected on_large_changes=False for exactly {n} patches "
+        f"(== threshold); got True (semantics flipped to >=?)"
+    )
 
 
 @pytest.mark.asyncio
@@ -784,3 +834,82 @@ async def test_run_mixed_success_patches_records_per_record_results():
     assert "WebflowError" in err
     assert "422" in err
     assert "bad-record" in err  # slug derived from "Bad Record"
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_blank_populated_cms_field_with_empty_upstream():
+    """Round-14 fix: the cardinal 'never blank a populated CMS field with
+    empty upstream' rule is pinned end-to-end through ``run()``.
+
+    This is the mass-blank-prevention scenario the reviewer flagged: if
+    an upstream API schema shift caused birth-year to start coming through
+    as ``None``, would the orchestrator silently overwrite the editor-
+    populated CMS values with empty? No — two layers of defense prevent
+    this:
+      1. ``_build_federal_payload`` strips None values before the diff
+      2. ``_diff_fields`` (via ``should_write`` / ``is_empty``) skips
+         empty upstream values
+
+    This test exercises both layers via run(). The federal record has
+    None for ``birthday`` and no twitter handle; the CMS record has
+    populated values for ``birth-year`` and ``twitter-handle``. The
+    PATCH must not touch those fields. Other federal-source fields
+    (``wikidata-id``, ``opensecrets-id``) WILL be patched, confirming
+    the orchestrator did process the record (this isn't a no-op skip).
+    """
+    cms = [_cms(
+        item_id="wf-1",
+        name="Editor Populated",
+        chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+        extra_fields={
+            # Editor populated these manually:
+            "birth-year": "1965",
+            "twitter-handle": "EditorPopulated",
+        },
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/x",
+        chamber="upper",
+        bioguide="X001",
+        is_federal=True,
+    )
+    # Federal source: None for the protected fields, populated for others
+    fed = _fed(
+        bioguide="X001",
+        birthday=None,    # ← upstream None (e.g. API schema shift)
+        twitter=None,     # ← upstream None (e.g. handle deleted)
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+        patch_recorder=patches,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert report.aborted is False
+    # The orchestrator DID process the record (verifies this isn't a
+    # no-op pass that would also incidentally avoid blanking).
+    assert len(patches) == 1, (
+        f"expected one PATCH (other fields differ), got {patches}"
+    )
+    _, fields = patches[0]
+
+    # Mass-blank prevention: the populated CMS fields are NOT blanked
+    # by None upstream
+    assert "birth-year" not in fields, (
+        f"mass-blank: birth-year was None upstream but appeared in PATCH "
+        f"payload — would have blanked editor-populated '1965'. fields={fields}"
+    )
+    assert "twitter-handle" not in fields, (
+        f"mass-blank: twitter-handle was None upstream but appeared in "
+        f"PATCH payload — would have blanked editor-populated handle. "
+        f"fields={fields}"
+    )
+    # Other federal fields ARE present (confirms processing happened)
+    assert fields.get("wikidata-id") == "Q123"
+    assert fields.get("opensecrets-id") == "N00012345"
