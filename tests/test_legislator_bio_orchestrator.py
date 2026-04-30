@@ -329,6 +329,11 @@ async def test_run_federal_via_openstates_full_flow():
     # Federal email-as-URL routed to contact-form-url
     assert fields.get("contact-form-url") == "https://www.rickscott.senate.gov/contact/contact"
     assert "email" not in fields  # bare email field stays empty for federal
+    # ballotpedia-slug and govtrack-id are URL-typed fields in the live
+    # Webflow CMS; the orchestrator constructs canonical URLs (and
+    # normalizes ballotpedia value's spaces → underscores).
+    assert fields["ballotpedia-slug"] == "https://ballotpedia.org/Rick_Scott"
+    assert fields["govtrack-id"] == "https://www.govtrack.us/congress/members/412345"
 
 
 @pytest.mark.asyncio

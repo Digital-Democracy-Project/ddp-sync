@@ -752,10 +752,23 @@ class LegislatorBioPipeline:
             payload["bioguide-id"] = ids.get("bioguide")
             payload["wikidata-id"] = ids.get("wikidata")
             payload["opensecrets-id"] = ids.get("opensecrets")
-            payload["ballotpedia-slug"] = ids.get("ballotpedia")
+            # ballotpedia-slug and govtrack-id are URL-typed in the live
+            # Webflow CMS even though the upstream values are bare slugs /
+            # numeric IDs. We construct the canonical URLs so the field
+            # accepts the value (and the website can render the link
+            # directly). The unitedstates YAML occasionally writes the
+            # ballotpedia value with spaces instead of underscores
+            # (observed for a 2025-elected freshman); normalize that.
+            bp = ids.get("ballotpedia")
+            if bp:
+                payload["ballotpedia-slug"] = (
+                    f"https://ballotpedia.org/{bp.replace(' ', '_')}"
+                )
             gov_track = ids.get("govtrack")
             if gov_track is not None:
-                payload["govtrack-id"] = str(gov_track)
+                payload["govtrack-id"] = (
+                    f"https://www.govtrack.us/congress/members/{gov_track}"
+                )
 
         # Bio (year-only birth — privacy)
         if federal is not None:

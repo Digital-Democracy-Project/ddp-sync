@@ -37,8 +37,8 @@ These let the website link out to the legislator's profile on partner platforms.
 | Bioguide ID | `bioguide-id` | Plain text | Federal only. Drives the official Congress.gov portrait URL. Also the join-key fallback for departed federal members. |
 | Wikidata ID | `wikidata-id` | Plain text | Federal only. Format: `Q12345678`. |
 | OpenSecrets ID | `opensecrets-id` | Plain text | Federal only. Format: `N00012345`. |
-| Ballotpedia Slug | `ballotpedia-slug` | Plain text | Federal only. Becomes part of `ballotpedia.org/{slug}`. |
-| GovTrack ID | `govtrack-id` | Plain text | Federal only. Numeric. |
+| Ballotpedia Slug | `ballotpedia-slug` | Link / URL | Federal only. Sync writes the canonical URL `https://ballotpedia.org/{slug}` (spaces in the upstream slug are normalized to underscores). **Live CMS uses Link/URL type** — confirmed during step-9 rollout. |
+| GovTrack ID | `govtrack-id` | Link / URL | Federal only. Sync writes `https://www.govtrack.us/congress/members/{id}`. **Live CMS uses Link/URL type** — confirmed during step-9 rollout. |
 
 State legislator records will leave these blank — OpenStates' `other_identifiers` is empty for state legislators.
 
