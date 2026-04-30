@@ -596,7 +596,117 @@ async def test_run_state_legislator_with_openstates_url_writes_openstates_id():
     report = await pipeline.run(BioSyncOptions(dry_run=False))
     assert report.errors == []
     _, fields = patches[0]
-    assert fields["openstates-id"] == "https://openstates.org/person/jane-state-x/"
+    # Trailing slash stripped to match Webflow's URL-field storage
+    # format and prevent ChurnPATCH (post-Phase-2.5 fix).
+    assert fields["openstates-id"] == "https://openstates.org/person/jane-state-x"
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_email_lowercased_to_match_webflow_storage():
+    """ChurnPATCH prevention: Webflow's email field lowercases on storage.
+    If we send mixed-case (some FL Senate emails were observed mixed-case
+    on the 2026-04-30 production run), every subsequent run sees a diff
+    and re-PATCHes. Lowercase before sending so the value round-trips."""
+    cms = [_cms(
+        item_id="wf-fl-mixed",
+        chamber="upper",
+        openstatesid="ocd-person/fl-mixed",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-mixed",
+        chamber="upper",
+        state="FL",
+        is_federal=False,
+        email="Senator.Smith@flsenate.gov",   # ← mixed case from upstream
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-mixed": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    # Lowercase before sending; the cardinal-rule diff matches Webflow's
+    # stored form on the next run.
+    assert fields["email"] == "senator.smith@flsenate.gov"
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_email_lowercase_no_churn_on_rerun():
+    """When CMS already has the lowercase email and upstream returns the
+    same value (mixed-case or lowercase), no re-PATCH happens."""
+    cms = [_cms(
+        item_id="wf-fl-stable",
+        chamber="lower",
+        openstatesid="ocd-person/fl-stable",
+        jurisdiction_ref=["juris-fl"],
+        extra_fields={
+            "email": "stable.rep@flhouse.gov",  # already lowercase in CMS
+        },
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-stable",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+        email="Stable.Rep@FLHOUSE.GOV",   # upstream returns mixed case
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-stable": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    if patches:
+        _, fields = patches[0]
+        assert "email" not in fields, (
+            f"ChurnPATCH: email was re-PATCHed despite CMS already having "
+            f"the lowercased form. fields={fields}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_openstates_url_no_churn_when_cms_has_no_trailing_slash():
+    """ChurnPATCH prevention for openstates-id (URL-typed): Webflow strips
+    trailing slash on storage; we strip before sending so the round-trip
+    matches."""
+    cms = [_cms(
+        item_id="wf-fl-osurl",
+        chamber="lower",
+        openstatesid="ocd-person/fl-osurl",
+        jurisdiction_ref=["juris-fl"],
+        extra_fields={
+            # CMS already has the no-slash form from a previous run.
+            "openstates-id": "https://openstates.org/person/jane-x",
+        },
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-osurl",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+    )
+    # Upstream returns with trailing slash (canonical OpenStates form).
+    os_record.openstates_url = "https://openstates.org/person/jane-x/"
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-osurl": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    if patches:
+        _, fields = patches[0]
+        assert "openstates-id" not in fields, (
+            f"ChurnPATCH: openstates-id re-PATCHed despite CMS having "
+            f"the slug-stripped form. fields={fields}"
+        )
 
 
 @pytest.mark.asyncio

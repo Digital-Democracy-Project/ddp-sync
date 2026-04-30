@@ -829,8 +829,12 @@ class LegislatorBioPipeline:
         # `openstates-id` field on the CMS; one-line "see this person on
         # OpenStates" link). Phase-2.5 addition; populated from
         # OpenStates' `openstates_url` field.
+        # Trailing slash is stripped because Webflow's URL field
+        # round-trips without it; without this normalization every run
+        # would re-PATCH (ChurnPATCH observed 2026-04-30 on 222/224
+        # records after the Phase-2.5 ship).
         if os_record is not None and os_record.openstates_url:
-            payload["openstates-id"] = os_record.openstates_url
+            payload["openstates-id"] = os_record.openstates_url.rstrip("/")
 
         # Cross-source IDs (mostly federal-only — the unitedstates dataset
         # publishes them all with high coverage, so prefer that source).
@@ -969,9 +973,11 @@ class LegislatorBioPipeline:
         """
         payload: dict[str, Any] = {}
 
-        # OpenStates profile URL → openstates-id (URL-typed CMS field)
+        # OpenStates profile URL → openstates-id (URL-typed CMS field).
+        # Trailing slash stripped to match Webflow's storage format
+        # (see _build_federal_payload comment for ChurnPATCH context).
         if os_record.openstates_url:
-            payload["openstates-id"] = os_record.openstates_url
+            payload["openstates-id"] = os_record.openstates_url.rstrip("/")
 
         payload["birth-year"] = self._year_from_iso(os_record.birth_date)
         payload["gender"] = os_record.gender
@@ -983,7 +989,13 @@ class LegislatorBioPipeline:
 
         email, form = split_email_field(os_record.email)
         if email:
-            payload["email"] = email
+            # Lowercase the local-part too — Webflow's email field
+            # appears to lowercase on storage, so upstream mixed-case
+            # emails (observed for some FL Senate records) churned
+            # every run when sent verbatim. Email addresses are
+            # treated as case-insensitive in practice (RFC 5321 allows
+            # case-sensitive local-parts but mainstream MTAs don't).
+            payload["email"] = email.lower()
         if form:
             payload["contact-form-url"] = form
 

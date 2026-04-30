@@ -256,6 +256,18 @@ Ran `scripts/probe_openstates_state_legs.py` against 10 FL state legislators. Ou
 - **Rollback playbook** — added to §Rollback procedure with per-record vs mass-revert distinction; `--undo-last-run` capability listed as backlog.
 - **Editor sign-off acceptance criteria** — table in §Rollout sequence with field-by-field expectations + sample-size threshold.
 
+### Post-Phase-2.5 ChurnPATCH fixes (2026-04-30)
+
+First post-Phase-2.5 production dry-run revealed two more storage-format-vs-payload mismatches:
+
+**`openstates-id` URL trailing slash:** OpenStates' `openstates_url` ends with `/` (e.g. `https://openstates.org/person/x-xxx/`). Webflow's URL field strips the trailing slash on storage, so every run saw `cms = "...x"` vs `upstream = "...x/"` → diff → re-PATCH. Fix: `.rstrip("/")` before sending. 222 of 224 records were churning (the 2 that stuck were ones where OpenStates happened to not emit a trailing slash). Also fixes a similar pattern that would arise if any future URL-typed field's upstream value carries a trailing slash that Webflow drops.
+
+**`email` lowercase normalization:** Webflow's email field lowercases on storage. FL House emails were already lowercase upstream so the probe didn't catch this; FL Senate (and likely other states) had mixed-case emails that Webflow normalized, churning every run. Fix: `email.lower()` before sending. 189 of 192 state records were churning (the 3 that stuck likely had URL-shaped emails routed to `contact-form-url` instead).
+
+**Generalized lesson:** Webflow URL and email field types apply normalization on storage. When we add a new write target, the storage format may differ from what we send, surfacing only in the second run as ChurnPATCH. Mitigation pattern: send the canonical/storage form (lowercase email, no-trailing-slash URL) at payload-build time so the diff round-trips correctly.
+
+3 new tests pin both fixes (mixed-case email lowercased, lowercase email no-churn-on-rerun, openstates-id no-churn-when-cms-no-trailing-slash).
+
 ### What we deliberately deferred
 
 - **Social handles for state legs** — confirmed not available from OpenStates. Phase 3 if a different upstream source is found.
