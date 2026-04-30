@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6, 7 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, + forthcoming round-11 hot-loop fix commit); 82-test suite landed. Eleven pm-review rounds folded in (rev 12). Steps 8–9 still pending.
+**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, + forthcoming step-8 commit); 90-test suite landed. Twelve pm-review rounds folded in (rev 13). Step 9 still pending.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -90,8 +90,9 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 6a | Audit test suite | (forthcoming) | ✅ 8 audit tests: A flags only federal-with-no-keys, A skips state, A doesn't flag records with one key, A handles empty federal set; C flags state-no-openstatesid, C filters by jurisdiction (case-insensitive), C scans all states when no jurisdiction; A aborts gracefully on WebflowError. Plus 4 endpoint integration tests for the audit-only paths. Total suite: **55 tests, all pass.** |
 | 7 | Run-summary alerting via Zapier | 4427dd3 + c492891 + round-11 hot-loop fix | ✅ `push_bio_sync_alert(webhook_url, report, *, large_changes_threshold=100)` mirrors `voatz_brevo.push_alert_to_zapier`. Wired into `LegislatorBioPipeline.run()` via `try/finally`; alert fires on **every non-dry-run completion including aborts**. Payload includes `on_failure` and `on_large_changes` threshold flags + the threshold value itself for Zapier-side routing. **Round-9 follow-ups:** jurisdiction cache 1h TTL + stale-on-empty-refresh reuse + `metric=webflow.jurisdiction_mapping_empty` breadcrumb. **Round-10 follow-ups:** `asyncio.Lock` serializes concurrent refresh attempts; `large_changes_threshold` extracted to a named constant + tunable parameter; `metric=legislator_bio_sync.alert_sent` on successful POST closes the SLA-dashboard gap. **Round-11 fix (real bug):** stale-reuse path now bumps the cache timestamp, preventing a hot-loop on Webflow where every call after TTL expiry would re-fire a failing fetch during a sustained outage. |
 | 7a | Alerting + cache test suite | 4427dd3 + c492891 + round-11 | ✅ 6 alert-function tests; 4 `run()` integration tests; 4 cache tests (TTL, stale-reuse on empty, empty-mapping breadcrumb, lock-serializes-concurrent-refresh); 2 round-10 tests (threshold-tunable, success-metric-emitted); **2 round-11 tests** (no-hot-loop on sustained failure, lock-serializes-failing-fetch with 10 concurrent callers). **Total suite: 82 tests, all pass.** |
-| 8 | Orchestrator-internal `run()` integration tests | — | ⏳ Foundation + endpoint + audit + alert tests landed; the only remaining gap is a single full-pass `run()` integration test exercising the orchestrator end-to-end. |
-| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ |
+| 8 | Orchestrator-internal `run()` integration tests | (forthcoming) | ✅ `tests/test_legislator_bio_orchestrator.py` — 8 integration tests covering full-pass `run()` flows: (1) federal happy path via OpenStates with bioguide-enrichment, (2) departed-federal bioguide-fallback (Karen Bass case), (3) state record skipped as Phase-2 stub (logged + not orphaned + no PATCH), (4) dry-run emits no PATCHes and no Zapier alert, (5) per-record WebflowError continues run with errors[] entry, (6) WebflowRateLimitError aborts run cleanly with alert still firing, (7) jurisdiction="us" filter excludes state records, (8) round-12 follow-up: jurisdiction-cache lock releases when fetch raises (deadlock-free recovery). New `_build_pipeline()` test fixture wires up fully-mocked Webflow / OpenStates / congress sources with helpers for fixture-building. |
+| 8a | Round-12 polish bundled into step 8 | (forthcoming) | ✅ Doc-comment on `get_jurisdiction_mapping` clarifies the returned dict is owned by the cache + treat as read-only. Lock-release-on-raising-fetch test (8th orchestrator test above) pins the contract. |
+| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ Last step — pre-merge staging smoke + 5-record dry-run + 1 live PATCH on a low-stakes record. |
 
 **Round-5 fixes applied (in commit 24d058e):**
 
@@ -902,8 +903,11 @@ Round-3 review surfaced two scope additions to land **before** any new modules: 
    c. ✅ Payload includes `on_failure` (errors > 0 OR aborted) and `on_large_changes` (patched + created > 100) threshold flags for Zapier-side routing.
    d. ✅ Round-9 follow-ups bundled: jurisdiction cache gains 1h TTL + stale-on-empty-refresh reuse + `metric=webflow.jurisdiction_mapping_empty` breadcrumb. Tests pin all three.
    e. ✅ 13 new tests; **total suite: 77 tests, all pass**.
-8. ⏳ Orchestrator-internal `run()` integration tests — next (foundation + endpoint + audit + alert tests landed; remaining gap is a single full-pass run() test)
-9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record
+8. **Orchestrator-internal `run()` integration tests — IMPLEMENTED:**
+   a. ✅ New `tests/test_legislator_bio_orchestrator.py` — 8 integration tests covering full-pass `run()` flows: federal-via-OpenStates happy path, bioguide-fallback for departed federal (Karen Bass case), state record Phase-2 stub, dry-run, per-record WebflowError, rate-limit-aborted-with-alert, jurisdiction filter, jurisdiction-cache lock-release-on-raising-fetch.
+   b. ✅ `_build_pipeline()` test fixture for fully-mocked end-to-end runs.
+   c. ✅ Round-12 polish bundled: doc-comment on `get_jurisdiction_mapping` returned dict + lock-release contract test. **Total suite: 90 tests, all pass.**
+9. ⏳ Dry-run against 5 federal members → 1 live PATCH on low-stakes record (last step)
 
 **Phase 2 — State coverage (target: 2–4 weeks after Phase 1)**
 1. Extend orchestrator to handle 7 active jurisdictions

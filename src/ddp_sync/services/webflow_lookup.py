@@ -331,6 +331,12 @@ class WebflowLookupService:
         against future high-parallelism callers.
 
         Never raises — callers always get a dict (possibly empty).
+
+        **Returned dict is owned by the cache** — treat it as read-only
+        (round-12 doc fix). Mutating the returned dict will corrupt cache
+        state for future callers within the TTL window. The orchestrator
+        and audits only read; if a future caller needs to mutate, copy
+        first via ``dict(mapping)``.
         """
         cached = self._jurisdiction_mapping
         if cached and (time.time() - cached[0]) < JURISDICTION_CACHE_TTL_SECONDS:
