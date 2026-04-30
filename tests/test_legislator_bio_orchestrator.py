@@ -532,6 +532,190 @@ async def test_run_state_legislator_email_url_routes_to_contact_form_url():
 
 
 @pytest.mark.asyncio
+async def test_run_state_legislator_missing_birth_date_does_not_set_birth_year():
+    """Phase-2.5 edge case: state legs with no birth_date in OpenStates
+    (5-of-10 in the FL probe) should not produce a birth-year field at
+    all (None gets stripped by the build's filter)."""
+    cms = [_cms(
+        item_id="wf-fl-bd",
+        chamber="lower",
+        openstatesid="ocd-person/fl-bd",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-bd",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+        # birth_date intentionally omitted (the OpenStates probe found
+        # 50% of FL state legs have it null)
+        gender="F",
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-bd": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    if patches:
+        _, fields = patches[0]
+        assert "birth-year" not in fields, (
+            "birth-year should not appear when birth_date is empty/None"
+        )
+        assert fields.get("gender") == "F"
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_with_openstates_url_writes_openstates_id():
+    """Phase-2.5: openstates_url → openstates-id (URL-typed CMS field)."""
+    cms = [_cms(
+        item_id="wf-fl-url",
+        chamber="lower",
+        openstatesid="ocd-person/fl-url",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-url",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+        gender="M",
+    )
+    # Manually set openstates_url on the dataclass (the test fixture
+    # doesn't yet support it as a kwarg, but the field exists post-
+    # Phase-2.5 update).
+    os_record.openstates_url = "https://openstates.org/person/jane-state-x/"
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-url": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    assert fields["openstates-id"] == "https://openstates.org/person/jane-state-x/"
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_fl_override_extracts_official_website():
+    """Phase-2.5: FL state-payload override picks the link with note
+    ``member detail page`` (or first link to a known FL host) for
+    official-website. Other states get default pass-through (no FL
+    override applied)."""
+    from ddp_sync.services.openstates_people import OpenStatesPerson
+    cms = [_cms(
+        item_id="wf-fl-ow",
+        chamber="lower",
+        openstatesid="ocd-person/fl-ow",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    raw = {
+        "id": "ocd-person/fl-ow",
+        "name": "Jane FL",
+        "current_role": {
+            "org_classification": "lower", "district": "57",
+        },
+        "jurisdiction": {"name": "Florida"},
+        "links": [
+            {"url": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4885", "note": ""},
+            {"url": "https://myfloridahouse.gov/Sections/Representatives/details.aspx?MemberId=4885&LegislativeTermId=90", "note": "member detail page"},
+            {"url": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4885", "note": ""},
+        ],
+    }
+    os_record = OpenStatesPerson.from_api(raw)
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-ow": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    # Override picks the "member detail page" note when present
+    assert fields["official-website"] == (
+        "https://myfloridahouse.gov/Sections/Representatives/details.aspx?MemberId=4885&LegislativeTermId=90"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_fl_override_falls_back_to_known_host():
+    """When no link has the 'member detail page' note, the FL override
+    falls back to the first link with a known FL legislature host."""
+    from ddp_sync.services.openstates_people import OpenStatesPerson
+    cms = [_cms(
+        item_id="wf-fl-host",
+        chamber="upper",
+        openstatesid="ocd-person/fl-host",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    raw = {
+        "id": "ocd-person/fl-host",
+        "name": "Jane FL Sen",
+        "current_role": {"org_classification": "upper"},
+        "jurisdiction": {"name": "Florida"},
+        "links": [
+            {"url": "https://example.com/random", "note": ""},
+            {"url": "https://www.flsenate.gov/Senators/S29", "note": ""},
+        ],
+    }
+    os_record = OpenStatesPerson.from_api(raw)
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-host": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    assert fields["official-website"] == (
+        "https://www.flsenate.gov/Senators/S29"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_non_fl_state_skips_fl_override():
+    """States without an override entry get the default state payload
+    (no official-website extraction). Confirms the override registry
+    is keyed correctly."""
+    from ddp_sync.services.openstates_people import OpenStatesPerson
+    cms = [_cms(
+        item_id="wf-ma-1",
+        chamber="lower",
+        openstatesid="ocd-person/ma-1",
+        jurisdiction_ref=["juris-ma"],
+    )]
+    raw = {
+        "id": "ocd-person/ma-1",
+        "name": "MA Rep",
+        "current_role": {"org_classification": "lower"},
+        "jurisdiction": {"name": "Massachusetts"},
+        "links": [
+            {"url": "https://malegislature.gov/Legislators/Profile/X", "note": "member detail page"},
+        ],
+    }
+    os_record = OpenStatesPerson.from_api(raw)
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/ma-1": os_record},
+        patch_recorder=patches,
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    if patches:
+        _, fields = patches[0]
+        # MA has no entry in _STATE_PAYLOAD_OVERRIDES, so even with
+        # a "member detail page" link, the default state builder
+        # doesn't extract official-website.
+        assert "official-website" not in fields
+
+
+@pytest.mark.asyncio
 async def test_run_state_legislator_no_capitol_office_skips_phone_and_address():
     """When OpenStates returns no capitol office, the orchestrator
     omits phone-capitol + office-address-capitol entirely (cardinal rule

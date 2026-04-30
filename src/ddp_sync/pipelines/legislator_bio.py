@@ -321,6 +321,65 @@ _FEDERAL_SEAT_REF_IDS: frozenset[str] = frozenset({
 })
 
 
+# ---------- Per-state payload overrides (Phase 2.5) ----------
+#
+# OpenStates carries some fields per-state that need jurisdiction-specific
+# extraction. The default state-builder is generic; overrides here
+# augment the payload for specific states. Each override receives the
+# OpenStatesPerson and returns a partial payload dict (or empty dict).
+#
+# The override is best-effort: if it raises, the orchestrator logs a
+# warning and continues with the default payload. Don't put critical
+# fields here — keep the override scoped to enrichment fields the
+# default state builder can't get generically.
+
+_FL_OFFICIAL_WEBSITE_HOSTS = (
+    "myfloridahouse.gov",
+    "www.myfloridahouse.gov",
+    "flsenate.gov",
+    "www.flsenate.gov",
+)
+_FL_PROFILE_LINK_NOTES = ("member detail page",)
+
+
+def _fl_state_override(os_record: "OpenStatesPerson") -> dict:
+    """FL-specific enrichment.
+
+    Extracts ``official-website`` from ``links[]`` by picking the
+    "member detail page" note when present (9-of-10 coverage in the
+    2026-04-30 probe), falling back to the first link with a known
+    FL-legislature host. Other states' override functions can mirror
+    this shape.
+    """
+    payload: dict = {}
+    links = os_record.links or []
+
+    chosen: str | None = None
+    for link in links:
+        note = (link.get("note") or "").strip().lower()
+        if note in _FL_PROFILE_LINK_NOTES:
+            chosen = link.get("url")
+            break
+    if not chosen:
+        for link in links:
+            url = link.get("url") or ""
+            try:
+                from urllib.parse import urlparse
+                if urlparse(url).netloc.lower() in _FL_OFFICIAL_WEBSITE_HOSTS:
+                    chosen = url
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    if chosen:
+        payload["official-website"] = chosen
+    return payload
+
+
+_STATE_PAYLOAD_OVERRIDES: dict[str, Callable[["OpenStatesPerson"], dict]] = {
+    "FL": _fl_state_override,
+}
+
+
 def _normalize_seat_refs(value: Any) -> list[str]:
     """Normalize the upstream ``seat`` field into a list of ref-ID strings.
 
@@ -766,6 +825,13 @@ class LegislatorBioPipeline:
         """
         payload: dict[str, Any] = {}
 
+        # OpenStates profile URL — applies to federal too (URL-typed
+        # `openstates-id` field on the CMS; one-line "see this person on
+        # OpenStates" link). Phase-2.5 addition; populated from
+        # OpenStates' `openstates_url` field.
+        if os_record is not None and os_record.openstates_url:
+            payload["openstates-id"] = os_record.openstates_url
+
         # Cross-source IDs (mostly federal-only — the unitedstates dataset
         # publishes them all with high coverage, so prefer that source).
         if federal is not None:
@@ -883,17 +949,29 @@ class LegislatorBioPipeline:
             vary in stability, but the field is URL-typed and accepts
             any URL — quality issues are a separate concern)
 
-        Skipped (Phase-2.5 follow-ups when warranted):
-          - twitter/facebook/instagram/youtube — would require parsing
-            os_record.links[]; coverage on state legs is sparse
-          - official-website — not a top-level OpenStatesPerson field;
-            often present in links[] under a "homepage" note, but the
-            note text is editor-managed upstream and not stable
-          - term-start / term-end / seniority-rank — OpenStatesPerson
-            doesn't surface roles[] term dates; current_role lacks
-            start_date for state. Defer until probed.
+        Confirmed not in OpenStates `/people` v3 for state legs (per the
+        2026-04-30 probe of 10 FL state legislators):
+          - twitter/facebook/instagram/youtube — zero matching URLs in
+            ``links[]`` across 10 sampled records; OpenStates simply
+            doesn't carry social media for FL state legs.
+          - ``current_role`` has only ``title``, ``org_classification``,
+            ``district``, ``division_id`` — no start_date / end_date.
+          - ``roles[]`` term-history is not returned by /people even
+            with default includes.
+          - ``other_identifiers`` is empty (no bioguide/wikidata/etc).
+          - ``biography`` is empty.
+
+        ``official-website`` IS extractable per-state but the
+        link-classification is jurisdiction-specific (FL House uses
+        note="member detail page"; other states will differ). Per-state
+        overrides happen via ``_STATE_PAYLOAD_OVERRIDES`` so the default
+        builder stays generic.
         """
         payload: dict[str, Any] = {}
+
+        # OpenStates profile URL → openstates-id (URL-typed CMS field)
+        if os_record.openstates_url:
+            payload["openstates-id"] = os_record.openstates_url
 
         payload["birth-year"] = self._year_from_iso(os_record.birth_date)
         payload["gender"] = os_record.gender
@@ -911,6 +989,23 @@ class LegislatorBioPipeline:
 
         if os_record.image:
             payload["photo-source-url"] = os_record.image
+
+        # Per-state overrides for jurisdiction-specific extraction (e.g.
+        # FL extracts official-website from links[] by host pattern).
+        # Default registry is empty; overrides return a partial payload
+        # dict that gets merged in. None-strip happens after merge.
+        override = _STATE_PAYLOAD_OVERRIDES.get(cms.state_code or "")
+        if override is not None:
+            try:
+                extra = override(os_record)
+                if extra:
+                    payload.update(extra)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "State payload override raised; ignoring",
+                    state_code=cms.state_code,
+                    error=str(e),
+                )
 
         # Strip None values so should_write doesn't see them as upstream
         return {k: v for k, v in payload.items() if v is not None}

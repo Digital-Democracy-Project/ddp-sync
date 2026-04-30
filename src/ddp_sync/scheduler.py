@@ -150,6 +150,19 @@ class UpdateScheduler:
         # Independent of legislator_sync — different pipeline, different
         # source data. See plans/PLAN-legislator-bio-sync.md.
         bio_config = self._sync_config.get("legislator_bio_sync", {})
+
+        # Round-17 fix: clean up the OTHER frequency's job id before
+        # registering this run's job. Without this, toggling frequency
+        # daily↔weekly and reloading config would leave the previous
+        # frequency's cron registered alongside the new one.
+        for stale_id in (
+            "daily_legislator_bio_sync", "weekly_legislator_bio_sync",
+        ):
+            try:
+                self.scheduler.remove_job(stale_id)
+            except Exception:  # noqa: BLE001 — JobLookupError variant
+                pass
+
         if bio_config.get("enabled", False):
             bio_sync_time = bio_config.get("sync_time_utc", "07:00")
             bio_hour, bio_minute = map(int, bio_sync_time.split(":"))
@@ -778,8 +791,15 @@ class UpdateScheduler:
             report = await pipeline.run(options)
 
             duration = (datetime.utcnow() - start_time).total_seconds()
+            # Round-17 fix: explicit metric event for external monitoring
+            # to scrape (separate from the orchestrator's per-record logs
+            # and from the Zapier alert, which is on a different
+            # routing path). success=False fires on aborted runs even
+            # though the wrapper itself didn't raise.
             logger.info(
                 "Scheduled legislator bio sync complete",
+                metric="legislator_bio_sync.scheduled_run_completed",
+                success=(not report.aborted) and len(report.errors) == 0,
                 duration_seconds=duration,
                 items_seen=report.cms_items_seen,
                 patched=len(report.would_patch),
@@ -797,7 +817,11 @@ class UpdateScheduler:
                 "duration_seconds": duration,
             }
         except Exception as e:
-            logger.exception("Scheduled legislator bio sync failed")
+            logger.exception(
+                "Scheduled legislator bio sync failed",
+                metric="legislator_bio_sync.scheduled_run_completed",
+                success=False,
+            )
             return {"success": False, "error": str(e)}
 
     async def _run_organization_sync(self) -> dict[str, Any]:

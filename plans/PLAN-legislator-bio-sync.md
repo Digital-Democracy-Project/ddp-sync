@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** ✅ **Phase 1 SHIPPED 2026-04-30.** Phase 1 federal sync against the FL delegation (32 records). State-leg baseline sync + APScheduler wiring + Audit B all landed same evening. 114-test suite. Sixteen pm-review rounds + four production-discovery iterations (chamber→seat data-model, URL-typed ID fields, Zapier Mustache→pre-formatted strings, term-date ChurnPATCH). The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs to Phase 2.5/3: social/website/term-date extraction for state legs (currently scoped conservatively); photo-upload pipeline for per-state CDN URLs; orphan-set instability (different state legs orphaned across runs — likely OpenStates jitter, needs probe).
+**Status:** ✅ **Phase 1 + Phase 2.5 (data-extraction layer) SHIPPED 2026-04-30.** Phase 1 federal sync (32 FL records) + state-leg baseline sync + APScheduler wiring + Audit B + Phase 2.5 enrichment (`openstates-id` URL field, FL `official-website` extraction via per-state override registry) + round-17 review fixes (scheduler-completion metric, job-id-collision cleanup, edge-case tests, rollback playbook, editor sign-off criteria). 122-test suite. Seventeen pm-review rounds + four production-discovery iterations (chamber→seat data-model, URL-typed ID fields, Zapier Mustache→pre-formatted strings, term-date ChurnPATCH). The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs: per-state photo-upload pipeline (Phase 3); state-leg social handles + term dates (deferred — OpenStates probe confirmed they're not in `/people` v3); orphan-set instability investigation; `--undo-last-run` mass-revert capability.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -210,6 +210,58 @@ aborted: false
 - Schema-cache field-existence tolerance: `dropped_fields: []` on every record means the cache is fetching the live schema and not silently dropping fields. If a field hadn't been added in Webflow, it would appear in `dropped_fields` and the operator would know.
 - ALB-timeout safety gate (503 + Retry-After 60): kicked in correctly after the first deploy; user retried and pre-warm completion log appeared.
 - Atomic data-model correction: the chamber→seat fix was a single commit (f235665) that mirrored the round-8 jurisdiction-resolver pattern. Test fixtures absorbed the change via a translation table, so no test-by-test rewrite was needed.
+
+---
+
+## Phase 2.5 — OpenStates probe findings + data-extraction layer (2026-04-30)
+
+### Probe results: what's actually in OpenStates `/people` v3 for state legs
+
+Ran `scripts/probe_openstates_state_legs.py` against 10 FL state legislators. Output is the source of truth for Phase 2.5 scope decisions; pre-probe assumptions about what was extractable were partly wrong.
+
+**Reliably populated (worth extracting):**
+- `name`, `given_name`, `family_name`, `party`, `gender` — 100%
+- `email` — 100% (real `@flhouse.gov` emails for all 10 — NOT contact-form URLs like federal)
+- `image` — 100% (myfloridahouse.gov-hosted JPGs)
+- `birth_date` — 50% (5 of 10) — partial coverage; gracefully None when missing
+- `openstates_url` — 100% (Phase-2.5 NEW — wired to `openstates-id` URL field on Webflow)
+- Capitol office (`name`, `voice`, `address`) — 100%
+- District office — 90%
+
+**Confirmed NOT available — earlier Phase-2.5 plans were wrong:**
+- **Social handles** (twitter/facebook/instagram/youtube) — zero matching URLs in `links[]` across all 10 records. OpenStates simply doesn't carry social media for FL state legs. **Decision:** drop the "parse `links[]` for socials" plan; defer to Phase 3 if/when a different upstream source is found.
+- **`current_role.start_date`/`end_date`** — only contains `title`, `org_classification`, `district`, `division_id`. **Decision:** state-leg term dates are unavailable from `/people` v3; defer until a different OpenStates endpoint is probed (or accept "no term dates for state").
+- **`roles[]` term history** — not returned by `/people` even with default include set. **Decision:** as above.
+- **`biography`** — Phase-0 finding confirmed (0 of 10).
+- **`other_identifiers`** — Phase-0 finding confirmed (0 of 10 for state).
+
+**Extractable per-state but not generic:**
+- `official-website` — no link has note=`"homepage"` or `"official"`. The closest is note=`"member detail page"` (9 of 10) or first link with a known FL House/Senate host. **Decision:** add a per-state override registry; FL-specific override extracts via the note + host fallback. Other states will need their own overrides as we onboard them.
+
+### Phase 2.5 implementation summary
+
+| Change | Where | Rationale |
+|---|---|---|
+| `openstates_url` field on `OpenStatesPerson` | `services/openstates_people.py` | Probe confirmed 100% population; previously discarded into `.raw` only. |
+| `openstates-id` (URL-typed CMS field) populated | `_build_federal_payload` + `_build_state_payload` | Federal AND state get a "see this person on OpenStates" link with one upstream field. |
+| `_STATE_PAYLOAD_OVERRIDES` registry | module-level in `pipelines/legislator_bio.py` | State-by-state extensions without polluting the default state-builder. Default = pass-through; FL = `official-website` extraction via "member detail page" note + host fallback. |
+| `_fl_state_override` | module-level | Picks `links[]` entry with note `"member detail page"` (9-of-10 coverage), falls back to first link with host in `_FL_OFFICIAL_WEBSITE_HOSTS`. Best-effort; orchestrator logs + continues if override raises. |
+
+### Round-17 review fixes folded in
+
+- **Scheduler-completion metric event** — `metric=legislator_bio_sync.scheduled_run_completed` log event with `success` flag (False on aborted, exceptions, OR errors > 0). Closes the observability gap that the Zapier alert (which fires from the pipeline's own try/finally — same path for HTTP and scheduler) doesn't fully cover.
+- **Job-id-collision cleanup** — `scheduler.start()` removes both `daily_legislator_bio_sync` and `weekly_legislator_bio_sync` ids before re-registering. Prevents stale cron from a previous frequency continuing to run alongside the new one across config reloads.
+- **State-path edge-case tests** — None birth_date, populated-OpenStates with no capitol office, FL override happy path + host-fallback path, non-FL state skips override (registry keying confirmed).
+- **`openstates-id` wiring tests** — both federal and state paths get the field when `os_record.openstates_url` is populated.
+- **Rollback playbook** — added to §Rollback procedure with per-record vs mass-revert distinction; `--undo-last-run` capability listed as backlog.
+- **Editor sign-off acceptance criteria** — table in §Rollout sequence with field-by-field expectations + sample-size threshold.
+
+### What we deliberately deferred
+
+- **Social handles for state legs** — confirmed not available from OpenStates. Phase 3 if a different upstream source is found.
+- **State-leg term dates** — confirmed not available from OpenStates `/people` v3. Could probe `/orgs/{id}/memberships` or similar in a future iteration; for now, accept "no term dates for state" and note that the cardinal rule preserves any editor-populated values.
+- **`--undo-last-run` mass-revert capability** — backlogged. Pre-deploy guardrails (dry-run + Audit B + per-record error isolation) carry the safety load until then.
+- **Per-state photo-upload pipeline** — Phase 3 (per the original PLAN). Currently we just store the OpenStates `image` URL; quality/stability varies but the URL-typed field accepts it.
 
 ---
 
@@ -931,9 +983,46 @@ Pick 2–3 known historical state→federal transitions (e.g., a recent state le
 
 ### Rollback procedure
 
-Webflow does not have a CMS revision history exposed via API, so true rollback isn't free. Mitigations:
-- **Drafts can be deleted via API** — auto-created drafts can be bulk-deleted by `created_by=ddp-sync` filter
-- **PATCHes:** the dry-run report (stored in Redis with 30-day TTL) preserves the exact diff for every run, so a manual revert is possible per-record. If a mass-revert is needed, an `--undo-last-run` trigger can replay the inverse diff. Phase 1 includes this command but doesn't ship it as scheduled — manual editor action only.
+Webflow does not have a CMS revision history exposed via API, so true rollback isn't free. The bio sync's per-record error isolation + cardinal rule (don't blank populated fields) limit blast radius even when individual record PATCHes are wrong, but a bad bulk write still requires manual remediation.
+
+**Operator playbook when a scheduled run produces unexpected writes:**
+
+1. **Stop further runs immediately.** Edit `config/sync_schedule.yaml` and set `legislator_bio_sync.enabled: false`, then `sudo systemctl restart ddp-sync`. The scheduler's job-id-cleanup preamble removes the registered cron on restart.
+2. **Identify scope of the bad run.** Check `sudo journalctl -u ddp-sync --since "1 hour ago" | grep "legislator_bio_sync.scheduled_run_completed"` for the run's `success`, `errors`, and `patched` counts. Cross-reference the Zapier alert's run-summary payload (every non-dry-run posts one).
+3. **Get the record-level diff** from the run's structured logs: `journalctl -u ddp-sync --since "<start>" | grep "Updated legislator in Webflow CMS"`. Each record's PATCH logs the field set written. The schema-cache check guarantees no unknown fields were sent.
+4. **For per-record revert:** the orchestrator does NOT currently snapshot pre-PATCH CMS state. Manual revert means an editor visiting the affected record in the Webflow Designer and restoring known-good values. Pre-deploy step: when bringing up new write paths (e.g., new bio fields, new state path), seed a sample record's pre-state so the team has a manual revert reference.
+5. **For mass-revert:** an `--undo-last-run` capability is scoped but not built (Phase-2.5 backlog item). Until shipped, mass-revert is impractical at >5 records — design choice favors prevention (cardinal rule + dry-run + Audit B + per-record error isolation) over after-the-fact undo.
+6. **Drafts:** auto-created drafts can be bulk-deleted via the Webflow API by filtering on `created_by=ddp-sync`. Phase 1 doesn't enable auto-create by default.
+
+**Pre-deploy guardrails for risky changes:**
+- Always dry-run with `?dry_run=true&limit=5` before flipping the scheduler `enabled: true` after any change to payload-build code or YAML knobs.
+- Phase 2.5+ payload changes (new fields, new state-leg overrides) get probe→test→one-record-live → full-run sequence per the §Step-9 runbook pattern.
+- Before adding a new state to the per-state override registry, run the OpenStates probe script (`scripts/probe_openstates_state_legs.py`) against that jurisdiction first to confirm assumptions.
+
+### Editor sign-off acceptance criteria (Phase 1 → scheduler enable gate)
+
+Editors confirming "Phase 1 is good to ramp" should verify these on a sample of 5+ records (mix of federal House, federal Senate, state lower, state upper):
+
+| Field | Source | Expected | Failure mode if wrong |
+|---|---|---|---|
+| `bioguide-id` | unitedstates YAML | 7-character ID like `H001098` | Wrong/empty would break federal-historical fallback |
+| `birth-year` | unitedstates / OpenStates | 4-digit year, plausible (1920-2010) | Wrong birthday → privacy concern; year-only is intentional |
+| `term-start` / `term-end` | unitedstates current term (federal) | ISO datetime `2025-01-03T00:00:00.000Z` | Date-only string would re-PATCH every run (ChurnPATCH — fixed in commit af55f38) |
+| `phone-capitol` | unitedstates / OpenStates capitol office | E.164 or formatted US phone | Wrong → editor / public misdirected |
+| `office-address-capitol` | unitedstates / OpenStates capitol office | Full street address with state abbr + ZIP | OpenStates address quality varies for some states |
+| `email` (state) | OpenStates direct | `@<jurisdiction>.gov` email or contact-form URL routed correctly | URL accidentally placed in email field instead of contact-form-url |
+| `contact-form-url` (federal) | OpenStates → routed via `split_email_field` | `https://...senate.gov/contact/contact` style | Email accidentally placed here instead of email field |
+| `official-website` | unitedstates (federal) / FL override (FL state) | URL to legislator's official page | Wrong page or empty when expected populated |
+| `photo-source-url` | bioguide-derived (federal) / OpenStates `image` (state) | Working URL | 404 / wrong person — quality issue, not a sync issue |
+| `ballotpedia-slug` | unitedstates `id.ballotpedia`, URL-constructed | `https://ballotpedia.org/<Name_With_Underscores>` | Bare slug or display name with spaces would 400 (fixed in 1c23eb2) |
+| `govtrack-id` | unitedstates `id.govtrack`, URL-constructed | `https://www.govtrack.us/congress/members/<id>` | Bare numeric ID would 400 (fixed in 1c23eb2) |
+| `openstates-id` (Phase 2.5) | OpenStates `openstates_url` field | `https://openstates.org/person/<slug>/` | Empty when OpenStates has the record |
+| social handles (federal only) | unitedstates social YAML | Bare handle (no `@`, no URL) | URL or `@`-prefixed value depending on Webflow field type |
+| `seat` (multi-ref) | NOT touched by sync | Pre-set by editor pointing into Seats CMS | Sync would mis-classify federal/state if blank |
+
+Acceptance threshold: **0 wrong values out of 5 sample records** for federal happy-path. State path's birth_date / official-website / social handles are coverage-dependent (50% / partial / 0% from probe); zero-coverage absences are not failures.
+
+If sample reveals systemic issue: stop, file a follow-up, do not enable scheduler until fixed. If sample reveals isolated issue (1 of 5 records): investigate the specific record's upstream data; the bio sync is unlikely the cause.
 
 ### Step-9 operational runbook
 

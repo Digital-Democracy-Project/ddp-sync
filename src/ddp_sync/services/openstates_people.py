@@ -81,6 +81,7 @@ class OpenStatesPerson:
     image: str | None              # photo URL
     biography: str | None
     jurisdiction_name: str | None  # human-readable (e.g. "Florida", "United States")
+    openstates_url: str | None     # https://openstates.org/person/<slug>/ — Phase-2.5
     current_role: dict             # {title, org_classification, district, division_id}
     other_identifiers: list[dict]  # [{identifier, scheme}]
     other_names: list[dict]
@@ -115,6 +116,7 @@ class OpenStatesPerson:
             image=(data.get("image") or None),
             biography=(data.get("biography") or None),
             jurisdiction_name=(juris_name or None),
+            openstates_url=(data.get("openstates_url") or None),
             current_role=(data.get("current_role") or {}),
             other_identifiers=(data.get("other_identifiers") or []),
             other_names=(data.get("other_names") or []),
