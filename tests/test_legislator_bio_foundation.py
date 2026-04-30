@@ -906,6 +906,10 @@ def test_push_bio_sync_alert_posts_payload_on_success():
     assert payload["aborted"] is False
     assert "synced_at" in payload
     assert "summary" in payload
+    # Pre-formatted warnings: failure flag is set so failure_warning is
+    # populated; large_changes_warning stays empty (collapses in Slack).
+    assert payload["failure_warning"] == "⚠️ Failure flag set — investigate"
+    assert payload["large_changes_warning"] == ""
 
 
 def test_push_bio_sync_alert_sets_on_failure_for_aborted_run():
@@ -947,6 +951,10 @@ def test_push_bio_sync_alert_sets_on_large_changes_above_threshold():
     assert captured["json"]["on_large_changes"] is True
     # Round-10 fix: threshold is now in payload for Zapier-side routing
     assert captured["json"]["large_changes_threshold"] == 100
+    # Pre-formatted warning includes the actual numbers for the Slack line
+    assert captured["json"]["large_changes_warning"] == (
+        "⚠️ Large-changes flag set (101 + 0 > 100)"
+    )
 
 
 def test_push_bio_sync_alert_threshold_is_tunable():

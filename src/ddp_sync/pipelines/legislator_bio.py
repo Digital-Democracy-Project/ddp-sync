@@ -168,6 +168,19 @@ def push_bio_sync_alert(
     on_failure = errors > 0 or report.aborted
     on_large_changes = (patched + created) > large_changes_threshold
 
+    # Pre-formatted warning lines. Zapier doesn't support Mustache
+    # conditional sections — only flat {{field}} interpolation — so the
+    # Slack template just drops these in unconditionally. Empty string
+    # when no warning, so the line collapses cleanly.
+    failure_warning = (
+        "⚠️ Failure flag set — investigate" if on_failure else ""
+    )
+    large_changes_warning = (
+        f"⚠️ Large-changes flag set ({patched} + {created} > "
+        f"{large_changes_threshold})"
+        if on_large_changes else ""
+    )
+
     payload = {
         "alert_type": "legislator_bio_sync_complete",
         "summary": (
@@ -192,6 +205,8 @@ def push_bio_sync_alert(
         "on_failure": on_failure,
         "on_large_changes": on_large_changes,
         "large_changes_threshold": large_changes_threshold,
+        "failure_warning": failure_warning,
+        "large_changes_warning": large_changes_warning,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
