@@ -134,3 +134,47 @@ Both errors were caught and swallowed, so the job reported "executed successfull
 **Impact:** Low — Congress API keys are free and public. But it adds noise and is not best practice.
 
 **Potential fix:** Add a log filter to redact `api_key=` values from httpx output, or move the key to a request header instead of a query parameter.
+
+---
+
+## Legislator Bio Sync
+
+### `/trigger/legislator-bio-sync` returns 503 with `Retry-After: 60`
+
+**Symptom:** First request after `systemctl restart ddp-sync` returns:
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 60
+{"detail":"Bio-sync source still warming up; retry in ~60s. ..."}
+```
+
+**Cause:** Expected. The bio sync depends on the unitedstates/congress-legislators dataset (8.6 MB historical YAML); parsing it takes ~55s. App startup fires `_prewarm_congress_legislators()` as a background task so the very first trigger request after a restart can race the pre-warm. The 503 + `Retry-After` is intentional — it avoids a silent ALB idle timeout.
+
+**Action:** Wait 60s and retry. If the 503 persists past 2 minutes, check `journalctl -u ddp-sync -f` for YAML fetch failures (e.g. GitHub raw-content unreachable from EC2).
+
+### Bio sync downloads YAML on every run
+
+**Symptom:** Each run hits `raw.githubusercontent.com/unitedstates/congress-legislators/...` instead of using the cache.
+
+**Cause:** The cache lives at `~/.cache/ddp-sync/congress-legislators/` with a 24h TTL. If the service runs as `ubuntu`, that resolves to `/home/ubuntu/.cache/...`. If the directory was deleted (e.g. by a disk-cleanup script), the next run re-downloads.
+
+**Action:** No action required — re-download is idempotent and adds ~5s to the run. If you want to confirm cache state: `ls -la /home/ubuntu/.cache/ddp-sync/congress-legislators/`.
+
+### Zapier alert didn't fire after a non-dry-run
+
+**Symptom:** A non-dry-run completed (logs show `metric=legislator_bio_sync.run_completed`) but no Zapier message arrived.
+
+**Diagnostics in order:**
+1. `ZAPIER_WEBHOOK_URL` empty in env → alerts disabled by design (same env var as Voatz→Brevo).
+2. Logs show `metric=legislator_bio_sync.alert_sent` → POST succeeded; problem is on the Zapier side (zap paused, filter rejected the payload).
+3. Logs show `push_bio_sync_alert returned False` or a non-2xx → Zapier endpoint rejected; check the Zap's runtime tab.
+
+The alert is wired in a `try/finally`, so it fires even on aborted runs (rate-limit, Webflow outage). Absence of the alert when neither (1) nor (2) is true is itself a signal worth investigating.
+
+### Editor reports "field not found" PATCH errors
+
+**Symptom:** `would_patch[]` shows an entry but the live PATCH log says "field not found in schema" and skips the field.
+
+**Cause:** The 21 new Webflow Legislator fields (per `plans/webflow-legislator-fields.md`) are added via the Designer; if a field hasn't been added yet, the bio sync detects this via the cached collection schema (1h TTL) and silently skips that field rather than failing the whole record. The check is intentional — partial schema rollout shouldn't block the sync.
+
+**Action:** Confirm the field exists in the Webflow Designer with the slug listed in `webflow-legislator-fields.md`. After the field is added, the schema cache will refresh on the next call (1h max).
