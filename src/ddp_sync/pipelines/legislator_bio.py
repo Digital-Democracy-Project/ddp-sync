@@ -716,13 +716,14 @@ class LegislatorBioPipeline:
                 cms, federal_record, os_record
             )
         else:
-            # Phase 2 work — state path. Skip with a clear marker for now.
-            logger.info(
-                "Skipping state legislator (Phase 2 work)",
-                webflow_id=cms.webflow_id,
-                name=cms.name,
-            )
-            return
+            # State path: OpenStates-only payload (no unitedstates equivalent
+            # for state legs). Defensive: os_record is always non-None here
+            # because the bioguide fallback at line 680 is federal-only —
+            # an unresolved state record short-circuits to upstream_orphans
+            # before reaching this branch.
+            if os_record is None:
+                return
+            payload = self._build_state_payload(cms, os_record)
 
         changed = self._diff_payload(
             cms.raw_fields, payload, options.locked_fields
@@ -855,6 +856,61 @@ class LegislatorBioPipeline:
                 f"https://unitedstates.github.io/images/congress/450x550/"
                 f"{bioguide}.jpg"
             )
+
+        # Strip None values so should_write doesn't see them as upstream
+        return {k: v for k, v in payload.items() if v is not None}
+
+    def _build_state_payload(
+        self,
+        cms: "CMSLegislator",
+        os_record: OpenStatesPerson,
+    ) -> dict:
+        """Build a Webflow PATCH payload for a state legislator (Phase 2).
+
+        OpenStates-only sourcing — state legs don't appear in the
+        unitedstates dataset. ``other_identifiers`` is empty for state
+        members per the Phase-0 probe, so the federal-only ID fields
+        (bioguide, wikidata, opensecrets, ballotpedia, govtrack) and
+        the bioguide-derived ``photo-source-url`` are all skipped.
+
+        Phase-2 baseline scope (intentionally conservative — fields that
+        are unreliably populated upstream for state legs are left for a
+        future iteration with measured data):
+          - birth-year, gender
+          - phone-capitol, office-address-capitol (from offices[capitol])
+          - email / contact-form-url (via split_email_field)
+          - photo-source-url (from OpenStates image; per-state CDN URLs
+            vary in stability, but the field is URL-typed and accepts
+            any URL — quality issues are a separate concern)
+
+        Skipped (Phase-2.5 follow-ups when warranted):
+          - twitter/facebook/instagram/youtube — would require parsing
+            os_record.links[]; coverage on state legs is sparse
+          - official-website — not a top-level OpenStatesPerson field;
+            often present in links[] under a "homepage" note, but the
+            note text is editor-managed upstream and not stable
+          - term-start / term-end / seniority-rank — OpenStatesPerson
+            doesn't surface roles[] term dates; current_role lacks
+            start_date for state. Defer until probed.
+        """
+        payload: dict[str, Any] = {}
+
+        payload["birth-year"] = self._year_from_iso(os_record.birth_date)
+        payload["gender"] = os_record.gender
+
+        cap = self._first_office(os_record.offices, "capitol")
+        if cap:
+            payload["phone-capitol"] = cap.get("voice")
+            payload["office-address-capitol"] = cap.get("address")
+
+        email, form = split_email_field(os_record.email)
+        if email:
+            payload["email"] = email
+        if form:
+            payload["contact-form-url"] = form
+
+        if os_record.image:
+            payload["photo-source-url"] = os_record.image
 
         # Strip None values so should_write doesn't see them as upstream
         return {k: v for k, v in payload.items() if v is not None}

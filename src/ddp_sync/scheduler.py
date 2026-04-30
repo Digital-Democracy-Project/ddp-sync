@@ -146,6 +146,52 @@ class UpdateScheduler:
                     sync_day=sync_day,
                 )
 
+        # Add legislator bio sync job (weekly or daily based on config)
+        # Independent of legislator_sync — different pipeline, different
+        # source data. See plans/PLAN-legislator-bio-sync.md.
+        bio_config = self._sync_config.get("legislator_bio_sync", {})
+        if bio_config.get("enabled", False):
+            bio_sync_time = bio_config.get("sync_time_utc", "07:00")
+            bio_hour, bio_minute = map(int, bio_sync_time.split(":"))
+            bio_frequency = bio_config.get("frequency", "weekly")
+
+            day_map = {
+                "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                "friday": 4, "saturday": 5, "sunday": 6,
+            }
+
+            if bio_frequency == "daily":
+                self.scheduler.add_job(
+                    self._run_legislator_bio_sync,
+                    trigger=CronTrigger(hour=bio_hour, minute=bio_minute),
+                    id="daily_legislator_bio_sync",
+                    name="Daily Legislator Bio Sync",
+                    replace_existing=True,
+                )
+                logger.info(
+                    "Legislator bio sync scheduled (daily)",
+                    sync_time=bio_sync_time,
+                )
+            else:
+                bio_sync_day = bio_config.get("sync_day", "sunday")
+                bio_day_of_week = day_map.get(bio_sync_day.lower(), 6)
+                self.scheduler.add_job(
+                    self._run_legislator_bio_sync,
+                    trigger=CronTrigger(
+                        day_of_week=bio_day_of_week,
+                        hour=bio_hour,
+                        minute=bio_minute,
+                    ),
+                    id="weekly_legislator_bio_sync",
+                    name="Weekly Legislator Bio Sync",
+                    replace_existing=True,
+                )
+                logger.info(
+                    "Legislator bio sync scheduled (weekly)",
+                    sync_time=bio_sync_time,
+                    sync_day=bio_sync_day,
+                )
+
         # Add organization sync job (monthly based on config)
         org_config = self._sync_config.get("organization_sync", {})
         if org_config.get("enabled", False):
@@ -679,6 +725,80 @@ class UpdateScheduler:
                 "success": False,
                 "error": str(e),
             }
+
+    async def _run_legislator_bio_sync(self) -> dict[str, Any]:
+        """Run the scheduled legislator bio + contact sync.
+
+        Mirrors the trigger endpoint's payload-build path: instantiates
+        ``LegislatorBioPipeline`` (which lazy-creates the underlying
+        services and warms the unitedstates dataset cache idempotently —
+        the 24h on-disk cache makes weekly runs cheap after the first).
+        Reads ``legislator_bio_sync`` block from sync_schedule.yaml for
+        runtime knobs. Errors are logged + re-surfaced in the return
+        dict so APScheduler's job history captures them; the orchestrator
+        itself wraps per-record errors and Zapier-alerts on its own
+        try/finally so this method's catch is just a defensive shell.
+        """
+        from datetime import date, datetime
+        from ddp_sync.pipelines.legislator_bio import (
+            BioSyncOptions, LegislatorBioPipeline,
+        )
+
+        bio_config = self._sync_config.get("legislator_bio_sync", {})
+        start_time = datetime.utcnow()
+
+        try:
+            historical_since_str = bio_config.get(
+                "historical_since", "2023-01-01"
+            )
+            try:
+                historical_since = date.fromisoformat(historical_since_str)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid historical_since in config; using 2023-01-01",
+                    raw_value=historical_since_str,
+                )
+                historical_since = date(2023, 1, 1)
+
+            options = BioSyncOptions(
+                target=bio_config.get("target", "all"),
+                jurisdiction=bio_config.get("jurisdiction"),
+                auto_create=bool(bio_config.get("auto_create", False)),
+                dry_run=False,
+                historical_since=historical_since,
+            )
+            logger.info(
+                "Starting scheduled legislator bio sync",
+                target=options.target,
+                jurisdiction=options.jurisdiction,
+                auto_create=options.auto_create,
+            )
+
+            pipeline = LegislatorBioPipeline()
+            report = await pipeline.run(options)
+
+            duration = (datetime.utcnow() - start_time).total_seconds()
+            logger.info(
+                "Scheduled legislator bio sync complete",
+                duration_seconds=duration,
+                items_seen=report.cms_items_seen,
+                patched=len(report.would_patch),
+                created=len(report.would_create),
+                errors=len(report.errors),
+                aborted=report.aborted,
+            )
+            return {
+                "success": not report.aborted,
+                "items_seen": report.cms_items_seen,
+                "patched": len(report.would_patch),
+                "errors": len(report.errors),
+                "aborted": report.aborted,
+                "abort_reason": report.abort_reason,
+                "duration_seconds": duration,
+            }
+        except Exception as e:
+            logger.exception("Scheduled legislator bio sync failed")
+            return {"success": False, "error": str(e)}
 
     async def _run_organization_sync(self) -> dict[str, Any]:
         """

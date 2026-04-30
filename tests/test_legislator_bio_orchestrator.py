@@ -108,6 +108,9 @@ def _os_person(
     email: str | None = None,
     capitol_phone: str | None = None,
     capitol_address: str | None = None,
+    birth_date: str | None = None,
+    gender: str | None = None,
+    image: str | None = None,
 ) -> OpenStatesPerson:
     raw: dict[str, Any] = {
         "id": openstates_id,
@@ -127,6 +130,12 @@ def _os_person(
         raw["other_identifiers"] = [{"scheme": "bioguide", "identifier": bioguide}]
     if email:
         raw["email"] = email
+    if birth_date:
+        raw["birth_date"] = birth_date
+    if gender:
+        raw["gender"] = gender
+    if image:
+        raw["image"] = image
     if capitol_phone or capitol_address:
         raw["offices"] = [{
             "classification": "capitol",
@@ -383,9 +392,11 @@ async def test_run_federal_bioguide_fallback_for_departed_member():
 
 
 @pytest.mark.asyncio
-async def test_run_state_record_phase_2_stub_skipped_not_orphaned():
-    """A state record where OpenStates resolves should be SKIPPED with a
-    'Phase 2' log line, not silently no-op'd, and not flagged as orphan."""
+async def test_run_state_record_with_no_writable_fields_no_ops():
+    """A state record where OpenStates resolves but has no populated bio
+    fields produces an empty payload — no PATCH, but resolved successfully
+    (not flagged as orphan). Confirms the diff-then-skip path works for
+    state legs, not just federal."""
     cms = [_cms(
         item_id="wf-3",
         name="FL state rep",
@@ -410,11 +421,149 @@ async def test_run_state_record_phase_2_stub_skipped_not_orphaned():
     report = await pipeline.run(BioSyncOptions(dry_run=False))
 
     assert report.cms_items_seen == 1
-    # OpenStates DID resolve; it just gets skipped at payload-build time
     assert report.items_resolved_via_openstates == 1
-    assert report.upstream_orphans == []     # NOT flagged as orphan
-    assert len(patches) == 0                  # NO PATCH (Phase 2 stub)
+    assert report.upstream_orphans == []
+    assert len(patches) == 0  # nothing to write; cardinal-rule no-op
     assert report.errors == []
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_full_flow():
+    """State legs get bio + contact + photo PATCHed from OpenStates only.
+    No federal-only IDs (bioguide, wikidata, opensecrets, ballotpedia,
+    govtrack); no social handles (Phase-2.5); no term dates."""
+    cms = [_cms(
+        item_id="wf-fl-1",
+        name="Jane State",
+        chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1",
+        name="Jane State",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+        birth_date="1972-05-04",
+        gender="F",
+        email="jane@myfloridahouse.gov",
+        capitol_phone="850-555-0100",
+        capitol_address="402 House Office Building, Tallahassee, FL",
+        image="https://www.flhouse.gov/Sections/Representatives/photos/jane.jpg",
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+        patch_recorder=patches,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+
+    assert report.aborted is False
+    assert report.errors == []
+    assert len(patches) == 1
+    webflow_id, fields = patches[0]
+    assert webflow_id == "wf-fl-1"
+
+    # State-sourced fields are populated
+    assert fields["birth-year"] == 1972
+    assert fields["gender"] == "F"
+    assert fields["email"] == "jane@myfloridahouse.gov"
+    assert fields["phone-capitol"] == "850-555-0100"
+    assert fields["office-address-capitol"] == (
+        "402 House Office Building, Tallahassee, FL"
+    )
+    assert fields["photo-source-url"] == (
+        "https://www.flhouse.gov/Sections/Representatives/photos/jane.jpg"
+    )
+
+    # Federal-only IDs are NOT in the state payload
+    for federal_id in (
+        "bioguide-id", "wikidata-id", "opensecrets-id",
+        "ballotpedia-slug", "govtrack-id",
+    ):
+        assert federal_id not in fields, (
+            f"federal-only id {federal_id} leaked into state payload"
+        )
+
+    # Phase-2.5 follow-ups not yet implemented for state
+    for deferred in (
+        "twitter-handle", "facebook-handle", "instagram-handle",
+        "youtube-handle", "term-start", "term-end", "seniority-rank",
+        "official-website",
+    ):
+        assert deferred not in fields, (
+            f"{deferred} should be Phase-2.5 work, not in baseline state payload"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_email_url_routes_to_contact_form_url():
+    """Some state legs (rare, but exists) have a contact-form URL in the
+    OpenStates email field; same split_email_field treatment as federal."""
+    cms = [_cms(
+        item_id="wf-fl-2",
+        name="State Form",
+        chamber="lower",
+        openstatesid="ocd-person/fl-2",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-2",
+        chamber="lower",
+        state="FL",
+        is_federal=False,
+        email="https://www.flhouse.gov/contact/form",
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-2": os_record},
+        patch_recorder=patches,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    assert fields["contact-form-url"] == "https://www.flhouse.gov/contact/form"
+    assert "email" not in fields
+
+
+@pytest.mark.asyncio
+async def test_run_state_legislator_no_capitol_office_skips_phone_and_address():
+    """When OpenStates returns no capitol office, the orchestrator
+    omits phone-capitol + office-address-capitol entirely (cardinal rule
+    won't blank populated CMS values via empty upstream)."""
+    cms = [_cms(
+        item_id="wf-fl-3",
+        name="No Office",
+        chamber="upper",
+        openstatesid="ocd-person/fl-3",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-3",
+        chamber="upper",
+        state="FL",
+        is_federal=False,
+        birth_date="1980-03-15",
+        # No capitol_phone / capitol_address → no offices entry
+    )
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-3": os_record},
+        patch_recorder=patches,
+    )
+
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.errors == []
+    _, fields = patches[0]
+    assert fields["birth-year"] == 1980
+    assert "phone-capitol" not in fields
+    assert "office-address-capitol" not in fields
 
 
 @pytest.mark.asyncio

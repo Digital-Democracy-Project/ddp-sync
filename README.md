@@ -13,6 +13,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
   - Flow 2: OpenStates → Pinecone (bill text re-ingestion on new versions)
   - Either flow can be disabled independently in `sync_schedule.yaml`
 - **Legislator sync** (weekly Sun 06:00 UTC): OpenStates → Pinecone
+- **Legislator bio sync** (weekly Sun 07:00 UTC, `enabled: false` by default): unitedstates/congress-legislators + OpenStates → Webflow Legislators CMS (bio, contact, term, social, photo URL fields)
 - **Organization sync** (monthly 1st 08:00 UTC): Webflow → Pinecone
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
 - **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): Full re-import
@@ -85,7 +86,7 @@ After non-dry-run completion (including aborted runs) the bio sync POSTs a summa
 
 The bio sync uses a multi-reference `seat` field on Legislators CMS records to determine federal vs state classification (refs into a Seats CMS with 4 items: `us-house`, `us-senate`, `state-house`, `state-senate`). The two federal seat ref-IDs are hardcoded in `pipelines/legislator_bio.py::_FEDERAL_SEAT_REF_IDS`. If the Seats CMS items are ever recreated, that constant needs a one-line update.
 
-Phase 1 federal-only sync was shipped 2026-04-30 against the FL congressional delegation (32 records). Manual-trigger only until Audit B passes and the scheduler is explicitly enabled (`legislator_bio_sync.enabled: true` in `config/sync_schedule.yaml`).
+Phase 1 sync (federal + state baseline) was shipped 2026-04-30 against the FL congressional delegation + 192 FL state legs. Audit B is wired (`audit_only=B` returns missing-openstatesid records and openstatesid duplicates). The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. State-leg payload is intentionally conservative (bio + capitol contact + photo URL); social handles, official-website, and term dates for state legs are deferred to Phase 2.5 pending an OpenStates probe.
 
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 

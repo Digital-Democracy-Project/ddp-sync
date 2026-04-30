@@ -103,6 +103,26 @@ legislator_sync:
   max_vote_bills_per_legislator: 200  # Max bills to check for votes per legislator
   vote_session: null                   # null = current session, or specify e.g. "2026"
 
+# Legislator Bio + Contact Sync Configuration
+# Syncs biographical and contact data into the existing Webflow Legislators
+# CMS. Federal: unitedstates/congress-legislators YAML (free). State:
+# OpenStates /people. See plans/PLAN-legislator-bio-sync.md.
+#
+# Phase-1 federal sync was shipped manually 2026-04-30. State-leg sync
+# landed shortly after. The schedule is enabled: false by default — flip
+# to true after editor verification + a monitoring window. auto_create
+# stays false by default even when enabled (auto-create discovery is
+# additionally gated by per-jurisdiction config).
+legislator_bio_sync:
+  enabled: false                # gate flip after editor sign-off
+  sync_time_utc: "07:00"        # after bill sync (04:00) + OpenStates leg sync (06:00)
+  frequency: weekly
+  sync_day: sunday
+  jurisdiction: null            # null = all jurisdictions; or "us" / state code
+  auto_create: false            # gated independently of `enabled`
+  historical_since: "2023-01-01"
+  target: all                   # all / webflow / pinecone
+
 # Legacy alias (deprecated, use legislator_sync instead)
 legislator_bills:
   enabled: false  # Disabled — superseded by legislator_sync above
