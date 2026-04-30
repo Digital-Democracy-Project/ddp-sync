@@ -66,10 +66,12 @@ class WebflowError(Exception):
     """
 
     def __init__(self, message: str, *, response: httpx.Response | None = None):
-        super().__init__(message)
         self.response = response
         self.status_code = response.status_code if response is not None else None
         self.error_detail = response.text[:500] if response is not None else None
+        if self.error_detail:
+            message = f"{message} body={self.error_detail!r}"
+        super().__init__(message)
 
 
 class WebflowRateLimitError(WebflowError):
