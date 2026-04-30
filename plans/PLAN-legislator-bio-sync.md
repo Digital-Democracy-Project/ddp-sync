@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** Phase 1 in progress — steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, + forthcoming round-14 follow-up commit); 95-test suite landed. Fourteen pm-review rounds folded in (rev 15). Step 9 still pending.
+**Status:** Phase 1 code-complete. Steps 1, 2, 3a, 3b, 4, 5, 6, 7, 8 implemented (commits 2852a36, 24d058e, c555f38, ee74124, b37e408, 8263902, e1834f8, 4427dd3, c492891, 507adaa, a0d2300, 0209c4c, d4efa66); 95-test suite landed. Fifteen pm-review rounds folded in; round-15 verdict `approve` / `ship`. Step 9 (pre-flight ✅; live execution gated on production deploy + editor sign-off) remaining — see runbook in §Rollout sequence.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -92,7 +92,7 @@ Phase 1 steps 1, 2, 3a, 3b have landed across two commits. Steps 4–9 are still
 | 7a | Alerting + cache test suite | 4427dd3 + c492891 + round-11 | ✅ 6 alert-function tests; 4 `run()` integration tests; 4 cache tests (TTL, stale-reuse on empty, empty-mapping breadcrumb, lock-serializes-concurrent-refresh); 2 round-10 tests (threshold-tunable, success-metric-emitted); **2 round-11 tests** (no-hot-loop on sustained failure, lock-serializes-failing-fetch with 10 concurrent callers). **Total suite: 82 tests, all pass.** |
 | 8 | Orchestrator-internal `run()` integration tests | a0d2300 + 0209c4c + round-14 | ✅ `tests/test_legislator_bio_orchestrator.py` — 13 integration tests covering full-pass `run()` flows: federal happy path, bioguide-fallback (Karen Bass), state Phase-2 stub, dry-run, per-record error, rate-limit abort with alert, jurisdiction filter, lock-release-on-raising-fetch, locked_fields exclusion, large_changes_threshold end-to-end, mixed-success PATCHes. **Round-14 additions:** (12) mass-blank-prevention — upstream None on populated CMS field → field NOT in PATCH (verifies both layers of defense: payload-build None-strip + diff-time `is_empty` check); (13) `==` threshold edge-case — at exactly threshold, `on_large_changes=False` (strict-`>` semantics pinned). `_build_pipeline()` fixture uses `MagicMock(spec=...)` on service mocks. |
 | 8a | Round-12/13/14 polish bundled into step 8 | a0d2300 + 0209c4c + round-14 | ✅ Doc-comment on `get_jurisdiction_mapping`; lock-release contract test; locked_fields/threshold/mixed-success/mass-blank/equals-threshold integration tests; `MagicMock(spec=...)` on service mocks; threshold test imports `DEFAULT_LARGE_CHANGES_THRESHOLD` constant rather than hardcoding (round-14 fix to allow ops to tune without breaking tests). |
-| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ Last step — pre-merge staging smoke + 5-record dry-run + 1 live PATCH on a low-stakes record. |
+| 9 | Dry-run + 1 live PATCH on low-stakes record | — | ⏳ Last step — operational, requires production deploy + Webflow API token + editor sign-off. **Pre-flight (local) ✅:** 95 tests green; trigger endpoint exposes `dry_run`, `limit`, `jurisdiction`, `audit_only`, `auto_create`, `historical_since`; `DEFAULT_LARGE_CHANGES_THRESHOLD=100` exposed; imports clean. Remaining steps run against the deployed environment per the runbook below. |
 
 **Round-5 fixes applied (in commit 24d058e):**
 
@@ -856,6 +856,45 @@ Pick 2–3 known historical state→federal transitions (e.g., a recent state le
 Webflow does not have a CMS revision history exposed via API, so true rollback isn't free. Mitigations:
 - **Drafts can be deleted via API** — auto-created drafts can be bulk-deleted by `created_by=ddp-sync` filter
 - **PATCHes:** the dry-run report (stored in Redis with 30-day TTL) preserves the exact diff for every run, so a manual revert is possible per-record. If a mass-revert is needed, an `--undo-last-run` trigger can replay the inverse diff. Phase 1 includes this command but doesn't ship it as scheduled — manual editor action only.
+
+### Step-9 operational runbook
+
+All commands assume `$DEPLOY_URL` and `$DDP_SYNC_API_KEY` are set in the operator's shell. Each gate must pass before the next step.
+
+**0. Push + deploy (operator).**
+- `git push origin main` — 14 commits ahead of origin at end of round-15.
+- Deploy with scheduler `enabled: false` (config flag — already the default).
+- Sanity: `curl -fsS -H "X-API-Key: $DDP_SYNC_API_KEY" "$DEPLOY_URL/health"` returns 200.
+- Regression smoke: `curl -fsSX POST -H "X-API-Key: $DDP_SYNC_API_KEY" "$DEPLOY_URL/trigger/bill-status-sync?dry_run=true"` — confirms the existing pipeline still works post-deploy.
+
+**1. Audit A (federal join-key coverage).** Must return zero unresolvable federal records before any sync runs.
+```
+curl -X POST -H "X-API-Key: $DDP_SYNC_API_KEY" "$DEPLOY_URL/trigger/legislator-bio-sync?audit_only=A" | jq .
+```
+- Expected: `unresolvable: []`. Any entry blocks step 2 until editors backfill `openstatesid` or `bioguide-id`.
+- If 503 (`Retry-After: 60`): pre-warm task is still parsing 8.6 MB historical YAML. Wait 60s and retry.
+
+**2. Dry-run against 5 federal members.**
+```
+curl -X POST -H "X-API-Key: $DDP_SYNC_API_KEY" "$DEPLOY_URL/trigger/legislator-bio-sync?dry_run=true&jurisdiction=us&limit=5" | jq .
+```
+- Inspect `would_patch[]` — every entry should be a sensible bio improvement, not a churn-PATCH.
+- Inspect `would_create[]` — should be empty (auto_create not set).
+- Inspect `errors[]` — should be empty.
+- Inspect `is_empty()` breadcrumbs — confirm no populated CMS fields are about to be blanked. If any are, **stop** and tighten `EMPTY_VALUES`.
+- Editor sign-off on the diff before continuing.
+
+**3. Live PATCH against ONE low-stakes federal record. ⚠ Modifies production CMS — operator must explicitly confirm before running.**
+
+The endpoint does not yet support a per-record selector — `limit=1` will PATCH whichever record sorts first off the iterator. Identify that record from step 2's output (it is the first entry in `would_patch[]`). Confirm it is low-stakes (e.g., a junior House member, no leadership role, no recent press around their CMS page). If you need to target a different record specifically, that requires adding a `target_slug` parameter — flag it and run a small follow-up PR before this step.
+
+```
+curl -X POST -H "X-API-Key: $DDP_SYNC_API_KEY" "$DEPLOY_URL/trigger/legislator-bio-sync?jurisdiction=us&limit=1&dry_run=false" | jq .
+```
+- Expected: `report.patched == 1`, `errors == []`, Zapier alert posts a summary, `metric=legislator_bio_sync.alert_sent` appears in logs.
+- Editor visually verifies the live CMS record now shows the expected fields.
+
+**4. Phase 1 sign-off.** With step 3 verified, Phase 1 is complete. Subsequent steps belong to the existing rollout-sequence table above (Audit B → enable scheduler → Phase 2).
 
 ---
 
