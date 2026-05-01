@@ -893,9 +893,18 @@ class LegislatorBioPipeline:
         cost.
         """
         if self.assets is None:
+            # Phase-3: assets uses a dedicated key with the assets:read +
+            # assets:write scopes (separate from the cms:* token used for
+            # item PATCHes). The general webflow_api_token doesn't carry
+            # assets:write — confirmed via 2026-04-30 production smoke
+            # which returned 403 OAuthForbidden on POST /assets.
+            assets_token = (
+                self.settings.webflow_assets_read_write_key
+                or self.settings.webflow_api_token
+            )
             try:
                 self.assets = WebflowAssetService(
-                    api_token=self.settings.webflow_api_token,
+                    api_token=assets_token,
                     site_id=self.settings.webflow_site_id,
                 )
             except ValueError as e:

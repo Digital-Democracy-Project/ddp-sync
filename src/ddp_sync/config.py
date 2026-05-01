@@ -50,6 +50,7 @@ class SyncSettings:
     webflow_votebot_api_key: str = ""  # Read-only CMS key (CMS:read scope)
     webflow_scheduler_api_key: str = ""  # Write-capable CMS key (CMS:write scope)
     webflow_api_token: str = ""
+    webflow_assets_read_write_key: str = ""  # Phase-3: assets:read + assets:write scopes for photo upload pipeline
     webflow_site_id: str = ""
     webflow_bills_collection_id: str = ""
     webflow_jurisdiction_collection_id: str = ""
@@ -129,6 +130,7 @@ def _load_from_env() -> dict:
         "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),
         "webflow_api_token": os.getenv("WEBFLOW_API_TOKEN", ""),
+        "webflow_assets_read_write_key": os.getenv("WEBFLOW_ASSETS_READ_WRITE_KEY", ""),
         "webflow_site_id": os.getenv("WEBFLOW_SITE_ID", ""),
         "webflow_bills_collection_id": os.getenv("WEBFLOW_BILLS_COLLECTION_ID", ""),
         "webflow_jurisdiction_collection_id": os.getenv("WEBFLOW_JURISDICTION_COLLECTION_ID", ""),
