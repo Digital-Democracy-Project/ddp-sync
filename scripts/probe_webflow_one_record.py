@@ -32,6 +32,7 @@ FIELDS_TO_SHOW = (
     "office-email", "open-states-url", "openstatesid",
     "official-website", "ballotpedia-slug", "govtrack-id",
     "phone-capitol", "office-address-capitol",
+    "legislator-image", "photo-source-url",
 )
 
 
