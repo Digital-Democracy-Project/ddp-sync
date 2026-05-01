@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** ✅ **Phase 1 + 2.5 + 3 (V1) SHIPPED + production-verified + editor sign-off complete 2026-05-01.** Full-run state: 216/224 records (96.4%) have `legislator-image` populated with Webflow-hosted assets; 28/32 federal + 188/192 state. The 8 unpopulated records all hit known upstream data gaps surfaced cleanly via per-record error isolation (4 federal freshmen / non-current bioguides not in `unitedstates/images`; 3 state legs with stale per-state CDN URLs returning 404/410; Michael Owen's `porttb.com` source). Zero Webflow API contract failures across 219 successful asset uploads — `fileHash` MD5 hex, signed-URL POST multipart, and Image field `{fileId, url, alt}` shape all confirmed working at scale. **Editors confirmed the data backfill + photos render correctly in the live CMS** (sign-off recorded 2026-05-01). Phase 3 V1 is closed.
+**Status:** ✅ **Phase 1 + 2.5 + 3 + 4 (V1) SHIPPED 2026-05-01.** Phase 1 shipped 2026-04-29; Phase 2.5 shipped 2026-04-30; Phase 3 production-verified + editor-signed-off 2026-05-01; Phase 4 V1 (scheduler-enable hardening — config wiring, congress.gov federal photo fallback, startup-time scope validation, photo coverage metrics) shipped 2026-05-01. 200 tests pass. Live state: 216/224 records (96.4%) have Webflow-hosted `legislator-image` assets. Scheduler is now safe to enable end-to-end (`legislator_bio_sync.enabled: true` + `upload_photos: true`). Phase 4 V1 deferred items (—undo-last-run, post-upload HEAD probe, Redis cross-run dedup, bulk-data state term-history, alternate state social-handles upstream, CI integration tests) are all in Phase 4.5/5 backlog with rationale documented.
 
 **Earlier status:** Phase 1 + 2.5 + 3 (V1) SHIPPED 2026-04-30. Phase 3 V1 ships: `strict_schema=true` BioSyncOptions flag (surfaces schema-cache silent drops as per-record errors), transient-404 retry on OpenStates `fetch_by_id` (targets the orphan-set-instability observed across runs), and a photo-upload pipeline (`WebflowAssetService` two-step Webflow Assets API integration; populates the `legislator-image` Image-typed field; opt-in via `upload_photos=true`; per-record failure isolation; default off pending operator-driven first-run verification). 140-test suite. Probed but deferred (data-side blockers): state-leg term dates (OpenStates v3 `/people` returns 422 on `include=roles`/`include=memberships`); state-leg social handles (zero in OpenStates `links[]` for FL House sample). Phase 4+ backlog: bulk-data ingestion for state term-history; alternate upstream for state social handles; `--undo-last-run` mass-revert; Redis-backed photo dedup cache.
 
@@ -382,6 +382,28 @@ The photo-upload flag is operator-driven; first run requires verification before
 6. **Editor sign-off** — same as Phase 1 sign-off criteria; sample 5+ records visually.
 
 7. **Enable in scheduler config (Phase 4 task)** — add `upload_photos: true` to `legislator_bio_sync` block in `sync_schedule.yaml` once operator is confident. Until then, ad-hoc operator triggers carry the load.
+
+## Phase 4 V1 — scheduler-enable hardening (2026-05-01)
+
+Four stages shipped to address round-19's HIGH/MEDIUM gaps for unattended scheduled runs. Goal: make `legislator_bio_sync.enabled: true` + `upload_photos: true` in `sync_schedule.yaml` safe to flip without surprises. 200 tests pass.
+
+**Stage 1 — wire scheduler config (commit 2b652a6).** The runner's `_run_legislator_bio_sync` now passes `upload_photos`, `upload_photos_dry_run`, and `strict_schema` from the YAML config into `BioSyncOptions`. Defaults False so a pre-Phase-4 YAML preserves manual-only behavior. Without this, even setting `enabled: true` wouldn't have invoked the photo pipeline on the weekly cron.
+
+**Stage 2 — federal photo fallback to congress.gov (commit d3909c6).** The `unitedstates/images` community dataset has gaps even for non-freshman federal members (4 of 32 FL records 404'd in production, including 2-year incumbents like Jared Moskowitz). `WebflowAssetService.upload_from_url()` now accepts `fallback_urls`; tries each in order, first success wins. Federal records get `https://www.congress.gov/img/member/{bioguide_lower}.jpg` as fallback. State records get no fallback (per-state CDNs vary too much). Cache stores AssetReference under both primary and winning URLs.
+
+**Stage 3 — startup-time scope validation (commit 8ccfcbe).** When `upload_photos: true` but `webflow_assets_read_write_key` is unset, the scheduler logs `metric=legislator_bio_sync.startup_misconfig` at start() so operators see the misconfig in journalctl BEFORE the cron fires (not after-the-fact). Closes the round-19 high-severity finding around silent runtime failure.
+
+**Stage 4 — photo coverage metrics (commit 5618eae).** New `BioSyncReport` counters: `photo_uploads_attempted`, `photo_uploads_succeeded`, `photo_uploads_failed`. Surfaced in three places: (a) the report itself, (b) the Zapier alert payload (with `photo_coverage_ratio` rounded to 3dp; null when no attempts), and (c) the scheduler's `metric=legislator_bio_sync.scheduled_run_completed` log event for dashboard scraping. Closes the round-19 medium finding "no metrics or alerting on coverage %".
+
+### Phase 4 V1 deferred to Phase 4.5 (with rationale)
+
+- **`--undo-last-run` mass-revert.** Half-baked without snapshot capture + replay endpoint scoped together. The PLAN's existing rollback section calls this out; capability stays scoped but deferred. Mitigation in the meantime: per-record diffs are visible in `would_patch[]` of each run; manual revert via Webflow Designer or direct curl PATCH per record.
+- **Programmatic post-upload HEAD probe.** Defensive against an unobserved failure mode (Webflow returns 200 on `POST /assets` but the `hostedUrl` doesn't render). 219/219 successful uploads in production verification suggest the failure mode is rare; the probe would add ~1s latency per upload (~3-4 minutes per full run) for unproven value. Defer until we observe an actual mis-rendering case.
+- **Redis-backed cross-run photo dedup cache.** Current cache is service-instance lifetime only. Cardinal rule already prevents repeat uploads for records that retain `legislator-image`; the niche case (legislator-image gets cleared but source URL hasn't changed) is rare enough not to warrant the persistence layer yet. Phase 5 if scheduled-run cost analysis flags it.
+- **Bulk-data ingestion for state-leg term-history** + **state-leg social handles upstream** — both genuinely blocked on different data sources, not Phase-4 scope.
+- **CI integration tests against Webflow Assets v2 sandbox.** Would help; sandbox setup is real work. Phase 5+.
+
+---
 
 ### Round-19 review feedback (2026-05-01)
 
@@ -1172,6 +1194,37 @@ Editors confirming "Phase 1 is good to ramp" should verify these on a sample of 
 Acceptance threshold: **0 wrong values out of 5 sample records** for federal happy-path. State path's birth_date / official-website / social handles are coverage-dependent (50% / partial / 0% from probe); zero-coverage absences are not failures.
 
 If sample reveals systemic issue: stop, file a follow-up, do not enable scheduler until fixed. If sample reveals isolated issue (1 of 5 records): investigate the specific record's upstream data; the bio sync is unlikely the cause.
+
+### Editor sign-off — Phase 4 (scheduler enable gate)
+
+Phase 1 sign-off above was for the manual-trigger workflow. Before flipping `legislator_bio_sync.enabled: true` (and especially `upload_photos: true`) in `sync_schedule.yaml`, editors should perform a more rigorous review per the round-19 recommendation:
+
+**Sample size and composition (≥10 records):**
+- 2 federal House (1 senior incumbent, 1 freshman/post-2023 entrant)
+- 2 federal Senate
+- 3 state House (mix of districts)
+- 2 state Senate
+- 1 record with a known upstream gap (e.g., one of the 8 photoless records — confirms graceful degradation)
+
+**Per-record checklist:**
+- [ ] Photo renders correctly in Webflow Designer (correct person, image not corrupted)
+- [ ] `legislator-image` populated as `{fileId, url, alt}` with Webflow CDN URL
+- [ ] `photo-source-url` Link field has the canonical source URL (preserved as fallback)
+- [ ] Bio fields match the source-of-truth (spot-check 2-3 fields per record against unitedstates YAML / OpenStates `/people` response)
+- [ ] No fields appear with `null`/empty when the source has a value (modulo the documented coverage gaps in §End-state population table)
+
+**Failure-mode verification (1 record):**
+- [ ] Pick a known-photoless record (Mike Haridopolos, Ashley Moody, Jared Moskowitz, Anna Luna, Michael Owen, or one of the other 3 stale-CDN state legs). Confirm:
+  - `legislator-image` is empty (cardinal rule preserved; sync didn't write garbage)
+  - `photo-source-url` Link still has the canonical URL (operator can hotlink if needed)
+  - Other bio fields ARE populated (photo failure isolated; rest of the record's data is fine)
+
+**Evidence to record:**
+- Screenshot or PR artifact attached to a sign-off ticket showing the 10+ records' rendered state
+- Date of sign-off + name of approver
+- Any flagged edge cases (mismatch between source-of-truth and CMS values) that aren't blocking but worth tracking
+
+**Acceptance:** 0 systemic issues + ≤1 isolated edge case across the 10 records → sign off and proceed to scheduler enable. Systemic issue (e.g., wrong photo for entire chamber) → stop and file Phase 5 follow-up.
 
 ### Step-9 operational runbook
 
