@@ -232,6 +232,9 @@ class UpdateScheduler:
         # --- DDP-API jobs (Voatz/Brevo + Webflow CMS) ---
         self._register_ddp_api_jobs()
 
+        # --- VoteBot eval cron (plan §3) ---
+        self._register_votebot_eval_job()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -293,6 +296,97 @@ class UpdateScheduler:
                 replace_existing=True,
             )
         logger.info("Webflow CMS batch jobs scheduled (weekly, Mon 03:00 UTC)", count=len(webflow_jobs))
+
+    def _register_votebot_eval_job(self) -> None:
+        """Register the weekly votebot eval cron (plan §3.3).
+
+        - Reads YAML block ``votebot_eval`` from sync_schedule.yaml.
+        - Validates required keys + types via ``validate_yaml_config``.
+        - Validates the votebot path (env > YAML > default; loud-fail).
+        - Skips registration on any validation failure (no silent no-op).
+        - Job parameters: ``max_instances=1`` + ``coalesce=True`` +
+          ``misfire_grace_time=3600`` for concurrency safety.
+        """
+        from ddp_sync.pipelines.votebot_eval import (
+            resolve_votebot_path,
+            validate_votebot_path,
+            validate_yaml_config,
+            run_votebot_eval,
+        )
+
+        config = self._sync_config.get("votebot_eval")
+        if not config:
+            logger.info("votebot_eval: not configured in sync_schedule.yaml — skipping")
+            return
+
+        validated, errors = validate_yaml_config(config)
+        if errors:
+            for err in errors:
+                logger.error("votebot_eval: YAML validation failed", error=err)
+            logger.error("votebot_eval: skipping registration due to config errors")
+            return
+
+        if not validated.get("enabled", False):
+            logger.info("votebot_eval: disabled in config — skipping")
+            return
+
+        votebot_path = resolve_votebot_path(validated)
+        is_valid, err = validate_votebot_path(votebot_path)
+        if not is_valid:
+            logger.error(
+                "votebot_eval: path validation failed at registration",
+                error=err,
+                votebot_path=votebot_path,
+            )
+            return
+
+        # Build the trigger.
+        sync_time_str = validated.get("sync_time_utc", "12:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        frequency = validated.get("frequency", "weekly")
+
+        if frequency == "daily":
+            trigger = CronTrigger(hour=hour, minute=minute)
+            cadence_str = f"daily at {sync_time_str} UTC"
+        else:
+            day_map = {
+                "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+                "thursday": "thu", "friday": "fri", "saturday": "sat",
+                "sunday": "sun",
+            }
+            sync_day = validated.get("sync_day", "sunday").lower()
+            trigger = CronTrigger(
+                day_of_week=day_map.get(sync_day, "sun"),
+                hour=hour, minute=minute,
+            )
+            cadence_str = f"weekly {sync_day} {sync_time_str} UTC"
+
+        days = validated.get("days", 7)
+        # Closure binds `days` + `validated` so the wrapper has everything it needs.
+        async def _votebot_eval_wrapper():
+            return await run_votebot_eval(
+                days=days,
+                settings=self.settings,
+                yaml_config=validated,
+                trigger="scheduled",
+            )
+
+        self.scheduler.add_job(
+            _votebot_eval_wrapper,
+            trigger=trigger,
+            id="weekly_votebot_eval",
+            name="Weekly VoteBot eval",
+            replace_existing=True,
+            max_instances=1,            # primary mutex is the Redis lock; this is belt+suspenders
+            coalesce=True,              # if multiple fires queue up, run once
+            misfire_grace_time=3600,    # 1h grace if scheduler was paused
+        )
+        logger.info(
+            "votebot_eval: registered",
+            cadence=cadence_str,
+            days=days,
+            votebot_path=votebot_path,
+        )
 
     def stop(self) -> None:
         """Stop the scheduler."""
@@ -779,12 +873,25 @@ class UpdateScheduler:
                 auto_create=bool(bio_config.get("auto_create", False)),
                 dry_run=False,
                 historical_since=historical_since,
+                # Phase-4: scheduler-level wiring for the operator-driven
+                # flags. Defaults preserve the "manual operator" behavior
+                # (everything off) so a config without these keys keeps
+                # the previous semantics. Operator flips upload_photos
+                # to true once the dedicated webflow_assets_read_write_key
+                # is configured AND a clean monitoring window has passed.
+                upload_photos=bool(bio_config.get("upload_photos", False)),
+                upload_photos_dry_run=bool(
+                    bio_config.get("upload_photos_dry_run", False)
+                ),
+                strict_schema=bool(bio_config.get("strict_schema", False)),
             )
             logger.info(
                 "Starting scheduled legislator bio sync",
                 target=options.target,
                 jurisdiction=options.jurisdiction,
                 auto_create=options.auto_create,
+                upload_photos=options.upload_photos,
+                strict_schema=options.strict_schema,
             )
 
             pipeline = LegislatorBioPipeline()

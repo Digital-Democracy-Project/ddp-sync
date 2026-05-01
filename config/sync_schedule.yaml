@@ -123,6 +123,30 @@ legislator_bio_sync:
   historical_since: "2023-01-01"
   target: all                   # all / webflow / pinecone
 
+  # Phase-3 photo upload pipeline (production-verified 2026-04-30 →
+  # editor-signed-off 2026-05-01). When true, the orchestrator uploads
+  # source images to Webflow's asset library and populates the
+  # legislator-image (Image type) field. Requires
+  # webflow_assets_read_write_key in the secret with assets:read +
+  # assets:write scopes. Operator flips after stable monitoring window;
+  # the cardinal rule preserves existing legislator-image values, so
+  # weekly runs only upload for records that lost their photo or are
+  # newly added.
+  upload_photos: false
+
+  # Phase-3 connectivity smoke variant: fetches + size-validates +
+  # hashes the source image but skips Webflow asset creation. Useful
+  # for one-off "is the source CDN reachable" runs without consuming
+  # Webflow's asset rate limit. No-op when upload_photos is false.
+  upload_photos_dry_run: false
+
+  # Phase-3 validation flag. When true, any payload field that the
+  # schema cache would silently drop (slug missing from the live CMS
+  # collection) becomes a per-record error. Operator flips this true
+  # after adding a new write target so missing slugs surface
+  # immediately instead of silently no-op'ing for a week.
+  strict_schema: false
+
 # Legacy alias (deprecated, use legislator_sync instead)
 legislator_bills:
   enabled: false  # Disabled — superseded by legislator_sync above
@@ -153,3 +177,26 @@ notifications:
   on_failure: true
   on_large_changes: true  # Alert if >100 bills updated
   email: ""  # Configure if needed
+
+# VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
+# Runs scripts/evaluate_production.py weekly via subprocess into votebot's
+# venv. Posts a Zapier alert with on_failure / on_regression /
+# on_bill_history_leak flags that the Zap routes to Slack on receiver side.
+# Manual trigger: POST /ddp-sync/v1/trigger/votebot-eval?days=7
+votebot_eval:
+  enabled: true
+  frequency: weekly                  # weekly only — eval is expensive
+  sync_day: sunday                   # Sunday early UTC = Saturday evening EST
+  sync_time_utc: "12:00"
+  days: 7                            # window passed to --days
+  max_days: 30                       # hard cap accepted by manual trigger
+  votebot_path: "/home/ubuntu/votebot"  # env VOTEBOT_PATH overrides this
+  thresholds:
+    # Set below current production baselines so first run isn't a false
+    # positive. Tighten as Deploy 2 (citation prompt) lifts the baseline.
+    citation_rate_floor: 0.20        # alert when citation_rate < this
+    pass_rate_floor: 0.40            # alert when pass_rate < this
+    delta_drop_pp: 10                # soft-alert when either rate drops by ≥ this many pp
+  notifications:
+    enabled: true                    # set false to suppress Zapier alerts
+    alert_on_success: true           # send the green-path summary too, not just failures

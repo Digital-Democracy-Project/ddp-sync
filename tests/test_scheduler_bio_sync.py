@@ -300,6 +300,70 @@ async def test_scheduler_frequency_toggle_does_not_leave_stale_job():
 
 
 @pytest.mark.asyncio
+async def test_scheduler_passes_upload_photos_strict_schema_through_to_options():
+    """Phase-4: scheduler runner reads upload_photos / upload_photos_dry_run /
+    strict_schema from YAML and threads them into BioSyncOptions."""
+    sched = _scheduler_with_yaml(
+        """
+        legislator_bio_sync:
+          enabled: true
+          upload_photos: true
+          upload_photos_dry_run: false
+          strict_schema: true
+        """
+    )
+    fake_report = MagicMock()
+    fake_report.aborted = False
+    fake_report.cms_items_seen = 0
+    fake_report.would_patch = []
+    fake_report.would_create = []
+    fake_report.errors = []
+    fake_report.abort_reason = None
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.run = AsyncMock(return_value=fake_report)
+        await sched._run_legislator_bio_sync()
+
+    options = instance.run.call_args.args[0]
+    assert options.upload_photos is True
+    assert options.upload_photos_dry_run is False
+    assert options.strict_schema is True
+
+
+@pytest.mark.asyncio
+async def test_scheduler_defaults_phase4_flags_to_false_when_yaml_lacks_them():
+    """Phase-4: backward-compat. A pre-Phase-4 sync_schedule.yaml without
+    upload_photos/strict_schema/upload_photos_dry_run keys defaults all
+    three to False, preserving the previous (manual-only) behavior."""
+    sched = _scheduler_with_yaml(
+        """
+        legislator_bio_sync:
+          enabled: true
+        """
+    )
+    fake_report = MagicMock()
+    fake_report.aborted = False
+    fake_report.cms_items_seen = 0
+    fake_report.would_patch = []
+    fake_report.would_create = []
+    fake_report.errors = []
+    fake_report.abort_reason = None
+    with patch(
+        "ddp_sync.pipelines.legislator_bio.LegislatorBioPipeline"
+    ) as MockPipeline:
+        instance = MockPipeline.return_value
+        instance.run = AsyncMock(return_value=fake_report)
+        await sched._run_legislator_bio_sync()
+
+    options = instance.run.call_args.args[0]
+    assert options.upload_photos is False
+    assert options.upload_photos_dry_run is False
+    assert options.strict_schema is False
+
+
+@pytest.mark.asyncio
 async def test_run_legislator_bio_sync_invalid_historical_since_falls_back():
     """Bad historical_since string → falls back to 2023-01-01, doesn't crash."""
     sched = _scheduler_with_yaml(
