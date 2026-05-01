@@ -24,6 +24,7 @@ Wire-up summary:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -412,8 +413,14 @@ def detect_regressions(headline: dict, last_run: dict | None, config: dict | Non
 # -----------------------------------------------------------------------------
 
 def _compute_timeout(days: int) -> int:
-    """Subprocess timeout scales with --days. Plan §3.2 step 2."""
-    return max(600, 60 + days * 60)
+    """Subprocess timeout scales with --days. Plan §3.2 step 2.
+
+    PM v5 build review on Phase 3 noted historical 30-day runs have
+    occasionally taken 45-55 min on c6g.large. Coefficient widened from
+    60s/day to 90s/day so a 30-day window gets 2760s (46 min) before
+    timeout, covering the documented worst case with margin.
+    """
+    return max(600, 120 + days * 90)
 
 
 async def run_votebot_eval(
@@ -534,7 +541,12 @@ async def _run_eval_holding_lock(
 
     proc_start = time.monotonic()
     try:
-        result = subprocess.run(
+        # Run the (potentially multi-minute) subprocess off the event loop
+        # via asyncio.to_thread so it doesn't starve the FastAPI worker /
+        # APScheduler heartbeat. PM v5 build review concern #1 — mirrors
+        # legislator_bio.py's asyncio.to_thread pattern for push_bio_sync_alert.
+        result = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             cwd=str(Path(votebot_path).expanduser()),
             capture_output=True,
@@ -586,8 +598,16 @@ async def _run_eval_holding_lock(
             pass
         return {"success": False, "error": "subprocess_nonzero", "returncode": result.returncode}
 
-    # Parse the saved JSON for the headline block.
+    # Parse the saved JSON for the headline block. PM v5 build review LOW
+    # concern: subprocess can return 0 yet write nothing (OOM mid-write,
+    # disk-full, etc.). Guard with explicit existence + non-zero size
+    # check so we surface "subprocess succeeded but no report" distinctly
+    # from "report exists but malformed".
     try:
+        if not report_path.exists():
+            raise FileNotFoundError(f"report not written: {report_path}")
+        if report_path.stat().st_size == 0:
+            raise ValueError(f"report file is empty: {report_path}")
         with open(report_path) as f:
             report_json = json.load(f)
         headline = report_json.get("headline")
@@ -650,13 +670,28 @@ async def _run_eval_holding_lock(
 
     should_alert = notif_enabled and (alert_on_success or regressions)
     if should_alert:
-        push_eval_alert(
-            getattr(settings, "zapier_webhook_url", "") or "",
-            headline,
-            regressions,
-            report_path=str(report_path),
-            trigger=trigger,
-        )
+        # Run the sync HTTP call off the event loop. push_eval_alert is
+        # fire-and-forget (returns bool, never raises) so we don't block
+        # the orchestrator on Zapier latency. Mirrors legislator_bio's
+        # use of asyncio.to_thread around push_bio_sync_alert.
+        try:
+            await asyncio.to_thread(
+                push_eval_alert,
+                getattr(settings, "zapier_webhook_url", "") or "",
+                headline,
+                regressions,
+                report_path=str(report_path),
+                trigger=trigger,
+            )
+        except Exception as e:  # noqa: BLE001
+            # push_eval_alert never raises, but defend against
+            # asyncio.to_thread surprises so a webhook hiccup doesn't
+            # mask a successful eval run.
+            logger.error(
+                "votebot_eval: Zapier alert task crashed",
+                error=str(e),
+                metric=METRIC_ALERT_FAILED,
+            )
 
     # Run-completed metric event (info level — distinct from regression_detected).
     logger.info(
@@ -709,20 +744,28 @@ async def _send_failure_alert(
     error: str,
 ) -> None:
     """Send a Zapier alert for a failed run with on_failure=True."""
-    push_eval_alert(
-        getattr(settings, "zapier_webhook_url", "") or "",
-        headline={
-            "n_query_processed": 0,
-            "citation_rate": 0,
-            "pass_rate": 0,
-            "cache_hit_rate": 0,
-            "bill_history_leak_count": 0,
-        },
-        regression_details=[],
-        report_path=report_path,
-        trigger=trigger,
-        error=error,
-    )
+    try:
+        await asyncio.to_thread(
+            push_eval_alert,
+            getattr(settings, "zapier_webhook_url", "") or "",
+            headline={
+                "n_query_processed": 0,
+                "citation_rate": 0,
+                "pass_rate": 0,
+                "cache_hit_rate": 0,
+                "bill_history_leak_count": 0,
+            },
+            regression_details=[],
+            report_path=report_path,
+            trigger=trigger,
+            error=error,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "votebot_eval: failure-alert task crashed",
+            error=str(e),
+            metric=METRIC_ALERT_FAILED,
+        )
 
 
 def _prune_old_reports(reports_dir: Path, max_age_days: int) -> int:

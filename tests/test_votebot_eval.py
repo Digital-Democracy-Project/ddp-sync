@@ -6,6 +6,7 @@ regression detection, Zapier alerting, metric string contracts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -53,21 +54,27 @@ def test_metric_strings_are_pinned():
 # -----------------------------------------------------------------------------
 
 def test_timeout_scales_with_days():
-    """A 7-day run gets the floor of 600s; a 30-day run gets 60 + 30*60 = 1860s."""
-    assert _compute_timeout(1) == 600   # min floor wins
-    assert _compute_timeout(7) == 600
-    assert _compute_timeout(10) == 660  # 60 + 600
-    assert _compute_timeout(30) == 1860
+    """Timeout = max(600, 120 + days * 90). PM v5 Phase-3 build review
+    widened the coefficient from 60 to 90 after empirical 30-day-window
+    runtime data showed ~45-55 min on c6g.large.
+    """
+    assert _compute_timeout(1) == 600   # min floor wins (120+90=210 < 600)
+    assert _compute_timeout(7) == 750   # 120 + 7*90 = 750
+    assert _compute_timeout(10) == 1020  # 120 + 10*90 = 1020
+    assert _compute_timeout(30) == 2820  # 120 + 30*90 = 2820
 
 
 def test_lock_ttl_binding_is_timeout_plus_300():
     """Plan §3.4 (post PM v4) — lock TTL = subprocess timeout + 300s safety margin
     so the lock never expires mid-run. PM v3 caught a 30-min fixed TTL bug;
-    PM v4 widened the margin from 120s to 300s for post-processing.
+    PM v4 widened the margin from 120s to 300s for post-processing; PM v5
+    Phase-3 build review widened the timeout coefficient from 60→90 s/day
+    after empirical c6g.large 30-day-window data showed ~45-55 min runs.
     """
     assert LOCK_SAFETY_MARGIN_S == 300
-    # For a 30-day window, lock TTL must be 1860 + 300 = 2160s.
-    assert _compute_timeout(30) + LOCK_SAFETY_MARGIN_S == 2160
+    # For a 30-day window: timeout = 120 + 30*90 = 2820s; lock TTL = 3120s.
+    assert _compute_timeout(30) == 2820
+    assert _compute_timeout(30) + LOCK_SAFETY_MARGIN_S == 3120
 
 
 # -----------------------------------------------------------------------------
@@ -413,11 +420,113 @@ async def test_run_votebot_eval_subprocess_uses_start_new_session(
 
 
 @pytest.mark.asyncio
+async def test_subprocess_runs_via_asyncio_to_thread(
+    fake_redis_store, monkeypatch, tmp_path
+):
+    """PM v5 Phase-3 build review HIGH concern #1 — subprocess.run is
+    blocking; calling it directly from an async function freezes the
+    event loop for minutes, starving other ddp-sync API + cron tasks.
+    Mirror legislator_bio's asyncio.to_thread pattern (line 704).
+
+    This test verifies asyncio.to_thread is used by spying on it and
+    asserting the wrapped subprocess.run is reached via that path.
+    """
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
+        lambda c: str(tmp_path),
+    )
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+    (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scripts" / "evaluate_production.py").touch()
+
+    to_thread_calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spying_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.asyncio.to_thread", spying_to_thread
+    )
+
+    def fake_run(*a, **kw):
+        m = MagicMock()
+        m.returncode = 1  # quick exit before JSON parse
+        m.stderr = b""
+        return m
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    await run_votebot_eval(days=7, settings=MagicMock())
+    # The orchestrator must wrap blocking calls (subprocess.run +
+    # push_eval_alert) in asyncio.to_thread. Both must show up in the
+    # spy log; the subprocess shows as "fake_run" because of the
+    # monkeypatch above. push_eval_alert is the most reliable signal
+    # that the alerting wrap is in place too.
+    assert "push_eval_alert" in to_thread_calls, (
+        f"expected push_eval_alert to be invoked via asyncio.to_thread; "
+        f"got calls: {to_thread_calls}"
+    )
+    # And there must be at least one subprocess wrap before that.
+    assert len(to_thread_calls) >= 2, (
+        f"expected at least 2 to_thread invocations (subprocess + alert); "
+        f"got {to_thread_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subprocess_zero_exit_but_no_report_returns_parse_error(
+    fake_redis_store, monkeypatch, tmp_path
+):
+    """PM v5 Phase-3 build review LOW concern #4 — subprocess can exit 0
+    yet write nothing (OOM mid-write, disk full, etc.). The pipeline must
+    surface this as a parse_error, not silently succeed."""
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
+        lambda c: str(tmp_path),
+    )
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+    (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scripts" / "evaluate_production.py").touch()
+
+    def fake_run(*a, **kw):
+        # Subprocess "succeeds" but writes no file.
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b""
+        m.stdout = b""
+        return m
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    result = await run_votebot_eval(days=7, settings=MagicMock())
+    assert result["success"] is False
+    assert result["error"] == "parse_error"
+    assert "report not written" in result["detail"].lower() or "missing" in result["detail"].lower()
+
+
+@pytest.mark.asyncio
 async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     fake_redis_store, monkeypatch, tmp_path
 ):
-    """For a 30-day run (timeout 1860s), the lock TTL must be 1860 + 300 = 2160s.
-    Catches the silent double-run bug PM v3 + v4 reviews surfaced.
+    """For a 30-day run (timeout 2820s after PM v5 widening), the lock TTL
+    must be 2820 + 300 = 3120s. Catches the silent double-run bug PM v3 +
+    v4 reviews surfaced.
     """
     monkeypatch.setattr(
         "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
@@ -443,10 +552,10 @@ async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
 
     await run_votebot_eval(days=30, settings=MagicMock())
-    # At least one ex= entry should be the lock-set call with TTL=2160.
+    # At least one ex= entry should be the lock-set call with TTL=3120.
     set_calls = fake_redis_store._client.set_ex_history
     lock_set_calls = [(k, ex) for (k, ex) in set_calls if k == LOCK_KEY]
     assert lock_set_calls, "lock was not set with an ex parameter"
-    assert lock_set_calls[0][1] == 2160, (
-        f"expected lock TTL 1860+300=2160, got {lock_set_calls[0][1]}"
+    assert lock_set_calls[0][1] == 3120, (
+        f"expected lock TTL 2820+300=3120, got {lock_set_calls[0][1]}"
     )
