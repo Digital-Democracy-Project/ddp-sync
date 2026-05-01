@@ -259,6 +259,80 @@ async def trigger_legislator_bio_sync(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/trigger/votebot-eval")
+async def trigger_votebot_eval(
+    days: int = 7,
+    token: str = Depends(api_key_auth),
+):
+    """Trigger an on-demand votebot eval run.
+
+    See plans/PLAN-eval-and-cache-hit-logging.md §3.4 for the full design.
+
+    Query params:
+        days: Window passed to evaluate_production.py --days. Bounded by
+              the YAML config's ``max_days`` (default 30). Out-of-range
+              returns 400.
+
+    Status codes:
+        200 — run completed successfully (returns headline + regressions).
+        400 — days outside [1, max_days].
+        409 — another run is currently in flight (returns current_run_id
+              + lock TTL).
+        500 — unexpected error.
+        503 — votebot path is invalid (Phase 1 not deployed, EC2 path
+              moved, etc.).
+    """
+    from ddp_sync.pipelines.votebot_eval import (
+        run_votebot_eval,
+        DEFAULT_MAX_DAYS,
+    )
+    from ddp_sync.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    yaml_config = (
+        scheduler._sync_config.get("votebot_eval") if scheduler else None
+    )
+    max_days = (yaml_config or {}).get("max_days", DEFAULT_MAX_DAYS)
+    if not isinstance(days, int) or days < 1 or days > max_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"days must be in [1, {max_days}], got {days}",
+        )
+
+    try:
+        result = await run_votebot_eval(
+            days=days,
+            yaml_config=yaml_config,
+            trigger="manual",
+        )
+    except Exception as e:
+        logger.exception("votebot-eval trigger failed unexpectedly")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if result.get("success"):
+        return result
+
+    err = result.get("error")
+    if err == "already_running":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "already_running",
+                "current_run_id": result.get("current_run_id"),
+            },
+        )
+    if err == "votebot_path_invalid":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "votebot_path_invalid",
+                "message": result.get("detail"),
+            },
+        )
+    # Other failures (timeout, subprocess_nonzero, redis_unavailable, parse_error)
+    raise HTTPException(status_code=500, detail=result)
+
+
 @router.post("/trigger/webflow/{job_name}")
 async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth)):
     """Trigger a specific Webflow CMS batch job."""

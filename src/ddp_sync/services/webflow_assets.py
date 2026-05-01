@@ -149,6 +149,7 @@ class WebflowAssetService:
         self,
         source_url: str,
         *,
+        fallback_urls: tuple[str, ...] = (),
         alt_text: str = "",
         dry_run: bool = False,
     ) -> AssetReference | None:
@@ -157,6 +158,13 @@ class WebflowAssetService:
         Cached on the service instance — second call with the same
         source_url returns the cached AssetReference without any HTTP
         traffic.
+
+        ``fallback_urls`` (Phase-4): when the primary ``source_url``
+        returns 404 from the source CDN (e.g., unitedstates/images
+        dataset gap for a federal freshman), the service will try each
+        fallback URL in order until one succeeds. First-success wins;
+        all failures raise the LAST WebflowAssetError so the caller
+        sees the whole chain in the diagnostic body.
 
         ``dry_run=True`` performs the source-image fetch + size check +
         hash computation but skips both the Webflow ``POST /assets``
@@ -178,15 +186,43 @@ class WebflowAssetService:
                 alt_text=alt_text or cached.alt_text,
             )
 
-        image_bytes, content_type = await self._fetch_image(source_url)
+        # Phase-4: try the primary URL, then each fallback in order.
+        # Only the LAST attempt's error is raised so the caller sees
+        # the chain (e.g., "unitedstates 404 + congress.gov 404 = real
+        # gap"). Each attempt that succeeds wins; subsequent fallbacks
+        # are not tried.
+        candidates = (source_url,) + tuple(fallback_urls)
+        image_bytes: bytes | None = None
+        content_type = "image/jpeg"
+        last_err: WebflowAssetError | None = None
+        winning_url: str = source_url
+        for url in candidates:
+            try:
+                image_bytes, content_type = await self._fetch_image(url)
+                winning_url = url
+                if last_err is not None:
+                    logger.info(
+                        "Webflow asset source-fetch fell back",
+                        primary=source_url,
+                        used=url,
+                        metric="webflow_assets.source_fetch_fallback",
+                    )
+                break
+            except WebflowAssetError as e:
+                last_err = e
+                continue
+        if image_bytes is None:
+            assert last_err is not None
+            raise last_err
+
         file_hash = hashlib.md5(image_bytes).hexdigest()  # noqa: S324
-        file_name = self._derive_filename(source_url, content_type)
+        file_name = self._derive_filename(winning_url, content_type)
 
         if dry_run:
             logger.info(
                 "Webflow asset upload skipped (dry_run)",
                 metric="webflow_assets.upload_dry_run",
-                source_url=source_url,
+                source_url=winning_url,
                 bytes=len(image_bytes),
                 file_hash=file_hash,
             )
@@ -206,11 +242,16 @@ class WebflowAssetService:
             hosted_url=asset_meta.get("hostedUrl", ""),
             alt_text=alt_text,
         )
+        # Cache against BOTH the requested primary and the actual
+        # winning URL — subsequent calls with either one as primary
+        # short-circuit.
         self._cache[source_url] = ref
+        if winning_url != source_url:
+            self._cache[winning_url] = ref
         logger.info(
             "Webflow asset uploaded",
             metric="webflow_assets.upload_complete",
-            source_url=source_url,
+            source_url=winning_url,
             asset_id=ref.asset_id,
             bytes=len(image_bytes),
         )

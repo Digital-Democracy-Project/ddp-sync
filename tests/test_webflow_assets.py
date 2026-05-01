@@ -253,6 +253,105 @@ async def test_upload_from_url_max_image_bytes_configurable():
             )
 
 
+@pytest.mark.asyncio
+async def test_upload_from_url_falls_back_to_secondary_when_primary_404s():
+    """Phase-4: when the primary source URL 404s, the service tries
+    each fallback URL in order. First success wins; the cache stores
+    the AssetReference under BOTH the requested primary and the winning
+    URL so subsequent calls short-circuit."""
+    service = WebflowAssetService(
+        api_token="test-token", site_id="test-site",
+    )
+
+    image_bytes = b"\x89PNG\r\n\x1a\nfake-png"
+    primary_404 = MagicMock(status_code=404, text="not found", content=b"")
+    fallback_ok = MagicMock(
+        status_code=200, content=image_bytes,
+        headers={"content-type": "image/jpeg"},
+    )
+    create_resp = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "id": "asset-fb",
+            "hostedUrl": "https://cdn.webflow.com/asset-fb.jpg",
+            "uploadUrl": "https://s3.amazonaws.com/webflow-uploads/sig",
+            "uploadDetails": {"key": "fb.jpg"},
+        },
+    )
+    put_resp = MagicMock(status_code=204, headers={}, content=b"")
+
+    def make_ctx(get_resp=None, post_resp=None):
+        cli = MagicMock()
+        cli.get = AsyncMock(return_value=get_resp) if get_resp else AsyncMock()
+        cli.post = AsyncMock(return_value=post_resp) if post_resp else AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=cli)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    contexts = [
+        make_ctx(get_resp=primary_404),     # primary fetch → 404
+        make_ctx(get_resp=fallback_ok),     # fallback fetch → 200
+        make_ctx(post_resp=create_resp),    # /assets POST
+        make_ctx(post_resp=put_resp),       # signed-URL upload
+    ]
+    with patch(
+        "ddp_sync.services.webflow_assets.httpx.AsyncClient",
+        side_effect=contexts,
+    ):
+        ref = await service.upload_from_url(
+            "https://unitedstates.github.io/images/congress/450x550/X001.jpg",
+            fallback_urls=("https://www.congress.gov/img/member/x001.jpg",),
+            alt_text="Federal Member",
+        )
+
+    assert ref is not None
+    assert ref.asset_id == "asset-fb"
+
+    # Cache stores under both URLs
+    assert "https://unitedstates.github.io/images/congress/450x550/X001.jpg" in service._cache
+    assert "https://www.congress.gov/img/member/x001.jpg" in service._cache
+
+
+@pytest.mark.asyncio
+async def test_upload_from_url_raises_last_error_when_all_candidates_404():
+    """If primary AND every fallback 404s, the service raises the LAST
+    error (the chain-end one) so the caller sees the final state."""
+    service = WebflowAssetService(
+        api_token="test-token", site_id="test-site",
+    )
+
+    primary_404 = MagicMock(status_code=404, text="primary not found", content=b"")
+    fallback_404 = MagicMock(status_code=404, text="fallback not found", content=b"")
+
+    def make_ctx(get_resp=None):
+        cli = MagicMock()
+        cli.get = AsyncMock(return_value=get_resp) if get_resp else AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=cli)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    contexts = [
+        make_ctx(get_resp=primary_404),
+        make_ctx(get_resp=fallback_404),
+    ]
+    with patch(
+        "ddp_sync.services.webflow_assets.httpx.AsyncClient",
+        side_effect=contexts,
+    ):
+        with pytest.raises(WebflowAssetError) as exc_info:
+            await service.upload_from_url(
+                "https://primary.example.com/img.jpg",
+                fallback_urls=("https://fallback.example.com/img.jpg",),
+                alt_text="X",
+            )
+
+    # The raised error carries the final attempt's context (the fallback
+    # url, not the primary)
+    assert "fallback.example.com" in str(exc_info.value)
+
+
 def test_constructor_validates_required_inputs():
     with pytest.raises(ValueError, match="api_token"):
         WebflowAssetService(api_token="", site_id="x")

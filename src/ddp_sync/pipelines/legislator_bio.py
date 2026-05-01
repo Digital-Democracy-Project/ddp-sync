@@ -937,9 +937,25 @@ class LegislatorBioPipeline:
         if self.assets is _NULL_ASSET_SERVICE_SENTINEL:
             return None
 
+        # Phase-4: federal records get a congress.gov fallback URL
+        # because the unitedstates/images community dataset has gaps
+        # for new freshmen + some non-current bioguides (4 of 32 FL
+        # federal records 404'd in production 2026-04-30). Congress.gov
+        # uses lowercase bioguide-id in the path. State records have no
+        # universal fallback (per-state CDNs vary too much).
+        fallback_urls: tuple[str, ...] = ()
+        if cms.is_federal and cms.bioguide_id:
+            fallback_urls = (
+                f"https://www.congress.gov/img/member/"
+                f"{cms.bioguide_id.lower()}.jpg",
+            )
+
         try:
             ref = await self.assets.upload_from_url(
-                source_url, alt_text=cms.name, dry_run=dry_run,
+                source_url,
+                fallback_urls=fallback_urls,
+                alt_text=cms.name,
+                dry_run=dry_run,
             )
         except WebflowAssetError as e:
             report.errors.append(

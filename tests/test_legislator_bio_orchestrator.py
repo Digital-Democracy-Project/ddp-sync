@@ -1442,6 +1442,83 @@ async def test_run_upload_photos_skips_when_cms_already_has_image():
 
 
 @pytest.mark.asyncio
+async def test_run_upload_photos_passes_congress_gov_fallback_for_federal():
+    """Phase-4: federal records get a congress.gov fallback URL for the
+    photo upload (because unitedstates/images dataset has gaps for new
+    freshmen). State records get no fallback (per-state CDNs vary)."""
+    from unittest.mock import MagicMock, AsyncMock
+    from ddp_sync.services.webflow_assets import AssetReference
+
+    cms_fed = [_cms(
+        item_id="wf-fed-1", chamber="Senate",
+        openstatesid="ocd-person/x", bioguide_id="X001",
+        jurisdiction_ref=["juris-us"],
+    )]
+    fed = _fed(bioguide="X001")
+    os_record = _os_person(
+        openstates_id="ocd-person/x", chamber="upper",
+        bioguide="X001", is_federal=True,
+    )
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock(return_value=AssetReference(
+        asset_id="asset-fed", hosted_url="https://cdn/fed.jpg",
+        alt_text="Fed Test",
+    ))
+    pipeline = _build_pipeline(
+        cms_items=cms_fed,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+    )
+    pipeline.assets = fake_assets
+
+    await pipeline.run(BioSyncOptions(dry_run=False, upload_photos=True))
+
+    fake_assets.upload_from_url.assert_awaited_once()
+    call_kwargs = fake_assets.upload_from_url.call_args.kwargs
+    fallback_urls = call_kwargs.get("fallback_urls") or ()
+    assert len(fallback_urls) == 1
+    # Lowercase bioguide in the path
+    assert fallback_urls[0] == "https://www.congress.gov/img/member/x001.jpg"
+
+
+@pytest.mark.asyncio
+async def test_run_upload_photos_no_fallback_for_state_records():
+    """State records get no fallback URLs (per-state CDNs vary too much
+    for a universal fallback). The upload either works on the primary
+    OpenStates `image` URL or fails per-record."""
+    from unittest.mock import MagicMock, AsyncMock
+    from ddp_sync.services.webflow_assets import AssetReference
+
+    cms_state = [_cms(
+        item_id="wf-st-1", chamber="lower",
+        openstatesid="ocd-person/y",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/y", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock(return_value=AssetReference(
+        asset_id="asset-st", hosted_url="https://cdn/st.jpg",
+        alt_text="State Test",
+    ))
+    pipeline = _build_pipeline(
+        cms_items=cms_state,
+        openstates_responses={"ocd-person/y": os_record},
+    )
+    pipeline.assets = fake_assets
+
+    await pipeline.run(BioSyncOptions(dry_run=False, upload_photos=True))
+
+    fake_assets.upload_from_url.assert_awaited_once()
+    call_kwargs = fake_assets.upload_from_url.call_args.kwargs
+    fallback_urls = call_kwargs.get("fallback_urls") or ()
+    assert fallback_urls == ()  # state path: no fallback
+
+
+@pytest.mark.asyncio
 async def test_run_upload_photos_dry_run_skips_legislator_image_field():
     """Phase-3 round-18: upload_photos_dry_run fetches/validates the
     source image but skips the actual Webflow asset creation. The
@@ -1511,7 +1588,7 @@ async def test_run_upload_photos_failure_isolated_does_not_abort():
     )
     from ddp_sync.services.webflow_assets import AssetReference
 
-    async def upload_side_effect(source_url, *, alt_text="", dry_run=False):
+    async def upload_side_effect(source_url, *, alt_text="", dry_run=False, fallback_urls=()):
         if "broken" in source_url:
             raise WebflowAssetError("404 fetching source image")
         return AssetReference(
