@@ -13,7 +13,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
   - Flow 2: OpenStates → Pinecone (bill text re-ingestion on new versions)
   - Either flow can be disabled independently in `sync_schedule.yaml`
 - **Legislator sync** (weekly Sun 06:00 UTC): OpenStates → Pinecone
-- **Legislator bio sync** (weekly Sun 07:00 UTC, `enabled: false` by default): unitedstates/congress-legislators + OpenStates → Webflow Legislators CMS (bio, contact, term, social, photo URL fields)
+- **Legislator bio sync** (weekly Sun 07:00 UTC, enabled 2026-05-01): unitedstates/congress-legislators + OpenStates → Webflow Legislators CMS (bio, contact, term, social, photo URL fields). Phase-3 photo upload pipeline populates the `legislator-image` (Image type) field with Webflow-hosted assets via the Webflow Assets v2 API. Per-state override registry handles jurisdiction-specific extraction (e.g., FL `official-website` from `links[]` "member detail page").
 - **Organization sync** (monthly 1st 08:00 UTC): Webflow → Pinecone
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
 - **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): Full re-import
@@ -46,6 +46,17 @@ DDP-Sync also stores `bill_slug` alongside `last_checked` in the `ddp:bill_versi
 - **Local dev**: `.env` file (copy from `.env.example`)
 
 Config is loaded once at startup. Source priority: Secrets Manager → `.env` → defaults.
+
+### Webflow API tokens
+
+DDP-Sync uses two distinct Webflow API tokens with different scopes:
+
+| Secret key | Scopes | Used by |
+|---|---|---|
+| `webflow_api_token` | `cms:read cms:write` | All Webflow CMS item PATCHes (bills, legislators, organizations) |
+| `webflow_assets_read_write_key` | `assets:read assets:write` | Phase-3 photo upload pipeline (`POST /v2/sites/{id}/assets`); without this, `upload_photos: true` runs disable photo uploads with `metric=webflow_assets.config_error` per record |
+
+The `cms:*` token does NOT carry `assets:write` — confirmed via 2026-04-30 production smoke (returned 403 OAuthForbidden on `POST /assets`). Keep them as separate keys so each can be rotated independently and the principle of least privilege is preserved.
 
 ## API
 
@@ -80,13 +91,25 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 
 `/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
 
-`/trigger/legislator-bio-sync` accepts query params: `dry_run` (bool), `auto_create` (bool), `jurisdiction` (str — `us` for federal or state code), `target` (`all` / `webflow` / `pinecone`), `limit` (int), `historical_since` (YYYY-MM-DD), `audit_only` (`A` = federal join-key coverage / `B` = bulk-import readiness (no missing or duplicate openstatesid) / `C` = pre-existing state CMS records lacking openstatesid). Returns 503 + `Retry-After: 60` while the unitedstates dataset is still being parsed at app startup (~55s; pre-warm fires at startup).
+`/trigger/legislator-bio-sync` accepts query params:
+- `dry_run` (bool) — preview the diff without writing
+- `auto_create` (bool) — create drafts for upstream-only members
+- `jurisdiction` (str) — `us` for federal or 2-letter state code
+- `target` (`all` / `webflow` / `pinecone`)
+- `limit` (int) — cap items processed (0 = unlimited)
+- `historical_since` (YYYY-MM-DD)
+- `audit_only` (`A` = federal join-key coverage / `B` = bulk-import readiness — no missing or duplicate openstatesid / `C` = pre-existing state CMS records lacking openstatesid)
+- `strict_schema` (bool) — Phase-3 fail-fast on schema-cache silent drops; flip True for the first run after adding a new write target
+- `upload_photos` (bool) — Phase-3 photo upload to Webflow's asset library (populates `legislator-image`); requires `webflow_assets_read_write_key` with `assets:read assets:write` scopes
+- `upload_photos_dry_run` (bool) — Phase-3 connectivity smoke; fetches + size-validates source images but skips Webflow asset creation
 
-After non-dry-run completion (including aborted runs) the bio sync POSTs a summary to the Zapier webhook configured via the `ZAPIER_WEBHOOK_URL` env var (same setting used by the Voatz→Brevo sync). Both alerts share the webhook and route via the top-level `alert_type` field — `user_sync_complete` for Voatz→Brevo, `legislator_bio_sync_complete` for bio-sync. Bio-sync payload includes `on_failure` and `on_large_changes` boolean flags + pre-formatted `failure_warning` and `large_changes_warning` strings (empty when not applicable, populated text otherwise — Zapier doesn't support Mustache conditionals, so flatten at the source). Set `ZAPIER_WEBHOOK_URL=` (empty) to disable alerts without removing the variable.
+Returns 503 + `Retry-After: 60` while the unitedstates dataset is still being parsed at app startup (~55s; pre-warm fires at startup).
+
+After non-dry-run completion (including aborted runs) the bio sync POSTs a summary to the Zapier webhook configured via the `ZAPIER_WEBHOOK_URL` env var (same setting used by the Voatz→Brevo sync). Both alerts share the webhook and route via the top-level `alert_type` field — `user_sync_complete` for Voatz→Brevo, `legislator_bio_sync_complete` for bio-sync. Bio-sync payload includes `on_failure` and `on_large_changes` boolean flags + pre-formatted `failure_warning` and `large_changes_warning` strings (empty when not applicable, populated text otherwise — Zapier doesn't support Mustache conditionals, so flatten at the source). Phase-4 photo coverage metrics: `photo_uploads_attempted`, `photo_uploads_succeeded`, `photo_uploads_failed`, `photo_coverage_ratio` (rounded to 3dp; null when no attempts). Set `ZAPIER_WEBHOOK_URL=` (empty) to disable alerts without removing the variable.
 
 The bio sync uses a multi-reference `seat` field on Legislators CMS records to determine federal vs state classification (refs into a Seats CMS with 4 items: `us-house`, `us-senate`, `state-house`, `state-senate`). The two federal seat ref-IDs are hardcoded in `pipelines/legislator_bio.py::_FEDERAL_SEAT_REF_IDS`. If the Seats CMS items are ever recreated, that constant needs a one-line update.
 
-Phase 1 + Phase 2.5 (federal + state baseline + per-state override registry) shipped 2026-04-30 against the FL congressional delegation (32) + 192 FL state legs. End-state population (read-only Webflow probe): federal `bioguide-id` / `wikidata-id` / `ballotpedia-slug` / `govtrack-id` / `birth-year` / `gender` / `term-start` / `term-end` / `phone-capitol` / `office-address-capitol` / `contact-form-url` / `official-website` / `photo-source-url` / `open-states-url` all 100%; state `gender` / `open-states-url` 100%, `office-email` 99%, `official-website` 98%, `photo-source-url` 98%, `birth-year` 71%, capitol contact ~80%. Audit B is wired (`audit_only=B` returns missing-openstatesid records and openstatesid duplicates). The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs to Phase 3: per-state photo-upload pipeline; state-leg social handles + term dates (deferred — OpenStates `/people` v3 doesn't surface them); orphan-set instability investigation; mass-revert capability.
+Phase 1 + 2.5 + 3 + 4 (V1) shipped 2026-04-30 → 2026-05-01 against the FL congressional delegation (32) + 192 FL state legs. End-state population (read-only Webflow probe): federal `bioguide-id` / `wikidata-id` / `ballotpedia-slug` / `govtrack-id` / `birth-year` / `gender` / `term-start` / `term-end` / `phone-capitol` / `office-address-capitol` / `contact-form-url` / `official-website` / `photo-source-url` / `open-states-url` all 100%; state `gender` / `open-states-url` 100%, `office-email` 99%, `official-website` 98%, `photo-source-url` 98%, `legislator-image` 96.4%, `birth-year` 71%, capitol contact ~80%. Audit B is wired (`audit_only=B` returns missing-openstatesid records and openstatesid duplicates). Phase-3 photo upload pipeline uploads source images to Webflow's asset library (federal records have a congress.gov fallback when the unitedstates/images dataset 404s). Phase 4 V1 hardened the scheduler-enable path (config wiring for `upload_photos` / `strict_schema`, startup-time scope validation, photo coverage metrics). **The bio sync is enabled in the weekly cron as of 2026-05-01** (`legislator_bio_sync.enabled: true` + `upload_photos: true` in `sync_schedule.yaml`). Phase 4.5/5 backlog: `--undo-last-run` mass-revert; post-upload HEAD probe; Redis cross-run photo dedup; bulk-data state term-history; alternate state social-handles upstream.
 
 **⚠ Schema-change checklist for the Legislators CMS:** when adding a new field to the Webflow Legislators collection, **publish the Webflow site** before running the bio sync. The schema endpoint reflects new fields immediately, but the items endpoint silently ignores writes to unpublished fields (PATCHes return 200 but the value doesn't persist). Verify with `scripts/probe_webflow_legislators.py` after the first sync run.
 

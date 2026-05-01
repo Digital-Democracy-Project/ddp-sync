@@ -189,6 +189,33 @@ The alert is wired in a `try/finally`, so it fires even on aborted runs (rate-li
 
 **Diagnostic:** Use `scripts/probe_webflow_legislators.py` to read back the population. If the field shows 0% populated despite `patched: N` from the bio sync, this is the issue.
 
+### Scheduled bio sync logs `metric=legislator_bio_sync.startup_misconfig` at app start
+
+**Symptom:** After restarting ddp-sync, `journalctl` shows an error event:
+```
+metric=legislator_bio_sync.startup_misconfig
+"legislator_bio_sync.upload_photos: true but webflow_assets_read_write_key is NOT configured. ..."
+```
+
+**Cause:** `sync_schedule.yaml` has `legislator_bio_sync.upload_photos: true` but the `webflow_assets_read_write_key` is missing from the secret (or is empty). The scheduled run will register normally, but every photo upload will fail with `metric=webflow_assets.config_error` once the cron fires.
+
+**Action:**
+1. Confirm the Webflow workspace has a token with `assets:read` and `assets:write` scopes (the existing `webflow_api_token` has only `cms:*` and is insufficient — confirmed 2026-04-30 via 403 OAuthForbidden).
+2. Add the token to `ddp-sync/credentials` in AWS Secrets Manager under the key `webflow_assets_read_write_key` (lowercase, with underscores).
+3. Restart ddp-sync; the misconfig event should not re-emit.
+
+If you want the bio sync to run WITHOUT photo uploads (e.g., temporarily during a Webflow incident), set `upload_photos: false` in `sync_schedule.yaml` and restart.
+
+### Photo upload pipeline: stale unitedstates/images URLs for federal members
+
+**Symptom:** Run summary shows `photo_uploads_failed > 0` for federal records; per-record errors include "Source image returned 404: https://unitedstates.github.io/images/congress/450x550/{bioguide}.jpg".
+
+**Cause:** The `unitedstates/images` GitHub Pages dataset is community-PR-maintained and lags new federal members significantly. As of 2026-04-30, 4 of 32 FL federal CMS records had bioguide-photos absent (including 2-year incumbents, not just freshmen).
+
+**Mitigation (Phase-4 V1, commit d3909c6):** Federal records now get a congress.gov fallback URL automatically: `https://www.congress.gov/img/member/{bioguide_lower}.jpg`. The `WebflowAssetService` tries the fallback after the primary 404s; first success wins. If both fail, the record's `legislator-image` stays empty and `photo-source-url` Link still has the canonical URL for the website to fall back via hotlinking.
+
+**Action:** No operator action needed — the fallback runs automatically. If both URLs fail for a specific record, an editor can manually upload a photo via the Webflow Designer (the cardinal rule preserves manual uploads).
+
 ### Suspected ChurnPATCH on a new field — diagnose schema mismatch first
 
 **Symptom:** A field appears in `changed_fields[]` on every run, even when the upstream value didn't change. Looks like a Webflow-side normalization mismatch (e.g., trailing slash, case).
