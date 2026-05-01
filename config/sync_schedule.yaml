@@ -114,7 +114,7 @@ legislator_sync:
 # stays false by default even when enabled (auto-create discovery is
 # additionally gated by per-jurisdiction config).
 legislator_bio_sync:
-  enabled: false                # gate flip after editor sign-off
+  enabled: true                 # enabled 2026-05-01 (post Phase-1+2.5+3+4 + editor sign-off)
   sync_time_utc: "07:00"        # after bill sync (04:00) + OpenStates leg sync (06:00)
   frequency: weekly
   sync_day: sunday
@@ -132,7 +132,7 @@ legislator_bio_sync:
   # the cardinal rule preserves existing legislator-image values, so
   # weekly runs only upload for records that lost their photo or are
   # newly added.
-  upload_photos: false
+  upload_photos: true           # enabled 2026-05-01 (key configured + 96.4% prod coverage verified)
 
   # Phase-3 connectivity smoke variant: fetches + size-validates +
   # hashes the source image but skips Webflow asset creation. Useful
