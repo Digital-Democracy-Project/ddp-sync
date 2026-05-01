@@ -98,6 +98,7 @@ async def trigger_legislator_bio_sync(
     audit_only: str | None = None,
     strict_schema: bool = False,
     upload_photos: bool = False,
+    upload_photos_dry_run: bool = False,
     token: str = Depends(api_key_auth),
 ):
     """Trigger the legislator bio + contact sync.
@@ -136,6 +137,14 @@ async def trigger_legislator_bio_sync(
                           when CMS already has a legislator-image set
                           (cardinal rule). Per-record upload failures
                           are logged + isolated, don't abort the run.
+        upload_photos_dry_run: Phase-3 connectivity smoke. When True
+                          (with upload_photos=True), the source image
+                          is fetched + size-validated + hashed but the
+                          Webflow asset-creation step is skipped.
+                          Lets operators smoke-test source-CDN
+                          reachability without consuming Webflow's
+                          asset rate limit or storage. No-op when
+                          upload_photos is False.
 
     Returns: BioSyncReport JSON.
 
@@ -234,6 +243,7 @@ async def trigger_legislator_bio_sync(
         historical_since=since,
         strict_schema=strict_schema,
         upload_photos=upload_photos,
+        upload_photos_dry_run=upload_photos_dry_run,
     )
 
     try:

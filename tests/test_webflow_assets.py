@@ -182,6 +182,77 @@ async def test_upload_from_url_image_too_large_rejected():
     assert "exceeds" in str(exc_info.value)
 
 
+@pytest.mark.asyncio
+async def test_upload_from_url_dry_run_skips_create_and_returns_none():
+    """Phase-3 round-18: dry_run=True fetches + validates + hashes the
+    source image but skips both POST /assets and the signed-URL upload.
+    Returns None so the orchestrator skips populating legislator-image.
+    """
+    service = WebflowAssetService(
+        api_token="test-token", site_id="test-site",
+    )
+    image_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    fetch_resp = MagicMock(
+        status_code=200, content=image_bytes,
+        headers={"content-type": "image/png"},
+    )
+
+    def make_ctx(get_resp=None, post_resp=None):
+        cli = MagicMock()
+        cli.get = AsyncMock(return_value=get_resp) if get_resp else AsyncMock()
+        cli.post = AsyncMock(return_value=post_resp) if post_resp else AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=cli)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    # Only one HTTP call is allowed (the source-image fetch); if /assets
+    # POST were attempted, the second context use would fail because
+    # we only provide one context.
+    fetch_ctx = make_ctx(get_resp=fetch_resp)
+    with patch(
+        "ddp_sync.services.webflow_assets.httpx.AsyncClient",
+        return_value=fetch_ctx,
+    ):
+        result = await service.upload_from_url(
+            "https://example.com/photo.png",
+            alt_text="X",
+            dry_run=True,
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_upload_from_url_max_image_bytes_configurable():
+    """Phase-3 round-18: max_image_bytes is configurable per service
+    instance. Default is 10 MB; tighter caps reject smaller images."""
+    service = WebflowAssetService(
+        api_token="test-token", site_id="test-site",
+        max_image_bytes=1024,  # 1 KB cap
+    )
+    fetch_resp = MagicMock(
+        status_code=200, content=b"x" * 2000,  # 2 KB image
+        headers={"content-type": "image/jpeg"},
+    )
+
+    def make_ctx(get_resp=None):
+        cli = MagicMock()
+        cli.get = AsyncMock(return_value=get_resp) if get_resp else AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=cli)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    with patch(
+        "ddp_sync.services.webflow_assets.httpx.AsyncClient",
+        return_value=make_ctx(get_resp=fetch_resp),
+    ):
+        with pytest.raises(WebflowAssetError, match="exceeds 1024"):
+            await service.upload_from_url(
+                "https://example.com/x.jpg", alt_text="X",
+            )
+
+
 def test_constructor_validates_required_inputs():
     with pytest.raises(ValueError, match="api_token"):
         WebflowAssetService(api_token="", site_id="x")

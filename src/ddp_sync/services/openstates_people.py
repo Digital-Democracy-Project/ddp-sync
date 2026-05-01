@@ -365,6 +365,15 @@ class OpenStatesPeopleClient:
                     )
                     await asyncio.sleep(wait)
                     continue
+                # Final attempt was 404 — emit a metric so dashboards
+                # can distinguish real orphans from transient-recovered
+                # flakes via the existing transient_404_retry counts.
+                logger.info(
+                    "OpenStates 404 persisted across retries",
+                    path=path,
+                    attempts=self.max_retry_attempts,
+                    metric="openstates.persistent_404",
+                )
                 return None
             if resp.status_code == 429:
                 wait = float(resp.headers.get("Retry-After", 2 ** attempt))

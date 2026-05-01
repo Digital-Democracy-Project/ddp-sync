@@ -683,6 +683,7 @@ class WebflowLookupService:
         *,
         publish: bool = True,
         api_key: str | None = None,
+        strict_schema: bool = False,
     ) -> WebflowPatchResult:
         """PATCH a Legislators CMS item with new field values.
 
@@ -697,6 +698,12 @@ class WebflowLookupService:
               published immediately. False writes without /live, so the
               change stays staged until an editor publishes the item.
             api_key: Override the default key (e.g. the scheduler key).
+            strict_schema: Phase-3 round-18 fix. When True, any payload
+              slug missing from the live CMS schema raises WebflowError
+              BEFORE the PATCH is sent — avoids the partial-write state
+              that post-PATCH enforcement left behind. The other fields
+              in the payload are NOT sent; operator fixes the schema and
+              re-runs for a complete-or-nothing PATCH per record.
 
         Returns:
             WebflowPatchResult with success=True and dropped_fields populated
@@ -704,8 +711,9 @@ class WebflowLookupService:
 
         Raises:
             WebflowRateLimitError: 429 persists after the retry budget.
-            WebflowError: any other non-2xx, missing collection id, or
-              missing API key.
+            WebflowError: any other non-2xx, missing collection id,
+              missing API key, OR (when strict_schema=True) any payload
+              slug missing from the live schema.
         """
         if not self.legislators_collection_id:
             raise WebflowError("legislators_collection_id is not configured")
@@ -734,6 +742,13 @@ class WebflowLookupService:
                 client, headers, field_data, self.legislators_collection_id
             )
             if dropped:
+                if strict_schema:
+                    raise WebflowError(
+                        f"strict_schema: payload fields not in live CMS "
+                        f"collection schema: {sorted(dropped)}. Add the "
+                        f"field(s) in the Webflow Designer + publish the "
+                        f"site, then re-run."
+                    )
                 logger.warning(
                     "Dropping unknown Webflow fields from legislator PATCH",
                     webflow_id=webflow_id,

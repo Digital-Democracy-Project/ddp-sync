@@ -249,7 +249,7 @@ def _build_pipeline(
     elif patch_error is not None:
         webflow.update_legislator_fields = AsyncMock(side_effect=patch_error)
     else:
-        async def fake_patch(webflow_id, fields, *, publish=True, api_key=None):
+        async def fake_patch(webflow_id, fields, *, publish=True, api_key=None, strict_schema=False):
             if patch_recorder is not None:
                 patch_recorder.append((webflow_id, dict(fields)))
             return WebflowPatchResult(success=True, webflow_id=webflow_id)
@@ -1261,7 +1261,7 @@ async def test_run_mixed_success_patches_records_per_record_results():
     # Selective patch: 2xx for the good ones, WebflowError for the bad one.
     patch_calls: list = []
 
-    async def selective_patch(webflow_id, fields, *, publish=True, api_key=None):
+    async def selective_patch(webflow_id, fields, *, publish=True, api_key=None, strict_schema=False):
         patch_calls.append(webflow_id)
         if webflow_id == "wf-bad":
             raise WebflowError("422 unprocessable on this record")
@@ -1403,6 +1403,49 @@ async def test_run_upload_photos_skips_when_cms_already_has_image():
 
 
 @pytest.mark.asyncio
+async def test_run_upload_photos_dry_run_skips_legislator_image_field():
+    """Phase-3 round-18: upload_photos_dry_run fetches/validates the
+    source image but skips the actual Webflow asset creation. The
+    legislator-image field is NOT populated in the payload because no
+    asset was created. Useful for connectivity smoke testing without
+    consuming Webflow's asset rate limit."""
+    from unittest.mock import MagicMock, AsyncMock
+    cms = [_cms(
+        item_id="wf-fl-1", chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    fake_assets = MagicMock()
+    # Simulate dry_run mode returning None
+    fake_assets.upload_from_url = AsyncMock(return_value=None)
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+        patch_recorder=patches,
+    )
+    pipeline.assets = fake_assets
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True, upload_photos_dry_run=True,
+    ))
+    # upload_from_url was called with dry_run=True
+    fake_assets.upload_from_url.assert_awaited_once()
+    call_kwargs = fake_assets.upload_from_url.call_args.kwargs
+    assert call_kwargs.get("dry_run") is True
+    # Other fields PATCH normally; legislator-image is NOT in the payload
+    # (no asset was actually created, so we have nothing to set).
+    assert report.errors == []
+    if patches:
+        _, fields = patches[0]
+        assert "legislator-image" not in fields
+
+
+@pytest.mark.asyncio
 async def test_run_upload_photos_failure_isolated_does_not_abort():
     """Per-record photo upload failure is logged + recorded as a
     per-record error; the rest of the payload still PATCHes; the run
@@ -1429,7 +1472,7 @@ async def test_run_upload_photos_failure_isolated_does_not_abort():
     )
     from ddp_sync.services.webflow_assets import AssetReference
 
-    async def upload_side_effect(source_url, *, alt_text=""):
+    async def upload_side_effect(source_url, *, alt_text="", dry_run=False):
         if "broken" in source_url:
             raise WebflowAssetError("404 fetching source image")
         return AssetReference(
@@ -1478,7 +1521,7 @@ async def test_run_strict_schema_off_tolerates_dropped_fields():
         bioguide="X001", is_federal=True,
     )
 
-    async def patch_with_drops(webflow_id, fields, *, publish=True, api_key=None):
+    async def patch_with_drops(webflow_id, fields, *, publish=True, api_key=None, strict_schema=False):
         # Simulate the schema cache dropping one field
         return WebflowPatchResult(
             success=True, webflow_id=webflow_id,
@@ -1503,9 +1546,14 @@ async def test_run_strict_schema_off_tolerates_dropped_fields():
 
 @pytest.mark.asyncio
 async def test_run_strict_schema_on_raises_on_dropped_fields():
-    """Phase-3: with strict_schema=True, any schema-cache drop becomes a
-    per-record error so the operator sees missing slugs immediately
-    instead of after a read-back probe."""
+    """Phase-3 round-18: strict_schema enforcement happens BEFORE the
+    PATCH inside update_legislator_fields, raising WebflowError when
+    any payload slug is missing. Avoids the partial-write state that
+    post-PATCH enforcement left behind. The orchestrator catches the
+    error per-record (existing isolation), records it in report.errors,
+    and continues to the next record.
+    """
+    from ddp_sync.services.webflow_lookup import WebflowError
     cms = [_cms(
         item_id="wf-1", chamber="Senate",
         openstatesid="ocd-person/x",
@@ -1517,17 +1565,22 @@ async def test_run_strict_schema_on_raises_on_dropped_fields():
         bioguide="X001", is_federal=True,
     )
 
-    async def patch_with_drops(webflow_id, fields, *, publish=True, api_key=None):
-        return WebflowPatchResult(
-            success=True, webflow_id=webflow_id,
-            dropped_fields={"open-states-url", "office-email"},
-        )
+    # Simulate update_legislator_fields raising on strict_schema with
+    # missing slugs (matches the real service-side enforcement).
+    async def patch_strict(webflow_id, fields, *, publish=True,
+                            api_key=None, strict_schema=False):
+        if strict_schema:
+            raise WebflowError(
+                "strict_schema: payload fields not in live CMS "
+                "collection schema: ['office-email', 'open-states-url']"
+            )
+        return WebflowPatchResult(success=True, webflow_id=webflow_id)
 
     pipeline = _build_pipeline(
         cms_items=cms,
         openstates_responses={"ocd-person/x": os_record},
         federal_records={"X001": fed},
-        patch_func=patch_with_drops,
+        patch_func=patch_strict,
     )
     report = await pipeline.run(
         BioSyncOptions(dry_run=False, strict_schema=True),
@@ -1536,7 +1589,6 @@ async def test_run_strict_schema_on_raises_on_dropped_fields():
     assert len(report.errors) == 1
     err = report.errors[0]
     assert "strict_schema" in err
-    # The actual missing slugs are surfaced in the error message
     assert "office-email" in err and "open-states-url" in err
     # Run still completes (per-record isolation); doesn't abort
     assert report.aborted is False

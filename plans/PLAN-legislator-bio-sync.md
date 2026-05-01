@@ -319,6 +319,31 @@ Three deliverables shipped across four commits (commits `9692202`, `e5e2049`, pl
 
 **3. Photo-upload pipeline V1 (`WebflowAssetService` + bio-sync integration).** Implements Webflow's two-step Assets v2 upload (POST `/v2/sites/{site_id}/assets` → PUT bytes to signed URL). New file `services/webflow_assets.py` (~250 LoC). New `BioSyncOptions.upload_photos` flag (default off — opt-in, gated on operator-driven first-run verification). When enabled and `legislator-image` (Image-typed CMS field) is currently empty, uploads the source from `photo-source-url` and populates the Image-field-shaped value `{fileId, url, alt}`. Per-record upload failures are isolated (logged + recorded in `report.errors`, don't abort the run); the `photo-source-url` Link field still carries the original URL even when upload fails so the website can fall back to hotlinking. Source-URL → AssetReference cache on the service instance (in-memory, lifetime of the run; Redis-backed cross-run cache is Phase 4). MD5-hash-based dedup matches Webflow's expected hash format. 10 MB cap on source-image fetches. 4 orchestrator tests + 6 asset-service unit tests pin behavior.
 
+### Round-18 review fixes (folded in same evening)
+
+PM-review round 18 verdict was `needs_revision` / `do_not_ship_yet` — the photo pipeline's contracts (fileHash format, Image field shape, signed-URL HTTP semantics) were unverified against the live Webflow API. Code-only fixes addressable without live verification went in:
+
+- **`strict_schema` enforcement moved pre-PATCH.** Was post-PATCH which left the CMS in a partial-write state when a slug was missing. Now in `update_legislator_fields`'s `_partition_payload` path, raising `WebflowError` BEFORE the PATCH is sent. Operator fixes the schema, then re-runs gets a complete-or-nothing PATCH per record.
+- **`upload_photos_dry_run` flag added.** Fetches + size-validates + hashes the source image but skips both Webflow API calls. Operator can smoke-test source-CDN reachability without consuming Webflow's asset rate limit. Per the operator runbook, this is the new step 2.5 between single-record-test and full-run.
+- **`MAX_IMAGE_BYTES` configurable** via `WebflowAssetService(max_image_bytes=...)` constructor kwarg. Defaults to 10 MB (Pro tier); lower tiers can override.
+- **Persistent-404 metric added** (`metric=openstates.persistent_404`) so dashboards can distinguish real orphans from transient-recovered flakes via the existing `transient_404_retry` count.
+- **Service docstring documents the unverified contracts** — fileHash format, Image field payload shape, signed-URL flow's HTTP semantics — with explicit fallback paths if the live API rejects the defensive choices.
+- **PUT/POST docstring corrected.** Comment said "PUT bytes"; code uses POST multipart (correct for S3 form POST policy). Now consistent.
+
+3 new tests added for the round-18 changes:
+- `test_upload_from_url_dry_run_skips_create_and_returns_none`
+- `test_upload_from_url_max_image_bytes_configurable`
+- `test_run_upload_photos_dry_run_skips_legislator_image_field`
+
+143 tests pass (was 140 pre-round-18).
+
+The reviewer also noted concerns that genuinely require operator-side verification:
+- fileHash format (MD5 hex vs base64) — operator confirms via single-record test
+- Image field payload shape (`{fileId, url, alt}` vs asset id string) — operator confirms via probe
+- Signed-URL flow (POST multipart vs PUT bytes) — operator confirms via single-record test
+
+These are the explicit gates in the Phase 3 operator runbook; not blocking for code merge with default-off flag.
+
 ### Probed but deferred (data-side blockers)
 
 - **State-leg term dates** — `scripts/probe_openstates_term_dates.py` confirmed `include=roles` and `include=memberships` both return 422 from OpenStates v3 `/people`. Term history is not API-accessible at the v3 `/people` level. Phase 4+ would require bulk-data CSV ingestion (different shape, separate pipeline).
@@ -330,13 +355,21 @@ The photo-upload flag is operator-driven; first run requires verification before
 
 1. **Pre-flight** — confirm `WEBFLOW_API_TOKEN` and `WEBFLOW_SITE_ID` are populated in production env (already required by other writes). The asset service uses both at lazy-init time.
 
-2. **Single-record test run** — pick a low-stakes record without an existing `legislator-image`:
+2. **Connectivity smoke (round-18 addition).** Use `upload_photos_dry_run=true` to fetch + size-validate + hash one record's source image without creating a Webflow asset:
+   ```
+   curl -fsSX POST -H "Authorization: Bearer $DDP_SYNC_API_KEY" \
+     "$DEPLOY_URL/trigger/legislator-bio-sync?dry_run=false&jurisdiction=us&limit=1&upload_photos=true&upload_photos_dry_run=true" \
+     | jq '{would_patch: .would_patch[0], errors}'
+   ```
+   Expected: `errors == []`; `legislator-image` NOT in `changed_fields`. Confirms source-CDN reachability + size-cap compliance before consuming Webflow's asset rate limit. Check `journalctl -u ddp-sync` for `metric=webflow_assets.upload_dry_run`.
+
+3. **Single-record live upload** — pick a low-stakes record without an existing `legislator-image`:
    ```
    curl -fsSX POST -H "Authorization: Bearer $DDP_SYNC_API_KEY" \
      "$DEPLOY_URL/trigger/legislator-bio-sync?dry_run=false&jurisdiction=us&limit=1&upload_photos=true" \
      | jq '{patched: .would_patch[0], errors}'
    ```
-   Expected: `would_patch[0].changed_fields` includes `legislator-image`; `errors == []`.
+   Expected: `would_patch[0].changed_fields` includes `legislator-image`; `errors == []`. **If this fails**, the live API has rejected one of the unverified contracts (fileHash format, Image field shape, signed-URL flow). Capture the error body via the `WebflowAssetError`'s `str()` (it surfaces `body=...`) and adjust `WebflowAssetService` accordingly.
 
 3. **Verify in Webflow Designer** — open the patched record; confirm `legislator-image` shows the uploaded photo. Compare visually to `photo-source-url` (should be the same image).
 

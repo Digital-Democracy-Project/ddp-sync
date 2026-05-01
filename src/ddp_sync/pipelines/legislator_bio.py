@@ -302,6 +302,13 @@ class BioSyncOptions:
     # continue, don't abort the run); the photo-source-url Link field
     # still carries the original URL even when upload fails.
     upload_photos: bool = False
+    # Phase-3 connectivity smoke: when True (and upload_photos is True),
+    # fetch + size-validate + hash the source image but skip the actual
+    # Webflow asset creation. Lets operators smoke-test source-CDN
+    # reachability without consuming Webflow's asset rate limit or
+    # storage. Implies upload_photos=True; no-op when upload_photos
+    # is False.
+    upload_photos_dry_run: bool = False
 
 
 @dataclass
@@ -828,6 +835,7 @@ class LegislatorBioPipeline:
         ):
             asset_value = await self._maybe_upload_photo(
                 cms, payload["photo-source-url"], report,
+                dry_run=options.upload_photos_dry_run,
             )
             if asset_value is not None:
                 payload["legislator-image"] = asset_value
@@ -846,9 +854,14 @@ class LegislatorBioPipeline:
             })
             return
 
-        # Live PATCH
+        # Live PATCH. Phase-3 strict_schema (round-18 fix): the
+        # update_legislator_fields service-side check raises BEFORE
+        # sending the PATCH when any payload slug is missing from the
+        # live CMS schema. Avoids the partial-write state the original
+        # post-PATCH check left behind.
         result = await self.webflow.update_legislator_fields(
-            cms.webflow_id, changed
+            cms.webflow_id, changed,
+            strict_schema=options.strict_schema,
         )
         report.would_patch.append({
             "webflow_id": cms.webflow_id,
@@ -856,15 +869,6 @@ class LegislatorBioPipeline:
             "changed_fields": sorted(changed.keys()),
             "dropped_fields": sorted(result.dropped_fields),
         })
-        # Phase-3 strict_schema: surface schema-cache drops as errors so
-        # the operator sees them instead of silently no-op'ing. Use this
-        # on the first run after any new write-target field is added.
-        if options.strict_schema and result.dropped_fields:
-            raise WebflowError(
-                f"strict_schema: payload fields not in live CMS collection "
-                f"schema: {sorted(result.dropped_fields)}. Add the field(s) "
-                f"in the Webflow Designer + publish the site, then re-run."
-            )
 
     # ---------- Phase-3 photo upload helper ----------
 
@@ -873,6 +877,8 @@ class LegislatorBioPipeline:
         cms: "CMSLegislator",
         source_url: str,
         report: BioSyncReport,
+        *,
+        dry_run: bool = False,
     ) -> dict | None:
         """Upload the source image into Webflow's asset library.
 
@@ -907,7 +913,7 @@ class LegislatorBioPipeline:
 
         try:
             ref = await self.assets.upload_from_url(
-                source_url, alt_text=cms.name,
+                source_url, alt_text=cms.name, dry_run=dry_run,
             )
         except WebflowAssetError as e:
             report.errors.append(
@@ -930,6 +936,12 @@ class LegislatorBioPipeline:
                 webflow_id=cms.webflow_id,
                 source_url=source_url,
             )
+            return None
+        # dry_run mode returns None from upload_from_url; the caller
+        # treats that the same as "no asset to set" — payload skips
+        # legislator-image. The fetch + size-check + hash already
+        # validated source-CDN reachability.
+        if ref is None:
             return None
         return ref.to_image_field_value()
 

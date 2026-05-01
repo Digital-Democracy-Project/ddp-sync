@@ -10,10 +10,25 @@ version via the ``legislator-image`` Image field.
 The Webflow Assets v2 API is a two-step upload:
   1. POST /v2/sites/{site_id}/assets with {fileName, fileHash, parentFolder?}
      → returns {id, hostedUrl, uploadUrl, uploadDetails, ...}
-  2. POST to uploadUrl with multipart form data using uploadDetails fields
-     + the raw file bytes
+  2. POST (S3-compatible multipart form-data) to uploadUrl with
+     uploadDetails fields + the file bytes. NOTE: Webflow uses an S3
+     POST policy, not PUT — the response from step 1 is a presigned
+     URL that expects multipart/form-data, NOT a PUT-with-bytes body.
 The asset id can then be set on an Image-typed field via the standard
 items PATCH endpoint.
+
+NOTE: Several contracts in this implementation are unverified against
+the live Webflow Assets v2 API as of Phase 3 V1 (2026-04-30). The
+operator runbook in §Phase 3 of plans/PLAN-legislator-bio-sync.md
+covers verification before flipping ``upload_photos`` default-on:
+  - fileHash format: MD5 hex (Webflow docs are ambiguous between hex
+    and base64; defensive choice). If the live API rejects, switch to
+    hashlib.md5(image_bytes).digest() base64-encoded.
+  - Image field PATCH payload shape: ``{fileId, url, alt}``. If the
+    live API rejects, the alternative is just the asset_id string.
+  - Signed-URL upload: POST multipart form-data (this implementation).
+    If the live API rejects with 405, switch to PUT raw bytes with
+    Content-Type from the source response.
 
 This service:
   - Fetches the image bytes from a source URL (handles redirects, common
@@ -113,6 +128,7 @@ class WebflowAssetService:
         site_id: str,
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        max_image_bytes: int = MAX_IMAGE_BYTES,
     ):
         if not api_token:
             raise ValueError("api_token is required")
@@ -121,6 +137,11 @@ class WebflowAssetService:
         self.api_token = api_token
         self.site_id = site_id
         self.timeout_seconds = timeout_seconds
+        # Configurable upper bound on source-image fetch size. Defaults
+        # to MAX_IMAGE_BYTES (10 MB — Webflow Pro+ tier limit). Lower
+        # tiers can override via constructor; future per-state photo
+        # CDNs that serve oversize originals can be capped explicitly.
+        self.max_image_bytes = max_image_bytes
         # source_url → AssetReference, in-memory for the run's lifetime
         self._cache: dict[str, AssetReference] = {}
 
@@ -129,12 +150,19 @@ class WebflowAssetService:
         source_url: str,
         *,
         alt_text: str = "",
-    ) -> AssetReference:
+        dry_run: bool = False,
+    ) -> AssetReference | None:
         """Upload an image fetched from ``source_url`` into Webflow.
 
         Cached on the service instance — second call with the same
         source_url returns the cached AssetReference without any HTTP
         traffic.
+
+        ``dry_run=True`` performs the source-image fetch + size check +
+        hash computation but skips both the Webflow ``POST /assets``
+        call and the signed-URL upload, returning ``None``. Lets
+        operators smoke-test source-CDN reachability without consuming
+        Webflow's asset rate limit or storage on an unverified run.
 
         Raises WebflowAssetError on any step's failure. Caller is
         expected to per-record-isolate (catch + log + continue) so a
@@ -153,6 +181,16 @@ class WebflowAssetService:
         image_bytes, content_type = await self._fetch_image(source_url)
         file_hash = hashlib.md5(image_bytes).hexdigest()  # noqa: S324
         file_name = self._derive_filename(source_url, content_type)
+
+        if dry_run:
+            logger.info(
+                "Webflow asset upload skipped (dry_run)",
+                metric="webflow_assets.upload_dry_run",
+                source_url=source_url,
+                bytes=len(image_bytes),
+                file_hash=file_hash,
+            )
+            return None
 
         asset_meta = await self._create_asset(file_name, file_hash)
         await self._put_to_signed_url(
@@ -196,9 +234,9 @@ class WebflowAssetService:
                 f"Source image returned {resp.status_code}: {source_url}",
                 response=resp,
             )
-        if len(resp.content) > MAX_IMAGE_BYTES:
+        if len(resp.content) > self.max_image_bytes:
             raise WebflowAssetError(
-                f"Source image exceeds {MAX_IMAGE_BYTES} bytes: "
+                f"Source image exceeds {self.max_image_bytes} bytes: "
                 f"{source_url} ({len(resp.content)} bytes)"
             )
         content_type = (
