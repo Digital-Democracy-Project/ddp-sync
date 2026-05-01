@@ -898,18 +898,35 @@ class LegislatorBioPipeline:
             # item PATCHes). The general webflow_api_token doesn't carry
             # assets:write — confirmed via 2026-04-30 production smoke
             # which returned 403 OAuthForbidden on POST /assets.
-            assets_token = (
-                self.settings.webflow_assets_read_write_key
-                or self.settings.webflow_api_token
-            )
+            #
+            # Round-19 fix: fail FAST on missing dedicated key rather
+            # than silently falling back to the cms token (which would
+            # re-trigger the 403 mid-run on every record). The reviewer
+            # flagged the silent-fallback as a high-severity safety
+            # gap. Operator who enabled upload_photos but didn't
+            # configure the dedicated key gets a single clear error
+            # logged once for the whole run.
+            assets_token = self.settings.webflow_assets_read_write_key
+            if not assets_token:
+                logger.error(
+                    "Photo upload disabled: webflow_assets_read_write_key "
+                    "is not configured. Add a Webflow API token with "
+                    "assets:read + assets:write scopes to the secret as "
+                    "`webflow_assets_read_write_key`. The cms:* token is "
+                    "insufficient (returns 403 OAuthForbidden on POST "
+                    "/assets).",
+                    metric="webflow_assets.config_error",
+                )
+                self.assets = _NULL_ASSET_SERVICE_SENTINEL  # type: ignore[assignment]
+                return None
             try:
                 self.assets = WebflowAssetService(
                     api_token=assets_token,
                     site_id=self.settings.webflow_site_id,
                 )
             except ValueError as e:
-                # Missing token / site_id config — log once + give up
-                # for this run (don't keep retrying)
+                # Missing site_id config — log once + give up for this
+                # run (don't keep retrying)
                 logger.error(
                     "Photo upload disabled: WebflowAssetService init failed",
                     error=str(e),

@@ -383,6 +383,29 @@ The photo-upload flag is operator-driven; first run requires verification before
 
 7. **Enable in scheduler config (Phase 4 task)** — add `upload_photos: true` to `legislator_bio_sync` block in `sync_schedule.yaml` once operator is confident. Until then, ad-hoc operator triggers carry the load.
 
+### Round-19 review feedback (2026-05-01)
+
+PM-review round 19 verdict: `needs_revision` / `ship_with_caution` / medium confidence. Reviewer acknowledged that production verification closed all the round-18 contract concerns (fileHash, signed-URL flow, Image field shape) but flagged operational-maturity gaps for unattended scheduled runs.
+
+**Round-19 HIGH severity finding addressed in code:**
+- **Silent fallback to cms token reintroduced 403 failure mode.** If the operator enables `upload_photos=true` but `webflow_assets_read_write_key` is missing, the prior code fell back to `webflow_api_token` (which lacks `assets:write`), reproducing the original 403 OAuthForbidden mid-run on every record. **Fix:** the orchestrator now fails fast at first photo-upload attempt with a clear single error logged once for the whole run, rather than silently falling back. Test pinned. (Same commit as this PLAN update.)
+
+**Round-19 HIGH/MEDIUM findings deferred to Phase 4 backlog (additions):**
+- **`--undo-last-run` mass-revert** (high) — 214 records were patched with no rollback path. Already in Phase 4 backlog.
+- **Programmatic post-upload probe** (medium) — HEAD the uploaded asset URL + verify content-length non-trivial after each upload. Treat zero/404 as failure. Adds latency but de-risks the silent-success-bad-asset case.
+- **Coverage metrics + alert thresholds** (medium) — `attempted_uploads`, `successful_uploads`, `coverage_ratio` log events with dashboard wiring. Without this, a regression to e.g. 70% coverage might go unnoticed run-to-run.
+- **Cross-run dedup cache (Redis-backed)** (medium) — current cache is service-instance lifetime only; repeat full runs re-fetch identical images. Not a correctness issue (cardinal rule preserves populated `legislator-image`), but burns Webflow asset rate-limit + storage on records that lose their photo for any reason.
+- **Automated upstream-photo-gap tracking** (medium) — when source URL 404/410s, log to a structured tracker editors can use to manually source replacement photos.
+- **Quantified editor sign-off checklist** (medium) — replace "operator inspects 5 records" with a structured checklist (≥10 records covering both chambers, success/failure edge cases, screenshots/checklist artifact).
+- **Startup-time scope validation** (high) — currently the fail-fast happens at first photo-upload attempt. A startup check (when scheduler-config has `upload_photos: true`) would catch missing tokens earlier. Phase 4 task.
+- **CI integration test against Assets v2** (low) — would catch Webflow contract regressions before prod. Could use a sandbox Webflow site or mock-server.
+
+**What worked well from the round-18 → round-19 journey:**
+- The operator runbook's step-by-step verification process exposed the real production blocker (token scope) within minutes of step 3.
+- The single-fix iteration (commit 350a1ce) addressed the blocker; subsequent steps confirmed all three originally-unverified contracts in one go.
+- Per-record error isolation correctly handled all 5 production failures (4 federal data-gap 404s + 1 stale state CDN URL) without aborting the run or affecting the other 214 records.
+- `WebflowAssetError`'s body-in-str pattern (round-17 lesson) made the 403 diagnosis a 60-second turnaround.
+
 ### What we deliberately deferred
 
 - **Social handles for state legs** — confirmed not available from OpenStates `/people` v3. Phase 4+ if a different upstream source is found (Ballotpedia scraper, per-state APIs, or webscraping per-state legislator pages).

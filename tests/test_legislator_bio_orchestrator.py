@@ -1366,6 +1366,45 @@ async def test_run_upload_photos_on_uploads_and_populates_legislator_image():
 
 
 @pytest.mark.asyncio
+async def test_run_upload_photos_fails_fast_when_assets_key_missing():
+    """Round-19 fix: when upload_photos=True but
+    webflow_assets_read_write_key is not configured, the orchestrator
+    skips photo upload (with a clear logged error) instead of silently
+    falling back to webflow_api_token — which would have re-triggered
+    the 403 OAuthForbidden the operator already saw in production.
+    """
+    cms = [_cms(
+        item_id="wf-fl-1", chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+    )
+    # Simulate the misconfiguration: cms token set, assets key blank.
+    pipeline.settings = MagicMock()
+    pipeline.settings.webflow_api_token = "cms-token-abc"
+    pipeline.settings.webflow_assets_read_write_key = ""
+    pipeline.settings.webflow_site_id = "site-id"
+    pipeline.assets = None  # force lazy-init path
+
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True,
+    ))
+    # Run completes (per-record error isolation); no assets created
+    assert report.aborted is False
+    # legislator-image is NOT in any patch (upload was disabled)
+    for entry in report.would_patch:
+        assert "legislator-image" not in entry.get("changed_fields", [])
+
+
+@pytest.mark.asyncio
 async def test_run_upload_photos_skips_when_cms_already_has_image():
     """Cardinal-rule preserves existing legislator-image — no upload
     attempted, asset service never called."""
