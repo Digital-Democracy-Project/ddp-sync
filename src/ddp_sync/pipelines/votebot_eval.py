@@ -416,11 +416,14 @@ def _compute_timeout(days: int) -> int:
     """Subprocess timeout scales with --days. Plan §3.2 step 2.
 
     PM v5 build review on Phase 3 noted historical 30-day runs have
-    occasionally taken 45-55 min on c6g.large. Coefficient widened from
-    60s/day to 90s/day so a 30-day window gets 2760s (46 min) before
-    timeout, covering the documented worst case with margin.
+    occasionally taken 45-55 min on c6g.large. Coefficient was widened
+    twice: 60→90 s/day after the first observation, then 90→120 s/day
+    after PM v5 v2 review pointed out that 90 left <5 min head-room on
+    the worst-case 55-min run. With 120 s/day, a 30-day window gets
+    3720s (62 min) before timeout — comfortable margin even if future
+    instances run slower.
     """
-    return max(600, 120 + days * 90)
+    return max(600, 120 + days * 120)
 
 
 async def run_votebot_eval(
@@ -621,6 +624,17 @@ async def _run_eval_holding_lock(
             run_id=run_id,
         )
         await _write_failure_status(redis_store, start_time, f"parse_error: {e}", trigger)
+        # Emit a Zapier alert with on_failure=True so operators see the
+        # parse failure in Slack, not just in the structured log.
+        # (Mirrors the subprocess_nonzero path; PM v5 v2 review noted
+        # the parse_error path was previously alerting only via the log.)
+        try:
+            await _send_failure_alert(
+                settings, yaml_config, str(report_path), trigger,
+                f"parse_error: {e}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"success": False, "error": "parse_error", "detail": str(e)}
 
     # Detect regressions.

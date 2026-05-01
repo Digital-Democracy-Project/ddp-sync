@@ -54,27 +54,28 @@ def test_metric_strings_are_pinned():
 # -----------------------------------------------------------------------------
 
 def test_timeout_scales_with_days():
-    """Timeout = max(600, 120 + days * 90). PM v5 Phase-3 build review
-    widened the coefficient from 60 to 90 after empirical 30-day-window
-    runtime data showed ~45-55 min on c6g.large.
+    """Timeout = max(600, 120 + days * 120). PM v5 Phase-3 review widened
+    coefficient 60→90→120 across iterations — 120 leaves 7 min margin
+    even on the worst-case 55-min historical 30-day run.
     """
-    assert _compute_timeout(1) == 600   # min floor wins (120+90=210 < 600)
-    assert _compute_timeout(7) == 750   # 120 + 7*90 = 750
-    assert _compute_timeout(10) == 1020  # 120 + 10*90 = 1020
-    assert _compute_timeout(30) == 2820  # 120 + 30*90 = 2820
+    assert _compute_timeout(1) == 600    # min floor wins (120+120=240 < 600)
+    assert _compute_timeout(4) == 600    # still under floor (120+480=600)
+    assert _compute_timeout(7) == 960    # 120 + 7*120 = 960 (16 min)
+    assert _compute_timeout(10) == 1320  # 120 + 10*120 = 1320 (22 min)
+    assert _compute_timeout(30) == 3720  # 120 + 30*120 = 3720 (62 min)
 
 
 def test_lock_ttl_binding_is_timeout_plus_300():
     """Plan §3.4 (post PM v4) — lock TTL = subprocess timeout + 300s safety margin
     so the lock never expires mid-run. PM v3 caught a 30-min fixed TTL bug;
-    PM v4 widened the margin from 120s to 300s for post-processing; PM v5
-    Phase-3 build review widened the timeout coefficient from 60→90 s/day
+    PM v4 widened the margin from 120s to 300s; PM v5 Phase-3 review
+    widened the timeout coefficient 60→90→120 s/day across two iterations
     after empirical c6g.large 30-day-window data showed ~45-55 min runs.
     """
     assert LOCK_SAFETY_MARGIN_S == 300
-    # For a 30-day window: timeout = 120 + 30*90 = 2820s; lock TTL = 3120s.
-    assert _compute_timeout(30) == 2820
-    assert _compute_timeout(30) + LOCK_SAFETY_MARGIN_S == 3120
+    # For a 30-day window: timeout = 120 + 30*120 = 3720s; lock TTL = 4020s.
+    assert _compute_timeout(30) == 3720
+    assert _compute_timeout(30) + LOCK_SAFETY_MARGIN_S == 4020
 
 
 # -----------------------------------------------------------------------------
@@ -466,19 +467,130 @@ async def test_subprocess_runs_via_asyncio_to_thread(
     monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
 
     await run_votebot_eval(days=7, settings=MagicMock())
-    # The orchestrator must wrap blocking calls (subprocess.run +
-    # push_eval_alert) in asyncio.to_thread. Both must show up in the
-    # spy log; the subprocess shows as "fake_run" because of the
-    # monkeypatch above. push_eval_alert is the most reliable signal
-    # that the alerting wrap is in place too.
+    # PM v5 v2 review tightened this assertion: the spy must see BOTH
+    # the subprocess wrap AND the push_eval_alert wrap. A future refactor
+    # that introduces a third unrelated to_thread call shouldn't be able
+    # to silently delete the critical wraps and have the test still pass.
+    #
+    # The subprocess shows as "fake_run" because monkeypatch replaced
+    # subprocess.run before the wrap captured the function. Either
+    # "run" or "fake_run" satisfies the contract — what matters is that
+    # the orchestrator hit the to_thread path before the subprocess
+    # would block the event loop.
     assert "push_eval_alert" in to_thread_calls, (
         f"expected push_eval_alert to be invoked via asyncio.to_thread; "
         f"got calls: {to_thread_calls}"
     )
-    # And there must be at least one subprocess wrap before that.
-    assert len(to_thread_calls) >= 2, (
-        f"expected at least 2 to_thread invocations (subprocess + alert); "
-        f"got {to_thread_calls}"
+    assert any(name in ("run", "fake_run") for name in to_thread_calls), (
+        f"expected subprocess.run (or its mock) to be invoked via "
+        f"asyncio.to_thread; got calls: {to_thread_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_failure_alert_runs_via_asyncio_to_thread(
+    fake_redis_store, monkeypatch, tmp_path
+):
+    """PM v5 v2 review concern — _send_failure_alert wraps push_eval_alert
+    in asyncio.to_thread too (the failure path is just as blocking-prone
+    as the success path). Trigger via subprocess_nonzero exit so we
+    exercise the failure branch."""
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
+        lambda c: str(tmp_path),
+    )
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+    (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scripts" / "evaluate_production.py").touch()
+
+    to_thread_calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spying_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.asyncio.to_thread", spying_to_thread
+    )
+
+    def fake_run(*a, **kw):
+        # Subprocess fails — drives the orchestrator into the
+        # subprocess_nonzero branch which calls _send_failure_alert.
+        m = MagicMock()
+        m.returncode = 1
+        m.stderr = b"some error"
+        return m
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    # Provide a webhook URL (otherwise push_eval_alert short-circuits).
+    settings = MagicMock()
+    settings.zapier_webhook_url = "https://hooks.zapier.example/x"
+
+    # Mock requests.post so the alert "succeeds" without HTTP call.
+    def fake_post(*a, **kw):
+        m = MagicMock()
+        m.status_code = 200
+        return m
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.requests.post", fake_post)
+
+    await run_votebot_eval(days=7, settings=settings)
+    # Failure-alert path must also wrap push_eval_alert in to_thread.
+    assert "push_eval_alert" in to_thread_calls, (
+        f"expected _send_failure_alert to wrap push_eval_alert in "
+        f"asyncio.to_thread; got calls: {to_thread_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_released_on_parse_error_path(
+    fake_redis_store, monkeypatch, tmp_path
+):
+    """PM v5 v2 review MEDIUM concern — a leaked lock on the parse_error
+    path would block the weekly cron until TTL expires (62+ min). The
+    finally block in run_votebot_eval must clear LOCK_KEY before
+    returning, regardless of the failure mode."""
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
+        lambda c: str(tmp_path),
+    )
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+    (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scripts" / "evaluate_production.py").touch()
+
+    # Subprocess "succeeds" but writes nothing — drives the parse_error
+    # path (FileNotFoundError on the report path).
+    def fake_run(*a, **kw):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b""
+        m.stdout = b""
+        return m
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    result = await run_votebot_eval(days=7, settings=MagicMock())
+    assert result["success"] is False
+    assert result["error"] == "parse_error"
+    # Critical: the lock must be released even on the parse_error path.
+    assert LOCK_KEY not in fake_redis_store._client.store, (
+        "lock leaked on parse_error path — would block the next weekly "
+        "cron until TTL expires"
     )
 
 
@@ -524,9 +636,9 @@ async def test_subprocess_zero_exit_but_no_report_returns_parse_error(
 async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     fake_redis_store, monkeypatch, tmp_path
 ):
-    """For a 30-day run (timeout 2820s after PM v5 widening), the lock TTL
-    must be 2820 + 300 = 3120s. Catches the silent double-run bug PM v3 +
-    v4 reviews surfaced.
+    """For a 30-day run (timeout 3720s after PM v5 v2 widening to 120 s/day),
+    the lock TTL must be 3720 + 300 = 4020s. Catches the silent double-run
+    bug PM v3 + v4 reviews surfaced.
     """
     monkeypatch.setattr(
         "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
@@ -552,10 +664,10 @@ async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
 
     await run_votebot_eval(days=30, settings=MagicMock())
-    # At least one ex= entry should be the lock-set call with TTL=3120.
+    # At least one ex= entry should be the lock-set call with TTL=4020.
     set_calls = fake_redis_store._client.set_ex_history
     lock_set_calls = [(k, ex) for (k, ex) in set_calls if k == LOCK_KEY]
     assert lock_set_calls, "lock was not set with an ex parameter"
-    assert lock_set_calls[0][1] == 3120, (
-        f"expected lock TTL 2820+300=3120, got {lock_set_calls[0][1]}"
+    assert lock_set_calls[0][1] == 4020, (
+        f"expected lock TTL 3720+300=4020, got {lock_set_calls[0][1]}"
     )
