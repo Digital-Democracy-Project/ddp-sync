@@ -252,6 +252,23 @@ def get_threshold(config: dict | None, key: str, default: float) -> float:
 # Zapier alerting (plan §3.7)
 # -----------------------------------------------------------------------------
 
+def _format_trend(current: float | None, previous: float | None) -> str:
+    """Render a percentage-point trend arrow vs the previous run.
+
+    Returns "" when no previous run is available, "—" when stable (within
+    1pp), "↗ +N.Npp" on improvement, "↘ -N.Npp" on degradation. Used in
+    the Zapier payload's *_trend fields so the Slack template can drop
+    them in unconditionally.
+    """
+    if current is None or previous is None:
+        return ""
+    diff_pp = (current - previous) * 100
+    if abs(diff_pp) < 1:
+        return "— flat"
+    arrow = "↗" if diff_pp > 0 else "↘"
+    return f"{arrow} {diff_pp:+.1f}pp"
+
+
 def push_eval_alert(
     webhook_url: str,
     headline: dict,
@@ -260,6 +277,7 @@ def push_eval_alert(
     report_path: str,
     trigger: str,
     error: str | None = None,
+    previous_headline: dict | None = None,
 ) -> bool:
     """POST a votebot-eval run summary to the configured Zapier webhook.
 
@@ -273,6 +291,11 @@ def push_eval_alert(
     The three flag bools (``on_failure``, ``on_regression``,
     ``on_bill_history_leak``) map directly to Zapier filter rules; routing
     config (which Slack channel, who to ping) lives in the Zap, not here.
+
+    The payload includes display-formatted strings (``citation_rate_pct``,
+    ``p50_latency_s``, ``status_emoji``, etc.) so the Slack template can
+    use ``{{field}}`` interpolation directly without Zapier Formatter
+    steps. ``previous_headline`` (when supplied) drives trend arrows.
     """
     if not webhook_url:
         logger.info(
@@ -302,27 +325,69 @@ def push_eval_alert(
             )
         regression_warning = "⚠️ Regressions: " + "; ".join(parts)
 
+    # Status emoji for at-a-glance Slack scanning.
+    if on_failure or on_bill_history_leak:
+        status_emoji = "🔴"
+    elif on_regression:
+        status_emoji = "🟡"
+    else:
+        status_emoji = "🟢"
+
+    # Display-formatted percentages so Slack templates don't need
+    # Zapier Formatter steps. Floats stay in the payload too for
+    # downstream consumers that want raw numbers.
+    citation_rate = headline.get("citation_rate", 0) or 0
+    pass_rate = headline.get("pass_rate") or 0
+    cache_hit_rate = headline.get("cache_hit_rate", 0) or 0
+    fallback_rate = headline.get("fallback_rate", 0) or 0
+    avg_confidence = headline.get("avg_confidence", 0) or 0
+    p50_ms = headline.get("p50_latency_ms_rag_only", 0) or 0
+    p95_ms = headline.get("p95_latency_ms_rag_only", 0) or 0
+
+    # Trend arrows vs previous run (empty string when no previous data).
+    prev = previous_headline or {}
+    citation_trend = _format_trend(citation_rate, prev.get("citation_rate"))
+    pass_trend = _format_trend(pass_rate, prev.get("pass_rate"))
+    cache_hit_trend = _format_trend(cache_hit_rate, prev.get("cache_hit_rate"))
+
+    leak_status = "✓ clean" if not on_bill_history_leak else "🚨 LEAK"
+
     payload = {
         "alert_type": "votebot_eval_complete",
+        "status_emoji": status_emoji,
         "summary": (
             f"n={headline.get('n_query_processed', 0)} "
-            f"citation_rate={headline.get('citation_rate', 0):.1%} "
-            f"pass_rate={(headline.get('pass_rate') or 0):.1%} "
-            f"cache_hit_rate={headline.get('cache_hit_rate', 0):.1%} "
+            f"citation_rate={citation_rate:.1%} "
+            f"pass_rate={pass_rate:.1%} "
+            f"cache_hit_rate={cache_hit_rate:.1%} "
             f"bill_history_leak_count={headline.get('bill_history_leak_count', 0)}"
         ),
         "window_days": headline.get("window_days"),
         "window_start": headline.get("window_start"),
         "window_end": headline.get("window_end"),
         "n_query_processed": headline.get("n_query_processed", 0),
-        "citation_rate": headline.get("citation_rate", 0),
-        "pass_rate": headline.get("pass_rate") or 0,
-        "avg_confidence": headline.get("avg_confidence", 0),
-        "cache_hit_rate": headline.get("cache_hit_rate", 0),
-        "fallback_rate": headline.get("fallback_rate", 0),
+        # Raw float metrics (kept for any downstream consumer that wants numbers).
+        "citation_rate": citation_rate,
+        "pass_rate": pass_rate,
+        "avg_confidence": avg_confidence,
+        "cache_hit_rate": cache_hit_rate,
+        "fallback_rate": fallback_rate,
         "bill_history_leak_count": headline.get("bill_history_leak_count", 0),
-        "p50_latency_ms_rag_only": headline.get("p50_latency_ms_rag_only", 0),
-        "p95_latency_ms_rag_only": headline.get("p95_latency_ms_rag_only", 0),
+        "p50_latency_ms_rag_only": p50_ms,
+        "p95_latency_ms_rag_only": p95_ms,
+        # Display-formatted strings — drop these directly into the Slack template.
+        "citation_rate_pct": f"{citation_rate:.1%}",
+        "pass_rate_pct": f"{pass_rate:.1%}",
+        "cache_hit_rate_pct": f"{cache_hit_rate:.1%}",
+        "fallback_rate_pct": f"{fallback_rate:.1%}",
+        "avg_confidence_fmt": f"{avg_confidence:.2f}",
+        "p50_latency_s": f"{p50_ms / 1000:.1f}s",
+        "p95_latency_s": f"{p95_ms / 1000:.1f}s",
+        "leak_status": leak_status,
+        # Trend arrows vs previous run (empty when no previous data).
+        "citation_trend": citation_trend,
+        "pass_trend": pass_trend,
+        "cache_hit_trend": cache_hit_trend,
         # Routing flags (Zapier filters key off these).
         "on_failure": on_failure,
         "on_regression": on_regression,
@@ -714,6 +779,10 @@ async def _run_eval_holding_lock(
         # fire-and-forget (returns bool, never raises) so we don't block
         # the orchestrator on Zapier latency. Mirrors legislator_bio's
         # use of asyncio.to_thread around push_bio_sync_alert.
+        #
+        # ``last_run`` was captured pre-overwrite (above), so it carries
+        # the PREVIOUS run's headline for trend-arrow computation. After
+        # this point ``LAST_RUN_KEY`` already holds the current run.
         try:
             await asyncio.to_thread(
                 push_eval_alert,
@@ -722,6 +791,7 @@ async def _run_eval_holding_lock(
                 regressions,
                 report_path=str(report_path),
                 trigger=trigger,
+                previous_headline=last_run,
             )
         except Exception as e:  # noqa: BLE001
             # push_eval_alert never raises, but defend against

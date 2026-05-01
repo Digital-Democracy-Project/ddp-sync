@@ -258,6 +258,164 @@ def test_push_eval_alert_returns_false_on_non_2xx():
     assert ok is False
 
 
+def test_push_eval_alert_payload_has_display_formatted_fields():
+    """The Slack template uses ``{{citation_rate_pct}}``, ``{{p50_latency_s}}``,
+    ``{{status_emoji}}`` etc. directly (no Zapier Formatter step needed).
+    Lock those fields into the contract.
+    """
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["payload"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post", side_effect=fake_post):
+        push_eval_alert(
+            webhook_url="https://hooks.zapier.example/x",
+            headline={
+                "n_query_processed": 18,
+                "citation_rate": 0.4444,
+                "pass_rate": 1.0,
+                "cache_hit_rate": 0.2778,
+                "fallback_rate": 0,
+                "avg_confidence": 0.7442,
+                "bill_history_leak_count": 0,
+                "p50_latency_ms_rag_only": 8847,
+                "p95_latency_ms_rag_only": 43496,
+                "window_days": 2,
+                "window_start": "2026-04-30",
+                "window_end": "2026-05-01",
+            },
+            regression_details=[],
+            report_path="/tmp/x.json",
+            trigger="scheduled",
+        )
+
+    p = captured["payload"]
+    # Pre-formatted percentage strings (one decimal).
+    assert p["citation_rate_pct"] == "44.4%"
+    assert p["pass_rate_pct"] == "100.0%"
+    assert p["cache_hit_rate_pct"] == "27.8%"
+    assert p["fallback_rate_pct"] == "0.0%"
+    assert p["avg_confidence_fmt"] == "0.74"
+    # Latency in seconds with 1 decimal.
+    assert p["p50_latency_s"] == "8.8s"
+    assert p["p95_latency_s"] == "43.5s"
+    # Status emoji on a clean run.
+    assert p["status_emoji"] == "🟢"
+    assert p["leak_status"] == "✓ clean"
+    # Trend strings empty when no previous_headline supplied.
+    assert p["citation_trend"] == ""
+    assert p["pass_trend"] == ""
+
+
+def test_push_eval_alert_status_emoji_escalation():
+    """Status emoji must escalate: 🟢 clean → 🟡 regression-only → 🔴 failure/leak."""
+    def fake_post_returning(payload_capture):
+        def _f(url, json, timeout):
+            payload_capture["payload"] = json
+            m = MagicMock()
+            m.status_code = 200
+            return m
+        return _f
+
+    base_headline = {
+        "n_query_processed": 10, "citation_rate": 0.5, "pass_rate": 0.9,
+        "cache_hit_rate": 0.2, "fallback_rate": 0, "avg_confidence": 0.7,
+        "bill_history_leak_count": 0, "p50_latency_ms_rag_only": 5000,
+        "p95_latency_ms_rag_only": 10000, "window_days": 7,
+        "window_start": "2026-04-24", "window_end": "2026-05-01",
+    }
+
+    # Clean run → 🟢
+    cap = {}
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post",
+               side_effect=fake_post_returning(cap)):
+        push_eval_alert("https://x", base_headline, [],
+                        report_path="/tmp/x", trigger="scheduled")
+    assert cap["payload"]["status_emoji"] == "🟢"
+
+    # Regression-only → 🟡
+    cap = {}
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post",
+               side_effect=fake_post_returning(cap)):
+        push_eval_alert("https://x", base_headline,
+                        [{"type": "fixed_floor", "metric": "citation_rate",
+                          "value": 0.1, "threshold": 0.2}],
+                        report_path="/tmp/x", trigger="scheduled")
+    assert cap["payload"]["status_emoji"] == "🟡"
+
+    # Bill-history leak → 🔴 (escalates above regression-only).
+    cap = {}
+    leak_headline = {**base_headline, "bill_history_leak_count": 3}
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post",
+               side_effect=fake_post_returning(cap)):
+        push_eval_alert("https://x", leak_headline, [],
+                        report_path="/tmp/x", trigger="scheduled")
+    assert cap["payload"]["status_emoji"] == "🔴"
+    assert cap["payload"]["leak_status"] == "🚨 LEAK"
+
+    # Failure → 🔴
+    cap = {}
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post",
+               side_effect=fake_post_returning(cap)):
+        push_eval_alert("https://x", base_headline, [],
+                        report_path="/tmp/x", trigger="scheduled",
+                        error="subprocess_timeout")
+    assert cap["payload"]["status_emoji"] == "🔴"
+
+
+def test_push_eval_alert_trend_arrows_vs_previous():
+    """When previous_headline is supplied, trend arrows render +Npp / -Npp /
+    flat for citation/pass/cache_hit rates."""
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["payload"] = json
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    with patch("ddp_sync.pipelines.votebot_eval.requests.post", side_effect=fake_post):
+        push_eval_alert(
+            webhook_url="https://hooks.zapier.example/x",
+            headline={
+                "n_query_processed": 50,
+                "citation_rate": 0.55,  # was 0.40
+                "pass_rate": 0.85,      # was 1.00
+                "cache_hit_rate": 0.30, # was 0.30 (flat)
+                "fallback_rate": 0,
+                "avg_confidence": 0.7,
+                "bill_history_leak_count": 0,
+                "p50_latency_ms_rag_only": 5000,
+                "p95_latency_ms_rag_only": 12000,
+                "window_days": 7,
+                "window_start": "2026-04-24",
+                "window_end": "2026-05-01",
+            },
+            regression_details=[],
+            report_path="/tmp/x.json",
+            trigger="scheduled",
+            previous_headline={
+                "citation_rate": 0.40,
+                "pass_rate": 1.00,
+                "cache_hit_rate": 0.30,
+            },
+        )
+
+    p = captured["payload"]
+    # citation +15pp → ↗ +15.0pp
+    assert "↗" in p["citation_trend"]
+    assert "+15.0pp" in p["citation_trend"]
+    # pass -15pp → ↘ -15.0pp
+    assert "↘" in p["pass_trend"]
+    assert "-15.0pp" in p["pass_trend"]
+    # cache_hit unchanged → "— flat"
+    assert "flat" in p["cache_hit_trend"]
+
+
 def test_push_eval_alert_returns_false_on_network_exception():
     """Connection errors must be swallowed."""
     def fake_post(*a, **kw):
