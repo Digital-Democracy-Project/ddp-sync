@@ -300,6 +300,112 @@ async def test_scheduler_frequency_toggle_does_not_leave_stale_job():
 
 
 @pytest.mark.asyncio
+async def test_scheduler_logs_startup_misconfig_when_upload_photos_enabled_but_assets_key_missing():
+    """Phase-4: startup-time scope validation. When YAML has
+    upload_photos: true but webflow_assets_read_write_key is unset,
+    the scheduler logs an error at start() so the operator sees the
+    misconfig BEFORE the cron fires (not after-the-fact)."""
+    sched = _scheduler_with_yaml(
+        """
+        legislator_bio_sync:
+          enabled: true
+          upload_photos: true
+        """
+    )
+    sched.settings = MagicMock()
+    sched.settings.sync_interval_minutes = 30
+    sched.settings.webflow_assets_read_write_key = ""  # ← misconfig
+
+    captured: list = []
+    fake_logger = MagicMock()
+    fake_logger.info = lambda msg, **kw: captured.append(("info", kw))
+    fake_logger.warning = lambda msg, **kw: captured.append(("warning", kw))
+    fake_logger.error = lambda msg, **kw: captured.append(("error", kw))
+
+    with patch("ddp_sync.scheduler.logger", new=fake_logger):
+        sched.start()
+    try:
+        misconfig_logs = [
+            kw for level, kw in captured
+            if level == "error"
+            and kw.get("metric") == "legislator_bio_sync.startup_misconfig"
+        ]
+        assert len(misconfig_logs) == 1, (
+            f"expected one startup_misconfig error log; got {captured}"
+        )
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_no_startup_misconfig_when_assets_key_configured():
+    """No misconfig log when both upload_photos: true AND the assets
+    key is configured."""
+    sched = _scheduler_with_yaml(
+        """
+        legislator_bio_sync:
+          enabled: true
+          upload_photos: true
+        """
+    )
+    sched.settings = MagicMock()
+    sched.settings.sync_interval_minutes = 30
+    sched.settings.webflow_assets_read_write_key = "valid-token-here"
+
+    captured: list = []
+    fake_logger = MagicMock()
+    fake_logger.info = lambda msg, **kw: captured.append(("info", kw))
+    fake_logger.warning = lambda msg, **kw: captured.append(("warning", kw))
+    fake_logger.error = lambda msg, **kw: captured.append(("error", kw))
+
+    with patch("ddp_sync.scheduler.logger", new=fake_logger):
+        sched.start()
+    try:
+        misconfig_logs = [
+            kw for level, kw in captured
+            if level == "error"
+            and kw.get("metric") == "legislator_bio_sync.startup_misconfig"
+        ]
+        assert misconfig_logs == []
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_no_startup_misconfig_when_upload_photos_false():
+    """No misconfig log when upload_photos: false even if assets key
+    is unset (the scheduled run won't attempt photo uploads anyway)."""
+    sched = _scheduler_with_yaml(
+        """
+        legislator_bio_sync:
+          enabled: true
+          upload_photos: false
+        """
+    )
+    sched.settings = MagicMock()
+    sched.settings.sync_interval_minutes = 30
+    sched.settings.webflow_assets_read_write_key = ""
+
+    captured: list = []
+    fake_logger = MagicMock()
+    fake_logger.info = lambda msg, **kw: captured.append(("info", kw))
+    fake_logger.warning = lambda msg, **kw: captured.append(("warning", kw))
+    fake_logger.error = lambda msg, **kw: captured.append(("error", kw))
+
+    with patch("ddp_sync.scheduler.logger", new=fake_logger):
+        sched.start()
+    try:
+        misconfig_logs = [
+            kw for level, kw in captured
+            if level == "error"
+            and kw.get("metric") == "legislator_bio_sync.startup_misconfig"
+        ]
+        assert misconfig_logs == []
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_passes_upload_photos_strict_schema_through_to_options():
     """Phase-4: scheduler runner reads upload_photos / upload_photos_dry_run /
     strict_schema from YAML and threads them into BioSyncOptions."""

@@ -164,6 +164,27 @@ class UpdateScheduler:
                 pass
 
         if bio_config.get("enabled", False):
+            # Phase-4 startup-time scope validation. If upload_photos is
+            # set true in YAML but webflow_assets_read_write_key isn't
+            # configured, the orchestrator's per-run fail-fast would
+            # disable photo uploads with an error logged once per run —
+            # but only after the cron fires. Surfacing it at startup
+            # gives the operator a clear signal hours/days before the
+            # first scheduled run rather than after-the-fact.
+            if bio_config.get("upload_photos", False) and not (
+                self.settings.webflow_assets_read_write_key
+            ):
+                logger.error(
+                    "legislator_bio_sync.upload_photos: true but "
+                    "webflow_assets_read_write_key is NOT configured. "
+                    "The scheduled run will skip photo uploads with a "
+                    "per-run error. Add a Webflow API token with "
+                    "assets:read + assets:write scopes to the secret "
+                    "as `webflow_assets_read_write_key`, or set "
+                    "upload_photos: false until the key is configured.",
+                    metric="legislator_bio_sync.startup_misconfig",
+                )
+
             bio_sync_time = bio_config.get("sync_time_utc", "07:00")
             bio_hour, bio_minute = map(int, bio_sync_time.split(":"))
             bio_frequency = bio_config.get("frequency", "weekly")
