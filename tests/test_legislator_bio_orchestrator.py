@@ -1296,6 +1296,113 @@ async def test_run_mixed_success_patches_records_per_record_results():
 
 
 @pytest.mark.asyncio
+async def test_run_strict_schema_off_tolerates_dropped_fields():
+    """Phase-3: by default, schema-cache drops are tolerated (run continues
+    with the kept fields, dropped reported in would_patch entry)."""
+    cms = [_cms(
+        item_id="wf-1", chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+    )]
+    fed = _fed(bioguide="X001")
+    os_record = _os_person(
+        openstates_id="ocd-person/x", chamber="upper",
+        bioguide="X001", is_federal=True,
+    )
+
+    async def patch_with_drops(webflow_id, fields, *, publish=True, api_key=None):
+        # Simulate the schema cache dropping one field
+        return WebflowPatchResult(
+            success=True, webflow_id=webflow_id,
+            dropped_fields={"some-missing-slug"},
+        )
+
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+        patch_func=patch_with_drops,
+    )
+    report = await pipeline.run(
+        BioSyncOptions(dry_run=False, strict_schema=False),
+    )
+    # Strict off: tolerated, no errors
+    assert report.errors == []
+    assert report.aborted is False
+    # would_patch entry surfaces the dropped fields for visibility
+    assert report.would_patch[0]["dropped_fields"] == ["some-missing-slug"]
+
+
+@pytest.mark.asyncio
+async def test_run_strict_schema_on_raises_on_dropped_fields():
+    """Phase-3: with strict_schema=True, any schema-cache drop becomes a
+    per-record error so the operator sees missing slugs immediately
+    instead of after a read-back probe."""
+    cms = [_cms(
+        item_id="wf-1", chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+    )]
+    fed = _fed(bioguide="X001")
+    os_record = _os_person(
+        openstates_id="ocd-person/x", chamber="upper",
+        bioguide="X001", is_federal=True,
+    )
+
+    async def patch_with_drops(webflow_id, fields, *, publish=True, api_key=None):
+        return WebflowPatchResult(
+            success=True, webflow_id=webflow_id,
+            dropped_fields={"open-states-url", "office-email"},
+        )
+
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+        patch_func=patch_with_drops,
+    )
+    report = await pipeline.run(
+        BioSyncOptions(dry_run=False, strict_schema=True),
+    )
+    # Strict on: per-record error captured
+    assert len(report.errors) == 1
+    err = report.errors[0]
+    assert "strict_schema" in err
+    # The actual missing slugs are surfaced in the error message
+    assert "office-email" in err and "open-states-url" in err
+    # Run still completes (per-record isolation); doesn't abort
+    assert report.aborted is False
+
+
+@pytest.mark.asyncio
+async def test_run_strict_schema_on_clean_run_no_errors():
+    """Strict mode is a no-op when every payload field exists in the
+    live CMS schema."""
+    cms = [_cms(
+        item_id="wf-1", chamber="Senate",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-us"],
+    )]
+    fed = _fed(bioguide="X001")
+    os_record = _os_person(
+        openstates_id="ocd-person/x", chamber="upper",
+        bioguide="X001", is_federal=True,
+    )
+    # Default _build_pipeline returns dropped_fields=set() (empty)
+
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+        federal_records={"X001": fed},
+    )
+    report = await pipeline.run(
+        BioSyncOptions(dry_run=False, strict_schema=True),
+    )
+    assert report.errors == []
+    assert report.aborted is False
+
+
+@pytest.mark.asyncio
 async def test_run_does_not_blank_populated_cms_field_with_empty_upstream():
     """Round-14 fix: the cardinal 'never blank a populated CMS field with
     empty upstream' rule is pinned end-to-end through ``run()``.

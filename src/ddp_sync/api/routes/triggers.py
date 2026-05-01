@@ -96,6 +96,7 @@ async def trigger_legislator_bio_sync(
     limit: int = 0,
     historical_since: str | None = None,
     audit_only: str | None = None,
+    strict_schema: bool = False,
     token: str = Depends(api_key_auth),
 ):
     """Trigger the legislator bio + contact sync.
@@ -118,6 +119,13 @@ async def trigger_legislator_bio_sync(
                           "B" (bulk-import readiness — every record has
                           openstatesid + no duplicates), "C" (pre-existing
                           state CMS records lacking openstatesid).
+        strict_schema:    Phase-3 validation flag. When True, any payload
+                          field that the schema cache would silently drop
+                          (slug missing from the live CMS collection)
+                          becomes a per-record error. Default False;
+                          flip True for the first deploy after adding a
+                          new write target so missing slugs surface
+                          instead of silently no-op'ing.
 
     Returns: BioSyncReport JSON.
 
@@ -214,6 +222,7 @@ async def trigger_legislator_bio_sync(
         dry_run=dry_run,
         limit=limit,
         historical_since=since,
+        strict_schema=strict_schema,
     )
 
     try:

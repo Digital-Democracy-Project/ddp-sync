@@ -281,6 +281,13 @@ class BioSyncOptions:
     limit: int = 0                       # 0 = unlimited
     historical_since: date = field(default_factory=lambda: date(2023, 1, 1))
     locked_fields: tuple[str, ...] = ()
+    # Phase-3: when True, any payload field that the schema cache would
+    # silently drop (because the slug doesn't exist in the live CMS
+    # collection) is treated as a per-record error. Default False so
+    # ongoing scheduled runs tolerate partial schema rollouts; flip True
+    # for the first deploy after adding a new write target so missing
+    # slugs surface as errors instead of silently no-op'ing.
+    strict_schema: bool = False
 
 
 @dataclass
@@ -808,6 +815,15 @@ class LegislatorBioPipeline:
             "changed_fields": sorted(changed.keys()),
             "dropped_fields": sorted(result.dropped_fields),
         })
+        # Phase-3 strict_schema: surface schema-cache drops as errors so
+        # the operator sees them instead of silently no-op'ing. Use this
+        # on the first run after any new write-target field is added.
+        if options.strict_schema and result.dropped_fields:
+            raise WebflowError(
+                f"strict_schema: payload fields not in live CMS collection "
+                f"schema: {sorted(result.dropped_fields)}. Add the field(s) "
+                f"in the Webflow Designer + publish the site, then re-run."
+            )
 
     # ---------- Federal payload builder ----------
 
