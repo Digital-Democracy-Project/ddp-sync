@@ -1296,6 +1296,174 @@ async def test_run_mixed_success_patches_records_per_record_results():
 
 
 @pytest.mark.asyncio
+async def test_run_upload_photos_off_does_not_call_assets():
+    """Default behavior: assets service not invoked when upload_photos=False.
+    photo-source-url Link still populates as before."""
+    from unittest.mock import MagicMock, AsyncMock
+    cms = [_cms(
+        item_id="wf-fl-1", chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock()
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+    )
+    pipeline.assets = fake_assets
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=True, upload_photos=False,
+    ))
+    assert report.errors == []
+    fake_assets.upload_from_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_upload_photos_on_uploads_and_populates_legislator_image():
+    """Phase-3: with upload_photos=True, asset service is called and
+    legislator-image is populated in the PATCH payload."""
+    from unittest.mock import MagicMock, AsyncMock
+    from ddp_sync.services.webflow_assets import AssetReference
+    cms = [_cms(
+        item_id="wf-fl-1", chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1", name="Jane FL",
+        chamber="lower", state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock(return_value=AssetReference(
+        asset_id="asset-123", hosted_url="https://cdn.webflow.com/asset-123.jpg",
+        alt_text="Jane FL",
+    ))
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+        patch_recorder=patches,
+    )
+    pipeline.assets = fake_assets
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True,
+    ))
+    assert report.errors == []
+    fake_assets.upload_from_url.assert_awaited_once()
+    _, fields = patches[0]
+    assert fields["legislator-image"] == {
+        "fileId": "asset-123",
+        "url": "https://cdn.webflow.com/asset-123.jpg",
+        "alt": "Jane FL",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_upload_photos_skips_when_cms_already_has_image():
+    """Cardinal-rule preserves existing legislator-image — no upload
+    attempted, asset service never called."""
+    from unittest.mock import MagicMock, AsyncMock
+    cms = [_cms(
+        item_id="wf-fl-1", chamber="lower",
+        openstatesid="ocd-person/fl-1",
+        jurisdiction_ref=["juris-fl"],
+        extra_fields={
+            # CMS already has an editor-uploaded image
+            "legislator-image": {
+                "fileId": "existing-asset",
+                "url": "https://cdn.webflow.com/existing.jpg",
+                "alt": "",
+            },
+        },
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/fl-1", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/photo.jpg",
+    )
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock()
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/fl-1": os_record},
+    )
+    pipeline.assets = fake_assets
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True,
+    ))
+    assert report.errors == []
+    fake_assets.upload_from_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_upload_photos_failure_isolated_does_not_abort():
+    """Per-record photo upload failure is logged + recorded as a
+    per-record error; the rest of the payload still PATCHes; the run
+    continues to subsequent records."""
+    from unittest.mock import MagicMock, AsyncMock
+    from ddp_sync.services.webflow_assets import WebflowAssetError
+    cms = [
+        _cms(item_id="wf-1", name="A", chamber="lower",
+             openstatesid="ocd-person/a",
+             jurisdiction_ref=["juris-fl"]),
+        _cms(item_id="wf-2", name="B", chamber="lower",
+             openstatesid="ocd-person/b",
+             jurisdiction_ref=["juris-fl"]),
+    ]
+    os_a = _os_person(
+        openstates_id="ocd-person/a", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://broken.example.com/photo.jpg",
+    )
+    os_b = _os_person(
+        openstates_id="ocd-person/b", chamber="lower",
+        state="FL", is_federal=False,
+        image="https://www.flhouse.gov/good.jpg",
+    )
+    from ddp_sync.services.webflow_assets import AssetReference
+
+    async def upload_side_effect(source_url, *, alt_text=""):
+        if "broken" in source_url:
+            raise WebflowAssetError("404 fetching source image")
+        return AssetReference(
+            asset_id="asset-ok", hosted_url="https://cdn.webflow.com/ok.jpg",
+            alt_text=alt_text,
+        )
+
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock(side_effect=upload_side_effect)
+    patches: list = []
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={
+            "ocd-person/a": os_a, "ocd-person/b": os_b,
+        },
+        patch_recorder=patches,
+    )
+    pipeline.assets = fake_assets
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True,
+    ))
+    # First record's photo upload failed → in errors but not aborted
+    assert any("photo upload" in e for e in report.errors)
+    assert report.aborted is False
+    # Both records got PATCH'd; A's PATCH didn't include legislator-image
+    # (upload failed); B's did.
+    assert len(patches) == 2
+    a_fields = next(f for wf, f in patches if wf == "wf-1")
+    b_fields = next(f for wf, f in patches if wf == "wf-2")
+    assert "legislator-image" not in a_fields
+    assert b_fields["legislator-image"]["fileId"] == "asset-ok"
+
+
+@pytest.mark.asyncio
 async def test_run_strict_schema_off_tolerates_dropped_fields():
     """Phase-3: by default, schema-cache drops are tolerated (run continues
     with the kept fields, dropped reported in would_patch entry)."""

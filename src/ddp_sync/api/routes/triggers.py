@@ -97,6 +97,7 @@ async def trigger_legislator_bio_sync(
     historical_since: str | None = None,
     audit_only: str | None = None,
     strict_schema: bool = False,
+    upload_photos: bool = False,
     token: str = Depends(api_key_auth),
 ):
     """Trigger the legislator bio + contact sync.
@@ -126,6 +127,15 @@ async def trigger_legislator_bio_sync(
                           flip True for the first deploy after adding a
                           new write target so missing slugs surface
                           instead of silently no-op'ing.
+        upload_photos:    Phase-3 photo-upload pipeline. When True, the
+                          orchestrator fetches the source image from
+                          photo-source-url and uploads to Webflow's
+                          asset library, populating the legislator-image
+                          (Image type) field. Default False; flip True
+                          after editor verification of a sample. Skipped
+                          when CMS already has a legislator-image set
+                          (cardinal rule). Per-record upload failures
+                          are logged + isolated, don't abort the run.
 
     Returns: BioSyncReport JSON.
 
@@ -223,6 +233,7 @@ async def trigger_legislator_bio_sync(
         limit=limit,
         historical_since=since,
         strict_schema=strict_schema,
+        upload_photos=upload_photos,
     )
 
     try:

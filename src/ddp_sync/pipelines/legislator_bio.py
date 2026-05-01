@@ -53,6 +53,11 @@ from ddp_sync.services.openstates_people import (
     OpenStatesRateLimitError,
 )
 from ddp_sync.services.rate_limiter import RateLimiter
+from ddp_sync.services.webflow_assets import (
+    AssetReference,
+    WebflowAssetError,
+    WebflowAssetService,
+)
 from ddp_sync.services.webflow_lookup import (
     WebflowError,
     WebflowLookupService,
@@ -288,6 +293,15 @@ class BioSyncOptions:
     # for the first deploy after adding a new write target so missing
     # slugs surface as errors instead of silently no-op'ing.
     strict_schema: bool = False
+    # Phase-3: when True, the orchestrator fetches the source image
+    # from photo-source-url and uploads to Webflow's asset library,
+    # populating the legislator-image (Image type) field. Default False
+    # because the upload flow is opt-in and per-state photo CDN
+    # stability varies; operator flips True after editor verification
+    # of a sample. Per-record upload failures are isolated (logged +
+    # continue, don't abort the run); the photo-source-url Link field
+    # still carries the original URL even when upload fails.
+    upload_photos: bool = False
 
 
 @dataclass
@@ -326,6 +340,12 @@ _FEDERAL_SEAT_REF_IDS: frozenset[str] = frozenset({
     "66316e20ae88354aed5df702",  # us-house
     "66316e0956dc73af879134b4",  # us-senate
 })
+
+
+# Sentinel for "photo upload was tried and is permanently disabled for
+# this run" — set on the orchestrator's ``self.assets`` field after a
+# config-error so subsequent records skip without re-running init.
+_NULL_ASSET_SERVICE_SENTINEL = object()
 
 
 # ---------- Per-state payload overrides (Phase 2.5) ----------
@@ -559,6 +579,7 @@ class LegislatorBioPipeline:
         congress: CongressLegislatorsSource | None = None,
         openstates: OpenStatesPeopleClient | None = None,
         openstates_rate_limiter: RateLimiter | None = None,
+        assets: "WebflowAssetService | None" = None,
     ):
         self.settings = settings or get_settings()
         self.webflow = webflow or WebflowLookupService(self.settings)
@@ -575,6 +596,10 @@ class LegislatorBioPipeline:
             )
         else:
             self.openstates = openstates
+        # Phase-3 photo upload service. Lazy-initialized on first use
+        # if the orchestrator was constructed without one and
+        # upload_photos is enabled — keeps the cold path cheap.
+        self.assets = assets
 
     # ---------- Public entry point ----------
 
@@ -791,6 +816,22 @@ class LegislatorBioPipeline:
                 return
             payload = self._build_state_payload(cms, os_record)
 
+        # Phase-3 photo upload (opt-in via options.upload_photos):
+        # uploads the source image into Webflow's asset library and
+        # populates legislator-image (Image-typed). Skipped when CMS
+        # already has the field populated (cardinal rule preserves
+        # editor-managed values; subsequent runs no-op cleanly).
+        if (
+            options.upload_photos
+            and not cms.raw_fields.get("legislator-image")
+            and payload.get("photo-source-url")
+        ):
+            asset_value = await self._maybe_upload_photo(
+                cms, payload["photo-source-url"], report,
+            )
+            if asset_value is not None:
+                payload["legislator-image"] = asset_value
+
         changed = self._diff_payload(
             cms.raw_fields, payload, options.locked_fields
         )
@@ -824,6 +865,73 @@ class LegislatorBioPipeline:
                 f"schema: {sorted(result.dropped_fields)}. Add the field(s) "
                 f"in the Webflow Designer + publish the site, then re-run."
             )
+
+    # ---------- Phase-3 photo upload helper ----------
+
+    async def _maybe_upload_photo(
+        self,
+        cms: "CMSLegislator",
+        source_url: str,
+        report: BioSyncReport,
+    ) -> dict | None:
+        """Upload the source image into Webflow's asset library.
+
+        Returns the Image-field-shaped dict (``{fileId, url, alt}``) on
+        success, or ``None`` on any failure (logged + recorded in the
+        run's errors list, but does NOT abort the record's PATCH; the
+        photo-source-url Link field still gets the original URL so the
+        website can fall back to hotlinking).
+
+        Lazy-initializes ``self.assets`` on first use so the cold path
+        of upload-photos-disabled runs doesn't pay the construction
+        cost.
+        """
+        if self.assets is None:
+            try:
+                self.assets = WebflowAssetService(
+                    api_token=self.settings.webflow_api_token,
+                    site_id=self.settings.webflow_site_id,
+                )
+            except ValueError as e:
+                # Missing token / site_id config — log once + give up
+                # for this run (don't keep retrying)
+                logger.error(
+                    "Photo upload disabled: WebflowAssetService init failed",
+                    error=str(e),
+                    metric="webflow_assets.config_error",
+                )
+                self.assets = _NULL_ASSET_SERVICE_SENTINEL  # type: ignore[assignment]
+                return None
+        if self.assets is _NULL_ASSET_SERVICE_SENTINEL:
+            return None
+
+        try:
+            ref = await self.assets.upload_from_url(
+                source_url, alt_text=cms.name,
+            )
+        except WebflowAssetError as e:
+            report.errors.append(
+                f"{cms.slug or cms.webflow_id}: photo upload failed: {e}"
+            )
+            logger.warning(
+                "Photo upload failed; skipping legislator-image",
+                webflow_id=cms.webflow_id,
+                source_url=source_url,
+                error=str(e),
+                metric="webflow_assets.upload_failed",
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            report.errors.append(
+                f"{cms.slug or cms.webflow_id}: photo upload unhandled: {e}"
+            )
+            logger.exception(
+                "Photo upload unhandled error",
+                webflow_id=cms.webflow_id,
+                source_url=source_url,
+            )
+            return None
+        return ref.to_image_field_value()
 
     # ---------- Federal payload builder ----------
 

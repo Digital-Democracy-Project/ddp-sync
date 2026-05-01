@@ -1,6 +1,10 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** ✅ **Phase 1 + Phase 2.5 SHIPPED + verified end-to-end 2026-04-30.** Federal (32) + state (192) bio sync running cleanly against the live FL CMS. 125-test suite. Seventeen pm-review rounds + five production-discovery iterations (chamber→seat data-model; URL-typed ID fields; Zapier Mustache→pre-formatted strings; term-date ISO-datetime coercion; **schema-mismatch — `email`/`openstates-id` slugs didn't exist, user added `office-email`/`campaign-email`/`open-states-url`, bio sync writes to new slugs**). End-state population (read-only Webflow probe): federal — every field 100% except seniority-rank 9% (upstream coverage), social handles 50–80% (upstream coverage), office-email 0% (federal emails route to contact-form-url, by design); state — open-states-url 100%, office-email 99%, official-website 98%, photo-source-url 98%, gender 100%, capitol contact ~80%, birth-year 71%. The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs: per-state photo-upload pipeline (Phase 3); state-leg social handles + term dates (deferred — OpenStates probe confirmed they're not in `/people` v3); orphan-set instability investigation; `--undo-last-run` mass-revert capability; `strict_schema=true` BioSyncOptions flag to surface schema-cache drops on first deploy of new write targets.
+**Status:** ✅ **Phase 1 + 2.5 + 3 (V1) SHIPPED 2026-04-30.** Phase 3 V1 ships: `strict_schema=true` BioSyncOptions flag (surfaces schema-cache silent drops as per-record errors), transient-404 retry on OpenStates `fetch_by_id` (targets the orphan-set-instability observed across runs), and a photo-upload pipeline (`WebflowAssetService` two-step Webflow Assets API integration; populates the `legislator-image` Image-typed field; opt-in via `upload_photos=true`; per-record failure isolation; default off pending operator-driven first-run verification). 140-test suite. Probed but deferred (data-side blockers): state-leg term dates (OpenStates v3 `/people` returns 422 on `include=roles`/`include=memberships`); state-leg social handles (zero in OpenStates `links[]` for FL House sample). Phase 4+ backlog: bulk-data ingestion for state term-history; alternate upstream for state social handles; `--undo-last-run` mass-revert; Redis-backed photo dedup cache.
+
+---
+
+**Earlier status:** Phase 1 + Phase 2.5 SHIPPED + verified end-to-end 2026-04-30. Federal (32) + state (192) bio sync running cleanly against the live FL CMS. 125-test suite. Seventeen pm-review rounds + five production-discovery iterations (chamber→seat data-model; URL-typed ID fields; Zapier Mustache→pre-formatted strings; term-date ISO-datetime coercion; **schema-mismatch — `email`/`openstates-id` slugs didn't exist, user added `office-email`/`campaign-email`/`open-states-url`, bio sync writes to new slugs**). End-state population (read-only Webflow probe): federal — every field 100% except seniority-rank 9% (upstream coverage), social handles 50–80% (upstream coverage), office-email 0% (federal emails route to contact-form-url, by design); state — open-states-url 100%, office-email 99%, official-website 98%, photo-source-url 98%, gender 100%, capitol contact ~80%, birth-year 71%. The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs: per-state photo-upload pipeline (Phase 3); state-leg social handles + term dates (deferred — OpenStates probe confirmed they're not in `/people` v3); orphan-set instability investigation; `--undo-last-run` mass-revert capability; `strict_schema=true` BioSyncOptions flag to surface schema-cache drops on first deploy of new write targets.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -305,12 +309,50 @@ Bio sync does NOT write `campaign-email` (no upstream source).
 - `probe_webflow_record.py` — schema dump + sample record fieldData
 - `probe_webflow_one_record.py` — draft vs live endpoint comparison for a single record
 
+## Phase 3 (V1) — 2026-04-30
+
+Three deliverables shipped across four commits (commits `9692202`, `e5e2049`, plus the photo-pipeline commit + final docs):
+
+**1. `strict_schema=true` BioSyncOptions flag (commit 9692202).** When enabled, any payload field that the schema cache silently drops becomes a per-record error. Default off for ongoing scheduled runs (preserves partial-rollout tolerance); flip on for the first run after adding a new write target. Would have caught the schema-mismatch bug from earlier in Phase 2.5 hours sooner. 3 tests pin: tolerates drops by default, raises on drops when strict, no-op when no drops in strict mode.
+
+**2. Transient-404 retry on OpenStates `fetch_by_id` (commit e5e2049).** Targets the orphan-set-instability observed across runs. Reuses the existing `max_retry_attempts` budget (default 3); only persistent 404s across all attempts return None. Per-record latency cost on truly-orphaned records adds ~7s of backoff; with ~3-5 orphans observed per run, ~20-35s total wall-time impact on a full run. Logs `metric=openstates.transient_404_retry` per retry so dashboards can track flakiness. 2 tests pin: transient case (404, 404, 200 → recovered); persistent case (404, 404, 404 → orphan).
+
+**3. Photo-upload pipeline V1 (`WebflowAssetService` + bio-sync integration).** Implements Webflow's two-step Assets v2 upload (POST `/v2/sites/{site_id}/assets` → PUT bytes to signed URL). New file `services/webflow_assets.py` (~250 LoC). New `BioSyncOptions.upload_photos` flag (default off — opt-in, gated on operator-driven first-run verification). When enabled and `legislator-image` (Image-typed CMS field) is currently empty, uploads the source from `photo-source-url` and populates the Image-field-shaped value `{fileId, url, alt}`. Per-record upload failures are isolated (logged + recorded in `report.errors`, don't abort the run); the `photo-source-url` Link field still carries the original URL even when upload fails so the website can fall back to hotlinking. Source-URL → AssetReference cache on the service instance (in-memory, lifetime of the run; Redis-backed cross-run cache is Phase 4). MD5-hash-based dedup matches Webflow's expected hash format. 10 MB cap on source-image fetches. 4 orchestrator tests + 6 asset-service unit tests pin behavior.
+
+### Probed but deferred (data-side blockers)
+
+- **State-leg term dates** — `scripts/probe_openstates_term_dates.py` confirmed `include=roles` and `include=memberships` both return 422 from OpenStates v3 `/people`. Term history is not API-accessible at the v3 `/people` level. Phase 4+ would require bulk-data CSV ingestion (different shape, separate pipeline).
+- **State-leg social handles** — Phase-2.5 OpenStates probe found zero `twitter.com`/`facebook.com`/`instagram.com`/`youtube.com` URLs across 10 sampled FL House records' `links[]`. OpenStates simply doesn't carry social media for FL state legs. Phase 4+ alternative source needed (Ballotpedia, per-state APIs, or webscraping).
+
+### Phase 3 operational runbook
+
+The photo-upload flag is operator-driven; first run requires verification before flipping default-on:
+
+1. **Pre-flight** — confirm `WEBFLOW_API_TOKEN` and `WEBFLOW_SITE_ID` are populated in production env (already required by other writes). The asset service uses both at lazy-init time.
+
+2. **Single-record test run** — pick a low-stakes record without an existing `legislator-image`:
+   ```
+   curl -fsSX POST -H "Authorization: Bearer $DDP_SYNC_API_KEY" \
+     "$DEPLOY_URL/trigger/legislator-bio-sync?dry_run=false&jurisdiction=us&limit=1&upload_photos=true" \
+     | jq '{patched: .would_patch[0], errors}'
+   ```
+   Expected: `would_patch[0].changed_fields` includes `legislator-image`; `errors == []`.
+
+3. **Verify in Webflow Designer** — open the patched record; confirm `legislator-image` shows the uploaded photo. Compare visually to `photo-source-url` (should be the same image).
+
+4. **Read back via probe** — `scripts/probe_webflow_record.py` should show `legislator-image` populated as `{fileId, url, alt}` dict.
+
+5. **Full-run** — `?upload_photos=true&dry_run=false` against all jurisdictions. Expect ~190 state legs to get new uploads (federal records already have photos via the source-URL field, and the cardinal rule preserves; if `legislator-image` was empty for any federal records, those upload too). Run takes longer than usual due to per-record image fetch + upload (~1-2s per record beyond the existing PATCH cost).
+
+6. **Editor sign-off** — same as Phase 1 sign-off criteria; sample 5+ records visually.
+
+7. **Enable in scheduler config (Phase 4 task)** — add `upload_photos: true` to `legislator_bio_sync` block in `sync_schedule.yaml` once operator is confident. Until then, ad-hoc operator triggers carry the load.
+
 ### What we deliberately deferred
 
-- **Social handles for state legs** — confirmed not available from OpenStates. Phase 3 if a different upstream source is found.
-- **State-leg term dates** — confirmed not available from OpenStates `/people` v3. Could probe `/orgs/{id}/memberships` or similar in a future iteration; for now, accept "no term dates for state" and note that the cardinal rule preserves any editor-populated values.
-- **`--undo-last-run` mass-revert capability** — backlogged. Pre-deploy guardrails (dry-run + Audit B + per-record error isolation) carry the safety load until then.
-- **Per-state photo-upload pipeline** — Phase 3 (per the original PLAN). Currently we just store the OpenStates `image` URL; quality/stability varies but the URL-typed field accepts it.
+- **Social handles for state legs** — confirmed not available from OpenStates `/people` v3. Phase 4+ if a different upstream source is found (Ballotpedia scraper, per-state APIs, or webscraping per-state legislator pages).
+- **State-leg term dates** — Phase-3 probe (`scripts/probe_openstates_term_dates.py`) confirmed `include=roles` and `include=memberships` both return 422 from OpenStates v3. There is no term-history available via the API. Bulk-data CSVs (downloads) would carry it but that's a different ingestion shape; defer to Phase 4+. The cardinal rule preserves any editor-populated values in the meantime.
+- **`--undo-last-run` mass-revert capability** — Phase-4 backlog. Pre-deploy guardrails (dry-run + Audit B + per-record error isolation + new `strict_schema=true` flag) carry the safety load until then.
 
 ---
 
