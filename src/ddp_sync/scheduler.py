@@ -934,6 +934,12 @@ class UpdateScheduler:
                 created=len(report.would_create),
                 errors=len(report.errors),
                 aborted=report.aborted,
+                # Phase-4 photo coverage metrics. Always present (zero
+                # when upload_photos was disabled) for stable
+                # dashboarding.
+                photo_uploads_attempted=report.photo_uploads_attempted,
+                photo_uploads_succeeded=report.photo_uploads_succeeded,
+                photo_uploads_failed=report.photo_uploads_failed,
             )
             return {
                 "success": not report.aborted,

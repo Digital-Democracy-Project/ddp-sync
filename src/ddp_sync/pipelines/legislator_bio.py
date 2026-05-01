@@ -186,12 +186,25 @@ def push_bio_sync_alert(
         if on_large_changes else ""
     )
 
+    # Phase-4: photo-upload coverage metrics. Computed only when at
+    # least one upload was attempted (otherwise ratio is undefined and
+    # we send 0/null). Surfaced both as raw counters and a coverage
+    # ratio for dashboarding.
+    photo_attempted = report.photo_uploads_attempted
+    photo_succeeded = report.photo_uploads_succeeded
+    photo_failed = report.photo_uploads_failed
+    photo_coverage_ratio = (
+        round(photo_succeeded / photo_attempted, 3)
+        if photo_attempted > 0 else None
+    )
+
     payload = {
         "alert_type": "legislator_bio_sync_complete",
         "summary": (
             f"items_seen={report.cms_items_seen} "
             f"patched={patched} created={created} "
-            f"merges={merges} orphans={orphans} errors={errors}"
+            f"merges={merges} orphans={orphans} errors={errors} "
+            f"photos={photo_succeeded}/{photo_attempted}"
         ),
         "items_seen": report.cms_items_seen,
         "items_resolved_via_openstates": (
@@ -212,6 +225,10 @@ def push_bio_sync_alert(
         "large_changes_threshold": large_changes_threshold,
         "failure_warning": failure_warning,
         "large_changes_warning": large_changes_warning,
+        "photo_uploads_attempted": photo_attempted,
+        "photo_uploads_succeeded": photo_succeeded,
+        "photo_uploads_failed": photo_failed,
+        "photo_coverage_ratio": photo_coverage_ratio,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -323,6 +340,14 @@ class BioSyncReport:
     errors: list[str] = field(default_factory=list)
     aborted: bool = False
     abort_reason: str | None = None
+    # Phase-4: photo-upload coverage metrics. Populated only when
+    # options.upload_photos is True. attempted = number of records the
+    # orchestrator tried to upload for (CMS legislator-image was empty
+    # AND a source URL was available); succeeded / failed split between
+    # them. failed records are also surfaced individually in errors[].
+    photo_uploads_attempted: int = 0
+    photo_uploads_succeeded: int = 0
+    photo_uploads_failed: int = 0
 
 
 # ---------- CMS index helpers ----------
@@ -950,6 +975,10 @@ class LegislatorBioPipeline:
                 f"{cms.bioguide_id.lower()}.jpg",
             )
 
+        # Phase-4: count this attempt (regardless of outcome). The
+        # success/failure split lands below.
+        report.photo_uploads_attempted += 1
+
         try:
             ref = await self.assets.upload_from_url(
                 source_url,
@@ -961,6 +990,7 @@ class LegislatorBioPipeline:
             report.errors.append(
                 f"{cms.slug or cms.webflow_id}: photo upload failed: {e}"
             )
+            report.photo_uploads_failed += 1
             logger.warning(
                 "Photo upload failed; skipping legislator-image",
                 webflow_id=cms.webflow_id,
@@ -973,6 +1003,7 @@ class LegislatorBioPipeline:
             report.errors.append(
                 f"{cms.slug or cms.webflow_id}: photo upload unhandled: {e}"
             )
+            report.photo_uploads_failed += 1
             logger.exception(
                 "Photo upload unhandled error",
                 webflow_id=cms.webflow_id,
@@ -982,9 +1013,12 @@ class LegislatorBioPipeline:
         # dry_run mode returns None from upload_from_url; the caller
         # treats that the same as "no asset to set" — payload skips
         # legislator-image. The fetch + size-check + hash already
-        # validated source-CDN reachability.
+        # validated source-CDN reachability. Count as success because
+        # the source-fetch flow worked, even though no asset was made.
         if ref is None:
+            report.photo_uploads_succeeded += 1
             return None
+        report.photo_uploads_succeeded += 1
         return ref.to_image_field_value()
 
     # ---------- Federal payload builder ----------

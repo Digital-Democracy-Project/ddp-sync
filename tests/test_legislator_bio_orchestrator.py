@@ -1442,6 +1442,82 @@ async def test_run_upload_photos_skips_when_cms_already_has_image():
 
 
 @pytest.mark.asyncio
+async def test_run_upload_photos_counts_in_coverage_metrics():
+    """Phase-4: photo_uploads_attempted / succeeded / failed counters
+    track each upload outcome for dashboarding."""
+    from unittest.mock import MagicMock, AsyncMock
+    from ddp_sync.services.webflow_assets import (
+        AssetReference, WebflowAssetError,
+    )
+
+    cms = [
+        _cms(item_id="wf-1", chamber="lower",
+             openstatesid="ocd-person/a",
+             jurisdiction_ref=["juris-fl"]),
+        _cms(item_id="wf-2", chamber="lower",
+             openstatesid="ocd-person/b",
+             jurisdiction_ref=["juris-fl"]),
+        _cms(item_id="wf-3", chamber="lower",
+             openstatesid="ocd-person/c",
+             jurisdiction_ref=["juris-fl"]),
+    ]
+    os_records = {
+        f"ocd-person/{x}": _os_person(
+            openstates_id=f"ocd-person/{x}",
+            chamber="lower", state="FL", is_federal=False,
+            image=f"https://www.flhouse.gov/{x}.jpg",
+        ) for x in ("a", "b", "c")
+    }
+
+    async def mixed_upload(source_url, *, alt_text="", dry_run=False, fallback_urls=()):
+        if "/b.jpg" in source_url:
+            raise WebflowAssetError("upstream 404")
+        return AssetReference(
+            asset_id=f"asset-{source_url[-5:-4]}",
+            hosted_url=f"https://cdn/{source_url[-5:-4]}.jpg",
+            alt_text=alt_text,
+        )
+
+    fake_assets = MagicMock()
+    fake_assets.upload_from_url = AsyncMock(side_effect=mixed_upload)
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses=os_records,
+    )
+    pipeline.assets = fake_assets
+
+    report = await pipeline.run(BioSyncOptions(
+        dry_run=False, upload_photos=True,
+    ))
+    # 3 attempts: a/c succeed, b fails
+    assert report.photo_uploads_attempted == 3
+    assert report.photo_uploads_succeeded == 2
+    assert report.photo_uploads_failed == 1
+
+
+@pytest.mark.asyncio
+async def test_run_no_photo_uploads_when_flag_off_means_zero_metrics():
+    """Default (upload_photos=False) leaves all photo metrics at zero."""
+    cms = [_cms(
+        item_id="wf-1", chamber="lower",
+        openstatesid="ocd-person/x",
+        jurisdiction_ref=["juris-fl"],
+    )]
+    os_record = _os_person(
+        openstates_id="ocd-person/x", chamber="lower",
+        state="FL", is_federal=False,
+    )
+    pipeline = _build_pipeline(
+        cms_items=cms,
+        openstates_responses={"ocd-person/x": os_record},
+    )
+    report = await pipeline.run(BioSyncOptions(dry_run=False))
+    assert report.photo_uploads_attempted == 0
+    assert report.photo_uploads_succeeded == 0
+    assert report.photo_uploads_failed == 0
+
+
+@pytest.mark.asyncio
 async def test_run_upload_photos_passes_congress_gov_fallback_for_federal():
     """Phase-4: federal records get a congress.gov fallback URL for the
     photo upload (because unitedstates/images dataset has gaps for new

@@ -910,6 +910,51 @@ async def test_openstates_fetch_by_id_returns_none_after_persistent_404():
     assert call_count[0] == 3
 
 
+def test_push_bio_sync_alert_includes_photo_coverage_metrics():
+    """Phase-4: Zapier payload includes photo upload counters + coverage
+    ratio for dashboarding."""
+    report = BioSyncReport(
+        cms_items_seen=10,
+        photo_uploads_attempted=8,
+        photo_uploads_succeeded=7,
+        photo_uploads_failed=1,
+    )
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock(); m.status_code = 200; return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        push_bio_sync_alert("https://example.com/zap", report)
+
+    payload = captured["json"]
+    assert payload["photo_uploads_attempted"] == 8
+    assert payload["photo_uploads_succeeded"] == 7
+    assert payload["photo_uploads_failed"] == 1
+    assert payload["photo_coverage_ratio"] == 0.875
+    # Summary line includes the photo split
+    assert "photos=7/8" in payload["summary"]
+
+
+def test_push_bio_sync_alert_photo_coverage_ratio_null_when_no_attempts():
+    """When upload_photos was disabled (zero attempts), coverage_ratio
+    is null rather than dividing-by-zero or reporting a misleading 1.0."""
+    report = BioSyncReport(cms_items_seen=10)
+    captured: dict = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        m = MagicMock(); m.status_code = 200; return m
+
+    with patch("ddp_sync.pipelines.legislator_bio.requests.post", new=fake_post):
+        push_bio_sync_alert("https://example.com/zap", report)
+
+    payload = captured["json"]
+    assert payload["photo_uploads_attempted"] == 0
+    assert payload["photo_coverage_ratio"] is None
+
+
 def test_normalize_state_code_clamps_to_two_letters():
     """Round-8 fix: only true 2-letter codes pass; full state names rejected."""
     from ddp_sync.services.webflow_lookup import WebflowLookupService
