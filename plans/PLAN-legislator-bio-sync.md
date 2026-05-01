@@ -1,6 +1,6 @@
 # PLAN: Legislator Bio + Contact Sync
 
-**Status:** ✅ **Phase 1 + Phase 2.5 (data-extraction layer) SHIPPED 2026-04-30.** Phase 1 federal sync (32 FL records) + state-leg baseline sync + APScheduler wiring + Audit B + Phase 2.5 enrichment (`openstates-id` URL field, FL `official-website` extraction via per-state override registry) + round-17 review fixes (scheduler-completion metric, job-id-collision cleanup, edge-case tests, rollback playbook, editor sign-off criteria). 122-test suite. Seventeen pm-review rounds + four production-discovery iterations (chamber→seat data-model, URL-typed ID fields, Zapier Mustache→pre-formatted strings, term-date ChurnPATCH). The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs: per-state photo-upload pipeline (Phase 3); state-leg social handles + term dates (deferred — OpenStates probe confirmed they're not in `/people` v3); orphan-set instability investigation; `--undo-last-run` mass-revert capability.
+**Status:** ✅ **Phase 1 + Phase 2.5 SHIPPED + verified end-to-end 2026-04-30.** Federal (32) + state (192) bio sync running cleanly against the live FL CMS. 125-test suite. Seventeen pm-review rounds + five production-discovery iterations (chamber→seat data-model; URL-typed ID fields; Zapier Mustache→pre-formatted strings; term-date ISO-datetime coercion; **schema-mismatch — `email`/`openstates-id` slugs didn't exist, user added `office-email`/`campaign-email`/`open-states-url`, bio sync writes to new slugs**). End-state population (read-only Webflow probe): federal — every field 100% except seniority-rank 9% (upstream coverage), social handles 50–80% (upstream coverage), office-email 0% (federal emails route to contact-form-url, by design); state — open-states-url 100%, office-email 99%, official-website 98%, photo-source-url 98%, gender 100%, capitol contact ~80%, birth-year 71%. The `legislator_bio_sync` block in `config/sync_schedule.yaml` defaults to `enabled: false` — operator flips after editor verification + monitoring window. Carry-overs: per-state photo-upload pipeline (Phase 3); state-leg social handles + term dates (deferred — OpenStates probe confirmed they're not in `/people` v3); orphan-set instability investigation; `--undo-last-run` mass-revert capability; `strict_schema=true` BioSyncOptions flag to surface schema-cache drops on first deploy of new write targets.
 **Created:** 2026-04-29
 **Repo:** ddp-sync
 **Target:** Phase 1 in ~2 weeks; Phase 2 in 4–6 weeks; Phases 3–4 in backlog
@@ -256,32 +256,54 @@ Ran `scripts/probe_openstates_state_legs.py` against 10 FL state legislators. Ou
 - **Rollback playbook** — added to §Rollback procedure with per-record vs mass-revert distinction; `--undo-last-run` capability listed as backlog.
 - **Editor sign-off acceptance criteria** — table in §Rollout sequence with field-by-field expectations + sample-size threshold.
 
-### Schema-mismatch fix: email + openstates-id field slugs (2026-04-30)
+### Post-Phase-2.5 "ChurnPATCH" diagnosis — was actually schema mismatch (2026-04-30)
 
-After the post-Phase-2.5 ChurnPATCH fix went live, a read-only Webflow probe (`scripts/probe_webflow_legislators.py`) revealed two fields that the bio sync was writing to but the live schema didn't have:
+What initially looked like a ChurnPATCH on `openstates-id` (222/224 records "re-patched" every run) and `email` (189/192) turned out to be the more fundamental issue documented in §Schema-mismatch fix below: **those slugs didn't exist in the live Legislators CMS**. The schema-cache filter dropped the writes silently. The cardinal-rule diff always saw `cms_value=None` vs `upstream_value="..."` → wrote it → write got dropped → CMS still None → next run, same diff. Looked like churn; was actually "field doesn't exist, every write is silently no-op'd".
 
-- **`email`** — bio sync wrote to `payload["email"]` for 192 state legs every run. The Legislators CMS schema has no `email` field. Schema-cache filter silently dropped the value before send. Live read-back showed 0/192 state records had any email surfaced.
-- **`openstates-id`** — Phase-2.5 wrote to `payload["openstates-id"]` for all 224 records. The schema only has `openstatesid` (PlainText, no hyphen — the join key) and not a separate `openstates-id` URL field. Same silent drop.
+We initially shipped two defensive transforms based on the wrong diagnosis (commit d78c200) — `.rstrip("/")` on the URL and `.lower()` on the email — both of which are still in place. They're harmless either way (the live CMS Webflow URL field preserves trailing slashes — verified via direct PATCH+GET against the API; the Email type's case-handling is consistent enough that `.lower()` doesn't introduce churn), and the comments in the code now point at the schema-mismatch root cause.
 
-**Fix:** the user added three new fields to the live CMS — `office-email` (Email type), `campaign-email` (Email type, editor-managed only), and `open-states-url` (Link type). Bio sync code now writes to:
-- `office-email` instead of `email` (Webflow Email type lowercases on storage; we already lowercase before sending)
-- `open-states-url` instead of `openstates-id` (URL field strips trailing slash; we already strip)
+**Generalized lesson:** when a field appears to ChurnPATCH on every run, suspect schema mismatch BEFORE storage-format normalization. Verify by reading back via the Webflow API (or running `scripts/probe_webflow_legislators.py`) — if the CMS shows `null` for the supposedly-patched field, the schema cache is dropping it, not Webflow normalizing. Backlog: `strict_schema=true` BioSyncOptions flag that raises on any `dropped_fields[]` entry, run once per new field for guaranteed-clean first deploy.
 
-Bio sync does NOT write to `campaign-email` (no upstream source).
+### Schema-mismatch fix: `email`/`openstates-id` slugs didn't exist (2026-04-30)
 
-**Generalized lesson — the schema-cache "graceful degradation" tradeoff:** the cache silently drops unknown fields so partial schema rollouts don't break the sync. Same mechanism makes "writing to a wrong slug" hard to diagnose — no errors surface, fields just stay empty. Mitigation: when adding a new write target, include a verifiable-success step (read back the field after first live PATCH; or surface `dropped_fields` in the run summary). Backlog item: enable a `strict_schema=true` BioSyncOptions flag that raises when any payload field is dropped, so we can run it once after each new write target ships.
+Two write targets the bio sync was sending to didn't exist in the live Legislators CMS schema:
 
-### Post-Phase-2.5 ChurnPATCH fixes (2026-04-30)
+- `payload["email"]` — bio sync wrote for 192 state legs every run; live schema has no `email` field. Schema-cache filter silently dropped 192 writes per run.
+- `payload["openstates-id"]` — Phase-2.5 wired this up; live schema has only `openstatesid` (PlainText join key, no hyphen) and not a separate `openstates-id` URL field.
 
-First post-Phase-2.5 production dry-run revealed two more storage-format-vs-payload mismatches:
+User added three new fields to the live CMS:
+- `office-email` (Email type) — for the official `.gov` address
+- `campaign-email` (Email type, editor-managed; bio sync doesn't write to this)
+- `open-states-url` (Link type) — for the OpenStates profile URL
 
-**`openstates-id` URL trailing slash:** OpenStates' `openstates_url` ends with `/` (e.g. `https://openstates.org/person/x-xxx/`). Webflow's URL field strips the trailing slash on storage, so every run saw `cms = "...x"` vs `upstream = "...x/"` → diff → re-PATCH. Fix: `.rstrip("/")` before sending. 222 of 224 records were churning (the 2 that stuck were ones where OpenStates happened to not emit a trailing slash). Also fixes a similar pattern that would arise if any future URL-typed field's upstream value carries a trailing slash that Webflow drops.
+Bio sync now writes:
+- `payload["office-email"]` instead of `payload["email"]` (lowercased before sending — defensive against the Webflow Email type's storage normalization)
+- `payload["open-states-url"]` instead of `payload["openstates-id"]` (trailing slash stripped before sending — defensive; the URL field actually preserves either form per direct-PATCH verification)
 
-**`email` lowercase normalization:** Webflow's email field lowercases on storage. FL House emails were already lowercase upstream so the probe didn't catch this; FL Senate (and likely other states) had mixed-case emails that Webflow normalized, churning every run. Fix: `email.lower()` before sending. 189 of 192 state records were churning (the 3 that stuck likely had URL-shaped emails routed to `contact-form-url` instead).
+Bio sync does NOT write `campaign-email` (no upstream source).
 
-**Generalized lesson:** Webflow URL and email field types apply normalization on storage. When we add a new write target, the storage format may differ from what we send, surfacing only in the second run as ChurnPATCH. Mitigation pattern: send the canonical/storage form (lowercase email, no-trailing-slash URL) at payload-build time so the diff round-trips correctly.
+**Operational gotcha — Webflow site republish required after schema changes:** after the user added the new CMS fields in the Designer, the bio sync's first PATCH attempts returned 200 but the values silently didn't persist. The schema endpoint (`/v2/collections/{id}`) reflected the new fields immediately, but the **items endpoint couldn't write to them until the user republished the site**. Direct curl probes confirmed: pre-republish PATCH = 200 + value silently no-op'd; post-republish PATCH = 200 + value persists. Add this to the rollout checklist for any future schema additions.
 
-3 new tests pin both fixes (mixed-case email lowercased, lowercase email no-churn-on-rerun, openstates-id no-churn-when-cms-no-trailing-slash).
+**End-to-end verification (read-only probe `scripts/probe_webflow_legislators.py`):**
+
+| Field | Federal coverage | State coverage | Notes |
+|---|---|---|---|
+| `open-states-url` | 32/32 (100%) | 192/192 (100%) | New Phase-2.5 field, fully populated |
+| `office-email` | 0/32 by design | 190/192 (99%) | Federal emails are URL-shaped → contact-form-url; 2 state outliers same |
+| `bioguide-id`, `wikidata-id`, `ballotpedia-slug`, `govtrack-id` | 100% | 0% (federal-only) | Per spec |
+| `birth-year` | 100% | 71% | State has partial upstream coverage |
+| `term-start`, `term-end` | 100% | 0% | OpenStates `/people` v3 doesn't surface state term dates |
+| `phone-capitol`, `office-address-capitol` | 100% | ~80% | State has partial upstream coverage |
+| `contact-form-url` | 100% | 0% | Federal email-as-URL routing |
+| `official-website` | 100% | 98% (FL override) | Per-state override registry working |
+| `twitter/facebook/instagram/youtube-handle` | 50–81% (upstream) | 0% (deferred) | Phase 3 for state |
+| `photo-source-url` | 100% | 98% | URL-typed; state photos vary in stability but URL stores fine |
+
+**3 read-only probe scripts shipped** in `scripts/` for ongoing diagnosis without manual Webflow Designer click-through:
+- `probe_openstates_state_legs.py` — what's actually populated upstream for state legs
+- `probe_webflow_legislators.py` — full-population audit per field, sparsest records
+- `probe_webflow_record.py` — schema dump + sample record fieldData
+- `probe_webflow_one_record.py` — draft vs live endpoint comparison for a single record
 
 ### What we deliberately deferred
 

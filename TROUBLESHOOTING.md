@@ -179,6 +179,29 @@ The alert is wired in a `try/finally`, so it fires even on aborted runs (rate-li
 
 **Action:** Confirm the field exists in the Webflow Designer with the slug listed in `webflow-legislator-fields.md`. After the field is added, the schema cache will refresh on the next call (1h max).
 
+### New CMS field added but bio sync writes don't persist
+
+**Symptom:** A new field is added to the Legislators CMS in the Webflow Designer; the bio sync run reports `patched: N` with the new field in `changed_fields[]` and `dropped_fields: []`; but reading the records back shows the field is still empty (`null`).
+
+**Cause (observed 2026-04-30):** Webflow's CMS schema has two layers — the Designer/draft state and the published-site state. New fields are visible in the schema endpoint (`GET /v2/collections/{id}`) immediately, but the items endpoint can't write to them until the **site is republished**. PATCH requests against unpublished fields return 200 but silently ignore the field's value.
+
+**Action:** After adding new CMS fields, click "Publish" on the Webflow site (the top-right Publish button in the Designer). Then re-run the bio sync.
+
+**Diagnostic:** Use `scripts/probe_webflow_legislators.py` to read back the population. If the field shows 0% populated despite `patched: N` from the bio sync, this is the issue.
+
+### Suspected ChurnPATCH on a new field — diagnose schema mismatch first
+
+**Symptom:** A field appears in `changed_fields[]` on every run, even when the upstream value didn't change. Looks like a Webflow-side normalization mismatch (e.g., trailing slash, case).
+
+**Cause (observed 2026-04-30):** Often the field's slug doesn't actually exist in the live CMS schema. The schema cache silently drops the write; CMS still has `null`; next run's diff still sees a mismatch. Looks like churn; is actually "field doesn't exist, every write is silently dropped".
+
+**Diagnostic order:**
+1. Run `scripts/probe_webflow_legislators.py` and check the field's population. If 0%, suspect schema mismatch.
+2. Run `scripts/probe_webflow_record.py` to dump the live schema. Compare the slug the bio sync writes vs the slug actually in the schema.
+3. If slugs match and population is still 0%, do a direct curl PATCH of one record (see `plans/PLAN-legislator-bio-sync.md` §Step-9 operational runbook) — if that works but the bio sync's PATCH doesn't, capture the response body for further diagnosis.
+
+Only after ruling out schema mismatch should you suspect URL-trailing-slash, email-case, or other storage-format normalization issues.
+
 ### Audit A returns `total_scanned: 0`
 
 **Symptom:** `POST /trigger/legislator-bio-sync?audit_only=A` returns `total_scanned: 0` even though the CMS has federal records.

@@ -79,15 +79,15 @@ def is_federal(field_data: dict) -> bool:
     return any(r in FEDERAL_SEAT_REF_IDS for r in seat)
 
 
-# Fields the bio sync writes (federal + state). All bio fields, plus
-# "openstates-id" (newly wired Phase-2.5).
+# Fields the bio sync writes (federal + state). Slugs match the live
+# Legislators CMS schema as of 2026-04-30.
 WRITE_TARGET_FIELDS = [
-    "openstates-id", "bioguide-id", "wikidata-id", "opensecrets-id",
+    "open-states-url", "bioguide-id", "wikidata-id", "opensecrets-id",
     "ballotpedia-slug", "govtrack-id",
     "birth-year", "gender",
     "term-start", "term-end", "seniority-rank",
     "phone-capitol", "office-address-capitol",
-    "email", "contact-form-url",
+    "office-email", "contact-form-url",
     "official-website",
     "twitter-handle", "facebook-handle", "instagram-handle", "youtube-handle",
     "photo-source-url",
