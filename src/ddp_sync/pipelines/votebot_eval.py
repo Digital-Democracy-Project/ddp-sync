@@ -90,25 +90,47 @@ def resolve_votebot_path(yaml_config: dict | None = None) -> str:
     return DEFAULT_VOTEBOT_PATH
 
 
-def validate_votebot_path(path: str) -> tuple[bool, str | None]:
+def resolve_venv_python(path: Path) -> Path | None:
+    """Find the venv python executable under ``path``.
+
+    VoteBot's prod venv is at ``votebot/venv/`` (no leading dot); ddp-sync's
+    is at ``.venv/`` (with dot). Local dev workstations frequently use
+    ``.venv/`` for both. Try both conventions and return the first that
+    exists + is executable; return None if neither works.
+
+    Memory: project_deployment.md documents this asymmetry; failing to
+    handle it would silently skip job registration on prod (where votebot
+    uses ``venv/`` no-dot).
+    """
+    for venv_dir in (".venv", "venv"):
+        candidate = path / venv_dir / "bin" / "python"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def validate_votebot_path(path: str) -> tuple[bool, str | None, Path | None]:
     """Validate that the votebot path has the venv + script we need.
 
-    Returns (is_valid, error_message). Used both at scheduler.start() time
-    (to skip job registration) and at manual-trigger time (to live-validate
-    in case the path was moved/removed since startup).
+    Returns (is_valid, error_message, venv_python). Used at scheduler.start()
+    time (to skip job registration), at manual-trigger time (to live-validate
+    in case the path was moved/removed since startup), and at subprocess-
+    invoke time (so the orchestrator builds cmd[] with the actual venv
+    python rather than re-resolving).
     """
     p = Path(path).expanduser()
     if not p.is_dir():
-        return False, f"votebot path does not exist or is not a directory: {p}"
-    venv_python = p / ".venv" / "bin" / "python"
-    if not venv_python.is_file():
-        return False, f"venv python not found: {venv_python}"
-    if not os.access(venv_python, os.X_OK):
-        return False, f"venv python not executable: {venv_python}"
+        return False, f"votebot path does not exist or is not a directory: {p}", None
+    venv_python = resolve_venv_python(p)
+    if venv_python is None:
+        return False, (
+            f"venv python not found at {p}/.venv/bin/python or "
+            f"{p}/venv/bin/python (and not executable in either)"
+        ), None
     script = p / "scripts" / "evaluate_production.py"
     if not script.is_file():
-        return False, f"eval script not found: {script}"
-    return True, None
+        return False, f"eval script not found: {script}", None
+    return True, None, venv_python
 
 
 # -----------------------------------------------------------------------------
@@ -451,7 +473,7 @@ async def run_votebot_eval(
 
     # Path validation (live, in case the path moved since startup).
     votebot_path = resolve_votebot_path(yaml_config)
-    is_valid, err = validate_votebot_path(votebot_path)
+    is_valid, err, venv_python = validate_votebot_path(votebot_path)
     if not is_valid:
         logger.error(
             "votebot_eval: path validation failed at run time",
@@ -489,6 +511,7 @@ async def run_votebot_eval(
             days=days,
             timeout_s=timeout_s,
             votebot_path=votebot_path,
+            venv_python=venv_python,
             run_id=run_id,
             start_time=start_time,
             trigger=trigger,
@@ -513,6 +536,7 @@ async def _run_eval_holding_lock(
     days: int,
     timeout_s: int,
     votebot_path: str,
+    venv_python: Path,
     run_id: str,
     start_time: datetime,
     trigger: str,
@@ -527,8 +551,10 @@ async def _run_eval_holding_lock(
     report_filename = f"eval_report_{end_date}_last{days}d_{hms}.json"
     report_path = eval_reports_dir / report_filename
 
+    # venv_python was resolved by validate_votebot_path() — handles both
+    # ``.venv/bin/python`` (dev) and ``venv/bin/python`` (votebot prod).
     cmd = [
-        str(Path(votebot_path).expanduser() / ".venv" / "bin" / "python"),
+        str(venv_python),
         "scripts/evaluate_production.py",
         "--days", str(days),
         "--output", str(report_path),

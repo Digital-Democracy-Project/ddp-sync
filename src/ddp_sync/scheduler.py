@@ -352,7 +352,7 @@ class UpdateScheduler:
             return
 
         votebot_path = resolve_votebot_path(validated)
-        is_valid, err = validate_votebot_path(votebot_path)
+        is_valid, err, _ = validate_votebot_path(votebot_path)
         if not is_valid:
             logger.error(
                 "votebot_eval: path validation failed at registration",

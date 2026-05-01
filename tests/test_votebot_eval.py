@@ -322,7 +322,7 @@ async def test_run_votebot_eval_lock_contention_returns_already_running(
     # Path validation must also pass before lock check.
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
 
     result = await run_votebot_eval(days=7, settings=MagicMock())
@@ -341,7 +341,7 @@ async def test_run_votebot_eval_path_invalid_returns_503_marker(
     translate to 503."""
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (False, "directory does not exist"),
+        lambda p: (False, "directory does not exist", None),
     )
     result = await run_votebot_eval(days=7, settings=MagicMock())
     assert result["success"] is False
@@ -359,7 +359,7 @@ async def test_run_votebot_eval_subprocess_timeout_writes_failure_status(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -395,7 +395,7 @@ async def test_run_votebot_eval_subprocess_uses_start_new_session(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -437,7 +437,7 @@ async def test_subprocess_runs_via_asyncio_to_thread(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -500,7 +500,7 @@ async def test_send_failure_alert_runs_via_asyncio_to_thread(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -563,7 +563,7 @@ async def test_lock_released_on_parse_error_path(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -606,7 +606,7 @@ async def test_subprocess_zero_exit_but_no_report_returns_parse_error(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
@@ -645,7 +645,7 @@ async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
-        lambda p: (True, None),
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
     )
     monkeypatch.setattr(
         "ddp_sync.pipelines.votebot_eval.resolve_votebot_path",
