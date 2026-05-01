@@ -349,6 +349,22 @@ class OpenStatesPeopleClient:
             if 200 <= resp.status_code < 300:
                 return resp.json()
             if resp.status_code == 404 and allow_404:
+                # Phase-3 stability fix: 404s on /people/{id} are sometimes
+                # transient and contribute to the orphan-set instability
+                # observed across bio-sync runs (different records flagged
+                # as orphan each run with no overlap). Retry with backoff
+                # before classifying as a real "not in OpenStates"; only
+                # the persistent 404 across retries returns None.
+                if attempt < self.max_retry_attempts - 1:
+                    wait = 2 ** attempt + random.uniform(0, 0.5)
+                    logger.warning(
+                        "OpenStates 404 — retrying (may be transient)",
+                        attempt=attempt + 1,
+                        path=path,
+                        metric="openstates.transient_404_retry",
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 return None
             if resp.status_code == 429:
                 wait = float(resp.headers.get("Retry-After", 2 ** attempt))
@@ -367,7 +383,14 @@ class OpenStatesPeopleClient:
                 response=resp,
             )
 
-        # Exhausted retry budget
+        # Exhausted retry budget. Persistent 404 with allow_404 → None
+        # (real orphan; not retried again).
+        if (
+            last_resp is not None
+            and last_resp.status_code == 404
+            and allow_404
+        ):
+            return None
         if last_resp is not None and last_resp.status_code == 429:
             raise OpenStatesRateLimitError(
                 f"OpenStates 429 persisted after {self.max_retry_attempts} retries: {path}",

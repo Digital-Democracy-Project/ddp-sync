@@ -824,6 +824,92 @@ async def test_audit_b_aborts_gracefully_on_webflow_error():
     assert report.total_scanned == 1
 
 
+@pytest.mark.asyncio
+async def test_openstates_fetch_by_id_retries_on_transient_404():
+    """Phase-3 stability fix: 404s on /people/{id} retry with backoff
+    before classifying as orphan. Targets the orphan-set instability
+    observed across runs (different state legs flagged each run).
+    """
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from ddp_sync.services.openstates_people import OpenStatesPeopleClient
+
+    client = OpenStatesPeopleClient(
+        api_key="test", max_retry_attempts=3,
+    )
+
+    # Sequence of responses: 404, 404, 200 (transient case)
+    responses = [
+        MagicMock(status_code=404, headers={}),
+        MagicMock(status_code=404, headers={}),
+        MagicMock(
+            status_code=200, headers={},
+            json=lambda: {"results": [{
+                "id": "ocd-person/x",
+                "name": "Recovered Record",
+                "jurisdiction": {"name": "Florida"},
+                "current_role": {},
+            }]},
+        ),
+    ]
+
+    call_idx = [0]
+
+    async def fake_get(url, headers=None, params=None):
+        r = responses[call_idx[0]]
+        call_idx[0] += 1
+        return r
+
+    fake_client_ctx = MagicMock()
+    fake_client_ctx.__aenter__ = AsyncMock(return_value=MagicMock(
+        get=AsyncMock(side_effect=fake_get),
+    ))
+    fake_client_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "ddp_sync.services.openstates_people.httpx.AsyncClient",
+        return_value=fake_client_ctx,
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        result = await client.fetch_by_id("ocd-person/x")
+
+    assert result is not None
+    assert result.name == "Recovered Record"
+    assert call_idx[0] == 3, "should have retried twice before succeeding"
+
+
+@pytest.mark.asyncio
+async def test_openstates_fetch_by_id_returns_none_after_persistent_404():
+    """When 404 persists across all retry attempts, fetch_by_id returns
+    None (real orphan)."""
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from ddp_sync.services.openstates_people import OpenStatesPeopleClient
+
+    client = OpenStatesPeopleClient(
+        api_key="test", max_retry_attempts=3,
+    )
+
+    call_count = [0]
+
+    async def always_404(url, headers=None, params=None):
+        call_count[0] += 1
+        return MagicMock(status_code=404, headers={})
+
+    fake_client_ctx = MagicMock()
+    fake_client_ctx.__aenter__ = AsyncMock(return_value=MagicMock(
+        get=AsyncMock(side_effect=always_404),
+    ))
+    fake_client_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "ddp_sync.services.openstates_people.httpx.AsyncClient",
+        return_value=fake_client_ctx,
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        result = await client.fetch_by_id("ocd-person/gone")
+
+    assert result is None
+    # All 3 attempts made before classifying as orphan
+    assert call_count[0] == 3
+
+
 def test_normalize_state_code_clamps_to_two_letters():
     """Round-8 fix: only true 2-letter codes pass; full state names rejected."""
     from ddp_sync.services.webflow_lookup import WebflowLookupService
