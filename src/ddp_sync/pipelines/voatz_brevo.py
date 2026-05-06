@@ -379,9 +379,11 @@ def add_contacts_to_brevo(api_key: str, list_id: int, users: list[dict],
 
         # Add phone/SMS if available. Brevo treats both `sms` and
         # `WHATSAPP` as unique keys -- resolve conflicts before assigning.
+        # NOTE: The bulk import endpoint ignores top-level `sms` — it must
+        # be set as the `SMS` attribute for the value to persist.
         if phone:
             if resolve_phone_ownership(api_key, phone, email, claimed_phones, brevo_phones):
-                contact["sms"] = phone
+                contact["attributes"]["SMS"] = phone
                 contact["attributes"]["WHATSAPP"] = phone
 
         contacts.append(contact)
@@ -511,7 +513,7 @@ def clear_phone_from_brevo_contact(api_key: str, phone: str) -> bool:
         try:
             put_resp = requests.put(
                 put_url, headers=headers,
-                json={"attributes": {"WHATSAPP": ""}, "sms": ""},
+                json={"attributes": {"SMS": "", "WHATSAPP": ""}},
                 timeout=30
             )
             time.sleep(0.1)
@@ -583,7 +585,7 @@ def resolve_phone_ownership(api_key: str, phone: str, new_email: str,
             try:
                 put_resp = requests.put(
                     put_url, headers=headers,
-                    json={"attributes": {"WHATSAPP": ""}, "sms": ""},
+                    json={"attributes": {"SMS": "", "WHATSAPP": ""}},
                     timeout=30
                 )
                 time.sleep(0.1)
