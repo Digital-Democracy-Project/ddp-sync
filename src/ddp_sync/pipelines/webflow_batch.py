@@ -29,7 +29,7 @@ def _get_webflow_client():
         logger.error("WEBFLOW_API_TOKEN not configured — skipping Webflow job")
         return None, None, None
 
-    from webflow_cms import WebflowClient
+    from ddp_sync.webflow_cms import WebflowClient
     return WebflowClient(token), bills_cid, orgs_cid
 
 
@@ -40,7 +40,7 @@ def run_webflow_fill_session_code():
         client, bills_cid, _ = _get_webflow_client()
         if not client or not bills_cid:
             return
-        from webflow_cms.services.fill_session_code import SessionCodeService
+        from ddp_sync.webflow_cms.services.fill_session_code import SessionCodeService
         result = SessionCodeService(client).fill(bills_cid)
         logger.info(f"Fill session-code: {result.items_updated} updated, {result.items_failed} failed")
     except Exception as e:
@@ -54,7 +54,7 @@ def run_webflow_fill_map_url():
         client, bills_cid, _ = _get_webflow_client()
         if not client or not bills_cid:
             return
-        from webflow_cms.services.fill_map_url import MapUrlService
+        from ddp_sync.webflow_cms.services.fill_map_url import MapUrlService
         result = MapUrlService(client).fill(bills_cid)
         logger.info(f"Fill map-url: {result.items_updated} updated, {result.items_failed} failed")
     except Exception as e:
@@ -68,7 +68,7 @@ def run_webflow_bill_org_sync():
         client, bills_cid, orgs_cid = _get_webflow_client()
         if not client or not bills_cid or not orgs_cid:
             return
-        from webflow_cms.services.bill_org_sync import BillOrgSyncService
+        from ddp_sync.webflow_cms.services.bill_org_sync import BillOrgSyncService
         result = BillOrgSyncService(client).sync_bill_org_references(bills_cid, orgs_cid)
         logger.info(f"Bill-org sync: {result.references_added} refs added, {len(result.errors)} errors")
     except Exception as e:
@@ -82,7 +82,7 @@ def run_webflow_org_about_parse():
         client, _, orgs_cid = _get_webflow_client()
         if not client or not orgs_cid:
             return
-        from webflow_cms.services.bill_org_sync import BillOrgSyncService
+        from ddp_sync.webflow_cms.services.bill_org_sync import BillOrgSyncService
         updated = BillOrgSyncService(client).parse_about_fields(orgs_cid)
         logger.info(f"Org about-parse: {updated} orgs updated")
     except Exception as e:
@@ -96,7 +96,7 @@ def run_webflow_check_org_missing():
         client, _, orgs_cid = _get_webflow_client()
         if not client or not orgs_cid:
             return
-        from webflow_cms.services.bill_org_sync import BillOrgSyncService
+        from ddp_sync.webflow_cms.services.bill_org_sync import BillOrgSyncService
         fields = ["about-organization", "website", "email", "contact-form", "description-4"]
         results = BillOrgSyncService(client).check_missing_fields(orgs_cid, fields)
         logger.info(f"Check org missing: {len(results)} orgs with gaps")
@@ -111,7 +111,7 @@ def run_webflow_find_duplicates():
         client, bills_cid, _ = _get_webflow_client()
         if not client or not bills_cid:
             return
-        from webflow_cms.services.duplicate_bills import DuplicateBillsService
+        from ddp_sync.webflow_cms.services.duplicate_bills import DuplicateBillsService
         groups = DuplicateBillsService(client).find_duplicates(bills_cid)
         dups = [g for g in groups if g.group_type == "duplicate"]
         comps = [g for g in groups if g.group_type == "companion"]
@@ -127,7 +127,7 @@ def run_webflow_merge_duplicate_orgs():
         client, bills_cid, orgs_cid = _get_webflow_client()
         if not client or not bills_cid or not orgs_cid:
             return
-        from webflow_cms.services.org_merge import OrgMergeService
+        from ddp_sync.webflow_cms.services.org_merge import OrgMergeService
         results = OrgMergeService(client).find_and_merge_exact_duplicates(orgs_cid, bills_cid)
         succeeded = [r for r in results if r.deleted]
         failed = [r for r in results if not r.deleted]
