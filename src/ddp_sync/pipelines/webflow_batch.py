@@ -118,3 +118,32 @@ def run_webflow_find_duplicates():
         logger.info(f"Find duplicates: {len(dups)} duplicate groups, {len(comps)} companion groups")
     except Exception as e:
         logger.error(f"Webflow find-duplicates job failed: {e}")
+
+
+def run_webflow_merge_duplicate_orgs():
+    """Scheduled job: detect and merge exact-duplicate organizations."""
+    logger.info("Starting Webflow merge-duplicate-orgs job")
+    try:
+        client, bills_cid, orgs_cid = _get_webflow_client()
+        if not client or not bills_cid or not orgs_cid:
+            return
+        from webflow_cms.services.org_merge import OrgMergeService
+        results = OrgMergeService(client).find_and_merge_exact_duplicates(orgs_cid, bills_cid)
+        succeeded = [r for r in results if r.deleted]
+        failed = [r for r in results if not r.deleted]
+        logger.info(
+            f"Merge duplicate orgs: {len(results)} processed, "
+            f"{len(succeeded)} merged, {len(failed)} failed"
+        )
+        for r in succeeded:
+            logger.info(
+                f"  Merged '{r.duplicate_name}' ({r.duplicate_id}) -> "
+                f"'{r.canonical_name}' | fields: {r.fields_migrated} | "
+                f"bill refs repointed: {r.bill_refs_repointed}"
+            )
+        for r in failed:
+            logger.error(
+                f"  Failed to merge '{r.duplicate_name}' ({r.duplicate_id}): {r.error}"
+            )
+    except Exception as e:
+        logger.error(f"Webflow merge-duplicate-orgs job failed: {e}")

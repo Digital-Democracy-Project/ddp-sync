@@ -345,6 +345,7 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
         "org-about-parse": webflow_batch.run_webflow_org_about_parse,
         "check-org-missing": webflow_batch.run_webflow_check_org_missing,
         "find-duplicates": webflow_batch.run_webflow_find_duplicates,
+        "merge-duplicate-orgs": webflow_batch.run_webflow_merge_duplicate_orgs,
     }
 
     func = job_map.get(job_name)
