@@ -40,8 +40,6 @@ dependencies = [
     # Voatz/Brevo pipeline (Phase 2)
     "email-validator>=2.0.0",
 
-    # Webflow CMS batch ops (Phase 2)
-    # "webflow-cms>=1.0.0",
 ]
 
 [project.optional-dependencies]

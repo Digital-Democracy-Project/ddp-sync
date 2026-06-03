@@ -216,7 +216,6 @@ Key bill fields (actual Webflow API names):
 
 - [DDP-API](https://github.com/Digital-Democracy-Project/ddp-api) — Auth gateway + API proxy
 - [VoteBot](https://github.com/Digital-Democracy-Project/votebot) — Chat/RAG service
-- [FillWebflowFields](https://github.com/VotingRightsBrigade/FillWebflowFields) — Webflow CMS management package (`webflow_cms`)
 
 ## License
 
