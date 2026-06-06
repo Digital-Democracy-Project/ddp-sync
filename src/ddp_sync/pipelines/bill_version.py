@@ -38,6 +38,11 @@ class VersionCheckResult:
     version_date: str = ""
     text_url: str = ""
     chunks_created: int = 0
+    history_chunks_created: int = 0
+    changelog_chunks_created: int = 0
+    changelog_skipped: bool = False
+    changelog_skip_reason: str = ""
+    surplus_chunks_deleted: int = 0
     webflow_updated: bool = False
     status_updated: bool = False
     webflow_patch_skipped: bool = False
@@ -56,6 +61,10 @@ class VersionSyncBatchResult:
     skipped: int = 0
     failed: int = 0
     chunks_created: int = 0
+    history_chunks_created: int = 0
+    changelog_chunks_created: int = 0
+    changelogs_skipped: int = 0
+    surplus_chunks_deleted: int = 0
     webflow_updates: int = 0
     status_updates: int = 0
     webflow_skipped: int = 0
@@ -448,6 +457,11 @@ class BillVersionSyncService:
         result = {
             "is_newer": False,
             "chunks_created": 0,
+            "history_chunks_created": 0,
+            "changelog_chunks_created": 0,
+            "changelog_skipped": False,
+            "changelog_skip_reason": "",
+            "surplus_chunks_deleted": 0,
             "version_note": "",
             "version_date": "",
             "text_url": "",
@@ -493,7 +507,7 @@ class BillVersionSyncService:
         )
 
         try:
-            chunks_created = await self._ingest_bill_text(
+            chunks_created, extracted_content = await self._ingest_bill_text(
                 webflow_id=webflow_id,
                 bill_title=bill_title,
                 bill_slug=bill_slug,
@@ -502,6 +516,54 @@ class BillVersionSyncService:
                 fields=fields,
             )
             result["chunks_created"] = chunks_created
+
+            if chunks_created > 0:
+                # Delete surplus chunks from the previous version (upsert already live).
+                old_chunk_count = cached.get("chunk_count") if cached else None
+                surplus_deleted = await self._delete_surplus_chunks(
+                    document_id=f"bill-pdf-{webflow_id}",
+                    old_chunk_count=old_chunk_count,
+                    new_chunk_count=chunks_created,
+                )
+                result["surplus_chunks_deleted"] = surplus_deleted
+
+                # Store permanent history record for this version.
+                history_chunks = await self._ingest_bill_history(
+                    webflow_id=webflow_id,
+                    bill_title=bill_title,
+                    bill_slug=bill_slug,
+                    text_url=text_url,
+                    media_type=media_type,
+                    version_date=result["version_date"],
+                    version_note=result["version_note"],
+                    jurisdiction=fields.get("jurisdiction", ""),
+                    content=extracted_content,
+                )
+                result["history_chunks_created"] = history_chunks
+
+                # Generate changelog if a previous version exists.
+                if cached:
+                    cl_chunks, cl_skipped, cl_reason = await self._generate_and_ingest_changelog(
+                        webflow_id=webflow_id,
+                        bill_title=bill_title,
+                        bill_slug=bill_slug,
+                        jurisdiction=fields.get("jurisdiction", ""),
+                        old_version=cached,
+                        new_version_date=result["version_date"],
+                        new_version_note=result["version_note"],
+                        new_content=extracted_content,
+                    )
+                    result["changelog_chunks_created"] = cl_chunks
+                    result["changelog_skipped"] = cl_skipped
+                    result["changelog_skip_reason"] = cl_reason
+                    if cl_skipped:
+                        logger.warning(
+                            "Changelog generation skipped",
+                            webflow_id=webflow_id,
+                            bill_title=bill_title,
+                            reason=cl_reason,
+                        )
+
         except Exception as e:
             result["error"] = str(e)
             logger.error(
@@ -520,6 +582,7 @@ class BillVersionSyncService:
             "version_note": latest_version.get("note", ""),
             "text_url": text_url,
             "media_type": media_type,
+            "chunk_count": result["chunks_created"],
             "last_checked": datetime.utcnow().isoformat(),
             "last_status": "",
             "bill_slug": bill_slug or "",
@@ -642,6 +705,11 @@ class BillVersionSyncService:
                 version_date=version_result["version_date"],
                 text_url=version_result["text_url"],
                 chunks_created=version_result["chunks_created"],
+                history_chunks_created=version_result["history_chunks_created"],
+                changelog_chunks_created=version_result["changelog_chunks_created"],
+                changelog_skipped=version_result["changelog_skipped"],
+                changelog_skip_reason=version_result["changelog_skip_reason"],
+                surplus_chunks_deleted=version_result["surplus_chunks_deleted"],
                 webflow_updated=status_result["webflow_updated"],
                 status_updated=status_result["status_updated"],
                 webflow_patch_skipped=status_result["patch_skipped"],
@@ -668,7 +736,7 @@ class BillVersionSyncService:
         text_url: str,
         media_type: str,
         fields: dict,
-    ) -> int:
+    ) -> tuple[int, str]:
         """Download bill text and ingest into Pinecone.
 
         Routes based on media_type:
@@ -677,7 +745,8 @@ class BillVersionSyncService:
         - Unknown → detect via _get_url_content_type(), then route
 
         Returns:
-            Number of chunks created
+            (chunks_created, extracted_content) — content passed to callers
+            so history/changelog can reuse it without re-downloading.
         """
         from ddp_sync.ingestion.pipeline import IngestionPipeline
         from ddp_sync.ingestion.sources.webflow import WebflowSource
@@ -704,7 +773,7 @@ class BillVersionSyncService:
                     media_type=media_type,
                     detected=detected,
                 )
-                return 0
+                return 0, ""
 
         if not doc:
             logger.warning(
@@ -712,7 +781,7 @@ class BillVersionSyncService:
                 webflow_id=webflow_id,
                 url=text_url,
             )
-            return 0
+            return 0, ""
 
         # Ingest with skip_duplicates=False to force overwrite
         result = await pipeline.ingest_document(
@@ -729,7 +798,268 @@ class BillVersionSyncService:
             chunks_upserted=result.chunks_upserted,
         )
 
+        return result.chunks_created, doc.content
+
+    async def _delete_surplus_chunks(
+        self,
+        document_id: str,
+        old_chunk_count: int | None,
+        new_chunk_count: int,
+    ) -> int:
+        """Delete chunk IDs from new_chunk_count up to old_chunk_count - 1.
+
+        Uses exact ID deletion (no metadata scan). Guards against a missing or
+        implausibly large cached value to avoid wiping valid new chunks.
+
+        Returns number of chunks deleted (0 if no-op).
+        """
+        if not old_chunk_count:
+            return 0
+        if old_chunk_count > new_chunk_count * 4:
+            logger.warning(
+                "Skipping surplus chunk deletion — old_chunk_count implausibly large",
+                document_id=document_id,
+                old_chunk_count=old_chunk_count,
+                new_chunk_count=new_chunk_count,
+            )
+            return 0
+        if old_chunk_count <= new_chunk_count:
+            return 0
+
+        from ddp_sync.services.vector_store import VectorStoreService
+
+        vector_store = VectorStoreService(self.settings)
+        ids_to_delete = [
+            f"{document_id}-chunk-{i}"
+            for i in range(new_chunk_count, old_chunk_count)
+        ]
+        await vector_store.delete(ids=ids_to_delete)
+        logger.info(
+            "Surplus bill chunks deleted",
+            document_id=document_id,
+            deleted_count=len(ids_to_delete),
+            old_chunk_count=old_chunk_count,
+            new_chunk_count=new_chunk_count,
+        )
+        return len(ids_to_delete)
+
+    async def _ingest_bill_history(
+        self,
+        webflow_id: str,
+        bill_title: str,
+        bill_slug: str,
+        text_url: str,
+        media_type: str,
+        version_date: str,
+        version_note: str,
+        jurisdiction: str,
+        content: str,
+    ) -> int:
+        """Ingest bill text as a permanent versioned history record.
+
+        Uses already-extracted content so the PDF/HTML is not re-downloaded.
+
+        Returns number of chunks created.
+        """
+        from ddp_sync.ingestion.metadata import DocumentMetadata
+        from ddp_sync.ingestion.pipeline import IngestionPipeline
+
+        if not content:
+            return 0
+
+        pipeline = IngestionPipeline(self.settings)
+        ddp_url = f"https://digitaldemocracyproject.org/bills/{bill_slug}" if bill_slug else None
+
+        metadata = DocumentMetadata(
+            document_id=f"bill-text-history-{webflow_id}-{version_date}",
+            document_type="bill-text-history",
+            source="OpenStates / Government Source",
+            title=f"{bill_title} - {version_note}" if version_note else bill_title,
+            jurisdiction=jurisdiction or None,
+            url=ddp_url,
+            extra={
+                "webflow_id": webflow_id,
+                "bill_slug": bill_slug or "",
+                "version_date": version_date,
+                "version_note": version_note,
+                "text_url": text_url,
+                "media_type": media_type,
+            },
+        )
+
+        result = await pipeline.ingest_document(
+            content=content,
+            metadata=metadata,
+            skip_duplicates=False,
+        )
+
+        logger.info(
+            "Bill version history stored",
+            webflow_id=webflow_id,
+            version_date=version_date,
+            version_note=version_note,
+            chunks_created=result.chunks_created,
+        )
         return result.chunks_created
+
+    async def _generate_and_ingest_changelog(
+        self,
+        webflow_id: str,
+        bill_title: str,
+        bill_slug: str,
+        jurisdiction: str,
+        old_version: dict,
+        new_version_date: str,
+        new_version_note: str,
+        new_content: str,
+    ) -> tuple[int, bool, str]:
+        """Generate an LLM changelog comparing old and new bill versions.
+
+        Attempts to re-download old text from old_version["text_url"]. Fails
+        gracefully on any error — the surrounding ingest is never blocked.
+
+        Returns:
+            (chunks_created, skipped, skip_reason)
+            skipped=True means no changelog was produced; ingest still succeeded.
+        """
+        import httpx
+        from openai import AsyncOpenAI
+
+        from ddp_sync.ingestion.metadata import DocumentMetadata
+        from ddp_sync.ingestion.pipeline import IngestionPipeline
+        from ddp_sync.ingestion.sources.webflow import WebflowSource
+
+        old_url = old_version.get("text_url", "")
+        old_media_type = old_version.get("media_type", "")
+        old_version_date = old_version.get("version_date", "")
+        old_version_note = old_version.get("version_note", "")
+
+        if not old_url:
+            return 0, True, "no_old_url"
+
+        # Re-download and extract old bill text.
+        try:
+            webflow_source = WebflowSource(self.settings)
+            fields: dict = {}  # Old URL only — no CMS fields needed for extraction
+            if "pdf" in old_media_type.lower():
+                old_doc = await webflow_source._process_bill_pdf(old_url, fields, webflow_id)
+            elif "html" in old_media_type.lower():
+                old_doc = await webflow_source._process_bill_html(old_url, fields, webflow_id)
+            else:
+                detected = await webflow_source._get_url_content_type(old_url)
+                if detected == "pdf":
+                    old_doc = await webflow_source._process_bill_pdf(old_url, fields, webflow_id)
+                elif detected == "html":
+                    old_doc = await webflow_source._process_bill_html(old_url, fields, webflow_id)
+                else:
+                    return 0, True, "old_url_unknown_content_type"
+
+            if not old_doc or not old_doc.content:
+                return 0, True, "old_url_no_content"
+
+            old_content = old_doc.content
+
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            return 0, True, f"old_url_fetch_failed: {type(e).__name__}"
+        except Exception as e:
+            return 0, True, f"old_text_extraction_failed: {type(e).__name__}"
+
+        if len(old_content) < 500:
+            return 0, True, "old_content_too_short"
+
+        # Generate structured changelog via OpenAI.
+        try:
+            client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+
+            # Truncate to avoid token limit issues on large bills.
+            max_chars = 40_000
+            old_truncated = old_content[:max_chars]
+            new_truncated = new_content[:max_chars]
+
+            prompt = f"""You are a legislative analyst. Compare these two versions of a bill and produce a structured changelog.
+
+BILL: {bill_title}
+FROM: {old_version_note} ({old_version_date})
+TO: {new_version_note} ({new_version_date})
+
+--- OLD VERSION ---
+{old_truncated}
+
+--- NEW VERSION ---
+{new_truncated}
+
+Produce the changelog in exactly this format:
+
+## What Changed: {bill_title}
+**From:** {old_version_note} ({old_version_date})
+**To:** {new_version_note} ({new_version_date})
+
+### Summary
+[1-2 sentences describing the overall nature of the changes]
+
+### Sections Added
+- [bullet list, or "None" if no sections were added]
+
+### Sections Removed
+- [bullet list, or "None" if no sections were removed]
+
+### Sections Modified
+- [bullet list describing what changed in each modified section]
+
+### Key Policy Implications
+- [bullet list of the most important policy consequences of these changes]
+
+Be specific and factual. Do not speculate beyond what the text shows."""
+
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
+                temperature=0.1,
+            )
+            changelog_text = response.choices[0].message.content or ""
+
+        except Exception as e:
+            return 0, True, f"openai_error: {type(e).__name__}"
+
+        if not changelog_text.strip():
+            return 0, True, "openai_empty_response"
+
+        # Ingest changelog as a permanent document.
+        pipeline = IngestionPipeline(self.settings)
+        ddp_url = f"https://digitaldemocracyproject.org/bills/{bill_slug}" if bill_slug else None
+
+        metadata = DocumentMetadata(
+            document_id=f"bill-changelog-{webflow_id}-{new_version_date}",
+            document_type="bill-changelog",
+            source="Digital Democracy Project",
+            title=f"{bill_title} — Changelog ({old_version_note} → {new_version_note})",
+            jurisdiction=jurisdiction or None,
+            url=ddp_url,
+            extra={
+                "webflow_id": webflow_id,
+                "bill_slug": bill_slug or "",
+                "version_from_date": old_version_date,
+                "version_from_note": old_version_note,
+                "version_to_date": new_version_date,
+                "version_to_note": new_version_note,
+            },
+        )
+
+        result = await pipeline.ingest_document(
+            content=changelog_text,
+            metadata=metadata,
+            skip_duplicates=False,
+        )
+
+        logger.info(
+            "Bill changelog generated and stored",
+            webflow_id=webflow_id,
+            version_from=old_version_note,
+            version_to=new_version_note,
+            chunks_created=result.chunks_created,
+        )
+        return result.chunks_created, False, ""
 
     async def sync_bill_versions(
         self,
@@ -872,6 +1202,11 @@ class BillVersionSyncService:
                 if check_result.status == "updated":
                     result.updated += 1
                     result.chunks_created += check_result.chunks_created
+                    result.history_chunks_created += check_result.history_chunks_created
+                    result.changelog_chunks_created += check_result.changelog_chunks_created
+                    if check_result.changelog_skipped:
+                        result.changelogs_skipped += 1
+                    result.surplus_chunks_deleted += check_result.surplus_chunks_deleted
                     if check_result.webflow_updated:
                         result.webflow_updates += 1
                     if check_result.status_updated:
@@ -888,6 +1223,11 @@ class BillVersionSyncService:
                         version=check_result.version_note,
                         date=check_result.version_date,
                         chunks=check_result.chunks_created,
+                        history_chunks=check_result.history_chunks_created,
+                        changelog_chunks=check_result.changelog_chunks_created,
+                        changelog_skipped=check_result.changelog_skipped,
+                        changelog_skip_reason=check_result.changelog_skip_reason,
+                        surplus_deleted=check_result.surplus_chunks_deleted,
                         webflow_updated=check_result.webflow_updated,
                         status_updated=check_result.status_updated,
                     )
@@ -972,6 +1312,10 @@ class BillVersionSyncService:
             skipped_jurisdiction=result.skipped_jurisdiction,
             failed=result.failed,
             chunks_created=result.chunks_created,
+            history_chunks_created=result.history_chunks_created,
+            changelog_chunks_created=result.changelog_chunks_created,
+            changelogs_skipped=result.changelogs_skipped,
+            surplus_chunks_deleted=result.surplus_chunks_deleted,
             webflow_updates=result.webflow_updates,
             status_updates=result.status_updates,
             webflow_skipped=result.webflow_skipped,
