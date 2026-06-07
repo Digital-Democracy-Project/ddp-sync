@@ -99,7 +99,7 @@ The daily bill sync entry point. **Do not reinvent these methods.**
   - `get_jurisdiction_info(jurisdiction) -> JurisdictionInfo | None` — cached
   - `_apply_rate_limit()` — alias for `self.rate_limiter.apply()`
 - **`BillSyncResult`** — `bill_id, jurisdiction, success, chunks_created, error`
-- **`SyncBatchResult`** — `total_bills, successful, failed, chunks_created, errors`
+- **`SyncBatchResult`** ⚠️ — `total_bills, successful, failed, chunks_created, errors`. **Name collision**: `pipelines/legislator_sync.py` also defines a class called `SyncBatchResult` with different fields. Always import from the correct module. Don't add a third `SyncBatchResult` — rename any new one to something specific (e.g. `OrgSyncBatchResult`).
 - **`OpenStatesUrl`** — `jurisdiction, session, bill_id, original_url`
 
 ## Rate limiter (`services/rate_limiter.py`)
@@ -130,7 +130,7 @@ Pub/sub channels (hardcoded strings in callers):
 
 ## Webflow write service (`services/webflow_lookup.py`)
 
-- **`WebflowLookupService`** — CMS PATCH operations. Despite the "Lookup" name, this is the **write** service.
+- **`WebflowLookupService`** ⚠️ — **Mixed read/write despite "Lookup" name.** Primary purpose is CMS PATCHes, but also exposes `get_legislator_details()` as a read path. Don't let the name mislead you into thinking reads need to go elsewhere — this class handles both. VoteBot has its own `WebflowLookupService` that is read-only; the two share a name but have entirely different method sets.
   - `update_bill_fields(webflow_id, field_data, api_key=None) -> bool`
   - `update_legislator_fields(webflow_id, field_data, api_key=None) -> bool`
   - `create_legislator_draft(field_data, api_key=None) -> WebflowCreateResult`
