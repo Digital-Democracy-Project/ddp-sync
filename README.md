@@ -10,7 +10,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
 
 - **Daily bill sync** (04:00 UTC): Shared OpenStates fetch with independent write paths:
   - Flow 1: OpenStates → Webflow CMS (status, status-date, status-chamber, gov-url)
-  - Flow 2: OpenStates → Pinecone (bill text re-ingestion on new versions)
+  - Flow 2: OpenStates → Pinecone — on each new version: upserts new bill-text chunks, deletes surplus old chunks (upsert-then-delete-by-ID using `chunk_count` from Redis cache to avoid a zero-chunk availability window), stores a permanent `bill-text-history-{webflow_id}-{version_date}` record, and generates an LLM changelog (`bill-changelog-{webflow_id}-{version_date}`) comparing old vs new text via `gpt-4o-mini`. Changelog generation fails gracefully (stale URLs, OpenAI errors) without blocking the ingest.
   - Either flow can be disabled independently in `sync_schedule.yaml`
 - **Legislator sync** (weekly Sun 06:00 UTC): OpenStates → Pinecone
 - **Legislator bio sync** (weekly Sun 07:00 UTC, enabled 2026-05-01): unitedstates/congress-legislators + OpenStates → Webflow Legislators CMS (bio, contact, term, social, photo URL fields). Phase-3 photo upload pipeline populates the `legislator-image` (Image type) field with Webflow-hosted assets via the Webflow Assets v2 API. Per-state override registry handles jurisdiction-specific extraction (e.g., FL `official-website` from `links[]` "member detail page").
@@ -38,7 +38,7 @@ DDP-Sync publishes Redis pub/sub events that other services consume. Subscribers
 |---|---|---|---|
 | `votebot:cache:invalidate` | After a successful bill text re-ingestion (`chunks_created > 0`) and `set_bill_version()` update | `{"slug": "...", "reason": "bill_version_change", "version_note": "..."}` | VoteBot's button-cache subscriber clears `votebot:button:{slug}:summary` and `votebot:button:{slug}:pros_cons`. See [PLAN-quick-action-buttons.md](https://github.com/Digital-Democracy-Project/votebot/blob/main/plans/PLAN-quick-action-buttons.md) Phase 5. |
 
-DDP-Sync also stores `bill_slug` alongside `last_checked` in the `ddp:bill_version:{webflow_id}` Redis record so VoteBot's startup reconciliation can map webflow_id → slug without an extra Webflow API call.
+DDP-Sync also stores `bill_slug` and `chunk_count` alongside `last_checked` in the `ddp:bill_version:{webflow_id}` Redis record. `bill_slug` lets VoteBot's startup reconciliation map webflow_id → slug without an extra Webflow API call. `chunk_count` enables the daily sync to delete surplus chunks by exact ID when a new bill version produces fewer chunks than the previous one.
 
 ## Configuration
 
