@@ -18,6 +18,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
 - **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): Full re-import
 - **Webflow CMS batch jobs** (weekly Mon 03:00 UTC): Fill fields, sync refs, detect bill duplicates, merge duplicate organizations
+- **API health check** (nightly 09:00 UTC): POSTs to `/get_events` for every configured Voatz org, asserts non-empty JSON results, and fires a Zapier alert on any failure. Manual run: `.venv/bin/python scripts/check_api_health.py [--dry-run]`
 
 ### Service Topology
 
@@ -120,6 +121,29 @@ Phase 1 + 2.5 + 3 + 4 (V1) shipped 2026-04-30 → 2026-05-01 against the FL cong
 Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`, `merge-duplicate-orgs`
 
 `merge-duplicate-orgs` detects exact-name duplicates across the Member Organizations collection (after normalization for "The", "&"→"and", Inc/LLC/Foundation suffixes, punctuation), merges bill references bidirectionally, and deletes the sparse copy. Canonical record is chosen by richness score (bill refs + populated fields). Safe to re-run — a second pass cleans up any stale references that blocked deletion on the first pass.
+
+### API Health Check
+
+Runs nightly at 09:00 UTC via APScheduler. Dynamically generates one check per configured Voatz org (each org is scoped to a jurisdiction) and POSTs to `/get_events` on `api.digitaldemocracyproject.org` with Voatz auth tokens. Asserts HTTP 200, non-empty body, valid JSON, and at least one item in the results list.
+
+**Manual run:**
+```bash
+.venv/bin/python scripts/check_api_health.py           # run + alert on failure
+.venv/bin/python scripts/check_api_health.py --dry-run # run without alerting
+```
+
+**Zapier payload** (`alert_type: api_health_check_failed`, fires only on failures):
+
+| Field | Description |
+|---|---|
+| `on_failure` | Always `true` when the webhook fires |
+| `failure_count` / `total_checks` | e.g. `2` / `9` |
+| `slack_message` | Pre-formatted mrkdwn string — use as `{{slack_message}}` in Zapier's Slack action |
+| `failures_text` | Same content as bullet list, without the header line |
+| `failures` | Array of `{name, description, error, status_code, body_preview, duration_ms}` |
+| `checked_at` | ISO 8601 timestamp |
+
+Add checks for non-Voatz endpoints in `FALLBACK_CHECKS` in `src/ddp_sync/pipelines/api_health_check.py`.
 
 ### Health / Schedule
 
