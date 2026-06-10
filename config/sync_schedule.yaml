@@ -178,6 +178,14 @@ notifications:
   on_large_changes: true  # Alert if >100 bills updated
   email: ""  # Configure if needed
 
+# API Health Check
+# Runs nightly against all configured Voatz orgs via /get_events.
+# Posts a Zapier alert (slack_message field) on any failures.
+# Manual trigger: .venv/bin/python scripts/check_api_health.py [--dry-run]
+api_health_check:
+  enabled: true
+  sync_time_utc: "09:00"   # after bill (04:00), leg (06:00), bio (07:00) syncs
+
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's
 # venv. Posts a Zapier alert with on_failure / on_regression /

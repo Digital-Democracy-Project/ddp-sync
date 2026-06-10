@@ -256,6 +256,9 @@ class UpdateScheduler:
         # --- VoteBot eval cron (plan §3) ---
         self._register_votebot_eval_job()
 
+        # --- API health check ---
+        self._register_api_health_check_job()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -1143,6 +1146,30 @@ class UpdateScheduler:
                 "success": False,
                 "error": str(e),
             }
+
+    def _register_api_health_check_job(self) -> None:
+        """Register the nightly API health check job."""
+        from ddp_sync.pipelines.api_health_check import run_api_health_check_job
+
+        config = self._sync_config.get("api_health_check", {})
+        if not config.get("enabled", False):
+            logger.info("api_health_check: disabled in config — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "09:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+
+        self.scheduler.add_job(
+            run_api_health_check_job,
+            trigger=CronTrigger(hour=hour, minute=minute),
+            id="api_health_check",
+            name="API health check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("api_health_check: registered", sync_time=sync_time_str)
 
     @property
     def is_running(self) -> bool:
