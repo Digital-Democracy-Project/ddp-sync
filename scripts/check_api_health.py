@@ -54,18 +54,6 @@ DDP_API_KEY = os.getenv("DDP_API_KEY", "")
 REQUEST_TIMEOUT = 30
 
 
-def _get_zapier_webhook_url() -> str:
-    """Return ZAPIER_WEBHOOK_URL from env, falling back to Secrets Manager."""
-    url = os.getenv("ZAPIER_WEBHOOK_URL", "")
-    if url:
-        return url
-    try:
-        from ddp_sync.config import get_settings
-        return get_settings().zapier_webhook_url or ""
-    except Exception:
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # Check definitions
 #
@@ -398,7 +386,9 @@ def main() -> int:
     if args.dry_run:
         print("[dry-run] Skipping Zapier alert.")
     else:
-        sent = push_health_alert(_get_zapier_webhook_url(), results)
+        from ddp_sync.config import get_settings
+        webhook_url = get_settings().zapier_webhook_url or ""
+        sent = push_health_alert(webhook_url, results)
         if sent:
             print("Zapier alert sent.")
         else:
