@@ -142,6 +142,50 @@ class CheckResult:
     duration_ms: int = 0
 
 
+_LIST_KEYS = ("items", "data", "events", "results", "bills")
+
+
+def _find_result_list(obj: object, depth: int = 0) -> tuple[list | None, str]:
+    """Recursively find the first non-empty list under a known wrapper key.
+
+    Handles flat lists, one-level dicts ({"results": [...]}), and two-level
+    dicts ({"events": {"results": [...]}}) so assertions work regardless of
+    how deeply the API wraps its payload.
+
+    Returns (list_or_None, dotted_path_string).
+    """
+    if isinstance(obj, list):
+        return obj, ""
+    if isinstance(obj, dict) and depth < 2:
+        for key in _LIST_KEYS:
+            if key in obj:
+                found, path = _find_result_list(obj[key], depth + 1)
+                if found is not None:
+                    return found, f".{key}{path}"
+    return None, ""
+
+
+def _check_non_empty(parsed: object, min_count: int) -> str | None:
+    """Return an error string if parsed contains fewer than min_count items."""
+    if isinstance(parsed, list):
+        if len(parsed) < min_count:
+            return f"result is a list with {len(parsed)} items (expected >= {min_count})"
+        return None
+
+    if isinstance(parsed, dict):
+        result_list, path = _find_result_list(parsed)
+        if result_list is not None:
+            if len(result_list) < min_count:
+                return f"result{path} has {len(result_list)} items (expected >= {min_count})"
+            return None
+        # Dict with no recognised list key — just ensure it isn't empty.
+        if not parsed:
+            return "response is an empty object {}"
+        return None
+
+    return f"unexpected response type: {type(parsed).__name__}"
+
+
 def _run_assertions(
     assertions: list[str],
     resp: requests.Response,
@@ -175,27 +219,9 @@ def _run_assertions(
         elif assertion == "non_empty_result":
             if parsed is None:
                 return "cannot check non_empty_result: response is not valid JSON"
-            if isinstance(parsed, list):
-                if len(parsed) < min_count:
-                    return (
-                        f"result is a list with {len(parsed)} items "
-                        f"(expected >= {min_count})"
-                    )
-            elif isinstance(parsed, dict):
-                for key in ("items", "data", "events", "results", "bills"):
-                    if key in parsed:
-                        inner = parsed[key]
-                        if not isinstance(inner, list) or len(inner) < min_count:
-                            return (
-                                f"result.{key} has "
-                                f"{len(inner) if isinstance(inner, list) else type(inner).__name__} "
-                                f"items (expected >= {min_count})"
-                            )
-                        return None
-                if not parsed:
-                    return "response is an empty object {}"
-            else:
-                return f"unexpected response type: {type(parsed).__name__}"
+            err = _check_non_empty(parsed, min_count)
+            if err:
+                return err
 
     return None
 
