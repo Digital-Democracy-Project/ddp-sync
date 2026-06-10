@@ -57,32 +57,18 @@ REQUEST_TIMEOUT = 30
 
 # ---------------------------------------------------------------------------
 # Check definitions
+#
+# CHECKS is built dynamically at startup: one /get_events check per
+# configured Voatz org (each org is scoped to a jurisdiction). If org
+# configs can't be loaded (e.g. Secrets Manager unavailable), falls back
+# to FALLBACK_CHECKS so the script still runs with a best-effort check.
+#
+# To add non-Voatz checks (e.g. a public /health endpoint), append them
+# directly to FALLBACK_CHECKS — they'll always be included.
 # ---------------------------------------------------------------------------
-CHECKS: list[dict] = [
-    {
-        "name": "utah_get_events",
-        "description": "/get_events for Utah returns a non-empty JSON result",
-        "path": "/get_events",
-        "method": "POST",
-        "voatz_auth": True,
-        # Any extra fields to include in the POST body alongside the Voatz tokens.
-        # Add a jurisdiction/state filter here once confirmed with the API.
-        "params": {},
-        "assertions": ["status_200", "body_not_empty", "valid_json", "non_empty_result"],
-        "min_count": 1,
-    },
-    # Add more checks here as needed. Examples:
-    #
-    # {
-    #     "name": "florida_get_events",
-    #     "description": "/get_events for Florida returns a non-empty JSON result",
-    #     "path": "/get_events",
-    #     "method": "POST",
-    #     "voatz_auth": True,
-    #     "params": {"state": "FL"},
-    #     "assertions": ["status_200", "body_not_empty", "valid_json", "non_empty_result"],
-    #     "min_count": 1,
-    # },
+
+FALLBACK_CHECKS: list[dict] = [
+    # Uncomment to add non-Voatz checks that always run:
     # {
     #     "name": "ddp_api_health",
     #     "description": "DDP API /health returns 200",
@@ -94,26 +80,53 @@ CHECKS: list[dict] = [
 ]
 
 
+def _build_checks() -> list[dict]:
+    """Generate one /get_events check per configured Voatz org."""
+    try:
+        from ddp_sync.pipelines.voatz_brevo import _get_org_configs
+        orgs = _get_org_configs()
+    except Exception as e:
+        print(f"Warning: could not load org configs ({e}), using fallback checks", file=sys.stderr)
+        return FALLBACK_CHECKS
+
+    if not orgs:
+        print("Warning: no org configs found, using fallback checks", file=sys.stderr)
+        return FALLBACK_CHECKS
+
+    checks = []
+    for org in orgs:
+        org_name = org.get("name") or f"org_{org.get('voatz_org_id', 'unknown')}"
+        slug = org_name.lower().replace(" ", "_")
+        checks.append({
+            "name": f"{slug}_get_events",
+            "description": f"/get_events for {org_name} returns a non-empty JSON result",
+            "path": "/get_events",
+            "method": "POST",
+            "voatz_auth": True,
+            "voatz_org": org,
+            "params": {},
+            "assertions": ["status_200", "body_not_empty", "valid_json", "non_empty_result"],
+            "min_count": 1,
+        })
+
+    return checks + FALLBACK_CHECKS
+
+
 # ---------------------------------------------------------------------------
 # Voatz authentication
 # ---------------------------------------------------------------------------
 
-def _get_voatz_tokens_for_check() -> tuple[dict, str] | tuple[None, str]:
-    """Authenticate with the first configured Voatz org.
+def _get_voatz_tokens_for_check(org: dict) -> tuple[dict, str] | tuple[None, str]:
+    """Authenticate with the given Voatz org config.
 
     Returns (auth_fields_dict, org_name) on success, or (None, error_message).
     auth_fields_dict contains the keys DDP-API expects: organizationId, WS, Csrf-Token.
     """
     try:
-        from ddp_sync.pipelines.voatz_brevo import _get_org_configs, get_voatz_tokens
+        from ddp_sync.pipelines.voatz_brevo import get_voatz_tokens
     except ImportError as e:
         return None, f"could not import voatz_brevo: {e}"
 
-    orgs = _get_org_configs()
-    if not orgs:
-        return None, "no Voatz org configs found in settings"
-
-    org = orgs[0]
     org_name = org.get("name", "unknown")
     tokens = get_voatz_tokens(org["voatz_email"], org["voatz_password"], org["voatz_org_id"])
     if not tokens:
@@ -236,7 +249,8 @@ def run_check(check: dict, base_url: str, headers: dict) -> CheckResult:
 
     # Voatz pre-authentication: merge auth tokens into the POST body.
     if check.get("voatz_auth"):
-        auth_fields, msg = _get_voatz_tokens_for_check()
+        org = check.get("voatz_org") or {}
+        auth_fields, msg = _get_voatz_tokens_for_check(org)
         if auth_fields is None:
             return CheckResult(
                 name=check["name"],
@@ -346,10 +360,12 @@ def main() -> int:
     if DDP_API_KEY:
         headers["Authorization"] = f"Bearer {DDP_API_KEY}"
 
-    ts = datetime.now(timezone.utc).isoformat()
-    print(f"[{ts}] Running {len(CHECKS)} check(s) against {DDP_API_BASE_URL}")
+    checks = _build_checks()
 
-    results = [run_check(check, DDP_API_BASE_URL, headers) for check in CHECKS]
+    ts = datetime.now(timezone.utc).isoformat()
+    print(f"[{ts}] Running {len(checks)} check(s) against {DDP_API_BASE_URL}")
+
+    results = [run_check(check, DDP_API_BASE_URL, headers) for check in checks]
 
     for r in results:
         status = "PASS" if r.passed else "FAIL"
