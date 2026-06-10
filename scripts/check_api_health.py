@@ -311,6 +311,12 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
     failures = [r for r in results if not r.passed]
     failure_lines = [f"{r.name}: {r.error}" for r in failures]
 
+    failures_text = "\n".join(
+        f"• *{r.name}*: {r.error}"
+        + (f"\n  `{r.body_preview[:120]}`" if r.body_preview else "")
+        for r in failures
+    )
+
     payload = {
         "alert_type": "api_health_check_failed",
         "on_failure": True,
@@ -318,6 +324,7 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
         "total_checks": len(results),
         "summary": f"{len(failures)}/{len(results)} checks failed",
         "failure_warning": "⚠️ DDP API health check failures: " + "; ".join(failure_lines),
+        "failures_text": failures_text,
         "failures": [
             {
                 "name": r.name,
