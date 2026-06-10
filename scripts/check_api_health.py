@@ -51,8 +51,19 @@ load_dotenv()
 
 DDP_API_BASE_URL = os.getenv("DDP_API_BASE_URL", "https://api.digitaldemocracyproject.org")
 DDP_API_KEY = os.getenv("DDP_API_KEY", "")
-ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
 REQUEST_TIMEOUT = 30
+
+
+def _get_zapier_webhook_url() -> str:
+    """Return ZAPIER_WEBHOOK_URL from env, falling back to Secrets Manager."""
+    url = os.getenv("ZAPIER_WEBHOOK_URL", "")
+    if url:
+        return url
+    try:
+        from ddp_sync.config import get_settings
+        return get_settings().zapier_webhook_url or ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +317,7 @@ def run_check(check: dict, base_url: str, headers: dict) -> CheckResult:
 def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
     """POST health check results to Zapier. Returns True on 2xx. Never raises."""
     if not webhook_url:
-        print("ZAPIER_WEBHOOK_URL not set — skipping alert", file=sys.stderr)
+        print("No Zapier webhook URL configured — skipping alert", file=sys.stderr)
         return False
 
     failures = [r for r in results if not r.passed]
@@ -387,7 +398,7 @@ def main() -> int:
     if args.dry_run:
         print("[dry-run] Skipping Zapier alert.")
     else:
-        sent = push_health_alert(ZAPIER_WEBHOOK_URL, results)
+        sent = push_health_alert(_get_zapier_webhook_url(), results)
         if sent:
             print("Zapier alert sent.")
         else:
