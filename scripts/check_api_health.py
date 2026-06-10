@@ -317,6 +317,12 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
         for r in failures
     )
 
+    slack_message = (
+        f":red_circle: *DDP API Health Check Failed* — {len(failures)} of {len(results)} checks failed\n\n"
+        + failures_text
+        + f"\n\n_Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+    )
+
     payload = {
         "alert_type": "api_health_check_failed",
         "on_failure": True,
@@ -325,6 +331,7 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
         "summary": f"{len(failures)}/{len(results)} checks failed",
         "failure_warning": "⚠️ DDP API health check failures: " + "; ".join(failure_lines),
         "failures_text": failures_text,
+        "slack_message": slack_message,
         "failures": [
             {
                 "name": r.name,
