@@ -28,6 +28,7 @@ class SyncSettings:
 
     # Auth
     api_key: str = ""
+    ddp_api_key: str = ""  # Bearer token for outbound calls to DDP-API
 
     # OpenAI
     openai_api_key: str = ""
@@ -118,6 +119,7 @@ def _load_from_env() -> dict:
     _config_source = "env"
     return {
         "api_key": os.getenv("DDP_SYNC_API_KEY", ""),
+        "ddp_api_key": os.getenv("DDP_API_KEY", ""),
         "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
         "openai_embedding_model": os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
         "pinecone_api_key": os.getenv("PINECONE_API_KEY", ""),

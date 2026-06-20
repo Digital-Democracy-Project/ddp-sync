@@ -38,7 +38,6 @@ import requests
 logger = logging.getLogger(__name__)
 
 DDP_API_BASE_URL = os.getenv("DDP_API_BASE_URL", "https://api.digitaldemocracyproject.org")
-DDP_API_KEY = os.getenv("DDP_API_KEY", "")
 REQUEST_TIMEOUT = 30
 
 FALLBACK_CHECKS: list[dict] = [
@@ -336,9 +335,12 @@ def run_api_health_check_job() -> dict:
 
     settings = get_settings()
     base_url = DDP_API_BASE_URL
+    ddp_api_key = settings.ddp_api_key or os.getenv("DDP_API_KEY", "")
     headers: dict = {}
-    if DDP_API_KEY:
-        headers["Authorization"] = f"Bearer {DDP_API_KEY}"
+    if ddp_api_key:
+        headers["Authorization"] = f"Bearer {ddp_api_key}"
+    else:
+        logger.warning("DDP_API_KEY not configured — health check requests will be unauthenticated")
 
     checks = build_checks()
     logger.info("API health check starting", extra={"check_count": len(checks), "base_url": base_url})

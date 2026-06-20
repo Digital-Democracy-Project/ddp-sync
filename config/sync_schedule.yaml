@@ -183,7 +183,10 @@ notifications:
 # Posts a Zapier alert (slack_message field) on any failures.
 # Manual trigger: .venv/bin/python scripts/check_api_health.py [--dry-run]
 api_health_check:
-  enabled: true
+  # enabled: true  # Disabled — DDP_API_KEY not yet configured in DDP-Sync's Secrets Manager secret.
+  #                # The health check sends no Authorization header when this key is missing,
+  #                # causing 401s on all /get_events checks. Fix: issue a read-scoped managed key
+  #                # via POST /admin/keys, store it as ddp_api_key in ddp-sync/credentials, then re-enable.
   sync_time_utc: "09:00"   # after bill (04:00), leg (06:00), bio (07:00) syncs
 
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
