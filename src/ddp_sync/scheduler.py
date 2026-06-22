@@ -259,6 +259,9 @@ class UpdateScheduler:
         # --- API health check ---
         self._register_api_health_check_job()
 
+        # --- OpenStates jurisdiction scrapes ---
+        self._register_openstates_scrape_jobs()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -413,6 +416,170 @@ class UpdateScheduler:
             days=days,
             votebot_path=votebot_path,
         )
+
+    def _register_openstates_scrape_jobs(self) -> None:
+        """Register independent APScheduler jobs for each OpenStates jurisdiction.
+
+        Replaces the sequential run-all-scrapes.sh launchd job. FL, WA, and
+        USA run as separate daily jobs so a 12-hour FL scrape no longer delays
+        WA or USA. Secondary states fan out concurrently inside their own
+        Sunday job. The patch_refresh job runs at 01:00 UTC before all scrapes.
+        """
+        from ddp_sync.pipelines.openstates_scrape import (
+            run_patch_refresh_job,
+            run_fl_scrapes_job,
+            run_wa_scrape_job,
+            run_usa_scrapes_job,
+            run_secondary_scrapes_job,
+            run_people_refresh_job,
+        )
+
+        config = self._sync_config.get("openstates_scrape", {})
+        if not config.get("enabled", False):
+            logger.info("openstates_scrape: disabled in config — skipping")
+            return
+
+        day_map = {
+            "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+            "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
+        }
+
+        # --- patch refresh ---
+        patch_cfg = config.get("patch_refresh", {})
+        if patch_cfg.get("enabled", True):
+            ph, pm = map(int, patch_cfg.get("sync_time_utc", "01:00").split(":"))
+
+            async def _patch_refresh_wrapper():
+                return await run_patch_refresh_job(config)
+
+            self.scheduler.add_job(
+                _patch_refresh_wrapper,
+                trigger=CronTrigger(hour=ph, minute=pm),
+                id="openstates_patch_refresh",
+                name="OpenStates: apply local patches",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "openstates_patch_refresh: registered",
+                sync_time=patch_cfg.get("sync_time_utc", "01:00"),
+            )
+
+        # --- primary jobs (daily) ---
+        primary_cfg = config.get("primary", {})
+        primary_time = primary_cfg.get("sync_time_utc", "02:00")
+        prh, prm = map(int, primary_time.split(":"))
+
+        if primary_cfg.get("fl", {}).get("enabled", True):
+            async def _fl_wrapper():
+                return await run_fl_scrapes_job(config)
+
+            self.scheduler.add_job(
+                _fl_wrapper,
+                trigger=CronTrigger(hour=prh, minute=prm),
+                id="openstates_fl_scrape",
+                name="OpenStates: FL scrape (all sessions)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("openstates_fl_scrape: registered", sync_time=primary_time)
+
+        if primary_cfg.get("wa", {}).get("enabled", True):
+            async def _wa_wrapper():
+                return await run_wa_scrape_job(config)
+
+            self.scheduler.add_job(
+                _wa_wrapper,
+                trigger=CronTrigger(hour=prh, minute=prm),
+                id="openstates_wa_scrape",
+                name="OpenStates: WA scrape",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("openstates_wa_scrape: registered", sync_time=primary_time)
+
+        if primary_cfg.get("usa", {}).get("enabled", True):
+            async def _usa_wrapper():
+                return await run_usa_scrapes_job(config)
+
+            self.scheduler.add_job(
+                _usa_wrapper,
+                trigger=CronTrigger(hour=prh, minute=prm),
+                id="openstates_usa_scrape",
+                name="OpenStates: USA scrape (lower + upper)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("openstates_usa_scrape: registered", sync_time=primary_time)
+
+        # --- secondary jobs (weekly) ---
+        sec_cfg = config.get("secondary", {})
+        if sec_cfg.get("enabled", True):
+            sec_day = sec_cfg.get("sync_day", "sunday")
+            sec_time = sec_cfg.get("sync_time_utc", "02:00")
+            sh, sm = map(int, sec_time.split(":"))
+
+            async def _secondary_wrapper():
+                return await run_secondary_scrapes_job(config)
+
+            self.scheduler.add_job(
+                _secondary_wrapper,
+                trigger=CronTrigger(
+                    day_of_week=day_map.get(sec_day.lower(), "sun"),
+                    hour=sh,
+                    minute=sm,
+                ),
+                id="openstates_secondary_scrapes",
+                name="OpenStates: secondary states",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "openstates_secondary_scrapes: registered",
+                jurisdictions=sec_cfg.get("jurisdictions"),
+                sync_day=sec_day,
+                sync_time=sec_time,
+            )
+
+        # --- people refresh (weekly) ---
+        people_cfg = config.get("people_refresh", {})
+        if people_cfg.get("enabled", True):
+            p_day = people_cfg.get("sync_day", "sunday")
+            p_time = people_cfg.get("sync_time_utc", "10:00")
+            pph, ppm = map(int, p_time.split(":"))
+
+            async def _people_wrapper():
+                return await run_people_refresh_job(config)
+
+            self.scheduler.add_job(
+                _people_wrapper,
+                trigger=CronTrigger(
+                    day_of_week=day_map.get(p_day.lower(), "sun"),
+                    hour=pph,
+                    minute=ppm,
+                ),
+                id="openstates_people_refresh",
+                name="OpenStates: people refresh",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "openstates_people_refresh: registered",
+                sync_day=p_day,
+                sync_time=p_time,
+            )
 
     def stop(self) -> None:
         """Stop the scheduler."""

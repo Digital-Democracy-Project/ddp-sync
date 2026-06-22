@@ -8,6 +8,14 @@ An open-source, unified data pipeline service for the Digital Democracy Project.
 
 DDP-Sync handles all scheduled and on-demand data sync operations:
 
+- **OpenStates scrape jobs** (managed via `openstates_scrape` block in `sync_schedule.yaml`):
+  - **Patch refresh** (daily 01:00 UTC): runs `apply-local-patches.sh` on the Mac Studio before any scrapes start
+  - **FL scrape** (daily 02:00 UTC): all four FL sessions sequentially (2026 → 2026D → 2026E → 2026F share `_data/fl/`)
+  - **WA scrape** (daily 02:00 UTC): runs in parallel with FL
+  - **USA scrape** (daily 02:00 UTC): House then Senate sequentially (share `_data/usa/`), parallel with FL and WA
+  - **Secondary states** (Sunday 02:00 UTC): VA, MI, MA, UT, AZ fanned out concurrently via `asyncio.gather` — independent `_data/` dirs, no conflicts
+  - **People refresh** (Sunday 10:00 UTC): `git pull` on the people repo + `os-people to-database` for all states
+  - Each job is an independent APScheduler `CronTrigger` with `max_instances=1, coalesce=True` — a long-running FL scrape no longer delays WA/USA or causes Sunday jobs to be skipped
 - **Daily bill sync** (04:00 UTC): Shared OpenStates fetch with independent write paths:
   - Flow 1: OpenStates → Webflow CMS (status, status-date, status-chamber, gov-url)
   - Flow 2: OpenStates → Pinecone — on each new version: upserts new bill-text chunks, deletes surplus old chunks (upsert-then-delete-by-ID using `chunk_count` from Redis cache to avoid a zero-chunk availability window), stores a permanent `bill-text-history-{webflow_id}-{version_date}` record, and generates an LLM changelog (`bill-changelog-{webflow_id}-{version_date}`) comparing old vs new text via `gpt-4o-mini`. Changelog generation fails gracefully (stale URLs, OpenAI errors) without blocking the ingest.
@@ -93,6 +101,9 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |
+| POST | `/trigger/openstates-scrape/{target}` | Trigger an OpenStates scrape job immediately (returns 202, runs in background) |
+
+`/trigger/openstates-scrape/{target}` — valid targets: `patches`, `fl`, `wa`, `usa`, `secondary`, `people`, `va`, `mi`, `ma`, `ut`, `az`
 
 `/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
 

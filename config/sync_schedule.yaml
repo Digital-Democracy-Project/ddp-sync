@@ -189,6 +189,65 @@ api_health_check:
   #                # via POST /admin/keys, store it as ddp_api_key in ddp-sync/credentials, then re-enable.
   sync_time_utc: "09:00"   # after bill (04:00), leg (06:00), bio (07:00) syncs
 
+# OpenStates Scrape Schedule
+# ==========================
+#
+# Replaces the ad-hoc run-all-scrapes.sh launchd job. Each jurisdiction is an
+# independent APScheduler job so a long-running FL scrape (12+ hours) no longer
+# delays WA, USA, or the Sunday secondary-state jobs.
+#
+# Cutover: disable the launchd com.ddp.openstates-scraper plist before enabling
+# this block, or both will run simultaneously and conflict.
+#
+# Schedule (UTC):
+#   01:00 daily   — patch refresh (apply-local-patches.sh)
+#   02:00 daily   — FL (all sessions, sequential), WA, USA (parallel with FL)
+#   02:00 Sunday  — VA, MI, MA, UT, AZ (concurrent, independent _data/ dirs)
+#   10:00 Sunday  — people refresh (after secondary scrapes complete)
+openstates_scrape:
+  enabled: true
+  openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
+
+  patch_refresh:
+    enabled: true
+    sync_time_utc: "01:00"
+
+  primary:
+    sync_time_utc: "02:00"
+
+    fl:
+      enabled: true
+      sessions:
+        - "2026"
+        - "2026D"
+        - "2026E"
+        - "2026F"
+
+    wa:
+      enabled: true
+
+    usa:
+      enabled: true
+      sessions:
+        - "119 chamber=lower"
+        - "119 chamber=upper"
+
+  secondary:
+    enabled: true
+    sync_day: sunday
+    sync_time_utc: "02:00"
+    jurisdictions:
+      - va
+      - mi
+      - ma
+      - ut
+      - az
+
+  people_refresh:
+    enabled: true
+    sync_day: sunday
+    sync_time_utc: "10:00"
+
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's
 # venv. Posts a Zapier alert with on_failure / on_regression /

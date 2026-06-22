@@ -5,7 +5,7 @@ import logging
 from dataclasses import asdict
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from ddp_sync.api.auth import api_key_auth
 
@@ -361,3 +361,72 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
     except Exception as e:
         logger.error(f"Webflow {job_name} trigger failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# OpenStates scrape triggers
+# ---------------------------------------------------------------------------
+
+# Targets that map to a named job function.
+_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people"}
+
+# Individual secondary-state codes accepted as single-jurisdiction triggers.
+_OPENSTATES_SINGLE_JURISDICTION = {"va", "mi", "ma", "ut", "az"}
+
+
+@router.post("/trigger/openstates-scrape/{target}")
+async def trigger_openstates_scrape(
+    target: str,
+    background_tasks: BackgroundTasks,
+    token: str = Depends(api_key_auth),
+):
+    """Trigger an OpenStates scrape job immediately, without waiting for its cron.
+
+    Returns 202 Accepted immediately; the job runs in the background and logs
+    to ~/Developer/repos/ddp-open-states/logs/scraper.log plus ddp-sync's
+    structured log. Flow status is written to Redis under ddp:flow:openstates_*.
+
+    Targets:
+        patches     — run apply-local-patches.sh (idempotent, ~30s)
+        fl          — all FL sessions sequentially (2026, 2026D, 2026E, 2026F)
+        wa          — WA scrape + import
+        usa         — USA lower then upper sequentially
+        secondary   — VA, MI, MA, UT, AZ concurrently
+        people      — git pull people repo + os-people to-database for all states
+        va|mi|ma|ut|az — single secondary-state scrape + import
+    """
+    from ddp_sync.pipelines.openstates_scrape import (
+        run_patch_refresh_job,
+        run_fl_scrapes_job,
+        run_wa_scrape_job,
+        run_usa_scrapes_job,
+        run_secondary_scrapes_job,
+        run_people_refresh_job,
+        run_single_scrape_job,
+    )
+    from ddp_sync.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_scrape", {}) if scheduler else {}
+
+    if target in _OPENSTATES_JOB_TARGETS:
+        job_map = {
+            "patches": run_patch_refresh_job,
+            "fl": run_fl_scrapes_job,
+            "wa": run_wa_scrape_job,
+            "usa": run_usa_scrapes_job,
+            "secondary": run_secondary_scrapes_job,
+            "people": run_people_refresh_job,
+        }
+        background_tasks.add_task(job_map[target], config)
+        return {"status": "started", "target": target}
+
+    if target in _OPENSTATES_SINGLE_JURISDICTION:
+        background_tasks.add_task(run_single_scrape_job, target, config)
+        return {"status": "started", "target": target}
+
+    available = sorted(_OPENSTATES_JOB_TARGETS | _OPENSTATES_SINGLE_JURISDICTION)
+    raise HTTPException(
+        status_code=404,
+        detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
+    )
