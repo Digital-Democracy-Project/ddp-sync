@@ -199,11 +199,21 @@ api_health_check:
 # Cutover: disable the launchd com.ddp.openstates-scraper plist before enabling
 # this block, or both will run simultaneously and conflict.
 #
-# Schedule (UTC):
-#   01:00 daily   — patch refresh (apply-local-patches.sh)
-#   02:00 daily   — FL (all sessions, sequential), WA, USA (parallel with FL)
-#   02:00 Sunday  — VA, MI, MA, UT, AZ (concurrent, independent _data/ dirs)
-#   10:00 Sunday  — people refresh (after secondary scrapes complete)
+# Schedule (UTC) — staggered to avoid simultaneous starts and spread Mac load:
+#
+#   Daily:
+#   01:00  patch refresh (apply-local-patches.sh)
+#   02:00  FL (all sessions sequential — 12+ hours, starts first)
+#   02:30  WA (~5 hours)
+#   03:00  USA lower → upper (~6 hours; shares slot with Mon Webflow batch, no conflict)
+#   04:00  bill sync [existing]
+#
+#   Sunday additionally:
+#   02:00  VA, MI, MA, UT, AZ (concurrent, independent _data/ dirs; alongside FL start)
+#   06:00  legislator sync [existing]
+#   07:00  bio sync [existing]
+#   10:00  people refresh (USA finishes ~09:00, safe margin)
+#   12:00  votebot eval [existing — FL still running but different resources]
 openstates_scrape:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
@@ -213,10 +223,9 @@ openstates_scrape:
     sync_time_utc: "01:00"
 
   primary:
-    sync_time_utc: "02:00"
-
     fl:
       enabled: true
+      sync_time_utc: "02:00"   # longest job — starts first
       sessions:
         - "2026"
         - "2026D"
@@ -225,9 +234,11 @@ openstates_scrape:
 
     wa:
       enabled: true
+      sync_time_utc: "02:30"   # 30 min after FL; finishes ~07:30
 
     usa:
       enabled: true
+      sync_time_utc: "03:00"   # 1 hour after FL; finishes ~09:00
       sessions:
         - "119 chamber=lower"
         - "119 chamber=upper"
@@ -235,7 +246,7 @@ openstates_scrape:
   secondary:
     enabled: true
     sync_day: sunday
-    sync_time_utc: "02:00"
+    sync_time_utc: "02:00"     # concurrent with FL start — independent _data/ dirs
     jurisdictions:
       - va
       - mi
@@ -246,7 +257,7 @@ openstates_scrape:
   people_refresh:
     enabled: true
     sync_day: sunday
-    sync_time_utc: "10:00"
+    sync_time_utc: "10:00"     # after secondary (~06:00) and USA (~09:00) finish
 
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's

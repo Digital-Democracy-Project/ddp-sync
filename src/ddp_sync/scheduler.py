@@ -467,18 +467,20 @@ class UpdateScheduler:
                 sync_time=patch_cfg.get("sync_time_utc", "01:00"),
             )
 
-        # --- primary jobs (daily) ---
+        # --- primary jobs (daily, each with its own sync_time_utc) ---
         primary_cfg = config.get("primary", {})
-        primary_time = primary_cfg.get("sync_time_utc", "02:00")
-        prh, prm = map(int, primary_time.split(":"))
 
-        if primary_cfg.get("fl", {}).get("enabled", True):
+        fl_cfg = primary_cfg.get("fl", {})
+        if fl_cfg.get("enabled", True):
+            fl_time = fl_cfg.get("sync_time_utc", "02:00")
+            flh, flm = map(int, fl_time.split(":"))
+
             async def _fl_wrapper():
                 return await run_fl_scrapes_job(config)
 
             self.scheduler.add_job(
                 _fl_wrapper,
-                trigger=CronTrigger(hour=prh, minute=prm),
+                trigger=CronTrigger(hour=flh, minute=flm),
                 id="openstates_fl_scrape",
                 name="OpenStates: FL scrape (all sessions)",
                 replace_existing=True,
@@ -486,15 +488,19 @@ class UpdateScheduler:
                 coalesce=True,
                 misfire_grace_time=3600,
             )
-            logger.info("openstates_fl_scrape: registered", sync_time=primary_time)
+            logger.info("openstates_fl_scrape: registered", sync_time=fl_time)
 
-        if primary_cfg.get("wa", {}).get("enabled", True):
+        wa_cfg = primary_cfg.get("wa", {})
+        if wa_cfg.get("enabled", True):
+            wa_time = wa_cfg.get("sync_time_utc", "02:30")
+            wah, wam = map(int, wa_time.split(":"))
+
             async def _wa_wrapper():
                 return await run_wa_scrape_job(config)
 
             self.scheduler.add_job(
                 _wa_wrapper,
-                trigger=CronTrigger(hour=prh, minute=prm),
+                trigger=CronTrigger(hour=wah, minute=wam),
                 id="openstates_wa_scrape",
                 name="OpenStates: WA scrape",
                 replace_existing=True,
@@ -502,15 +508,19 @@ class UpdateScheduler:
                 coalesce=True,
                 misfire_grace_time=3600,
             )
-            logger.info("openstates_wa_scrape: registered", sync_time=primary_time)
+            logger.info("openstates_wa_scrape: registered", sync_time=wa_time)
 
-        if primary_cfg.get("usa", {}).get("enabled", True):
+        usa_cfg = primary_cfg.get("usa", {})
+        if usa_cfg.get("enabled", True):
+            usa_time = usa_cfg.get("sync_time_utc", "03:00")
+            usah, usam = map(int, usa_time.split(":"))
+
             async def _usa_wrapper():
                 return await run_usa_scrapes_job(config)
 
             self.scheduler.add_job(
                 _usa_wrapper,
-                trigger=CronTrigger(hour=prh, minute=prm),
+                trigger=CronTrigger(hour=usah, minute=usam),
                 id="openstates_usa_scrape",
                 name="OpenStates: USA scrape (lower + upper)",
                 replace_existing=True,
@@ -518,7 +528,7 @@ class UpdateScheduler:
                 coalesce=True,
                 misfire_grace_time=3600,
             )
-            logger.info("openstates_usa_scrape: registered", sync_time=primary_time)
+            logger.info("openstates_usa_scrape: registered", sync_time=usa_time)
 
         # --- secondary jobs (weekly) ---
         sec_cfg = config.get("secondary", {})
