@@ -18,6 +18,14 @@ if [ -f "$PROJECT_DIR/.env" ]; then
     set +a
 fi
 
+# Slack bot token for direct health alerts (no Zapier) — canonical source is
+# ddp-agents/.env, shared with run-scrape.sh and the bash health monitor.
+if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+    SLACK_BOT_TOKEN=$(grep -E '^SLACK_BOT_TOKEN=' /Users/agentsmith/Developer/repos/ddp-agents/.env \
+        2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"'"'" | awk '{print $1}')
+    export SLACK_BOT_TOKEN
+fi
+
 # Scheduler must be enabled explicitly so accidental restarts on EC2
 # don't result in two schedulers fighting over the same Redis jobs.
 export SCHEDULER_ENABLED=true

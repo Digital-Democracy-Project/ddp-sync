@@ -265,59 +265,46 @@ def run_check(check: dict, base_url: str, headers: dict) -> CheckResult:
 # ---------------------------------------------------------------------------
 
 def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
-    """POST health check results to Zapier. Returns True on 2xx. Never raises."""
-    if not webhook_url:
-        logger.warning("No Zapier webhook URL configured — skipping alert")
-        return False
+    """Post failed health checks straight to Slack via bot token. Returns True on success.
 
+    Never raises. The legacy ``webhook_url`` arg (Zapier) is ignored — kept only for
+    call-site compatibility. Delivery is now a direct ``chat.postMessage`` using
+    ``SLACK_BOT_TOKEN`` (channel from ``HEALTH_ALERT_SLACK_CHANNEL``, default
+    #automation-errors), removing Zapier as a relay in the path.
+    """
     failures = [r for r in results if not r.passed]
-    failure_lines = [f"{r.name}: {r.error}" for r in failures]
+    if not failures:
+        return True
 
     failures_text = "\n".join(
         f"• *{r.name}*: {r.error}"
         + (f"\n  `{r.body_preview[:120]}`" if r.body_preview else "")
         for r in failures
     )
-
-    slack_message = (
+    text = (
         f":red_circle: *DDP API Health Check Failed* — {len(failures)} of {len(results)} checks failed\n\n"
         + failures_text
         + f"\n\n_Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
     )
 
-    payload = {
-        "alert_type": "api_health_check_failed",
-        "on_failure": True,
-        "failure_count": len(failures),
-        "total_checks": len(results),
-        "summary": f"{len(failures)}/{len(results)} checks failed",
-        "failure_warning": "⚠️ DDP API health check failures: " + "; ".join(failure_lines),
-        "failures_text": failures_text,
-        "slack_message": slack_message,
-        "failures": [
-            {
-                "name": r.name,
-                "description": r.description,
-                "error": r.error,
-                "status_code": r.status_code,
-                "body_preview": r.body_preview,
-                "duration_ms": r.duration_ms,
-            }
-            for r in failures
-        ],
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-    }
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        logger.warning("SLACK_BOT_TOKEN not set — cannot post health alert")
+        return False
+    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
 
     try:
-        resp = requests.post(webhook_url, json=payload, timeout=30)
-        if 200 <= resp.status_code < 300:
-            return True
-        logger.error(
-            "Zapier webhook returned non-2xx",
-            extra={"status_code": resp.status_code, "body": resp.text[:200]},
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": channel, "text": text},
+            timeout=15,
         )
+        if resp.ok and resp.json().get("ok"):
+            return True
+        logger.error("Slack chat.postMessage failed: %s", resp.text[:200])
     except Exception as e:  # noqa: BLE001
-        logger.error("Zapier webhook error: %s", e)
+        logger.error("Slack health alert error: %s", e)
     return False
 
 
