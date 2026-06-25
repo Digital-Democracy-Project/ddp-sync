@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 import structlog
 import yaml
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -15,6 +17,12 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.services.legislative_calendar import StateLegislativeCalendar
 
 logger = structlog.get_logger()
+
+# The schedule config uses `sync_time_utc` fields, so triggers must fire in UTC. NOTE:
+# APScheduler applies the scheduler's tz only to triggers IT builds (the add_job(..., "cron",
+# **kw) form); a pre-built CronTrigger(...) object keeps its construction-default LOCAL tz. So
+# each CronTrigger below must also pass timezone=_UTC explicitly, not just the scheduler tz.
+_UTC = ZoneInfo("UTC")
 
 # Default config path — try package-relative first (editable install),
 # then CWD-relative (non-editable install / systemd WorkingDirectory)
@@ -49,7 +57,7 @@ class UpdateScheduler:
         """
         self.settings = settings or get_settings()
         self.config_path = config_path or DEFAULT_CONFIG_PATH
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = AsyncIOScheduler(timezone=_UTC)
         self.calendar = StateLegislativeCalendar()
         self._is_running = False
         self._update_callbacks: list[Callable] = []
@@ -454,7 +462,7 @@ class UpdateScheduler:
 
             self.scheduler.add_job(
                 _patch_refresh_wrapper,
-                trigger=CronTrigger(hour=ph, minute=pm),
+                trigger=CronTrigger(hour=ph, minute=pm, timezone=_UTC),
                 id="openstates_patch_refresh",
                 name="OpenStates: apply local patches",
                 replace_existing=True,
@@ -480,7 +488,7 @@ class UpdateScheduler:
 
             self.scheduler.add_job(
                 _fl_wrapper,
-                trigger=CronTrigger(hour=flh, minute=flm),
+                trigger=CronTrigger(hour=flh, minute=flm, timezone=_UTC),
                 id="openstates_fl_scrape",
                 name="OpenStates: FL scrape (all sessions)",
                 replace_existing=True,
@@ -500,7 +508,7 @@ class UpdateScheduler:
 
             self.scheduler.add_job(
                 _wa_wrapper,
-                trigger=CronTrigger(hour=wah, minute=wam),
+                trigger=CronTrigger(hour=wah, minute=wam, timezone=_UTC),
                 id="openstates_wa_scrape",
                 name="OpenStates: WA scrape",
                 replace_existing=True,
@@ -520,7 +528,7 @@ class UpdateScheduler:
 
             self.scheduler.add_job(
                 _usa_wrapper,
-                trigger=CronTrigger(hour=usah, minute=usam),
+                trigger=CronTrigger(hour=usah, minute=usam, timezone=_UTC),
                 id="openstates_usa_scrape",
                 name="OpenStates: USA scrape (lower + upper)",
                 replace_existing=True,
@@ -546,6 +554,7 @@ class UpdateScheduler:
                     day_of_week=day_map.get(sec_day.lower(), "sun"),
                     hour=sh,
                     minute=sm,
+                    timezone=_UTC,
                 ),
                 id="openstates_secondary_scrapes",
                 name="OpenStates: secondary states",
@@ -577,6 +586,7 @@ class UpdateScheduler:
                     day_of_week=day_map.get(p_day.lower(), "sun"),
                     hour=pph,
                     minute=ppm,
+                    timezone=_UTC,
                 ),
                 id="openstates_people_refresh",
                 name="OpenStates: people refresh",
