@@ -89,6 +89,10 @@ async def run(*, dry_run: bool, limit: int | None) -> BackfillResult:
             result.skipped_no_openstates_id.append(name)
             continue
 
+        # Webflow stores the bare UUID; OpenStates API needs the full OCD ID.
+        if not openstates_id.startswith("ocd-person/"):
+            openstates_id = f"ocd-person/{openstates_id}"
+
         try:
             person = await openstates.fetch_by_id(openstates_id)
         except OpenStatesError as e:
