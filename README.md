@@ -165,6 +165,18 @@ Add checks for non-Voatz endpoints in `FALLBACK_CHECKS` in `src/ddp_sync/pipelin
 
 ## Deployment
 
+ddp-sync runs on **two hosts**, no leader election — each runs its own scheduler
+(`app.py`: "single worker, no leader election"), so their job sets overlap harmlessly:
+
+| Host | Manager | Role |
+|------|---------|------|
+| **EC2 civic** | systemd (`ddp-sync.service`) | Canonical scheduler for cloud jobs: Webflow CMS, Pinecone, Brevo, legislator-bio |
+| **Mac Studio** | **system LaunchDaemon** (`com.ddp.ddp-sync`) | Runs the OpenStates **scrapes** — must be local (subprocesses `run-scrape.sh` against the local Postgres) |
+
+A change to this repo should be deployed to **both** targets.
+
+### EC2 civic (systemd)
+
 ```bash
 cd /home/ubuntu/ddp-sync
 git pull origin main
@@ -172,6 +184,22 @@ source .venv/bin/activate
 pip install .
 sudo systemctl restart ddp-sync
 ```
+
+### Mac Studio (system LaunchDaemon)
+
+The Mac is administered SSH-only with no reliable Aqua session, so ddp-sync there is a
+**system LaunchDaemon** (`/Library/LaunchDaemons/com.ddp.ddp-sync.plist`, source in
+`infrastructure/com.ddp.ddp-sync.plist`) — **not** a GUI LaunchAgent, which can't be
+reloaded over SSH. Deploy from an admin account:
+
+```bash
+cd /Users/agentsmith/Developer/repos/ddp-sync && git pull origin main
+sudo launchctl kickstart -k system/com.ddp.ddp-sync   # restart to pick up changes
+curl -s http://localhost:8001/ddp-sync/v1/schedule    # verify the six OpenStates jobs
+```
+
+Reinstall the plist (after editing it) and full recovery steps are in
+`ddp-infra/README.md` → "Restart Procedures".
 
 ### Systemd Service
 
