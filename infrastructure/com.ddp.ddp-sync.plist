@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System LaunchDaemon for ddp-sync on the Mac Studio.
+
+  Replaces the per-user GUI LaunchAgent (~/Library/LaunchAgents/com.ddp.ddp-sync.plist),
+  which only loads inside an Aqua/console login session. This machine is administered
+  over SSH with no console login, so gui/<uid> agents never come up after a reboot
+  (root cause of the 2026-07-04 scrape outage). A system daemon loads at boot with no
+  login required.
+
+  Install (from an admin account):
+    sudo cp infrastructure/com.ddp.ddp-sync.plist /Library/LaunchDaemons/com.ddp.ddp-sync.plist
+    sudo chown root:wheel /Library/LaunchDaemons/com.ddp.ddp-sync.plist
+    sudo chmod 644        /Library/LaunchDaemons/com.ddp.ddp-sync.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.ddp.ddp-sync.plist
+
+  Runs as agentsmith so it keeps read/write access to /Users/agentsmith paths, the
+  .venv, the local Postgres via Colima, and run-scrape.sh.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ddp.ddp-sync</string>
+
+    <key>UserName</key>
+    <string>agentsmith</string>
+    <key>GroupName</key>
+    <string>staff</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/agentsmith/Developer/repos/ddp-sync/scripts/start-ddp-sync.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/agentsmith/Developer/repos/ddp-sync</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- HOME must be set explicitly for a daemon: run-scrape.sh's subprocess
+             (docker/colima context, poetry cache) resolves paths under it. -->
+        <key>HOME</key>
+        <string>/Users/agentsmith</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Auto-start at boot and keep alive on crash (self-heals if Colima/Redis
+         aren't up yet — it'll retry until the DB is reachable). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/agentsmith/Developer/repos/ddp-sync/logs/ddp-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/agentsmith/Developer/repos/ddp-sync/logs/ddp-sync.log</string>
+</dict>
+</plist>
