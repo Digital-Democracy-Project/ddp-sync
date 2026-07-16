@@ -226,6 +226,12 @@ openstates_scrape:
     fl:
       enabled: true
       sync_time_utc: "02:00"   # longest job — starts first
+      # Weekly while FL is out of session — new draft bills aren't introduced
+      # until ~November, so daily scrapes are wasted work and each one wipes
+      # _data/fl on startup (colliding with historical backfills). Runs Sunday
+      # 02:00 UTC alongside the secondary batch (independent _data/ dirs).
+      # Remove sync_day (revert to daily) once the 2027 session opens.
+      sync_day: sunday
       sessions:
         - "2026"
         - "2026D"
