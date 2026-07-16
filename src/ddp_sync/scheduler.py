@@ -482,13 +482,22 @@ class UpdateScheduler:
         if fl_cfg.get("enabled", True):
             fl_time = fl_cfg.get("sync_time_utc", "02:00")
             flh, flm = map(int, fl_time.split(":"))
+            # Optional weekly cadence. FL has no bills to scrape while out of
+            # session (new drafts aren't introduced until ~November), and a
+            # daily FL scrape wipes _data/fl on startup — which collides with
+            # any in-progress historical backfill sharing that dir. Set
+            # sync_day to run weekly; absent → daily (in-session default).
+            fl_day = fl_cfg.get("sync_day")
+            fl_trigger_kwargs = {"hour": flh, "minute": flm, "timezone": _UTC}
+            if fl_day:
+                fl_trigger_kwargs["day_of_week"] = day_map.get(fl_day.lower(), "sun")
 
             async def _fl_wrapper():
                 return await run_fl_scrapes_job(config)
 
             self.scheduler.add_job(
                 _fl_wrapper,
-                trigger=CronTrigger(hour=flh, minute=flm, timezone=_UTC),
+                trigger=CronTrigger(**fl_trigger_kwargs),
                 id="openstates_fl_scrape",
                 name="OpenStates: FL scrape (all sessions)",
                 replace_existing=True,
@@ -496,7 +505,11 @@ class UpdateScheduler:
                 coalesce=True,
                 misfire_grace_time=3600,
             )
-            logger.info("openstates_fl_scrape: registered", sync_time=fl_time)
+            logger.info(
+                "openstates_fl_scrape: registered",
+                sync_time=fl_time,
+                sync_day=fl_day or "daily",
+            )
 
         wa_cfg = primary_cfg.get("wa", {})
         if wa_cfg.get("enabled", True):
