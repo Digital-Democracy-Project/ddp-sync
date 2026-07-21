@@ -77,6 +77,20 @@ class SyncSettings:
     debug: bool = False
     log_level: str = "INFO"
 
+    # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
+    # instance only, per Ramon's 2026-07-20 call to run this dispatching
+    # from ddp-sync's local instance, not EC2 production — same-box call,
+    # no WireGuard hop needed.
+    cams_base_url: str = "http://localhost:8000"
+    cams_api_token: str = ""
+    # CAMS's artifacts/{task_id}/task_result.json directory — read directly
+    # off the shared local filesystem rather than a new HTTP endpoint,
+    # matching how Agent Smith's own get_task_artifacts tool already reads
+    # this same directory in-process. No default — this is a machine-
+    # specific absolute path (ddp-agents' working directory); must be set
+    # via CAMS_ARTIFACTS_DIR, not guessed.
+    cams_artifacts_dir: str = ""
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -150,6 +164,9 @@ def _load_from_env() -> dict:
         "environment": os.getenv("ENVIRONMENT", "production"),
         "debug": os.getenv("DEBUG", "false").lower() == "true",
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
+        "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
+        "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
+        "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
     }
 
 

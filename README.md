@@ -71,6 +71,18 @@ DDP-Sync uses two distinct Webflow API tokens with different scopes:
 
 The `cms:*` token does NOT carry `assets:write` — confirmed via 2026-04-30 production smoke (returned 403 OAuthForbidden on `POST /assets`). Keep them as separate keys so each can be rotated independently and the principle of least privilege is preserved.
 
+### LegBot dispatch (CAMS)
+
+`src/ddp_sync/services/legbot_client.py` (added 2026-07-21, `ddp-agents`' `PLAN-legbot.md` Phase 3) dispatches bill-analysis questions to LegBot — CAMS's legislative bill agent — via CAMS's generic task API, then reads the structured answer directly off CAMS's local filesystem (no HTTP result endpoint, matching how CAMS's own Agent Smith reads that same directory in-process). Only runs from the local Mac Studio `ddp-sync` instance, not EC2 production — same box as CAMS, no WireGuard hop needed.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CAMS_BASE_URL` | `http://localhost:8000` | CAMS's API base URL |
+| `CAMS_API_TOKEN` | `""` | Bearer token for CAMS's task API (matches CAMS's own `CAMS_API_TOKEN`) |
+| `CAMS_ARTIFACTS_DIR` | `""` (must be set) | Absolute path to `ddp-agents`' `artifacts/` directory — machine-specific, not guessed |
+
+**Not yet wired into any write path** — this client dispatches and returns LegBot's answer only; there's nowhere durable to write it yet (`BillArtifact`, `ddp-infra`'s Phase 6, doesn't exist). See `ddp-infra/PLAN-bill-document-provenance.md` Phase 8 for the eventual write-path design.
+
 ## API
 
 All endpoints are prefixed with `/ddp-sync/v1` (set in `src/ddp_sync/app.py` as `API_PREFIX`). The paths in the tables below are **relative to that prefix** — combine them when calling the service.
