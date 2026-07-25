@@ -224,7 +224,14 @@ openstates_scrape:
 
   primary:
     fl:
-      enabled: true
+      enabled: true  # RE-ENABLED 2026-07-25 — was paused 2026-07-24 for the historical backfill
+      # (2024 then 2023 regular sessions), which collided with this job's shared _data/fl folder.
+      # Both sessions confirmed finished 2026-07-25 (2023 regular at 05:24 EDT, per
+      # ddp-open-states's notes/fl-committee-org-resolution-gaps-20260725 branch) via a manual
+      # run outside this scheduler — the logs/last-run/fl_session_<id>.ts marker this was
+      # originally gated on never appeared (that directory doesn't exist; it's this very job
+      # that would have created it), so re-enabling here is based on that external confirmation,
+      # not the marker.
       sync_time_utc: "02:00"   # longest job — starts first
       # Weekly while FL is out of session — new draft bills aren't introduced
       # until ~November, so daily scrapes are wasted work and each one wipes
