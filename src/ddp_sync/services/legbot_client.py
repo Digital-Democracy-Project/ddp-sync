@@ -6,10 +6,11 @@ get a structured answer about a bill's text — the same interface Agent
 Smith's own dispatch_legbot tool uses. No CAMS-side code exists specific to
 this caller; this is a second caller of an already-general endpoint.
 
-Only bill_summary/bill_pros_cons (LegBot's existing summary_500char/pros_cons
-question types) are wired through this client today — bill_changelog is a
-separate capability gated on ddp-infra's own Phase 1 diff computation
-landing first (see PLAN-legbot.md Phase 3).
+dispatch_bill_question wires LegBot's single-input question types
+(summary_500char, pros_cons, etc.); dispatch_bill_changelog wires the
+two-input bill_changelog type (old_bill_source + a precomputed diff, see
+PLAN-legbot.md Phase 3) — the caller computes the diff, LegBot fetches its
+own copy of old_bill_source to build its two-part prompt.
 
 Scope note: this module dispatches and returns LegBot's structured answer
 plus which backend produced it. It does NOT write that answer anywhere
@@ -63,6 +64,81 @@ async def dispatch_bill_question(
         timeout_seconds: how long to poll before giving up.
 
     Returns:
+        See _dispatch_and_await.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't
+            be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "bill_source": bill_source,
+            "question_type": question_type,
+            "caller": "ddp_sync",
+        },
+        question_type=question_type,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def dispatch_bill_changelog(
+    old_bill_source: str,
+    diff_source: str,
+    *,
+    diff_format: str = "unified_diff_v1",
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict:
+    """Dispatch a bill_changelog task to LegBot and return its structured answer.
+
+    Args:
+        old_bill_source: URL to the prior version's PDF/HTML, or its raw
+            text. LegBot fetches its own copy of this (see
+            ddp-agents' legbot/handlers.py handle_ingest) to build its
+            two-part prompt — the caller does not need to pre-fetch it for
+            LegBot's sake, only to compute diff_source below.
+        diff_source: a precomputed diff between the prior and new version's
+            text. LegBot does not re-derive what changed — it explains the
+            impact of the changes the diff already identifies.
+        diff_format: must match LegBot's one supported format
+            ("unified_diff_v1" — the literal output of Python's
+            difflib.unified_diff(), unvalidated against a real fixture
+            corpus yet; see PLAN-legbot.md AC11a, deliberately deferred).
+        timeout_seconds: how long to poll before giving up.
+
+    Returns:
+        See _dispatch_and_await. answer["insufficient_information"] is True
+        both when LegBot's model judged the bill too short/vague to answer,
+        and when handle_ingest skipped the task outright (no prior version
+        archived, diff unavailable, unsupported diff format, malformed
+        diff) — the latter also sets answer["reason"] to one of those four
+        skip reasons.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't
+            be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "old_bill_source": old_bill_source,
+            "diff_source": diff_source,
+            "diff_format": diff_format,
+            "question_type": "bill_changelog",
+            "caller": "ddp_sync",
+        },
+        question_type="bill_changelog",
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _dispatch_and_await(
+    payload: dict,
+    *,
+    question_type: str,
+    timeout_seconds: float,
+) -> dict:
+    """Shared dispatch/poll/read-result mechanics for any analyze_bill payload.
+
+    Returns:
         A dict with two keys:
           - "answer": the parsed "answer" dict LegBot's ANALYZE handler
             produced (matches each question type's output_shape,
@@ -78,10 +154,6 @@ async def dispatch_bill_question(
             should treat model_version/prompt_version as genuinely unknown
             (null) rather than guessing, until that gap is closed on the
             ddp-agents side.
-
-    Raises:
-        LegBotDispatchError: task failed, timed out, or its result couldn't
-            be read from disk.
     """
     settings = get_settings()
     if not settings.cams_artifacts_dir:
@@ -93,11 +165,7 @@ async def dispatch_bill_question(
     create_payload = {
         "bot": "legbot",
         "task_type": "analyze_bill",
-        "payload": {
-            "bill_source": bill_source,
-            "question_type": question_type,
-            "caller": "ddp_sync",
-        },
+        "payload": payload,
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:

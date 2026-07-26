@@ -12,6 +12,7 @@ Replaces the daily bill-history/bill-votes sync with a targeted check:
 """
 
 import asyncio
+import difflib
 import gc
 import json
 from dataclasses import dataclass, field
@@ -1021,17 +1022,17 @@ class BillVersionSyncService:
         new_version_note: str,
         new_content: str,
     ) -> tuple[int, bool, str]:
-        """Generate an LLM changelog comparing old and new bill versions.
+        """Generate a changelog comparing old and new bill versions via LegBot.
 
-        Attempts to re-download old text from old_version["text_url"]. Fails
-        gracefully on any error — the surrounding ingest is never blocked.
+        Attempts to re-download old text from old_version["text_url"] (needed
+        here to compute the diff LegBot is handed). Fails gracefully on any
+        error — the surrounding ingest is never blocked.
 
         Returns:
             (chunks_created, skipped, skip_reason)
             skipped=True means no changelog was produced; ingest still succeeded.
         """
         import httpx
-        from openai import AsyncOpenAI
 
         from ddp_sync.ingestion.metadata import DocumentMetadata
         from ddp_sync.ingestion.pipeline import IngestionPipeline
@@ -1075,63 +1076,68 @@ class BillVersionSyncService:
         if len(old_content) < 500:
             return 0, True, "old_content_too_short"
 
-        # Generate structured changelog via OpenAI.
+        # Generate structured changelog via LegBot (ddp-infra Phase 4 /
+        # PLAN-legbot.md's bill_changelog capability) -- replaces the old
+        # direct gpt-4o-mini call. ddp-sync computes the diff (LegBot is
+        # handed a precomputed diff, not two full documents to re-diff
+        # itself) but still passes old_url as old_bill_source so LegBot can
+        # fetch its own copy of the old text for its two-part prompt -- see
+        # ddp-agents' legbot/handlers.py handle_ingest.
+        diff_text = "\n".join(
+            difflib.unified_diff(
+                old_content.splitlines(),
+                new_content.splitlines(),
+                fromfile=old_version_note or "previous version",
+                tofile=new_version_note or "this version",
+                lineterm="",
+            )
+        )
+        if not diff_text.strip():
+            return 0, True, "no_diff_produced"
+
+        from ddp_sync.services.legbot_client import (
+            LegBotDispatchError,
+            dispatch_bill_changelog,
+        )
+
         try:
-            client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+            dispatch_result = await dispatch_bill_changelog(
+                old_bill_source=old_url,
+                diff_source=diff_text,
+            )
+        except LegBotDispatchError as e:
+            return 0, True, f"legbot_dispatch_failed: {type(e).__name__}"
 
-            # Truncate to avoid token limit issues on large bills.
-            max_chars = 40_000
-            old_truncated = old_content[:max_chars]
-            new_truncated = new_content[:max_chars]
+        answer = dispatch_result["answer"]
+        if answer.get("insufficient_information"):
+            # Covers both handle_ingest's four skip reasons (no prior
+            # version archived, diff unavailable, unsupported diff format,
+            # malformed diff) and handle_analyze's own graceful skip (bill
+            # too short/vague to answer confidently) -- same "answer" shape
+            # either way, per config/legbot_questions.yaml.
+            return 0, True, answer.get("reason", "legbot_insufficient_information")
 
-            prompt = f"""You are a legislative analyst. Compare these two versions of a bill and produce a structured changelog.
+        def _bullet_list(items: list) -> str:
+            return "\n".join(f"- {item}" for item in items) if items else "- None"
 
-BILL: {bill_title}
-FROM: {old_version_note} ({old_version_date})
-TO: {new_version_note} ({new_version_date})
-
---- OLD VERSION ---
-{old_truncated}
-
---- NEW VERSION ---
-{new_truncated}
-
-Produce the changelog in exactly this format:
-
-## What Changed: {bill_title}
+        changelog_text = f"""## What Changed: {bill_title}
 **From:** {old_version_note} ({old_version_date})
 **To:** {new_version_note} ({new_version_date})
 
-### Summary
-[1-2 sentences describing the overall nature of the changes]
-
 ### Sections Added
-- [bullet list, or "None" if no sections were added]
+{_bullet_list(answer.get("sections_added") or [])}
 
 ### Sections Removed
-- [bullet list, or "None" if no sections were removed]
+{_bullet_list(answer.get("sections_removed") or [])}
 
 ### Sections Modified
-- [bullet list describing what changed in each modified section]
+{_bullet_list(answer.get("sections_modified") or [])}
 
 ### Key Policy Implications
-- [bullet list of the most important policy consequences of these changes]
-
-Be specific and factual. Do not speculate beyond what the text shows."""
-
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1500,
-                temperature=0.1,
-            )
-            changelog_text = response.choices[0].message.content or ""
-
-        except Exception as e:
-            return 0, True, f"openai_error: {type(e).__name__}"
+{answer.get("policy_implications") or "None noted."}"""
 
         if not changelog_text.strip():
-            return 0, True, "openai_empty_response"
+            return 0, True, "legbot_empty_response"
 
         # Ingest changelog as a permanent document.
         pipeline = IngestionPipeline(self.settings)

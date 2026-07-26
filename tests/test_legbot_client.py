@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ddp_sync.services.legbot_client import LegBotDispatchError, dispatch_bill_question
+from ddp_sync.services.legbot_client import (
+    LegBotDispatchError,
+    dispatch_bill_changelog,
+    dispatch_bill_question,
+)
 
 
 @dataclass
@@ -98,6 +102,44 @@ async def test_failed_task_raises(tmp_path):
     ):
         with pytest.raises(LegBotDispatchError, match="status=failed"):
             await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+
+@pytest.mark.asyncio
+async def test_changelog_happy_path_sends_two_input_payload(tmp_path):
+    task_id = "chg456"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {
+        "sections_added": ["A new penalty provision in Section 4"],
+        "sections_removed": [],
+        "sections_modified": ["The definitions in Section 2"],
+        "policy_implications": "Tightens enforcement.",
+        "insufficient_information": False,
+    }
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "claude"})
+    )
+
+    mock_client = _mock_client(statuses=["queued", "completed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        result = await dispatch_bill_changelog(
+            "https://example.com/old-bill.pdf",
+            "--- a/old\n+++ b/new\n@@ -1 +1 @@\n-old line\n+new line",
+        )
+
+    assert result == {"answer": answer, "backend": "claude"}
+    post_call = mock_client.post.await_args
+    payload = post_call.kwargs["json"]["payload"]
+    assert payload["question_type"] == "bill_changelog"
+    assert payload["old_bill_source"] == "https://example.com/old-bill.pdf"
+    assert payload["diff_source"].startswith("--- a/old")
+    assert payload["diff_format"] == "unified_diff_v1"
+    assert payload["caller"] == "ddp_sync"
 
 
 @pytest.mark.asyncio
