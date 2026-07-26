@@ -7,10 +7,12 @@ merged 2026-07-26). This module is the plan's step 4: "write the result to
 both ddp-broker-py AND Pinecone — both writes are required for the job to
 count as done, not ddp-broker-py with Pinecone as an optional follow-up."
 
-Only bill_summary/bill_pros_cons are wired here, matching legbot_client's own
-current scope — bill_changelog is still gated on LegBot's AC11a diff-format
-validation, and bill_impact_analysis has no settled output schema yet (see
-the plan's Phase 8 section).
+bill_summary/bill_pros_cons/bill_vote_yes_frame/bill_vote_no_frame/
+bill_supporting_orgs/bill_opposing_orgs are wired here — bill_changelog is
+still gated on LegBot's AC11a diff-format validation (and has its own
+dispatch path, dispatch_bill_changelog, not this one), and
+bill_impact_analysis has no settled output schema yet (see the plan's
+Phase 8 section).
 
 Scope note: this module generates and stores ONE artifact for a caller-
 supplied bill version. It does NOT implement Phase 8's step 1 ("find bill
@@ -36,21 +38,36 @@ logger = structlog.get_logger()
 _ARTIFACT_TYPE_TO_QUESTION_TYPE = {
     "bill_summary": "summary_500char",
     "bill_pros_cons": "pros_cons",
+    "bill_vote_yes_frame": "vote_yes_frame",
+    "bill_vote_no_frame": "vote_no_frame",
+    "bill_supporting_orgs": "supporting_orgs",
+    "bill_opposing_orgs": "opposing_orgs",
 }
+
+# artifact_types whose answer is already plain text under an answer["text"]
+# key (config/legbot_questions.yaml's output_shape) — flattened identically.
+_TEXT_ANSWER_ARTIFACT_TYPES = {"bill_summary", "bill_vote_yes_frame", "bill_vote_no_frame"}
+
+# artifact_types whose answer is a single list under answer["org_types"]
+# ([{type, reason}, ...], config/legbot_questions.yaml) — flattened identically.
+_ORG_TYPES_ANSWER_ARTIFACT_TYPES = {"bill_supporting_orgs", "bill_opposing_orgs"}
 
 
 def _content_from_answer(artifact_type: str, answer: dict) -> str:
     """Flatten LegBot's structured answer into BillArtifact.content.
 
-    bill_summary's answer is already plain text. pros_cons' answer is
-    structured (separate pros/cons lists) — stored as a JSON string rather
-    than inventing a Markdown format the plan doesn't specify; a consumer
-    rendering this artifact_type should json.loads() it back.
+    bill_summary/bill_vote_yes_frame/bill_vote_no_frame's answer is already
+    plain text. pros_cons/supporting_orgs/opposing_orgs' answers are
+    structured — stored as a JSON string rather than inventing a Markdown
+    format the plan doesn't specify; a consumer rendering these artifact
+    types should json.loads() the content back.
     """
-    if artifact_type == "bill_summary":
+    if artifact_type in _TEXT_ANSWER_ARTIFACT_TYPES:
         return answer["text"]
     if artifact_type == "bill_pros_cons":
         return json.dumps({"pros": answer["pros"], "cons": answer["cons"]})
+    if artifact_type in _ORG_TYPES_ANSWER_ARTIFACT_TYPES:
+        return json.dumps({"org_types": answer["org_types"]})
     raise ValueError(f"Unsupported artifact_type for content extraction: {artifact_type}")
 
 

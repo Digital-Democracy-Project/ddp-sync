@@ -4,6 +4,7 @@ connecting LegBot dispatch to the BillArtifact ledger + Pinecone.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -91,6 +92,75 @@ async def test_pros_cons_content_is_json_and_still_writes_on_pinecone_failure():
     assert write_kwargs["status"] == "complete"
     # Pinecone failed -- must not be silently treated as synced.
     assert write_kwargs["pinecone_synced_at"] is None
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "question_type"),
+    [("bill_vote_yes_frame", "vote_yes_frame"), ("bill_vote_no_frame", "vote_no_frame")],
+)
+@pytest.mark.asyncio
+async def test_vote_frame_happy_path_writes_broker_and_pinecone(artifact_type, question_type):
+    dispatch_result = {
+        "answer": {"text": "Vote yes if you want...", "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 4, "created": True}),
+    ) as mock_write:
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type=artifact_type
+        )
+
+    assert result == {"id": 4, "created": True}
+    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], question_type)
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == "Vote yes if you want..."
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "question_type"),
+    [("bill_supporting_orgs", "supporting_orgs"), ("bill_opposing_orgs", "opposing_orgs")],
+)
+@pytest.mark.asyncio
+async def test_org_types_happy_path_writes_broker_and_pinecone(artifact_type, question_type):
+    dispatch_result = {
+        "answer": {
+            "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}],
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 5, "created": True}),
+    ) as mock_write:
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type=artifact_type
+        )
+
+    assert result == {"id": 5, "created": True}
+    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], question_type)
+    write_kwargs = mock_write.await_args.kwargs
+    assert json.loads(write_kwargs["content"]) == {
+        "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}]
+    }
+    assert write_kwargs["status"] == "complete"
 
 
 @pytest.mark.asyncio
