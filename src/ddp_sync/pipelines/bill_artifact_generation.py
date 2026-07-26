@@ -75,7 +75,7 @@ async def generate_and_store_bill_artifact(
 
     Genuinely unrecoverable failures — LegBot unreachable/timed out
     (LegBotDispatchError), or ddp-broker-py rejecting/unreachable
-    (BrokerWriteError) — propagate to the caller rather than being
+    (BrokerClientError) — propagate to the caller rather than being
     swallowed; there's no BillArtifact row to record them on in the second
     case, and no point creating a placeholder failed row from a dispatch
     that produced no answer at all in the first.
