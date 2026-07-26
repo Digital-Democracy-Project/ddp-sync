@@ -11,10 +11,11 @@ question types) are wired through this client today — bill_changelog is a
 separate capability gated on ddp-infra's own Phase 1 diff computation
 landing first (see PLAN-legbot.md Phase 3).
 
-Scope note: this module dispatches and returns LegBot's structured answer.
-It does NOT write that answer anywhere durable (e.g. BillArtifact) — that
-table doesn't exist yet (ddp-infra Phase 6). Wiring this into a write path
-is a separate, later piece of work.
+Scope note: this module dispatches and returns LegBot's structured answer
+plus which backend produced it. It does NOT write that answer anywhere
+durable — see ddp_sync.pipelines.bill_artifact_generation (ddp-infra Phase 8)
+for the piece that persists this into ddp-broker-py's BillArtifact (Phase 6)
+and Pinecone.
 """
 
 from __future__ import annotations
@@ -62,8 +63,21 @@ async def dispatch_bill_question(
         timeout_seconds: how long to poll before giving up.
 
     Returns:
-        The parsed "answer" dict LegBot's ANALYZE handler produced
-        (matches each question type's output_shape, config/legbot_questions.yaml).
+        A dict with two keys:
+          - "answer": the parsed "answer" dict LegBot's ANALYZE handler
+            produced (matches each question type's output_shape,
+            config/legbot_questions.yaml).
+          - "backend": which router choice served this ("openai"/"mlx"/
+            "claude", per ddp-agents' wm_snapshot_keys.py), or None if CAMS
+            didn't record one. This is the only model-identifying field
+            CAMS's task snapshot currently exposes — it does NOT include a
+            precise model string (that's computed in ddp-agents'
+            legbot/handlers.py but never written to the snapshot, confirmed
+            2026-07-26) or a prompt version. Callers populating
+            BillArtifact.model_name/model_version/prompt_version (Phase 6)
+            should treat model_version/prompt_version as genuinely unknown
+            (null) rather than guessing, until that gap is closed on the
+            ddp-agents side.
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't
@@ -134,4 +148,4 @@ async def dispatch_bill_question(
         "LegBot task completed", task_id=task_id, question_type=question_type,
         insufficient_information=answer.get("insufficient_information"),
     )
-    return answer
+    return {"answer": answer, "backend": snapshot.get("backend")}

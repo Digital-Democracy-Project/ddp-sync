@@ -78,7 +78,7 @@ async def test_happy_path_returns_answer(tmp_path):
             "https://example.com/bill.pdf", "summary_500char"
         )
 
-    assert result == answer
+    assert result == {"answer": answer, "backend": "mlx"}
     # Confirm the dispatched payload matches the shape LegBot's handlers expect
     post_call = mock_client.post.await_args
     assert post_call.kwargs["json"]["bot"] == "legbot"

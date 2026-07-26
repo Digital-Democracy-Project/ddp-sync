@@ -91,6 +91,12 @@ class SyncSettings:
     # via CAMS_ARTIFACTS_DIR, not guessed.
     cams_artifacts_dir: str = ""
 
+    # ddp-broker-py (BillArtifact write path — ddp-infra Phase 8). Local Mac
+    # Studio dev stack by default (README's port 8080); production points at
+    # the real broker host/token via env.
+    ddp_broker_api_base: str = "http://localhost:8080"
+    ddp_broker_api_token: str = ""
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -167,6 +173,8 @@ def _load_from_env() -> dict:
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
         "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
+        "ddp_broker_api_base": os.getenv("DDP_BROKER_API_BASE", "http://localhost:8080"),
+        "ddp_broker_api_token": os.getenv("DDP_BROKER_API_TOKEN", ""),
     }
 
 
