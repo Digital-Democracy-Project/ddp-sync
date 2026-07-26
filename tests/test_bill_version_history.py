@@ -376,11 +376,13 @@ async def test_versioned_document_ids_are_unique():
 
 
 # ---------------------------------------------------------------------------
-# Redis chunk_count persistence
+# BillVersion chunk_count persistence (Phase 4 -- replaces the old Redis
+# version cache; see PLAN-bill-document-provenance.md's 2026-07-26 decision
+# to drop Redis from this job entirely)
 # ---------------------------------------------------------------------------
 
-async def test_chunk_count_written_to_redis_cache():
-    """chunk_count is included in the Redis version record after ingest."""
+async def test_chunk_count_written_to_bill_version():
+    """chunk_count is included in the BillVersion write after ingest."""
     svc = _make_service()
 
     mock_doc = _make_doc_source("Bill text " * 100)
@@ -388,16 +390,19 @@ async def test_chunk_count_written_to_redis_cache():
     mock_pipeline = AsyncMock()
     mock_pipeline.ingest_document = AsyncMock(return_value=mock_ingest)
     mock_redis = AsyncMock()
-    mock_redis.get_bill_version = AsyncMock(return_value=None)
     mock_redis.set_bill_version = AsyncMock()
     mock_redis.publish = AsyncMock(return_value=0)
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
 
     bill_data = {
+        "id": "ocd-bill/test-uuid-1234",
         "versions": [{"date": "2026-05-20", "note": "Introduced", "links": [{"url": "https://example.gov/bill.pdf", "media_type": "application/pdf"}]}]
     }
 
     with (
         patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.get_latest_bill_version", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
         patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "Bill text " * 100))),
         patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
         patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
@@ -412,10 +417,82 @@ async def test_chunk_count_written_to_redis_cache():
             fields={},
         )
 
-    set_call = mock_redis.set_bill_version.call_args
-    version_data = set_call.args[1]
-    assert "chunk_count" in version_data
-    assert version_data["chunk_count"] == 4
+    write_call = mock_write_bill_version.call_args
+    assert write_call.kwargs["chunk_count"] == 4
+    assert write_call.kwargs["bill_openstates_id"] == "test-uuid-1234"
+    assert write_call.kwargs["pinecone_ingested"] is True
+
+
+async def test_no_bill_version_write_when_bill_data_has_no_id():
+    """A malformed OpenStates response (no 'id') can't be recorded in
+    BillVersion -- logged and skipped, not a crash, and doesn't block the
+    Pinecone ingestion that already happened."""
+    svc = _make_service()
+    mock_write_bill_version = AsyncMock()
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+    mock_redis.publish = AsyncMock(return_value=0)
+
+    bill_data = {
+        "versions": [{"date": "2026-05-20", "note": "Introduced", "links": [{"url": "https://example.gov/bill.pdf", "media_type": "application/pdf"}]}]
+    }
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "Bill text " * 100))),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._generate_and_ingest_changelog", new=AsyncMock(return_value=(0, True, "no_old_url"))),
+    ):
+        result = await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Test Bill",
+            jurisdiction_code="US",
+            bill_data=bill_data,
+            bill_slug="test-bill",
+            fields={},
+        )
+
+    mock_write_bill_version.assert_not_called()
+    assert result["chunks_created"] == 4
+
+
+async def test_broker_read_failure_skips_this_bill_without_crashing():
+    """A ddp-broker-py outage during the read must not be treated as 'never
+    seen before' (which would re-ingest/re-bill every bill on every run
+    during an outage) -- it should skip this bill this run instead."""
+    from ddp_sync.services.broker_client import BrokerClientError
+
+    svc = _make_service()
+    mock_ingest_text = AsyncMock()
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+
+    bill_data = {
+        "id": "ocd-bill/test-uuid-5678",
+        "versions": [{"date": "2026-05-20", "note": "Introduced", "links": [{"url": "https://example.gov/bill.pdf", "media_type": "application/pdf"}]}]
+    }
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch(
+            "ddp_sync.services.broker_client.get_latest_bill_version",
+            new=AsyncMock(side_effect=BrokerClientError("ddp-broker-py unreachable")),
+        ),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=mock_ingest_text),
+    ):
+        result = await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Test Bill",
+            jurisdiction_code="US",
+            bill_data=bill_data,
+            bill_slug="test-bill",
+            fields={},
+        )
+
+    assert result["is_newer"] is False
+    mock_ingest_text.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

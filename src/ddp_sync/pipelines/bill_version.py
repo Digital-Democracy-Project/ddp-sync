@@ -2,10 +2,13 @@
 
 Replaces the daily bill-history/bill-votes sync with a targeted check:
 1. For each current-session bill, fetch OpenStates `versions` array
-2. Compare latest version against Redis cache
+2. Compare latest version against ddp-broker-py's BillVersion table
+   (PLAN-bill-document-provenance.md Phase 4 — replaces the Redis version
+   cache this used to read/write; Redis is still used for VoteBot's
+   separate webflow_id -> slug lookup cache, see check_and_reingest_version)
 3. If newer: download bill text (PDF or HTML), re-ingest into Pinecone,
    update Webflow CMS gov-url
-4. If unchanged: update last_checked timestamp only
+4. If unchanged: no-op (VoteBot's slug cache is still refreshed either way)
 """
 
 import asyncio
@@ -154,6 +157,19 @@ class BillVersionSyncService:
                 html_link = (url, media_type or "unknown")
 
         return pdf_link or html_link
+
+    @staticmethod
+    def _extract_bill_openstates_id(bill_data: dict) -> str | None:
+        """Bare UUID (no `ocd-bill/` prefix) from an OpenStates bill response's
+        `id` field, matching ddp-broker-py's Bill.openstates_id convention
+        (PLAN-bill-document-provenance.md Phase 4). None if bill_data has no
+        id — shouldn't happen for a real OpenStates API response, but this
+        function doesn't assume it.
+        """
+        raw_id = bill_data.get("id") or ""
+        if not raw_id:
+            return None
+        return raw_id.rsplit("/", 1)[-1]
 
     @staticmethod
     def _is_newer_version(latest_version: dict, cached: dict | None) -> bool:
@@ -437,8 +453,16 @@ class BillVersionSyncService:
     ) -> dict:
         """Flow 2 write path: check for new bill version and re-ingest to Pinecone.
 
-        Compares the latest version from bill_data against the Redis version
-        cache. If newer, downloads the bill text and ingests it into Pinecone.
+        Compares the latest version from bill_data against ddp-broker-py's
+        BillVersion table (PLAN-bill-document-provenance.md Phase 4 — Redis is
+        no longer the source of truth for this check, per the 2026-07-26
+        decision to drop it from this job entirely, not just add a fallback).
+        If newer, downloads the bill text and ingests it into Pinecone.
+
+        Redis is still written to at the end (unchanged) purely to keep
+        VoteBot's webflow_id -> slug lookup cache fresh (services/button_cache.py
+        reconciliation) — a separate concern from version tracking that this
+        redesign doesn't touch.
 
         Args:
             webflow_id: Webflow item ID
@@ -452,6 +476,11 @@ class BillVersionSyncService:
             Dict with keys: is_newer, chunks_created, version_note,
             version_date, text_url, error
         """
+        from ddp_sync.services.broker_client import (
+            BrokerClientError,
+            get_latest_bill_version,
+            write_bill_version,
+        )
         from ddp_sync.services.redis_store import get_redis_store
 
         result = {
@@ -483,15 +512,41 @@ class BillVersionSyncService:
         text_url, media_type = url_info
         result["text_url"] = text_url
 
-        # Compare against Redis cache
-        redis_store = get_redis_store()
-        cached = await redis_store.get_bill_version(webflow_id)
+        # Compare against ddp-broker-py's BillVersion (Phase 4) instead of
+        # Redis. bill_openstates_id comes straight from the OpenStates
+        # response already in hand (bill_data) -- no extra fetch needed.
+        bill_openstates_id = self._extract_bill_openstates_id(bill_data)
+        cached: dict | None = None
+        if bill_openstates_id:
+            try:
+                cached = await get_latest_bill_version(bill_openstates_id)
+            except BrokerClientError as e:
+                # Can't tell if this is genuinely new -- skip this bill this
+                # run rather than risk re-processing (and re-billing OpenAI/
+                # Pinecone) on a false "new" during a ddp-broker-py outage.
+                # The next scheduled run will catch it once the read works.
+                logger.error(
+                    "Failed to read BillVersion from ddp-broker-py -- "
+                    "skipping this bill's version check this run",
+                    webflow_id=webflow_id,
+                    bill_title=bill_title,
+                    error=str(e),
+                )
+                await self._refresh_slug_cache(webflow_id, bill_slug, latest_version)
+                return result
+        else:
+            logger.warning(
+                "OpenStates bill_data has no 'id' -- cannot check BillVersion, "
+                "treating as never-seen",
+                webflow_id=webflow_id,
+                bill_title=bill_title,
+            )
 
         if not self._is_newer_version(latest_version, cached):
-            # Update last_checked in cache
-            if cached:
-                cached["last_checked"] = datetime.utcnow().isoformat()
-                await redis_store.set_bill_version(webflow_id, cached)
+            # Keep VoteBot's webflow_id -> slug cache fresh regardless of
+            # whether the version changed -- separate concern from the
+            # version-tracking check above (see docstring).
+            await self._refresh_slug_cache(webflow_id, bill_slug, latest_version)
             return result
 
         # Newer version detected
@@ -573,21 +628,47 @@ class BillVersionSyncService:
                 error=str(e),
             )
 
-        # Update Redis version cache regardless of ingestion success.
-        # bill_slug is stored alongside the version record so VoteBot's
-        # startup reconciliation can map webflow_id -> slug without an
-        # additional Webflow API call (see services/button_cache.py).
-        version_data = {
-            "version_date": latest_version.get("date", ""),
-            "version_note": latest_version.get("note", ""),
-            "text_url": text_url,
-            "media_type": media_type,
-            "chunk_count": result["chunks_created"],
-            "last_checked": datetime.utcnow().isoformat(),
-            "last_status": "",
-            "bill_slug": bill_slug or "",
-        }
-        await redis_store.set_bill_version(webflow_id, version_data)
+        # Record this version in ddp-broker-py's BillVersion (Phase 4) --
+        # regardless of ingestion success, matching the old Redis behavior:
+        # a bill whose ingest failed still gets marked "seen" so a permanently
+        # broken document doesn't get re-fetched and re-failed forever. This
+        # is the durable "have we seen this" ledger now; Redis no longer is.
+        if bill_openstates_id:
+            try:
+                await write_bill_version(
+                    bill_openstates_id=bill_openstates_id,
+                    jurisdiction=jurisdiction_code,
+                    session_code=fields.get("session-code", ""),
+                    version_date=result["version_date"],
+                    version_note=result["version_note"],
+                    text_url=text_url,
+                    media_type=media_type,
+                    chunk_count=result["chunks_created"],
+                    pinecone_ingested=result["chunks_created"] > 0,
+                )
+            except BrokerClientError as e:
+                # Not recorded -> this version may look "new" again next run
+                # and get re-processed. Logged loudly rather than silently
+                # swallowed, but doesn't fail this run -- the actual content
+                # work above already succeeded or already recorded its own
+                # error in result["error"].
+                logger.error(
+                    "Failed to record BillVersion in ddp-broker-py -- this "
+                    "version may be re-processed next run",
+                    webflow_id=webflow_id,
+                    bill_title=bill_title,
+                    error=str(e),
+                )
+        else:
+            logger.warning(
+                "Cannot record BillVersion -- OpenStates bill_data had no 'id'",
+                webflow_id=webflow_id,
+                bill_title=bill_title,
+            )
+
+        # Keep VoteBot's webflow_id -> slug cache fresh -- separate concern
+        # from the version-tracking write above (see docstring).
+        await self._refresh_slug_cache(webflow_id, bill_slug, latest_version)
 
         # Publish cache invalidation for VoteBot's button cache, but only if
         # ingestion actually produced new chunks. Without that guard, a no-op
@@ -597,6 +678,7 @@ class BillVersionSyncService:
         # See plans/PLAN-quick-action-buttons.md (Phase 5 / Fix invalidation).
         if result.get("chunks_created", 0) > 0 and bill_slug:
             try:
+                redis_store = get_redis_store()
                 payload = json.dumps({
                     "slug": bill_slug,
                     "reason": "bill_version_change",
@@ -620,6 +702,32 @@ class BillVersionSyncService:
                 )
 
         return result
+
+    @staticmethod
+    async def _refresh_slug_cache(webflow_id: str, bill_slug: str, latest_version: dict) -> None:
+        """Keep Redis's webflow_id -> slug mapping fresh for VoteBot's
+        startup reconciliation (services/button_cache.py) -- unrelated to
+        Phase 4's version-tracking redesign above, which uses ddp-broker-py's
+        BillVersion instead of this same Redis key for its own "have we seen
+        this" check. Never raises -- a failure here shouldn't fail the
+        surrounding version check, same tolerance the old inline write had.
+        """
+        from ddp_sync.services.redis_store import get_redis_store
+
+        try:
+            redis_store = get_redis_store()
+            await redis_store.set_bill_version(webflow_id, {
+                "version_date": latest_version.get("date", ""),
+                "version_note": latest_version.get("note", ""),
+                "bill_slug": bill_slug or "",
+            })
+        except Exception as e:
+            logger.warning(
+                "Failed to refresh VoteBot slug cache",
+                webflow_id=webflow_id,
+                bill_slug=bill_slug,
+                error=str(e),
+            )
 
     async def check_and_update_bill(
         self,
