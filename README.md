@@ -47,7 +47,7 @@ DDP-Sync publishes Redis pub/sub events that other services consume. Subscribers
 |---|---|---|---|
 | `votebot:cache:invalidate` | After a successful bill text re-ingestion (`chunks_created > 0`) and `set_bill_version()` update | `{"slug": "...", "reason": "bill_version_change", "version_note": "..."}` | VoteBot's button-cache subscriber clears `votebot:button:{slug}:summary` and `votebot:button:{slug}:pros_cons`. See [PLAN-quick-action-buttons.md](https://github.com/Digital-Democracy-Project/votebot/blob/main/plans/PLAN-quick-action-buttons.md) Phase 5. |
 
-DDP-Sync also stores `bill_slug` and `chunk_count` alongside `last_checked` in the `ddp:bill_version:{webflow_id}` Redis record. `bill_slug` lets VoteBot's startup reconciliation map webflow_id → slug without an extra Webflow API call. `chunk_count` enables the daily sync to delete surplus chunks by exact ID when a new bill version produces fewer chunks than the previous one.
+**Updated 2026-07-26 (Phase 4, PR #4):** the `ddp:bill_version:{webflow_id}` Redis record is now VoteBot-cache-only — `version_date`/`version_note`/`bill_slug`, so VoteBot's startup reconciliation can map webflow_id → slug without an extra Webflow API call. It no longer carries `chunk_count`, and it's no longer what `check_and_reingest_version` checks to decide "have we seen this version" — that check, and the surplus-chunk-deletion `chunk_count` it needs from the *previous* version, now come from `ddp-broker-py`'s `BillVersion` table via `broker_client.get_latest_bill_version()`/`write_bill_version()` (`ddp-infra`'s `PLAN-bill-document-provenance.md`, Phase 4). This closes a real risk the old Redis-only design had: the Mac Studio dev and EC2 civic production `ddp-sync` instances point at genuinely separate Redis, so each could independently decide "this is a new version" — a single shared Postgres table has no second instance left to diverge against. A `ddp-broker-py` read failure skips that bill's check for the run rather than treating it as "never seen" (an outage shouldn't look like every bill just became new).
 
 ## Configuration
 
@@ -81,7 +81,7 @@ The `cms:*` token does NOT carry `assets:write` — confirmed via 2026-04-30 pro
 | `CAMS_API_TOKEN` | `""` | Bearer token for CAMS's task API (matches CAMS's own `CAMS_API_TOKEN`) |
 | `CAMS_ARTIFACTS_DIR` | `""` (must be set) | Absolute path to `ddp-agents`' `artifacts/` directory — machine-specific, not guessed |
 
-**Not yet wired into any write path** — this client dispatches and returns LegBot's answer only; there's nowhere durable to write it yet (`BillArtifact`, `ddp-infra`'s Phase 6, doesn't exist). See `ddp-infra/PLAN-bill-document-provenance.md` Phase 8 for the eventual write-path design.
+**Updated 2026-07-26 (Phase 8, PR #3):** now wired into a real write path. `pipelines/bill_artifact_generation.py` orchestrates dispatch → Pinecone ingest → a `ddp-broker-py` write (`broker_client.write_bill_artifact()`, `POST /api/bill-artifacts/`, shared-secret `ServiceTokenAuthentication` via `DDP_BROKER_API_TOKEN`) for `bill_summary`/`bill_pros_cons`. `model_version`/`prompt_version` are left null on every write — CAMS's task snapshot exposes a coarse `backend` tag, not LegBot's precise `model_used` string (tracked separately, `ddp-agents`' `PLAN-legbot.md` §14/AC15, not yet built). See `ddp-infra/PLAN-bill-document-provenance.md` Phase 8 for the full design and the production write path (still gated on `ddp-api`'s proxy + the EC2 broker's WireGuard peer — this only runs from the local Mac Studio instance today).
 
 ## API
 
