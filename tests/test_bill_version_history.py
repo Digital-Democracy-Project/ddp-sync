@@ -179,23 +179,28 @@ async def test_history_returns_zero_on_empty_content():
 # ---------------------------------------------------------------------------
 
 async def test_changelog_generated_and_ingested():
-    """Happy path: old URL downloadable, OpenAI returns content, changelog ingested."""
+    """Happy path: old URL downloadable, LegBot returns a structured answer, changelog ingested."""
     svc = _make_service()
 
     old_doc = _make_doc_source("Old bill text " * 50)
     mock_pipeline = AsyncMock()
     mock_pipeline.ingest_document = AsyncMock(return_value=_make_ingest_result(1))
 
-    mock_openai_response = MagicMock()
-    mock_openai_response.choices[0].message.content = "## What Changed\n**From:** Introduced\n**To:** Engrossed\n\n### Summary\nSections were added."
-
-    mock_client = AsyncMock()
-    mock_client.chat.completions.create = AsyncMock(return_value=mock_openai_response)
+    legbot_answer = {
+        "sections_added": ["A new penalty provision"],
+        "sections_removed": [],
+        "sections_modified": ["The definitions section"],
+        "policy_implications": "Tightens enforcement.",
+        "insufficient_information": False,
+    }
 
     with (
         patch("ddp_sync.ingestion.sources.webflow.WebflowSource") as MockWS,
         patch("ddp_sync.ingestion.pipeline.IngestionPipeline", return_value=mock_pipeline),
-        patch("openai.AsyncOpenAI", return_value=mock_client),
+        patch(
+            "ddp_sync.services.legbot_client.dispatch_bill_changelog",
+            new=AsyncMock(return_value={"answer": legbot_answer, "backend": "claude"}),
+        ) as mock_dispatch,
     ):
         MockWS.return_value._process_bill_pdf = AsyncMock(return_value=old_doc)
 
@@ -218,11 +223,16 @@ async def test_changelog_generated_and_ingested():
     assert chunks == 1
     assert skipped is False
     assert reason == ""
+    mock_dispatch.assert_awaited_once()
+    dispatch_kwargs = mock_dispatch.await_args.kwargs
+    assert dispatch_kwargs["old_bill_source"] == "https://example.gov/old.pdf"
+    assert "Old bill text" in dispatch_kwargs["diff_source"] or "New bill text" in dispatch_kwargs["diff_source"]
     call_kwargs = mock_pipeline.ingest_document.call_args.kwargs
     assert call_kwargs["metadata"].document_id == "bill-changelog-webflow123-2026-05-20"
     assert call_kwargs["metadata"].document_type == "bill-changelog"
     assert call_kwargs["metadata"].extra["version_from_note"] == "Introduced"
     assert call_kwargs["metadata"].extra["version_to_note"] == "Engrossed"
+    assert "A new penalty provision" in mock_pipeline.ingest_document.call_args.kwargs["content"]
 
 
 async def test_changelog_skipped_when_no_old_url():
@@ -273,19 +283,21 @@ async def test_changelog_skipped_on_stale_url():
     assert "old_url_fetch_failed" in reason
 
 
-async def test_changelog_skipped_on_openai_error():
-    """OpenAI raises → skipped gracefully, no exception propagated."""
+async def test_changelog_skipped_on_legbot_dispatch_error():
+    """LegBot dispatch raises → skipped gracefully, no exception propagated."""
+    from ddp_sync.services.legbot_client import LegBotDispatchError
+
     svc = _make_service()
     old_doc = _make_doc_source("Old bill text " * 50)
 
     with (
         patch("ddp_sync.ingestion.sources.webflow.WebflowSource") as MockWS,
-        patch("openai.AsyncOpenAI") as MockOAI,
+        patch(
+            "ddp_sync.services.legbot_client.dispatch_bill_changelog",
+            new=AsyncMock(side_effect=LegBotDispatchError("CAMS unreachable")),
+        ),
     ):
         MockWS.return_value._process_bill_pdf = AsyncMock(return_value=old_doc)
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(side_effect=Exception("API unavailable"))
-        MockOAI.return_value = mock_client
 
         chunks, skipped, reason = await svc._generate_and_ingest_changelog(
             webflow_id="webflow123",
@@ -305,7 +317,81 @@ async def test_changelog_skipped_on_openai_error():
 
     assert chunks == 0
     assert skipped is True
-    assert "openai_error" in reason
+    assert "legbot_dispatch_failed" in reason
+
+
+async def test_changelog_skipped_when_legbot_reports_insufficient_information():
+    """LegBot's own graceful skip (e.g. no_prior_version_archived) is passed through."""
+    svc = _make_service()
+    old_doc = _make_doc_source("Old bill text " * 50)
+
+    legbot_answer = {"insufficient_information": True, "reason": "diff_unavailable"}
+
+    with (
+        patch("ddp_sync.ingestion.sources.webflow.WebflowSource") as MockWS,
+        patch(
+            "ddp_sync.services.legbot_client.dispatch_bill_changelog",
+            new=AsyncMock(return_value={"answer": legbot_answer, "backend": None}),
+        ),
+    ):
+        MockWS.return_value._process_bill_pdf = AsyncMock(return_value=old_doc)
+
+        chunks, skipped, reason = await svc._generate_and_ingest_changelog(
+            webflow_id="webflow123",
+            bill_title="Test Bill",
+            bill_slug="test-bill",
+            jurisdiction="US",
+            old_version={
+                "text_url": "https://example.gov/old.pdf",
+                "media_type": "application/pdf",
+                "version_date": "2026-03-01",
+                "version_note": "Introduced",
+            },
+            new_version_date="2026-05-20",
+            new_version_note="Engrossed",
+            new_content="New bill text " * 50,
+        )
+
+    assert chunks == 0
+    assert skipped is True
+    assert reason == "diff_unavailable"
+
+
+async def test_changelog_skipped_when_diff_is_empty():
+    """Old and new content are identical → no diff to hand LegBot, skip before dispatch."""
+    svc = _make_service()
+    identical_text = "Old bill text " * 50
+    old_doc = _make_doc_source(identical_text)
+
+    with (
+        patch("ddp_sync.ingestion.sources.webflow.WebflowSource") as MockWS,
+        patch(
+            "ddp_sync.services.legbot_client.dispatch_bill_changelog",
+            new=AsyncMock(),
+        ) as mock_dispatch,
+    ):
+        MockWS.return_value._process_bill_pdf = AsyncMock(return_value=old_doc)
+
+        chunks, skipped, reason = await svc._generate_and_ingest_changelog(
+            webflow_id="webflow123",
+            bill_title="Test Bill",
+            bill_slug="test-bill",
+            jurisdiction="US",
+            old_version={
+                "text_url": "https://example.gov/old.pdf",
+                "media_type": "application/pdf",
+                "version_date": "2026-03-01",
+                "version_note": "Introduced",
+            },
+            new_version_date="2026-05-20",
+            new_version_note="Engrossed",
+            new_content=identical_text,
+        )
+
+    assert chunks == 0
+    assert skipped is True
+    assert reason == "no_diff_produced"
+    mock_dispatch.assert_not_awaited()
 
 
 async def test_changelog_skipped_when_old_content_too_short():
