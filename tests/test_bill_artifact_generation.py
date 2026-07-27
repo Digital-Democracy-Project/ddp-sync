@@ -25,7 +25,7 @@ _COMMON_KWARGS = dict(
 async def test_rejects_unsupported_artifact_type():
     with pytest.raises(ValueError, match="Unsupported artifact_type"):
         await generate_and_store_bill_artifact(
-            **_COMMON_KWARGS, artifact_type="bill_impact_analysis"
+            **_COMMON_KWARGS, artifact_type="qa_report"
         )
 
 
@@ -159,6 +159,43 @@ async def test_org_types_happy_path_writes_broker_and_pinecone(artifact_type, qu
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
         "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}]
+    }
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_impact_analysis_happy_path_writes_broker_and_pinecone():
+    dispatch_result = {
+        "answer": {
+            "affected_parties": [{"party": "small businesses", "effect": "new licensing fee"}],
+            "fiscal_or_programmatic_effects": "Appropriates $2M for enforcement.",
+            "effective_date": "2027-01-01",
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 6, "created": True}),
+    ) as mock_write:
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_impact_analysis"
+        )
+
+    assert result == {"id": 6, "created": True}
+    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "impact_analysis")
+    write_kwargs = mock_write.await_args.kwargs
+    assert json.loads(write_kwargs["content"]) == {
+        "affected_parties": [{"party": "small businesses", "effect": "new licensing fee"}],
+        "fiscal_or_programmatic_effects": "Appropriates $2M for enforcement.",
+        "effective_date": "2027-01-01",
     }
     assert write_kwargs["status"] == "complete"
 

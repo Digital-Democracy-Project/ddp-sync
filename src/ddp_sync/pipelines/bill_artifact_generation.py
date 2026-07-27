@@ -8,11 +8,10 @@ both ddp-broker-py AND Pinecone — both writes are required for the job to
 count as done, not ddp-broker-py with Pinecone as an optional follow-up."
 
 bill_summary/bill_pros_cons/bill_vote_yes_frame/bill_vote_no_frame/
-bill_supporting_orgs/bill_opposing_orgs are wired here — bill_changelog is
-still gated on LegBot's AC11a diff-format validation (and has its own
-dispatch path, dispatch_bill_changelog, not this one), and
-bill_impact_analysis has no settled output schema yet (see the plan's
-Phase 8 section).
+bill_supporting_orgs/bill_opposing_orgs/bill_impact_analysis are wired
+here — bill_changelog is still gated on LegBot's AC11a diff-format
+validation (and has its own dispatch path, dispatch_bill_changelog, not
+this one).
 
 Scope note: this module generates and stores ONE artifact for a caller-
 supplied bill version. It does NOT implement Phase 8's step 1 ("find bill
@@ -42,6 +41,7 @@ _ARTIFACT_TYPE_TO_QUESTION_TYPE = {
     "bill_vote_no_frame": "vote_no_frame",
     "bill_supporting_orgs": "supporting_orgs",
     "bill_opposing_orgs": "opposing_orgs",
+    "bill_impact_analysis": "impact_analysis",
 }
 
 # artifact_types whose answer is already plain text under an answer["text"]
@@ -57,10 +57,10 @@ def _content_from_answer(artifact_type: str, answer: dict) -> str:
     """Flatten LegBot's structured answer into BillArtifact.content.
 
     bill_summary/bill_vote_yes_frame/bill_vote_no_frame's answer is already
-    plain text. pros_cons/supporting_orgs/opposing_orgs' answers are
-    structured — stored as a JSON string rather than inventing a Markdown
-    format the plan doesn't specify; a consumer rendering these artifact
-    types should json.loads() the content back.
+    plain text. pros_cons/supporting_orgs/opposing_orgs/bill_impact_analysis'
+    answers are structured — stored as a JSON string rather than inventing a
+    Markdown format the plan doesn't specify; a consumer rendering these
+    artifact types should json.loads() the content back.
     """
     if artifact_type in _TEXT_ANSWER_ARTIFACT_TYPES:
         return answer["text"]
@@ -68,6 +68,12 @@ def _content_from_answer(artifact_type: str, answer: dict) -> str:
         return json.dumps({"pros": answer["pros"], "cons": answer["cons"]})
     if artifact_type in _ORG_TYPES_ANSWER_ARTIFACT_TYPES:
         return json.dumps({"org_types": answer["org_types"]})
+    if artifact_type == "bill_impact_analysis":
+        return json.dumps({
+            "affected_parties": answer["affected_parties"],
+            "fiscal_or_programmatic_effects": answer["fiscal_or_programmatic_effects"],
+            "effective_date": answer["effective_date"],
+        })
     raise ValueError(f"Unsupported artifact_type for content extraction: {artifact_type}")
 
 
