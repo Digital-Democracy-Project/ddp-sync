@@ -97,6 +97,21 @@ class SyncSettings:
     ddp_broker_api_base: str = "http://localhost:8080"
     ddp_broker_api_token: str = ""
 
+    # Local api-v3 archived-text lookup (ddp-infra PLAN-bill-document-
+    # provenance.md, "Real gap found 2026-07-29/30" — OPEN-13). A small,
+    # dedicated read against ddp-open-states' own local api-v3 instance
+    # (docker-compose.ddp.yml maps its container to host port 8002 on the
+    # Mac Studio, same box ddp-sync's LegBot dispatch already runs on — see
+    # cams_base_url above), NOT the same thing as openstates_api_key/the
+    # public v3.openstates.org API bill_sync.py calls, and NOT the site-wide
+    # OPENSTATES_API_BASE cutover PLAN-local-openstates-migration.md scopes.
+    # No default key — api-v3's apikey_auth has no dev bypass; must be set
+    # (the local dev stack's seeded Profile key is the well-known
+    # 00000000-0000-0000-0000-000000000001 sentinel used elsewhere in this
+    # project, e.g. ddp-open-states/quality_check.py, start-os-api.sh).
+    local_openstates_api_base: str = "http://localhost:8002"
+    local_openstates_api_key: str = ""
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -175,6 +190,8 @@ def _load_from_env() -> dict:
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
         "ddp_broker_api_base": os.getenv("DDP_BROKER_API_BASE", "http://localhost:8080"),
         "ddp_broker_api_token": os.getenv("DDP_BROKER_API_TOKEN", ""),
+        "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
+        "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
     }
 
 

@@ -17,6 +17,20 @@ Scope note: this module generates and stores ONE artifact for a caller-
 supplied bill version. It does NOT implement Phase 8's step 1 ("find bill
 versions that don't have the artifacts they need yet") — that requires
 BillVersion rows to actually exist, which is Phase 4's job, not yet built.
+
+bill_source resolution (added 2026-07-30, ddp-infra's "Real gap found
+2026-07-29/30" design): before dispatching to LegBot, check whether
+ddp-open-states already has archived text for this bill's latest version
+(local_openstates_client.get_archived_bill_text, OPEN-13) and use it
+directly if present -- skipping the live-fetch-and-re-extract LegBot would
+otherwise do for a document ddp-open-states already extracted once. Falls
+back to the caller-supplied bill_source (a live URL) unchanged when no
+archived text is available, exactly as before this change. Scoped to the
+7 single-version artifact types this module already handles -- bill_source
+here is always resolved for a bill's *current* version, so this never
+applies to bill_changelog (dispatch_bill_changelog, bill_version.py's own
+path), which needs the *prior* version's text specifically and isn't
+touched by this change.
 """
 
 from __future__ import annotations
@@ -30,6 +44,7 @@ from ddp_sync.ingestion.metadata import DocumentMetadata
 from ddp_sync.ingestion.pipeline import IngestionPipeline
 from ddp_sync.services.broker_client import write_bill_artifact
 from ddp_sync.services.legbot_client import dispatch_bill_question
+from ddp_sync.services.local_openstates_client import get_archived_bill_text
 
 logger = structlog.get_logger()
 
@@ -77,6 +92,26 @@ def _content_from_answer(artifact_type: str, answer: dict) -> str:
     raise ValueError(f"Unsupported artifact_type for content extraction: {artifact_type}")
 
 
+async def _resolve_bill_source(bill_openstates_id: str, live_url_fallback: str) -> str:
+    """Prefer ddp-open-states' already-archived text over a live-fetch URL.
+
+    Checks the local api-v3 instance for already-archived, already-extracted
+    text for this bill's latest version (OPEN-13). If present, LegBot is
+    handed that text directly instead of a URL it would otherwise have to
+    download and extract itself. Falls back to live_url_fallback --
+    ddp-sync's existing behavior -- when no archived text is available,
+    exactly as if this function didn't exist.
+    """
+    archived_text = await get_archived_bill_text(bill_openstates_id)
+    if archived_text:
+        logger.info(
+            "Using ddp-open-states' archived bill text -- skipping LegBot live fetch",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return archived_text
+    return live_url_fallback
+
+
 async def generate_and_store_bill_artifact(
     *,
     bill_openstates_id: str,
@@ -110,7 +145,8 @@ async def generate_and_store_bill_artifact(
         raise ValueError(f"Unsupported artifact_type for Phase 8 dispatch: {artifact_type}")
 
     question_type = _ARTIFACT_TYPE_TO_QUESTION_TYPE[artifact_type]
-    dispatch_result = await dispatch_bill_question(bill_source, question_type)
+    resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
+    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
 
