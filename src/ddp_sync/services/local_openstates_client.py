@@ -28,11 +28,16 @@ bill's *latest* version, and only on this single-bill detail endpoint
 (never the paginated /bills list/search endpoint). That's sufficient for
 bill_summary/bill_pros_cons/bill_impact_analysis/bill_vote_yes_frame/
 bill_vote_no_frame/bill_supporting_orgs/bill_opposing_orgs, which only need
-a bill's current text — it does NOT cover bill_changelog, which needs the
-*prior* version's text specifically (a further, not-yet-scoped extension).
-Do not call this for changelog generation; bill_version.py's
-_generate_and_ingest_changelog has its own prior-version live-fetch path,
-untouched by this module.
+a bill's current text — use get_archived_bill_text for those.
+
+bill_changelog needs the *prior* version's text plus a diff, not just
+get_archived_bill_text's latest-only raw_text — use
+get_archived_changelog_inputs below instead, which reads api-v3's
+extended response (ddp-infra "excellent news" fix, 2026-07-30):
+diff_from_previous_version is precomputed and permanently stored by
+openstates-core's archive_bill_versions() at scrape time (2026-07-20), and
+api-v3 now surfaces it, plus the immediately-previous version's own
+raw_text, on the same single-bill detail endpoint.
 """
 
 from __future__ import annotations
@@ -117,17 +122,107 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
         )
         return None
 
-    # api-v3's own postprocess_includes attaches raw_text to at most one
-    # link (the latest version's preferred PDF-over-HTML link) -- scanning
-    # every version/link for the first non-empty raw_text is equivalent to
-    # re-deriving "latest" ourselves, and simpler.
-    for version in data.get("versions") or []:
-        for link in version.get("links") or []:
-            raw_text = link.get("raw_text")
-            if raw_text:
-                return raw_text
+    # api-v3's postprocess_includes attaches raw_text to both the latest version's
+    # preferred link AND (since the bill_changelog fix, 2026-07-30) the version
+    # immediately before it -- so this can no longer just return the first non-empty
+    # raw_text found across any version, that risks returning the *previous* version's
+    # text instead of latest's. Explicitly pick the latest version by (date, note),
+    # same ordering convention used everywhere else in this plan.
+    versions = data.get("versions") or []
+    if not versions:
+        return None
+    latest = max(versions, key=lambda v: (v.get("date", ""), v.get("note", "")))
+    for link in latest.get("links") or []:
+        raw_text = link.get("raw_text")
+        if raw_text:
+            return raw_text
 
     return None
+
+
+async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
+    """Look up already-archived old_bill_source + diff_source for bill_changelog, from the
+    local api-v3 instance (ddp-open-states' Phase 1 permanent archive).
+
+    Reads the same single-bill detail endpoint get_archived_bill_text does, but pulls the two
+    fields bill_changelog specifically needs instead of just latest's raw_text:
+    - old_bill_source: the version immediately before latest's own raw_text.
+    - diff_source: latest's diff_from_previous_version -- a difflib.unified_diff() of latest's
+      text against that same immediately-previous version's text, precomputed and permanently
+      stored by openstates-core's archive_bill_versions() at scrape time (2026-07-20), not
+      re-derived here.
+
+    Args:
+        bill_openstates_id: bare UUID (no "ocd-bill/" prefix), same convention as
+            get_archived_bill_text.
+
+    Returns:
+        {"old_bill_source": str, "diff_source": str} if both are archived and non-empty, else
+        None -- covering every "not available" case identically (fewer than two versions,
+        latest not archived, previous not archived, no diff computed yet e.g. previous was the
+        first version ever archived, local api-v3 unreachable/rejecting/non-JSON, or the bill
+        not found at all). Deliberately never raises, same posture as get_archived_bill_text:
+        this is a pre-check for an optimization, not a required read -- any failure here must
+        fall back to bill_version.py's existing live-refetch-and-diff path exactly as if this
+        function didn't exist, never abort changelog generation.
+    """
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return None
+
+    params: dict[str, str] = {"include": "versions"}
+    if settings.local_openstates_api_key:
+        params["apikey"] = settings.local_openstates_api_key
+
+    url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, params=params)
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Local api-v3 unreachable -- falling back to live-refetch changelog inputs",
+            bill_openstates_id=bill_openstates_id,
+            error=str(exc),
+        )
+        return None
+
+    if resp.status_code >= 400:
+        # Covers 404 (bill not in the local archive at all, the common case today) and any
+        # other rejection identically -- both fall back the same way.
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "Local api-v3 returned a non-JSON response -- falling back to live-refetch "
+            "changelog inputs",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return None
+
+    versions = data.get("versions") or []
+    if len(versions) < 2:
+        return None
+
+    ordered = sorted(versions, key=lambda v: (v.get("date", ""), v.get("note", "")))
+    latest, previous = ordered[-1], ordered[-2]
+
+    diff_source = latest.get("diff_from_previous_version")
+    if not diff_source:
+        return None
+
+    old_bill_source = None
+    for link in previous.get("links") or []:
+        raw_text = link.get("raw_text")
+        if raw_text:
+            old_bill_source = raw_text
+            break
+    if not old_bill_source:
+        return None
+
+    return {"old_bill_source": old_bill_source, "diff_source": diff_source}
 
 
 async def list_current_session_bill_candidates(
