@@ -309,7 +309,7 @@ votebot_eval:
 # dispatch (compute cost) plus real broker writes, so it should stay off
 # until the rest of Phase 0/1 is live. Flip to true once ready.
 concept_statement_dispatch:
-  enabled: false
+  enabled: true
   frequency: weekly
   sync_day: sunday
   sync_time_utc: "11:00"      # after people_refresh (10:00), before votebot_eval (12:00)
