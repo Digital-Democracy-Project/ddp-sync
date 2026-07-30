@@ -1,5 +1,6 @@
 """Reads/writes bill data in ddp-broker-py — ddp-infra's
-PLAN-bill-document-provenance.md Phases 4 and 8.
+PLAN-bill-document-provenance.md Phases 4 and 8, and
+PLAN-bill-concept-polling.md Phase 0.
 
 - write_bill_artifact: the "write to ddp-broker-py" half of Phase 8's step 4;
   see ddp_sync.pipelines.bill_artifact_generation for the other half, the
@@ -7,11 +8,16 @@ PLAN-bill-document-provenance.md Phases 4 and 8.
 - get_latest_bill_version / write_bill_version: the read/write pair Phase 4's
   Redis-dropping redesign uses instead of Redis for "have we seen this bill
   version before."
+- get_concept_statement_set / create_concept_statement_set: the read/write
+  pair for ConceptStatementSet (PLAN-bill-concept-polling.md §0.3, built in
+  ddp-broker-py PR #247) — see ddp_sync.pipelines.concept_statement_dispatch
+  for the caller.
 
 Goes through ddp-broker-py's HTTP API rather than a direct DB connection —
-ddp-broker-py owns BillVersion/BillArtifact (Phase 1/6); this is a writer,
-not a second owner of that data, matching the plan's Phase 9 note preferring
-the broker API over a direct RDS connection for exactly this kind of write.
+ddp-broker-py owns BillVersion/BillArtifact/ConceptStatementSet; this is a
+writer, not a second owner of that data, matching the plan's Phase 9 note
+preferring the broker API over a direct RDS connection for exactly this
+kind of write.
 """
 
 from __future__ import annotations
@@ -236,5 +242,137 @@ async def write_bill_version(
         version_note=version_note,
         version_id=result.get("id"),
         created=result.get("created"),
+    )
+    return result
+
+
+async def get_concept_statement_set(
+    *,
+    gov_id: str,
+    jurisdiction_iso2: str,
+    session_code: str,
+) -> dict | None:
+    """Read the current *published* ConceptStatementSet for a bill, if any
+    (ddp-infra PLAN-bill-concept-polling.md §1.1's public read endpoint,
+    GET /api/concept-statements/ — unauthenticated, resolves
+    ConceptStatementSet.objects.current(...)).
+
+    Returns:
+        None when no *published* set exists yet for this bill identity.
+        This does NOT mean "never dispatched" — a set can also exist in
+        `pending` or `rejected` status, neither of which this endpoint
+        ever surfaces (§0.3's public-read rule: only published sets are
+        ever returned publicly). See
+        ddp_sync.pipelines.concept_statement_dispatch's own docstring for
+        what that means for the batch job's dedup logic. Otherwise, the
+        resolved set's fields as ddp-broker-py's API reports them
+        (including its own `id`, `statements`, vote tallies, etc).
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request or was
+            unreachable — a real failure, distinct from "not found."
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot read ConceptStatementSet."
+        )
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{settings.ddp_broker_api_base}/api/concept-statements/",
+                params={
+                    "gov_id": gov_id,
+                    "jurisdiction": jurisdiction_iso2,
+                    "session": session_code,
+                },
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the ConceptStatementSet read "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    if not result.pop("found", False):
+        return None
+    return result
+
+
+async def create_concept_statement_set(
+    *,
+    gov_id: str,
+    jurisdiction_iso2: str,
+    session_code: str,
+    statements: list[str],
+    source_document_url: str = "",
+    model_name: str | None = None,
+) -> dict:
+    """Create a new ConceptStatementSet row (ddp-infra
+    PLAN-bill-concept-polling.md §0.3/§0.4) — POST
+    /api/concept-statement-sets/, authenticated the same way
+    write_bill_artifact already is (Bearer ddp_broker_api_token).
+
+    Unlike write_bill_artifact, this never upserts. ConceptStatementSet is
+    immutable-once-created by design (§0.3: "regeneration creates a new
+    row, it never edits an existing one") — every call to this function
+    creates a brand-new row, always landing in `status="pending"`
+    (ddp-broker-py's own default), regardless of whether a set already
+    exists for this bill identity. Whether a new row is actually warranted
+    is the *caller's* decision (see
+    ddp_sync.pipelines.concept_statement_dispatch's dedup note) — this
+    function has no opinion and performs no existence check of its own.
+
+    Returns:
+        The created row as ddp-broker-py's API reports it, e.g.
+        {"id": 12, "gov_id": ..., "status": "pending", "generated_at": ...}.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the write or was
+            unreachable.
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot write ConceptStatementSet."
+        )
+
+    payload = {
+        "gov_id": gov_id,
+        "jurisdiction_iso2": jurisdiction_iso2,
+        "session_code": session_code,
+        "statements": statements,
+        "source_document_url": source_document_url,
+        "model_name": model_name,
+    }
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{settings.ddp_broker_api_base}/api/concept-statement-sets/",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the ConceptStatementSet write "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    logger.info(
+        "ConceptStatementSet written",
+        gov_id=gov_id,
+        jurisdiction_iso2=jurisdiction_iso2,
+        session_code=session_code,
+        set_id=result.get("id"),
     )
     return result
