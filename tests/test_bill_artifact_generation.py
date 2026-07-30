@@ -21,6 +21,21 @@ _COMMON_KWARGS = dict(
 )
 
 
+@pytest.fixture(autouse=True)
+def no_archived_text_by_default():
+    """Every test in this file gets the "not archived" fallback path by
+    default (get_archived_bill_text returns None), matching what today's
+    behavior looks like for every non-FL bill / not-yet-archived FL bill --
+    the common case. Tests exercising the archived-text-found path override
+    this explicitly. Never makes a real HTTP call either way.
+    """
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_bill_text",
+        new=AsyncMock(return_value=None),
+    ) as mock_lookup:
+        yield mock_lookup
+
+
 @pytest.mark.asyncio
 async def test_rejects_unsupported_artifact_type():
     with pytest.raises(ValueError, match="Unsupported artifact_type"):
@@ -225,3 +240,72 @@ async def test_insufficient_information_is_recorded_as_a_failed_artifact_no_pine
     assert write_kwargs["status"] == "failed"
     assert write_kwargs["failure_stage"] == "generation"
     assert write_kwargs["failure_reason"] == "insufficient_information"
+
+
+# ---------------------------------------------------------------------------
+# bill_source resolution (ddp-infra "Real gap found 2026-07-29/30" -- prefer
+# ddp-open-states' archived text over a live-fetch URL, OPEN-13)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_by_default):
+    """When the local api-v3 instance already has archived text for this
+    bill's latest version, LegBot is dispatched with that text directly --
+    never the live URL bill_source would otherwise have been.
+    """
+    no_archived_text_by_default.return_value = "ARCHIVED FULL BILL TEXT"
+    dispatch_result = {
+        "answer": {"text": "A plain-language summary.", "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 7, "created": True}),
+    ):
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert result == {"id": 7, "created": True}
+    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "summary_500char")
+
+
+@pytest.mark.asyncio
+async def test_archived_text_not_found_falls_back_to_live_url_bill_source(
+    no_archived_text_by_default,
+):
+    """When the local api-v3 instance has no archived text (the common case
+    today -- a non-FL bill, or an FL bill not yet archived), LegBot is
+    dispatched with the caller-supplied live URL exactly as before this
+    change -- fallback behavior, not a regression.
+    """
+    dispatch_result = {
+        "answer": {"text": "A plain-language summary.", "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 8, "created": True}),
+    ):
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert result == {"id": 8, "created": True}
+    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "summary_500char")

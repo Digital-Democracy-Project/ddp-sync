@@ -235,6 +235,74 @@ async def test_changelog_generated_and_ingested():
     assert "A new penalty provision" in mock_pipeline.ingest_document.call_args.kwargs["content"]
 
 
+async def test_changelog_never_calls_the_archived_text_lookup():
+    """Regression guard for ddp-infra's "Real gap found 2026-07-29/30" fix:
+    that change only touches bill_source resolution for the 7 single-version
+    artifact types in pipelines/bill_artifact_generation.py. bill_changelog
+    needs the *prior* version's text specifically -- OPEN-13's archived
+    raw_text is latest-version-only, so this path must keep re-downloading
+    old_url exactly as before, and must never call the new archived-text
+    lookup at all (patched here to raise if it is, rather than just
+    asserting not-called, so a stray import/call fails loudly)."""
+    svc = _make_service()
+
+    old_doc = _make_doc_source("Old bill text " * 50)
+    mock_pipeline = AsyncMock()
+    mock_pipeline.ingest_document = AsyncMock(return_value=_make_ingest_result(1))
+
+    legbot_answer = {
+        "sections_added": [],
+        "sections_removed": [],
+        "sections_modified": ["The definitions section"],
+        "policy_implications": "Tightens enforcement.",
+        "insufficient_information": False,
+    }
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError(
+            "_generate_and_ingest_changelog must never call the archived-text "
+            "lookup -- it needs the prior version's text, which OPEN-13 "
+            "doesn't expose."
+        )
+
+    with (
+        patch("ddp_sync.ingestion.sources.webflow.WebflowSource") as MockWS,
+        patch("ddp_sync.ingestion.pipeline.IngestionPipeline", return_value=mock_pipeline),
+        patch(
+            "ddp_sync.services.legbot_client.dispatch_bill_changelog",
+            new=AsyncMock(return_value={"answer": legbot_answer, "backend": "claude"}),
+        ) as mock_dispatch,
+        patch(
+            "ddp_sync.services.local_openstates_client.get_archived_bill_text",
+            side_effect=_fail_if_called,
+        ) as mock_archive_lookup,
+    ):
+        MockWS.return_value._process_bill_pdf = AsyncMock(return_value=old_doc)
+
+        chunks, skipped, _reason = await svc._generate_and_ingest_changelog(
+            webflow_id="webflow123",
+            bill_title="Test Bill",
+            bill_slug="test-bill",
+            jurisdiction="US",
+            old_version={
+                "text_url": "https://example.gov/old.pdf",
+                "media_type": "application/pdf",
+                "version_date": "2026-03-01",
+                "version_note": "Introduced",
+            },
+            new_version_date="2026-05-20",
+            new_version_note="Engrossed",
+            new_content="New bill text " * 50,
+        )
+
+    assert chunks == 1
+    assert skipped is False
+    mock_archive_lookup.assert_not_called()
+    dispatch_kwargs = mock_dispatch.await_args.kwargs
+    # Old text is still resolved via the live re-download path, unchanged.
+    assert dispatch_kwargs["old_bill_source"] == "https://example.gov/old.pdf"
+
+
 async def test_changelog_skipped_when_no_old_url():
     """old_version has no text_url → skip immediately."""
     svc = _make_service()
