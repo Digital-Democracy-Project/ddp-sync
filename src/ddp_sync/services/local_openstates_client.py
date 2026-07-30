@@ -128,3 +128,134 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
                 return raw_text
 
     return None
+
+
+async def list_current_session_bill_candidates(
+    jurisdiction_iso2: str,
+    *,
+    limit: int,
+) -> list[dict]:
+    """List bill identities for a jurisdiction's current session, read from
+    the local api-v3 instance's paginated bill list -- the bill-enumeration
+    half of ddp-infra PLAN-bill-concept-polling.md §0.4's scheduled batch
+    dispatch job (get_archived_bill_text above is that same job's per-bill
+    *text* lookup, called once per candidate this function returns).
+
+    Deliberately reads the *local*, unthrottled api-v3 instance (same
+    host/auth this module already needs for get_archived_bill_text) rather
+    than the live, rate-limited v3.openstates.org API bill_sync.py's
+    curated Webflow-bill pipeline hits -- this job has no Webflow-curated
+    bill list to iterate in the first place (that's the whole point of
+    building this on /explore's reach, not BillArtifact's), and there's no
+    reason to spend OpenStates' 30k-calls/day quota enumerating identities
+    a dependency this file already has can answer for free.
+
+    "Current session" is resolved via OpenStatesSource.
+    get_current_session_identifier() -- the same session-resolution call
+    bill_sync.py's own is_current_session_async() already makes -- not a
+    new session-detection mechanism.
+
+    Args:
+        jurisdiction_iso2: two-letter state code (e.g. "fl", "wa").
+        limit: maximum number of candidates to return (the batch job's own
+            max_bills_per_run cap, or whatever remains of it).
+
+    Returns:
+        A list of dicts, each {"gov_id", "session_code",
+        "live_url_fallback"} -- gov_id is the bare UUID (ocd-bill/ prefix
+        stripped, matching get_archived_bill_text's own convention);
+        live_url_fallback is the bill's first recorded source URL, handed
+        to dispatch_and_store_concept_statements as the live-fetch
+        fallback bill_source (used only when get_archived_bill_text finds
+        nothing archived for this same gov_id).
+
+        Deliberately does NOT request raw_text here -- that's the
+        paginated /bills list's own documented gap (OPEN-13/BROKER-8, see
+        get_archived_bill_text's docstring); resolving each candidate's
+        actual bill_source (archived vs. live) stays get_archived_bill_text's
+        job, not this one's.
+
+        Never raises: any failure (no current session resolvable, local
+        api-v3 unreachable/rejecting/non-JSON) returns an empty list, same
+        never-abort-the-run posture as get_archived_bill_text -- a listing
+        failure for one jurisdiction should skip that jurisdiction for this
+        run, not crash the whole batch.
+    """
+    if limit <= 0:
+        return []
+
+    # Imported locally to avoid a module-level import cycle risk (this
+    # module is imported by services/*, ingestion/sources/openstates is
+    # imported by pipelines/* -- both are leaves today, but this keeps the
+    # dependency direction local and explicit rather than assumed).
+    from ddp_sync.ingestion.sources.openstates import OpenStatesSource
+
+    session_code = await OpenStatesSource().get_current_session_identifier(jurisdiction_iso2)
+    if not session_code:
+        logger.warning(
+            "No current session identifier resolved -- skipping jurisdiction "
+            "for this concept-statement batch run",
+            jurisdiction_iso2=jurisdiction_iso2,
+        )
+        return []
+
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return []
+
+    params: dict[str, str | int] = {
+        "jurisdiction": jurisdiction_iso2.lower(),
+        "session": session_code,
+        "per_page": limit,
+    }
+    if settings.local_openstates_api_key:
+        params["apikey"] = settings.local_openstates_api_key
+
+    url = f"{settings.local_openstates_api_base}/bills"
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, params=params)
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Local api-v3 unreachable -- skipping jurisdiction for this "
+            "concept-statement batch run",
+            jurisdiction_iso2=jurisdiction_iso2,
+            error=str(exc),
+        )
+        return []
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "Local api-v3 rejected the bill-list read -- skipping "
+            "jurisdiction for this concept-statement batch run",
+            jurisdiction_iso2=jurisdiction_iso2,
+            status_code=resp.status_code,
+        )
+        return []
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "Local api-v3 returned a non-JSON bill-list response -- "
+            "skipping jurisdiction for this concept-statement batch run",
+            jurisdiction_iso2=jurisdiction_iso2,
+        )
+        return []
+
+    candidates = []
+    for bill in data.get("results", []) or []:
+        raw_id = bill.get("id", "") or ""
+        gov_id = raw_id.rsplit("/", 1)[-1] if raw_id else ""
+        if not gov_id:
+            continue
+        sources = bill.get("sources") or []
+        live_url_fallback = sources[0].get("url", "") if sources else ""
+        candidates.append({
+            "gov_id": gov_id,
+            "session_code": session_code,
+            "live_url_fallback": live_url_fallback,
+        })
+
+    return candidates[:limit]

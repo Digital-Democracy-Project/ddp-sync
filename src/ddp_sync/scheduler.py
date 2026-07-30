@@ -270,6 +270,10 @@ class UpdateScheduler:
         # --- OpenStates jurisdiction scrapes ---
         self._register_openstates_scrape_jobs()
 
+        # --- Concept-statement dispatch batch job (ddp-infra
+        # PLAN-bill-concept-polling.md §0.4) ---
+        self._register_concept_statement_dispatch_job()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -612,6 +616,102 @@ class UpdateScheduler:
                 "openstates_people_refresh: registered",
                 sync_day=p_day,
                 sync_time=p_time,
+            )
+
+    def _register_concept_statement_dispatch_job(self) -> None:
+        """Register the concept-statement dispatch batch job (ddp-infra
+        PLAN-bill-concept-polling.md §0.4; Gating Question 3 resolved
+        2026-07-30 by Ramon: a scheduled batch job, not on-demand).
+
+        - Reads YAML block ``concept_statement_dispatch`` from
+          sync_schedule.yaml. Mirrors ``legislator_bio_sync``'s own
+          ``enabled``/``frequency``/``sync_day``/``sync_time_utc`` shape
+          exactly, including its round-17 stale-job-id cleanup (toggling
+          frequency daily<->weekly across a config reload must not leave
+          both jobs registered).
+        - Disabled (no-op) unless ``enabled: true``.
+        - Jurisdictions default to sync_schedule.yaml's top-level
+          ``active_jurisdictions`` seed list (this job's own
+          ``jurisdictions`` key overrides it, if set) -- reusing the same
+          "tracked jurisdictions" set bill_sync.py/legislator_sync already
+          treat as canonical, not a new list.
+        - ``max_instances=1`` + ``coalesce=True`` + ``misfire_grace_time``,
+          matching every other batch job in this file -- this job dispatches
+          real LegBot calls and writes to a real broker endpoint, so an
+          overlapping second run must never fire concurrently with the first.
+        """
+        from ddp_sync.pipelines.concept_statement_dispatch import (
+            run_concept_statement_batch_job,
+        )
+
+        config = self._sync_config.get("concept_statement_dispatch", {})
+
+        # Round-17-style fix (see legislator_bio_sync above): clean up the
+        # OTHER frequency's job id before registering this run's job.
+        for stale_id in (
+            "daily_concept_statement_dispatch", "weekly_concept_statement_dispatch",
+        ):
+            try:
+                self.scheduler.remove_job(stale_id)
+            except Exception:  # noqa: BLE001 — JobLookupError variant
+                pass
+
+        if not config.get("enabled", False):
+            logger.info("concept_statement_dispatch: disabled in config — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "11:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        frequency = config.get("frequency", "weekly")
+
+        jurisdictions = config.get("jurisdictions") or self._sync_config.get(
+            "active_jurisdictions", []
+        )
+
+        async def _concept_statement_dispatch_wrapper():
+            return await run_concept_statement_batch_job(config, jurisdictions=jurisdictions)
+
+        day_map = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+
+        if frequency == "daily":
+            self.scheduler.add_job(
+                _concept_statement_dispatch_wrapper,
+                trigger=CronTrigger(hour=hour, minute=minute, timezone=_UTC),
+                id="daily_concept_statement_dispatch",
+                name="Concept-statement dispatch (daily)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "concept_statement_dispatch: registered (daily)",
+                sync_time=sync_time_str,
+                jurisdictions=jurisdictions,
+            )
+        else:
+            sync_day = config.get("sync_day", "sunday")
+            day_of_week = day_map.get(sync_day.lower(), 6)
+            self.scheduler.add_job(
+                _concept_statement_dispatch_wrapper,
+                trigger=CronTrigger(
+                    day_of_week=day_of_week, hour=hour, minute=minute, timezone=_UTC,
+                ),
+                id="weekly_concept_statement_dispatch",
+                name="Concept-statement dispatch (weekly)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "concept_statement_dispatch: registered (weekly)",
+                sync_time=sync_time_str,
+                sync_day=sync_day,
+                jurisdictions=jurisdictions,
             )
 
     def stop(self) -> None:

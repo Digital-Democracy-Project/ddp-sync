@@ -10,6 +10,8 @@ import pytest
 
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    create_concept_statement_set,
+    get_concept_statement_set,
     get_latest_bill_version,
     write_bill_artifact,
     write_bill_version,
@@ -236,4 +238,155 @@ async def test_write_bill_version_raises_on_error_status():
                 session_code="2026",
                 version_date="2026-01-05",
                 version_note="Introduced",
+            )
+
+
+# ---------------------------------------------------------------------------
+# ConceptStatementSet read/write (ddp-infra PLAN-bill-concept-polling.md §0.4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_set_returns_none_when_not_found():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"found": False}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_concept_statement_set(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+
+    assert result is None
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/concept-statements/"
+    assert call.kwargs["params"] == {
+        "gov_id": "abc", "jurisdiction": "FL", "session": "2026",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_set_returns_the_set_when_found():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "found": True,
+        "id": 12,
+        "statements": ["A statement."],
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_concept_statement_set(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+
+    assert result["id"] == 12
+    assert result["statements"] == ["A statement."]
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_set_raises_on_error_status():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"detail": "bad request"}'
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="400"):
+            await get_concept_statement_set(
+                gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_concept_statement_set_posts_expected_payload():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {
+        "id": 12,
+        "gov_id": "abc",
+        "jurisdiction_iso2": "FL",
+        "session_code": "2026",
+        "statements": ["A statement.", "Another statement."],
+        "status": "pending",
+        "generated_at": "2026-07-30T00:00:00Z",
+    }
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await create_concept_statement_set(
+            gov_id="abc",
+            jurisdiction_iso2="FL",
+            session_code="2026",
+            statements=["A statement.", "Another statement."],
+            source_document_url="https://example.com/bill.pdf",
+            model_name="mlx",
+        )
+
+    assert result["id"] == 12
+    assert result["status"] == "pending"
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://localhost:8080/api/concept-statement-sets/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert call.kwargs["json"]["gov_id"] == "abc"
+    assert call.kwargs["json"]["jurisdiction_iso2"] == "FL"
+    assert call.kwargs["json"]["session_code"] == "2026"
+    assert call.kwargs["json"]["statements"] == ["A statement.", "Another statement."]
+    assert call.kwargs["json"]["source_document_url"] == "https://example.com/bill.pdf"
+    assert call.kwargs["json"]["model_name"] == "mlx"
+
+
+@pytest.mark.asyncio
+async def test_create_concept_statement_set_raises_on_error_status():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"statements": ["This field is required."]}'
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="400"):
+            await create_concept_statement_set(
+                gov_id="abc",
+                jurisdiction_iso2="FL",
+                session_code="2026",
+                statements=[],
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_concept_statement_set_raises_when_unreachable():
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="unreachable"):
+            await create_concept_statement_set(
+                gov_id="abc",
+                jurisdiction_iso2="FL",
+                session_code="2026",
+                statements=["A statement."],
             )

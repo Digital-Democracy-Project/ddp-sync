@@ -294,3 +294,25 @@ votebot_eval:
   notifications:
     enabled: true                    # set false to suppress Zapier alerts
     alert_on_success: true           # send the green-path summary too, not just failures
+
+# Concept-Statement Dispatch (ddp-infra PLAN-bill-concept-polling.md §0.4)
+# =========================================================================
+# Scheduled batch job: dispatches LegBot's new concept_statements question
+# type for current-session bills in tracked jurisdictions (active_jurisdictions
+# above, unless overridden by `jurisdictions` below), then stores the result
+# via ddp-broker-py's POST /api/concept-statement-sets/ endpoint. Gating
+# Question 3 (ddp-infra plan) resolved 2026-07-30 by Ramon: a scheduled
+# batch job, not on-demand-on-first-view.
+#
+# Disabled by default -- concept-statement polling (Phase 0/1 of that plan)
+# hasn't shipped a poll UI on ddp-next yet, and this job hits real LegBot
+# dispatch (compute cost) plus real broker writes, so it should stay off
+# until the rest of Phase 0/1 is live. Flip to true once ready.
+concept_statement_dispatch:
+  enabled: false
+  frequency: weekly
+  sync_day: sunday
+  sync_time_utc: "11:00"      # after people_refresh (10:00), before votebot_eval (12:00)
+  max_bills_per_run: 25       # bounds real per-run LegBot-dispatch + broker-write cost
+  # jurisdictions:             # absent/null = reuse active_jurisdictions above
+  #   - FL
