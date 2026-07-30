@@ -608,6 +608,7 @@ class BillVersionSyncService:
                         new_version_date=result["version_date"],
                         new_version_note=result["version_note"],
                         new_content=extracted_content,
+                        bill_openstates_id=bill_openstates_id,
                     )
                     result["changelog_chunks_created"] = cl_chunks
                     result["changelog_skipped"] = cl_skipped
@@ -1021,12 +1022,17 @@ class BillVersionSyncService:
         new_version_date: str,
         new_version_note: str,
         new_content: str,
+        bill_openstates_id: str | None = None,
     ) -> tuple[int, bool, str]:
         """Generate a changelog comparing old and new bill versions via LegBot.
 
-        Attempts to re-download old text from old_version["text_url"] (needed
-        here to compute the diff LegBot is handed). Fails gracefully on any
-        error — the surrounding ingest is never blocked.
+        Prefers ddp-open-states' already-archived changelog inputs (diff_from_previous_version
+        + the prior version's own raw_text, both precomputed at scrape time by
+        archive_bill_versions() and surfaced by api-v3 -- ddp-infra's bill_changelog diff-
+        endpoint fix, 2026-07-30) over re-downloading old_version["text_url"] and re-deriving
+        the diff locally. Falls back to that live re-fetch-and-diff exactly as before when
+        bill_openstates_id is unavailable or nothing is archived for this bill yet. Fails
+        gracefully on any error either way — the surrounding ingest is never blocked.
 
         Returns:
             (chunks_created, skipped, skip_reason)
@@ -1037,63 +1043,81 @@ class BillVersionSyncService:
         from ddp_sync.ingestion.metadata import DocumentMetadata
         from ddp_sync.ingestion.pipeline import IngestionPipeline
         from ddp_sync.ingestion.sources.webflow import WebflowSource
+        from ddp_sync.services.local_openstates_client import get_archived_changelog_inputs
 
         old_url = old_version.get("text_url", "")
         old_media_type = old_version.get("media_type", "")
         old_version_date = old_version.get("version_date", "")
         old_version_note = old_version.get("version_note", "")
 
-        if not old_url:
-            return 0, True, "no_old_url"
+        old_bill_source: str | None = None
+        diff_text: str | None = None
 
-        # Re-download and extract old bill text.
-        try:
-            webflow_source = WebflowSource(self.settings)
-            fields: dict = {}  # Old URL only — no CMS fields needed for extraction
-            if "pdf" in old_media_type.lower():
-                old_doc = await webflow_source._process_bill_pdf(old_url, fields, webflow_id)
-            elif "html" in old_media_type.lower():
-                old_doc = await webflow_source._process_bill_html(old_url, fields, webflow_id)
-            else:
-                detected = await webflow_source._get_url_content_type(old_url)
-                if detected == "pdf":
+        if bill_openstates_id:
+            archived = await get_archived_changelog_inputs(bill_openstates_id)
+            if archived:
+                old_bill_source = archived["old_bill_source"]
+                diff_text = archived["diff_source"]
+                logger.info(
+                    "Using ddp-open-states' archived changelog inputs -- skipping live "
+                    "refetch and local diff",
+                    bill_openstates_id=bill_openstates_id,
+                )
+
+        if diff_text is None:
+            if not old_url:
+                return 0, True, "no_old_url"
+
+            # Re-download and extract old bill text.
+            try:
+                webflow_source = WebflowSource(self.settings)
+                fields: dict = {}  # Old URL only — no CMS fields needed for extraction
+                if "pdf" in old_media_type.lower():
                     old_doc = await webflow_source._process_bill_pdf(old_url, fields, webflow_id)
-                elif detected == "html":
+                elif "html" in old_media_type.lower():
                     old_doc = await webflow_source._process_bill_html(old_url, fields, webflow_id)
                 else:
-                    return 0, True, "old_url_unknown_content_type"
+                    detected = await webflow_source._get_url_content_type(old_url)
+                    if detected == "pdf":
+                        old_doc = await webflow_source._process_bill_pdf(old_url, fields, webflow_id)
+                    elif detected == "html":
+                        old_doc = await webflow_source._process_bill_html(old_url, fields, webflow_id)
+                    else:
+                        return 0, True, "old_url_unknown_content_type"
 
-            if not old_doc or not old_doc.content:
-                return 0, True, "old_url_no_content"
+                if not old_doc or not old_doc.content:
+                    return 0, True, "old_url_no_content"
 
-            old_content = old_doc.content
+                old_content = old_doc.content
 
-        except (httpx.HTTPError, httpx.TimeoutException) as e:
-            return 0, True, f"old_url_fetch_failed: {type(e).__name__}"
-        except Exception as e:
-            return 0, True, f"old_text_extraction_failed: {type(e).__name__}"
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                return 0, True, f"old_url_fetch_failed: {type(e).__name__}"
+            except Exception as e:
+                return 0, True, f"old_text_extraction_failed: {type(e).__name__}"
 
-        if len(old_content) < 500:
-            return 0, True, "old_content_too_short"
+            if len(old_content) < 500:
+                return 0, True, "old_content_too_short"
 
-        # Generate structured changelog via LegBot (ddp-infra Phase 4 /
-        # PLAN-legbot.md's bill_changelog capability) -- replaces the old
-        # direct gpt-4o-mini call. ddp-sync computes the diff (LegBot is
-        # handed a precomputed diff, not two full documents to re-diff
-        # itself) but still passes old_url as old_bill_source so LegBot can
-        # fetch its own copy of the old text for its two-part prompt -- see
-        # ddp-agents' legbot/handlers.py handle_ingest.
-        diff_text = "\n".join(
-            difflib.unified_diff(
-                old_content.splitlines(),
-                new_content.splitlines(),
-                fromfile=old_version_note or "previous version",
-                tofile=new_version_note or "this version",
-                lineterm="",
+            # Generate structured changelog via LegBot (ddp-infra Phase 4 /
+            # PLAN-legbot.md's bill_changelog capability) -- replaces the old
+            # direct gpt-4o-mini call. ddp-sync computes the diff (LegBot is
+            # handed a precomputed diff, not two full documents to re-diff
+            # itself). old_bill_source is the already-fetched/extracted text,
+            # not old_url -- LegBot no longer fetches URLs itself (PLAN §24,
+            # 2026-07-30), so handing it a URL here would just skip with
+            # old_bill_source_is_unresolved_url.
+            old_bill_source = old_content
+            diff_text = "\n".join(
+                difflib.unified_diff(
+                    old_content.splitlines(),
+                    new_content.splitlines(),
+                    fromfile=old_version_note or "previous version",
+                    tofile=new_version_note or "this version",
+                    lineterm="",
+                )
             )
-        )
-        if not diff_text.strip():
-            return 0, True, "no_diff_produced"
+            if not diff_text.strip():
+                return 0, True, "no_diff_produced"
 
         from ddp_sync.services.legbot_client import (
             LegBotDispatchError,
@@ -1102,7 +1126,7 @@ class BillVersionSyncService:
 
         try:
             dispatch_result = await dispatch_bill_changelog(
-                old_bill_source=old_url,
+                old_bill_source=old_bill_source,
                 diff_source=diff_text,
             )
         except LegBotDispatchError as e:
