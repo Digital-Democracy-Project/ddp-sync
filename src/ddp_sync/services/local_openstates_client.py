@@ -161,13 +161,21 @@ async def list_current_session_bill_candidates(
             max_bills_per_run cap, or whatever remains of it).
 
     Returns:
-        A list of dicts, each {"gov_id", "session_code",
-        "live_url_fallback"} -- gov_id is the bare UUID (ocd-bill/ prefix
-        stripped, matching get_archived_bill_text's own convention);
-        live_url_fallback is the bill's first recorded source URL, handed
-        to dispatch_and_store_concept_statements as the live-fetch
-        fallback bill_source (used only when get_archived_bill_text finds
-        nothing archived for this same gov_id).
+        A list of dicts, each {"gov_id", "bill_openstates_id", "session_code",
+        "live_url_fallback"}. **`gov_id` and `bill_openstates_id` are two
+        different identities, not interchangeable** -- fixed 2026-07-30
+        after live testing found every real dispatch through this path
+        failed `ConceptStatementSet.gov_id`'s `max_length=20` (a bare UUID
+        is 36 characters). `gov_id` is the bill's short public identifier
+        (`Bill.identifier`, e.g. "SJR 2F"), matching every other `gov_id` in
+        this plan (`BillPromotionRequest`, `ConceptStatementSet`, the public
+        read/vote API); `bill_openstates_id` is the bare UUID (`ocd-bill/`
+        prefix stripped), needed only for `get_archived_bill_text`'s archive
+        lookup, which is keyed on that UUID, not the identifier.
+        live_url_fallback is the bill's first recorded source URL, handed to
+        dispatch_and_store_concept_statements as the live-fetch fallback
+        bill_source (used only when get_archived_bill_text finds nothing
+        archived for this bill).
 
         Deliberately does NOT request raw_text here -- that's the
         paginated /bills list's own documented gap (OPEN-13/BROKER-8, see
@@ -246,14 +254,16 @@ async def list_current_session_bill_candidates(
 
     candidates = []
     for bill in data.get("results", []) or []:
+        gov_id = (bill.get("identifier") or "").strip()
         raw_id = bill.get("id", "") or ""
-        gov_id = raw_id.rsplit("/", 1)[-1] if raw_id else ""
-        if not gov_id:
+        bill_openstates_id = raw_id.rsplit("/", 1)[-1] if raw_id else ""
+        if not gov_id or not bill_openstates_id:
             continue
         sources = bill.get("sources") or []
         live_url_fallback = sources[0].get("url", "") if sources else ""
         candidates.append({
             "gov_id": gov_id,
+            "bill_openstates_id": bill_openstates_id,
             "session_code": session_code,
             "live_url_fallback": live_url_fallback,
         })

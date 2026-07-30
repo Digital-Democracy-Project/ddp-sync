@@ -97,6 +97,7 @@ _QUESTION_TYPE = "concept_statements"
 async def dispatch_and_store_concept_statements(
     *,
     gov_id: str,
+    bill_openstates_id: str,
     jurisdiction_iso2: str,
     session_code: str,
     bill_source: str,
@@ -105,9 +106,18 @@ async def dispatch_and_store_concept_statements(
     persist the result as a new `ConceptStatementSet` row.
 
     Args:
-        gov_id: bare OpenStates bill UUID (no "ocd-bill/" prefix), matching
-            get_archived_bill_text's own convention -- used both to check
-            ddp-open-states' archive and as this set's own identity key.
+        gov_id: the bill's short public identifier (e.g. "SJR 2F",
+            `Bill.identifier`) -- this set's own identity key, matching
+            every other `gov_id` in this plan (`BillPromotionRequest`,
+            `ConceptStatementSet`, the public read/vote API) and fitting
+            `ConceptStatementSet.gov_id`'s `max_length=20`. **Not** the
+            OpenStates UUID -- fixed 2026-07-30 after live testing found
+            every real dispatch failed this field's length constraint
+            (a bare UUID is 36 characters) because this parameter and
+            `bill_openstates_id` below used to be the same value.
+        bill_openstates_id: bare OpenStates bill UUID (no "ocd-bill/"
+            prefix), matching get_archived_bill_text's own convention --
+            used only to check ddp-open-states' archive, never stored.
         jurisdiction_iso2: two-letter state code (e.g. "FL").
         session_code: the bill's legislative session identifier.
         bill_source: URL to the bill's PDF/HTML (the live-fetch fallback,
@@ -131,7 +141,7 @@ async def dispatch_and_store_concept_statements(
             ConceptStatementSet row to record a failure on (unlike
             BillArtifact's "failed" status write path).
     """
-    resolved_bill_source = await _resolve_bill_source(gov_id, bill_source)
+    resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
     dispatch_result = await dispatch_bill_question(resolved_bill_source, _QUESTION_TYPE)
     answer = dispatch_result["answer"]
 
@@ -207,6 +217,7 @@ async def run_concept_statement_batch_job(
             considered += 1
 
             gov_id = candidate["gov_id"]
+            bill_openstates_id = candidate["bill_openstates_id"]
             session_code = candidate["session_code"]
             bill_source = candidate["live_url_fallback"]
 
@@ -229,6 +240,7 @@ async def run_concept_statement_batch_job(
             try:
                 result = await dispatch_and_store_concept_statements(
                     gov_id=gov_id,
+                    bill_openstates_id=bill_openstates_id,
                     jurisdiction_iso2=jurisdiction_iso2,
                     session_code=session_code,
                     bill_source=bill_source,
