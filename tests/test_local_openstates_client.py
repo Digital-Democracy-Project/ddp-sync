@@ -56,10 +56,12 @@ async def test_happy_path_returns_gov_id_session_and_live_url():
         "results": [
             {
                 "id": "ocd-bill/11111111-0000-0000-0000-000000000001",
+                "identifier": "SJR 1",
                 "sources": [{"url": "https://flsenate.gov/bill/1.pdf"}],
             },
             {
                 "id": "ocd-bill/22222222-0000-0000-0000-000000000002",
+                "identifier": "HB 219",
                 "sources": [{"url": "https://flsenate.gov/bill/2.pdf"}],
             },
         ]
@@ -74,12 +76,14 @@ async def test_happy_path_returns_gov_id_session_and_live_url():
 
     assert result == [
         {
-            "gov_id": "11111111-0000-0000-0000-000000000001",
+            "gov_id": "SJR 1",
+            "bill_openstates_id": "11111111-0000-0000-0000-000000000001",
             "session_code": "2026",
             "live_url_fallback": "https://flsenate.gov/bill/1.pdf",
         },
         {
-            "gov_id": "22222222-0000-0000-0000-000000000002",
+            "gov_id": "HB 219",
+            "bill_openstates_id": "22222222-0000-0000-0000-000000000002",
             "session_code": "2026",
             "live_url_fallback": "https://flsenate.gov/bill/2.pdf",
         },
@@ -91,13 +95,42 @@ async def test_happy_path_returns_gov_id_session_and_live_url():
 
 
 @pytest.mark.asyncio
+async def test_gov_id_is_the_short_identifier_not_the_uuid_regression():
+    """Regression test for the 2026-07-30 live-testing bug: gov_id must
+    always fit ConceptStatementSet.gov_id's max_length=20 -- a bare
+    OpenStates UUID (36 characters) never does, and every real dispatch
+    through the old code failed this exact way, every time."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "results": [{
+            "id": "ocd-bill/a3afb726-fac4-41e7-b428-0cae1f4ddada",
+            "identifier": "SJR 2F",
+            "sources": [{"url": "https://flsenate.gov/bill/x.pdf"}],
+        }]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026F"):
+        result = await list_current_session_bill_candidates("fl", limit=10)
+
+    assert len(result[0]["gov_id"]) <= 20
+    assert result[0]["gov_id"] == "SJR 2F"
+    assert result[0]["bill_openstates_id"] == "a3afb726-fac4-41e7-b428-0cae1f4ddada"
+
+
+@pytest.mark.asyncio
 async def test_truncates_to_limit():
     mock_client = AsyncMock()
     response = MagicMock()
     response.status_code = 200
     response.json.return_value = {
         "results": [
-            {"id": f"ocd-bill/{n}", "sources": [{"url": f"https://x/{n}"}]}
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": [{"url": f"https://x/{n}"}]}
             for n in range(5)
         ]
     }
@@ -118,7 +151,11 @@ async def test_missing_sources_yields_empty_live_url_fallback_not_a_crash():
     response = MagicMock()
     response.status_code = 200
     response.json.return_value = {
-        "results": [{"id": "ocd-bill/33333333-0000-0000-0000-000000000003", "sources": []}]
+        "results": [{
+            "id": "ocd-bill/33333333-0000-0000-0000-000000000003",
+            "identifier": "SB 42",
+            "sources": [],
+        }]
     }
     mock_client.get = AsyncMock(return_value=response)
 
@@ -129,10 +166,38 @@ async def test_missing_sources_yields_empty_live_url_fallback_not_a_crash():
         result = await list_current_session_bill_candidates("fl", limit=10)
 
     assert result == [{
-        "gov_id": "33333333-0000-0000-0000-000000000003",
+        "gov_id": "SB 42",
+        "bill_openstates_id": "33333333-0000-0000-0000-000000000003",
         "session_code": "2026",
         "live_url_fallback": "",
     }]
+
+
+@pytest.mark.asyncio
+async def test_bill_missing_identifier_is_skipped_not_crashed():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "results": [
+            {"id": "ocd-bill/44444444-0000-0000-0000-000000000004", "sources": []},
+            {
+                "id": "ocd-bill/55555555-0000-0000-0000-000000000005",
+                "identifier": "HB 55",
+                "sources": [],
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=10)
+
+    assert len(result) == 1
+    assert result[0]["gov_id"] == "HB 55"
 
 
 @pytest.mark.asyncio

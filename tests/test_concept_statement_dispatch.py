@@ -22,7 +22,8 @@ from ddp_sync.services.broker_client import BrokerClientError
 from ddp_sync.services.legbot_client import LegBotDispatchError
 
 _COMMON_KWARGS = dict(
-    gov_id="8d71a94e-0000-0000-0000-000000000001",
+    gov_id="HB 123",
+    bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
     jurisdiction_iso2="FL",
     session_code="2026",
     bill_source="https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
@@ -124,7 +125,7 @@ async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_
         result = await dispatch_and_store_concept_statements(**_COMMON_KWARGS)
 
     assert result == {"id": 1}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["gov_id"])
+    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "concept_statements")
 
 
@@ -144,7 +145,7 @@ async def test_archived_text_not_found_falls_back_to_live_url(no_archived_text_b
         result = await dispatch_and_store_concept_statements(**_COMMON_KWARGS)
 
     assert result == {"id": 2}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["gov_id"])
+    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "concept_statements")
 
 
@@ -187,6 +188,7 @@ async def test_broker_client_error_propagates():
 def _candidate(n: int) -> dict:
     return {
         "gov_id": f"gov-id-{n}",
+        "bill_openstates_id": f"bill-openstates-id-{n}",
         "session_code": "2026",
         "live_url_fallback": f"https://example.com/bill-{n}.pdf",
     }
@@ -248,7 +250,7 @@ async def test_batch_job_skips_bills_with_existing_published_set():
 async def test_batch_job_counts_insufficient_information_separately_from_created():
     candidates = [_candidate(1), _candidate(2)]
 
-    async def _fake_dispatch(*, gov_id, jurisdiction_iso2, session_code, bill_source):
+    async def _fake_dispatch(*, gov_id, bill_openstates_id, jurisdiction_iso2, session_code, bill_source):
         return None if gov_id == "gov-id-1" else {"id": 5}
 
     with patch(
@@ -273,7 +275,7 @@ async def test_batch_job_counts_insufficient_information_separately_from_created
 async def test_batch_job_records_errors_without_aborting_the_run():
     candidates = [_candidate(1), _candidate(2)]
 
-    async def _fake_dispatch(*, gov_id, jurisdiction_iso2, session_code, bill_source):
+    async def _fake_dispatch(*, gov_id, bill_openstates_id, jurisdiction_iso2, session_code, bill_source):
         if gov_id == "gov-id-1":
             raise LegBotDispatchError("timed out")
         return {"id": 6}
@@ -296,6 +298,33 @@ async def test_batch_job_records_errors_without_aborting_the_run():
     assert result["created"] == 1
     assert len(result["errors"]) == 1
     assert "gov-id-1" in result["errors"][0]
+
+
+@pytest.mark.asyncio
+async def test_batch_job_passes_gov_id_and_bill_openstates_id_as_distinct_values_regression():
+    """Regression test for the 2026-07-30 live-testing bug: the batch job
+    must forward both identities from each candidate as two separate,
+    non-interchangeable arguments -- gov_id (short identifier, stored) and
+    bill_openstates_id (UUID, archive-lookup only). Passing the UUID as
+    gov_id made every real dispatch fail ConceptStatementSet.gov_id's
+    max_length=20 check, 100% of the time."""
+    candidates = [_candidate(1)]
+    with patch(
+        "ddp_sync.pipelines.concept_statement_dispatch.list_current_session_bill_candidates",
+        new=AsyncMock(return_value=candidates),
+    ), patch(
+        "ddp_sync.pipelines.concept_statement_dispatch.get_concept_statement_set",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "ddp_sync.pipelines.concept_statement_dispatch.dispatch_and_store_concept_statements",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_dispatch_store:
+        await run_concept_statement_batch_job({"max_bills_per_run": 10}, jurisdictions=["FL"])
+
+    call_kwargs = mock_dispatch_store.await_args.kwargs
+    assert call_kwargs["gov_id"] == "gov-id-1"
+    assert call_kwargs["bill_openstates_id"] == "bill-openstates-id-1"
+    assert call_kwargs["gov_id"] != call_kwargs["bill_openstates_id"]
 
 
 @pytest.mark.asyncio
