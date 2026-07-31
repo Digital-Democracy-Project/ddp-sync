@@ -272,6 +272,28 @@ openstates_scrape:
     sync_day: sunday
     sync_time_utc: "10:00"     # after secondary (~06:00) and USA (~09:00) finish
 
+# Split out from openstates_scrape (2026-07-31) — bill-document archiving to DDP-HOT used to
+# run as the last step of each scrape job, gating that job's incremental-cutoff marker write on
+# the archive step finishing too. A run whose archive step ran long or died left the cutoff
+# stuck, making the next run slower and more likely to also miss its own archive window —
+# observed live: a WA run still archiving 1h45m+ after scrape+import had already finished
+# cleanly. Now fully independent: runs every jurisdiction in `jurisdictions` concurrently, on its
+# own schedule, with no relationship to when/whether that jurisdiction's own scrape last ran.
+# Same jurisdiction list as ddp-open-states's ARCHIVE_ENABLED_STATES (activate.sh) — keep in
+# sync if that list ever changes.
+openstates_archive:
+  enabled: true
+  openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
+  sync_time_utc: "05:00"   # daily; well clear of the 01:00-03:00 scrape-job start times, though
+                           # overlap with a live scrape is safe by design (natural-key skip check)
+  jurisdictions:
+    - fl
+    - ut
+    - az
+    - wa
+    - va
+    - mi
+
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's
 # venv. Posts a Zapier alert with on_failure / on_regression /

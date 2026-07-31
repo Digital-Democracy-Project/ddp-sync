@@ -270,6 +270,9 @@ class UpdateScheduler:
         # --- OpenStates jurisdiction scrapes ---
         self._register_openstates_scrape_jobs()
 
+        # --- OpenStates bill-document archive (independent of scrape schedule) ---
+        self._register_openstates_archive_jobs()
+
         # --- Concept-statement dispatch batch job (ddp-infra
         # PLAN-bill-concept-polling.md §0.4) ---
         self._register_concept_statement_dispatch_job()
@@ -617,6 +620,59 @@ class UpdateScheduler:
                 sync_day=p_day,
                 sync_time=p_time,
             )
+
+    def _register_openstates_archive_jobs(self) -> None:
+        """Register the OpenStates bill-document archive job.
+
+        Split out of the scrape jobs (2026-07-31, ddp-open-states
+        PLAN-open-states.md's incremental-scraping section): archiving to
+        DDP-HOT used to run as the last step of run-scrape.sh, gating that
+        script's incremental-cutoff marker write on the archive step
+        finishing too — a run whose archive step ran long or died left the
+        cutoff stuck, making the next run slower and more likely to also
+        miss its own archive window. Archiving is now a fully independent
+        job, fanning out to every ARCHIVE_ENABLED_STATE jurisdiction
+        concurrently on its own schedule, with no relationship to when or
+        whether that jurisdiction's own scrape last ran.
+        """
+        from ddp_sync.pipelines.openstates_archive import run_archive_jobs
+
+        config = self._sync_config.get("openstates_archive", {})
+        if not config.get("enabled", False):
+            logger.info("openstates_archive: disabled in config — skipping")
+            return
+
+        day_map = {
+            "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+            "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
+        }
+
+        archive_time = config.get("sync_time_utc", "05:00")
+        ah, am = map(int, archive_time.split(":"))
+        archive_day = config.get("sync_day")
+        trigger_kwargs = {"hour": ah, "minute": am, "timezone": _UTC}
+        if archive_day:
+            trigger_kwargs["day_of_week"] = day_map.get(archive_day.lower(), "sun")
+
+        async def _archive_wrapper():
+            return await run_archive_jobs(config)
+
+        self.scheduler.add_job(
+            _archive_wrapper,
+            trigger=CronTrigger(**trigger_kwargs),
+            id="openstates_archive",
+            name="OpenStates: bill-document archive",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            "openstates_archive: registered",
+            jurisdictions=config.get("jurisdictions"),
+            sync_day=archive_day or "daily",
+            sync_time=archive_time,
+        )
 
     def _register_concept_statement_dispatch_job(self) -> None:
         """Register the concept-statement dispatch batch job (ddp-infra
