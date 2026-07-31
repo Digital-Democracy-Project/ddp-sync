@@ -430,3 +430,48 @@ async def trigger_openstates_scrape(
         status_code=404,
         detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
     )
+
+
+# Jurisdictions with bill-document archiving enabled — same list as ddp-open-states's
+# ARCHIVE_ENABLED_STATES (activate.sh) and openstates_archive.jurisdictions in
+# sync_schedule.yaml. Keep in sync if that list ever changes.
+_OPENSTATES_ARCHIVE_JURISDICTIONS = {"fl", "ut", "az", "wa", "va", "mi"}
+
+
+@router.post("/trigger/openstates-archive/{target}")
+async def trigger_openstates_archive(
+    target: str,
+    background_tasks: BackgroundTasks,
+    token: str = Depends(api_key_auth),
+):
+    """Trigger OpenStates bill-document archiving immediately, without waiting for its cron.
+
+    Split out from the scrape trigger (2026-07-31) — archiving is now fully independent of
+    scraping (see openstates_archive in sync_schedule.yaml), so it gets its own trigger too.
+    Returns 202 Accepted immediately; the job runs in the background and logs to
+    ~/Developer/repos/ddp-open-states/logs/scraper.log plus ddp-sync's structured log. Flow
+    status is written to Redis under ddp:flow:openstates_archive.
+
+    Targets:
+        all                        — every jurisdiction in ARCHIVE_ENABLED_STATES, concurrently
+        fl|ut|az|wa|va|mi          — a single jurisdiction
+    """
+    from ddp_sync.pipelines.openstates_archive import run_archive_jobs, run_single_archive_job
+    from ddp_sync.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+
+    if target == "all":
+        background_tasks.add_task(run_archive_jobs, config)
+        return {"status": "started", "target": target}
+
+    if target in _OPENSTATES_ARCHIVE_JURISDICTIONS:
+        background_tasks.add_task(run_single_archive_job, target, config)
+        return {"status": "started", "target": target}
+
+    available = sorted(_OPENSTATES_ARCHIVE_JURISDICTIONS | {"all"})
+    raise HTTPException(
+        status_code=404,
+        detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
+    )
