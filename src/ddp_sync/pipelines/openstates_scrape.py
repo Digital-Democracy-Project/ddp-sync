@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -100,6 +101,36 @@ def _alert_scrape_failure(label: str, error: str, duration_seconds: float) -> No
             logger.error("openstates_scrape: CAMS report error", error=str(e))
 
 
+def _run_with_group_kill(
+    cmd: list[str], env: dict, timeout: int
+) -> tuple[int, bytes, bytes, bool]:
+    """Run cmd to completion or timeout, killing its whole process group on timeout.
+
+    subprocess.run(timeout=...) only kills the direct child on TimeoutExpired — verified
+    empirically 2026-08-01 that a grandchild process survives a plain subprocess.run
+    timeout-kill even with start_new_session=True (that flag only makes the child its own
+    process-group leader; nothing then targets that group). For run-scrape.sh specifically,
+    the surviving grandchildren are exactly the processes actually doing work — os-update's
+    scrape/import, the backgrounded sweep-import loop — which would otherwise keep running
+    (and keep holding the import lock, keep writing into $STATE_DATADIR) after ddp-sync has
+    already decided the run failed and moved on. Managing the Popen object directly here so a
+    timeout can os.killpg() the whole group instead of just the one process we started.
+    """
+    process = subprocess.Popen(
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return process.returncode, stdout, stderr, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # process (and its group) already gone
+        stdout, stderr = process.communicate()  # reap; collect whatever was already buffered
+        return process.returncode, stdout, stderr, True
+
+
 async def _run_scrape(
     jurisdiction: str,
     session_arg: str | None,
@@ -131,34 +162,54 @@ async def _run_scrape(
 
     start = time.monotonic()
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            env=env,
-            capture_output=True,
-            timeout=timeout,
-            start_new_session=True,  # kill grandchildren on timeout
+        returncode, _stdout, stderr, timed_out = await asyncio.to_thread(
+            _run_with_group_kill, cmd, env, timeout
         )
         duration = round(time.monotonic() - start, 1)
 
-        if result.returncode != 0:
-            stderr_tail = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error(
+                "openstates_scrape: timeout",
+                jurisdiction=jurisdiction,
+                session=session_arg,
+                timeout_s=timeout,
+                duration_seconds=duration,
+            )
+            # Whole process group killed above, before run-scrape.sh's own ERR trap ever got a
+            # chance to run — it never alerted on this one. We're the only ones who know it
+            # happened, so we're the only ones who can alert.
+            _alert_scrape_failure(label, f"timed out after {timeout}s", duration)
+            return {
+                "success": False,
+                "error": "timeout",
+                "jurisdiction": label,
+                "duration_seconds": duration,
+            }
+
+        if returncode != 0:
+            stderr_tail = (stderr or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_scrape: failed",
                 jurisdiction=jurisdiction,
                 session=session_arg,
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr_tail,
                 duration_seconds=duration,
             )
-            # Not alerting here: run-scrape.sh's own on_failure() already fired its Slack/CAMS
-            # alert from inside the process before exiting nonzero — alerting again here would
-            # double-page for the exact same failure. The three paths below are different: they
-            # all happen *outside* run-scrape.sh's own process (killed by us, or we never even
-            # got a chance to run it), so it never got to alert on its own.
+            if returncode < 0:
+                # Negative returncode = killed by a signal that didn't originate from our own
+                # timeout handling above (OOM killer, `kill` from an operator, another
+                # supervisor). run-scrape.sh's `trap ... ERR` only fires on an ordinary command
+                # failure inside the script, not on the script's own process receiving a
+                # terminating signal — so unlike a plain nonzero exit, this one was never
+                # self-alerted, and we're the only ones who saw it.
+                _alert_scrape_failure(label, f"killed by signal {-returncode}", duration)
+            # else (positive returncode): run-scrape.sh's own on_failure() already fired its
+            # Slack/CAMS alert from inside the process before exiting nonzero — alerting again
+            # here would double-page for the exact same failure.
             return {
                 "success": False,
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "jurisdiction": label,
                 "duration_seconds": duration,
             }
@@ -171,25 +222,6 @@ async def _run_scrape(
         )
         return {"success": True, "jurisdiction": label, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - start, 1)
-        logger.error(
-            "openstates_scrape: timeout",
-            jurisdiction=jurisdiction,
-            session=session_arg,
-            timeout_s=timeout,
-            duration_seconds=duration,
-        )
-        # Killed the whole process tree (start_new_session=True) before run-scrape.sh's own
-        # ERR trap ever got a chance to run — it never alerted on this one. We're the only ones
-        # who know it happened, so we're the only ones who can alert.
-        _alert_scrape_failure(label, f"timed out after {timeout}s", duration)
-        return {
-            "success": False,
-            "error": "timeout",
-            "jurisdiction": label,
-            "duration_seconds": duration,
-        }
     except Exception as e:
         duration = round(time.monotonic() - start, 1)
         logger.error(
