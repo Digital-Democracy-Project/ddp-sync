@@ -58,6 +58,8 @@ async def write_bill_artifact(
     failure_reason: str | None = None,
     chunk_count: int = 0,
     pinecone_synced_at: str | None = None,
+    compare_version_date: str | None = None,
+    compare_version_note: str | None = None,
 ) -> dict:
     """Create or update a BillArtifact row in ddp-broker-py.
 
@@ -67,6 +69,14 @@ async def write_bill_artifact(
     same (bill_version, artifact_type, model_version, prompt_version)
     combination upserts rather than duplicates, matching BillArtifact's own
     uniqueness constraint (Phase 6) — safe to retry after a network failure.
+
+    compare_version_date/compare_version_note are only ever set by
+    generate_and_store_bill_changelog (artifact_type=bill_changelog) — the
+    prior version this artifact's changelog diffs against. ddp-broker-py
+    resolves them to a BillVersion FK with a strict lookup, scoped to the
+    same bill; a non-existent, self-referential, or ambiguous pair is
+    rejected with a 400, surfacing here as BrokerClientError same as any
+    other rejected write — no special handling needed for it.
 
     Returns:
         The written row as ddp-broker-py's API reports it, e.g.
@@ -100,6 +110,8 @@ async def write_bill_artifact(
         "failure_reason": failure_reason,
         "chunk_count": chunk_count,
         "pinecone_synced_at": pinecone_synced_at,
+        "compare_version_date": compare_version_date,
+        "compare_version_note": compare_version_note,
     }
     headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
 

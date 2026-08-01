@@ -8,10 +8,20 @@ both ddp-broker-py AND Pinecone — both writes are required for the job to
 count as done, not ddp-broker-py with Pinecone as an optional follow-up."
 
 bill_summary/bill_pros_cons/bill_vote_yes_frame/bill_vote_no_frame/
-bill_supporting_orgs/bill_opposing_orgs/bill_impact_analysis are wired
-here — bill_changelog is still gated on LegBot's AC11a diff-format
-validation (and has its own dispatch path, dispatch_bill_changelog, not
-this one).
+bill_supporting_orgs/bill_opposing_orgs/bill_impact_analysis all dispatch
+via generate_and_store_bill_artifact, below -- a single caller-supplied
+bill_source, one dispatch_bill_question call each.
+
+bill_changelog is the 8th type, but doesn't fit that shape (it needs a
+prior version's text plus a precomputed diff, not a single bill_source)
+-- see generate_and_store_bill_changelog, its own function further down
+this file, not a branch of generate_and_store_bill_artifact. Until this
+was added (ddp-infra's "bill_changelog's missing BillArtifact write path",
+approved 2026-08-01 after 5 rounds of /pm-review), bill_changelog's only
+caller of dispatch_bill_changelog was bill_version.py's legacy
+_generate_and_ingest_changelog, which writes to Pinecone only, never
+BillArtifact -- that function is untouched by this change and still
+serves whatever the Webflow-CMS sync flow needs it for.
 
 Scope note: this module generates and stores ONE artifact for a caller-
 supplied bill version. It does NOT implement Phase 8's step 1 ("find bill
@@ -26,11 +36,11 @@ directly if present -- skipping the live-fetch-and-re-extract LegBot would
 otherwise do for a document ddp-open-states already extracted once. Falls
 back to the caller-supplied bill_source (a live URL) unchanged when no
 archived text is available, exactly as before this change. Scoped to the
-7 single-version artifact types this module already handles -- bill_source
-here is always resolved for a bill's *current* version, so this never
-applies to bill_changelog (dispatch_bill_changelog, bill_version.py's own
-path), which needs the *prior* version's text specifically and isn't
-touched by this change.
+7 single-version artifact types generate_and_store_bill_artifact handles
+-- bill_source here is always resolved for a bill's *current* version, so
+this never applies to generate_and_store_bill_changelog, which resolves
+its own two inputs via get_archived_changelog_inputs instead (no live-
+fetch fallback at all -- see that function's own docstring).
 """
 
 from __future__ import annotations
@@ -42,9 +52,12 @@ import structlog
 
 from ddp_sync.ingestion.metadata import DocumentMetadata
 from ddp_sync.ingestion.pipeline import IngestionPipeline
-from ddp_sync.services.broker_client import write_bill_artifact
-from ddp_sync.services.legbot_client import dispatch_bill_question
-from ddp_sync.services.local_openstates_client import get_archived_bill_text
+from ddp_sync.services.broker_client import BrokerClientError, write_bill_artifact
+from ddp_sync.services.legbot_client import dispatch_bill_changelog, dispatch_bill_question
+from ddp_sync.services.local_openstates_client import (
+    get_archived_bill_text,
+    get_archived_changelog_inputs,
+)
 
 logger = structlog.get_logger()
 
@@ -66,6 +79,54 @@ _TEXT_ANSWER_ARTIFACT_TYPES = {"bill_summary", "bill_vote_yes_frame", "bill_vote
 # artifact_types whose answer is a single list under answer["org_types"]
 # ([{type, reason}, ...], config/legbot_questions.yaml) — flattened identically.
 _ORG_TYPES_ANSWER_ARTIFACT_TYPES = {"bill_supporting_orgs", "bill_opposing_orgs"}
+
+
+class ArchivedVersionMismatchError(Exception):
+    """Raised when get_archived_changelog_inputs resolved a different version as
+    "latest" than the one the caller asked to generate a changelog for.
+
+    Deliberately never accompanied by any BillArtifact write, successful or
+    failed -- see generate_and_store_bill_changelog's own docstring for why.
+    """
+
+
+def _bullet_list(items: list) -> str:
+    return "\n".join(f"- {item}" for item in items) if items else "- None"
+
+
+def _bill_changelog_content_from_answer(
+    answer: dict, *, old_version_note: str, new_version_note: str
+) -> str:
+    """Flatten LegBot's bill_changelog answer into BillArtifact.content.
+
+    Reuses bill_version.py's own _generate_and_ingest_changelog template
+    verbatim (bullet-list helper, section structure) -- ddp-next's real
+    BillChangelog.tsx parses content as light Markdown (##/### headings, -
+    bullets, **bold**), not JSON, confirmed by reading that component
+    directly. old_version_note/new_version_note are caller-side context
+    (the two versions being diffed), not part of LegBot's own answer --
+    the legacy template also sourced them this way, not from the answer.
+    One deliberate difference from that legacy template: no "## What
+    Changed: {bill_title}" top-level heading -- generate_and_store_
+    bill_changelog has no bill_title parameter (not part of the reviewed
+    design), and BillChangelog.tsx already renders its own "What Changed"
+    section label above this content, so repeating it here would just be
+    redundant.
+    """
+    return f"""**From:** {old_version_note}
+**To:** {new_version_note}
+
+### Sections Added
+{_bullet_list(answer.get("sections_added") or [])}
+
+### Sections Removed
+{_bullet_list(answer.get("sections_removed") or [])}
+
+### Sections Modified
+{_bullet_list(answer.get("sections_modified") or [])}
+
+### Key Policy Implications
+{answer.get("policy_implications") or "None noted."}"""
 
 
 def _content_from_answer(artifact_type: str, answer: dict) -> str:
@@ -206,3 +267,185 @@ async def generate_and_store_bill_artifact(
         model_name=model_name,
         pinecone_synced_at=pinecone_synced_at,
     )
+
+
+async def generate_and_store_bill_changelog(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    version_date: str,
+    version_note: str,
+) -> dict:
+    """Dispatch bill_changelog to LegBot, then persist the result to
+    ddp-broker-py and Pinecone -- the 8th BillArtifact type, not part of
+    generate_and_store_bill_artifact above because it needs a prior
+    version's text plus a precomputed diff, not a single bill_source.
+
+    ddp-infra's PLAN-bill-document-provenance.md, "bill_changelog's missing
+    BillArtifact write path" (approved 2026-08-01 after 5 rounds of
+    /pm-review).
+
+    Latest-version-only by construction: get_archived_changelog_inputs only
+    ever resolves the single most recent version transition, with no way to
+    look up an arbitrary older one. Callers must only invoke this for a
+    bill's actual current/latest version.
+
+    No live-refetch-and-diff fallback, unlike bill_version.py's legacy
+    _generate_and_ingest_changelog -- one real diff-computation path
+    (ddp-open-states, at scrape time), not two. If nothing's archived yet,
+    this reports a failed row rather than re-deriving a diff itself.
+
+    Raises:
+        ArchivedVersionMismatchError: the caller's version_date/version_note
+            don't match the version get_archived_changelog_inputs resolved
+            as latest -- a stale caller, or the bill has moved on to a newer
+            version since the caller looked it up. Deliberately raises
+            *without writing anything at all*, not a failed row: writing a
+            failed row here would upsert via write_bill_artifact's own
+            (bill_version, artifact_type, model_version, prompt_version) key,
+            which resolves from this call's own (stale) version_date/
+            version_note -- exactly the row a real, already-successful
+            changelog for that version might already occupy. This is a
+            caller/timing bug, not a "couldn't analyze this bill" outcome;
+            there is no correct row to write for it, and the one thing that
+            must never happen is silently overwriting a good row with a bad
+            one. Safe to simply retry later with fresh version info -- since
+            nothing was written, a future coverage check still sees this bill
+            as missing bill_changelog and will dispatch it again.
+        LegBotDispatchError: LegBot unreachable/timed out -- propagates
+            uncaught, same convention as generate_and_store_bill_artifact.
+        BrokerClientError: ddp-broker-py rejected the write or was
+            unreachable -- propagates uncaught, same convention as
+            generate_and_store_bill_artifact.
+
+    Returns:
+        The BillArtifact row as ddp-broker-py's API reports it.
+    """
+    archived = await get_archived_changelog_inputs(bill_openstates_id)
+
+    if archived is None:
+        logger.info(
+            "No archived changelog inputs for bill_changelog -- recording a "
+            "failed artifact",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type="bill_changelog",
+            content="",
+            status="failed",
+            failure_stage="generation",
+            failure_reason="no_archived_changelog_inputs",
+        )
+
+    if (
+        archived["latest_version_date"] != version_date
+        or archived["latest_version_note"] != version_note
+    ):
+        logger.warning(
+            "bill_changelog_archived_version_mismatch",
+            bill_openstates_id=bill_openstates_id,
+            requested_version_date=version_date,
+            requested_version_note=version_note,
+            archived_latest_version_date=archived["latest_version_date"],
+            archived_latest_version_note=archived["latest_version_note"],
+        )
+        raise ArchivedVersionMismatchError(
+            f"Requested a bill_changelog for version_date={version_date!r}/"
+            f"version_note={version_note!r}, but get_archived_changelog_inputs "
+            f"resolved the current latest version as "
+            f"{archived['latest_version_date']!r}/{archived['latest_version_note']!r} "
+            "-- refusing to write a changelog under a stale or mismatched "
+            "version identity."
+        )
+
+    dispatch_result = await dispatch_bill_changelog(
+        old_bill_source=archived["old_bill_source"],
+        diff_source=archived["diff_source"],
+    )
+    answer = dispatch_result["answer"]
+    model_name = dispatch_result.get("backend")
+
+    if answer.get("insufficient_information"):
+        logger.info(
+            "LegBot reported insufficient_information for bill_changelog -- "
+            "recording a failed artifact",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type="bill_changelog",
+            content="",
+            status="failed",
+            failure_stage="generation",
+            failure_reason=answer.get("reason", "insufficient_information"),
+            model_name=model_name,
+            compare_version_date=archived["old_version_date"],
+            compare_version_note=archived["old_version_note"],
+        )
+
+    content = _bill_changelog_content_from_answer(
+        answer,
+        old_version_note=archived["old_version_note"],
+        new_version_note=version_note,
+    )
+
+    pinecone_synced_at = None
+    try:
+        pipeline = IngestionPipeline()
+        metadata = DocumentMetadata(
+            document_id=f"bill-artifact-bill_changelog-{bill_openstates_id}-{version_date}",
+            document_type="bill-artifact-bill_changelog",
+            source="Digital Democracy Project",
+            jurisdiction=jurisdiction,
+            bill_id=bill_openstates_id,
+            extra={"session_code": session_code, "version_note": version_note},
+        )
+        await pipeline.ingest_document(content=content, metadata=metadata, skip_duplicates=False)
+        pinecone_synced_at = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        logger.exception(
+            "Pinecone ingest failed for bill_changelog -- writing to "
+            "ddp-broker-py anyway (pinecone_synced_at stays null, so it's "
+            "visible as stale and re-syncable rather than silently missing)",
+            bill_openstates_id=bill_openstates_id,
+        )
+
+    try:
+        return await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type="bill_changelog",
+            content=content,
+            status="complete",
+            model_name=model_name,
+            pinecone_synced_at=pinecone_synced_at,
+            compare_version_date=archived["old_version_date"],
+            compare_version_note=archived["old_version_note"],
+        )
+    except BrokerClientError:
+        # Distinguishable from other write failures, per this design's own
+        # review: includes the compare_version fields that were attempted,
+        # so an operator can tell a compare_version FK-resolution failure
+        # (api-v3 has archived a version ddp-broker-py's BillVersion table
+        # hasn't synced yet -- rare) apart from any other rejection, and can
+        # find/investigate the orphaned Pinecone document this leaves behind.
+        logger.exception(
+            "bill_changelog_write_failed",
+            bill_openstates_id=bill_openstates_id,
+            compare_version_date=archived["old_version_date"],
+            compare_version_note=archived["old_version_note"],
+        )
+        raise
