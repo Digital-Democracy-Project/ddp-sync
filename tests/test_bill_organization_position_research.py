@@ -1,0 +1,210 @@
+"""Tests for the Organization Position Research pipeline (ddp-infra's
+PLAN-bill-document-provenance.md Phase 8, approved 2026-08-01 after 4 rounds
+of /pm-review): find_bill_positions -> per-org verify_bill_position -> write.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from ddp_sync.pipelines.bill_organization_position_research import (
+    _MAX_ORGANIZATIONS_PER_INVOCATION,
+    generate_and_store_bill_organization_positions,
+)
+from ddp_sync.services.broker_client import BrokerClientError
+from ddp_sync.services.legbot_client import LegBotDispatchError
+
+_COMMON_KWARGS = dict(
+    bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
+    jurisdiction="FL",
+    session_code="2026",
+    version_date="2026-01-05",
+    version_note="Introduced",
+    bill_source="https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
+    gov_id="HB123",
+    bill_title="An act relating to test fixtures",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_archived_text_by_default():
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research._resolve_bill_source",
+        new=AsyncMock(side_effect=lambda bill_openstates_id, live_url_fallback: live_url_fallback),
+    ):
+        yield
+
+
+def _find_result(positions, insufficient_information=False):
+    return {
+        "answer": {"positions": positions, "insufficient_information": insufficient_information},
+        "backend": "openai",
+    }
+
+
+def _verify_result(verdict="confirmed", insufficient_information=False, content_incomplete=False):
+    return {
+        "answer": {
+            "verdict": verdict,
+            "insufficient_information": insufficient_information,
+            "content_looks_incomplete": content_incomplete,
+            "explanation": "explanation text",
+        },
+        "backend": "openai",
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_positions_found_writes_nothing():
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result([])),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert result == []
+    mock_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_insufficient_information_writes_nothing():
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(
+            return_value=_find_result(
+                [{"org_name": "Sierra Club", "position": "support", "citation_url": "https://x.invalid"}],
+                insufficient_information=True,
+            )
+        ),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert result == []
+    mock_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_happy_path_verifies_and_writes_each_organization():
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid", "citation_excerpt": "excerpt a"},
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid", "citation_excerpt": "excerpt b"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ) as mock_verify, patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(side_effect=[{"id": 1}, {"id": 2}]),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 2
+    assert all(r["outcome"] == "written" for r in result)
+    assert [r["position_id"] for r in result] == [1, 2]
+
+    assert mock_verify.await_count == 2
+    first_call_args = mock_verify.await_args_list[0].args
+    assert first_call_args[0] == "https://a.invalid"
+    assert "Sierra Club" in first_call_args[1]
+    assert "HB123" in first_call_args[1]
+
+    first_write_kwargs = mock_write.await_args_list[0].kwargs
+    assert first_write_kwargs["org_name"] == "Sierra Club"
+    assert first_write_kwargs["verification_verdict"] == "confirmed"
+    assert first_write_kwargs["status"] == "complete"
+    # Same invocation_id stamped on both rows.
+    assert mock_write.await_args_list[0].kwargs["invocation_id"] == mock_write.await_args_list[1].kwargs["invocation_id"]
+
+
+@pytest.mark.asyncio
+async def test_truncates_to_cap_and_logs():
+    many_positions = [
+        {"org_name": f"Org {i}", "position": "support", "citation_url": f"https://{i}.invalid"}
+        for i in range(_MAX_ORGANIZATIONS_PER_INVOCATION + 5)
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(many_positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == _MAX_ORGANIZATIONS_PER_INVOCATION
+    assert mock_write.await_count == _MAX_ORGANIZATIONS_PER_INVOCATION
+
+
+@pytest.mark.asyncio
+async def test_verification_failure_isolated_to_one_organization():
+    """One organization's verify_bill_position dispatch failing must not
+    abort the run -- the loop continues, and that row is written with
+    status=failed, verification_verdict left at ddp-broker-py's own pending
+    default (never overwritten by this pipeline itself)."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(side_effect=[LegBotDispatchError("timed out"), _verify_result()]),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(side_effect=[{"id": 1}, {"id": 2}]),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 2
+    assert result[0]["outcome"] == "verification_failed"
+    assert result[1]["outcome"] == "written"
+
+    first_write_kwargs = mock_write.await_args_list[0].kwargs
+    assert first_write_kwargs["status"] == "failed"
+    assert first_write_kwargs["failure_stage"] == "verification"
+    # verification_verdict is deliberately absent from write_kwargs on
+    # failure -- left at ddp-broker-py's own "pending" default, not
+    # re-asserted by this pipeline.
+    assert "verification_verdict" not in first_write_kwargs
+
+
+@pytest.mark.asyncio
+async def test_broker_write_failure_isolated_to_one_organization():
+    """A broker-write failure for one organization must not abort the run
+    either -- the loop continues to the next organization."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(side_effect=[BrokerClientError("unreachable"), {"id": 2}]),
+    ):
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 2
+    assert result[0]["outcome"] == "broker_write_failed"
+    assert result[0]["position_id"] is None
+    assert result[1]["outcome"] == "written"

@@ -130,6 +130,120 @@ async def write_bill_artifact(
     return result
 
 
+async def write_bill_organization_position(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    version_date: str,
+    version_note: str,
+    invocation_id: str,
+    org_name: str,
+    position: str,
+    citation_url: str,
+    citation_excerpt: str = "",
+    find_model_name: str | None = None,
+    find_model_version: str | None = None,
+    find_prompt_version: str | None = None,
+    find_prompt_hash: str | None = None,
+    find_generation_config: dict | None = None,
+    find_code_commit_sha: str | None = None,
+    verification_verdict: str = "pending",
+    verification_insufficient_information: bool = False,
+    verification_content_incomplete: bool = False,
+    verification_explanation: str = "",
+    verify_model_name: str | None = None,
+    verify_model_version: str | None = None,
+    verify_prompt_version: str | None = None,
+    verify_prompt_hash: str | None = None,
+    verify_generation_config: dict | None = None,
+    verify_code_commit_sha: str | None = None,
+    status: str = "complete",
+    failure_stage: str | None = None,
+    failure_reason: str | None = None,
+) -> dict:
+    """Create a BillOrganizationPosition row in ddp-broker-py — ddp-infra's
+    PLAN-bill-document-provenance.md Phase 8, "Organization Position
+    Research" (approved 2026-08-01 after 4 rounds of /pm-review).
+
+    Identifies the target BillVersion by its natural key, same as
+    write_bill_artifact. Unlike write_bill_artifact, this always creates a
+    new row — never an upsert. Every dispatch is a new finding; a history
+    of individual findings, not a single current-value slot.
+
+    Returns:
+        {"id": <int>} — the created row's id.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the write or was
+            unreachable.
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot write BillOrganizationPosition."
+        )
+
+    payload = {
+        "bill_openstates_id": bill_openstates_id,
+        "jurisdiction": jurisdiction,
+        "session_code": session_code,
+        "version_date": version_date,
+        "version_note": version_note,
+        "invocation_id": invocation_id,
+        "org_name": org_name,
+        "position": position,
+        "citation_url": citation_url,
+        "citation_excerpt": citation_excerpt,
+        "find_model_name": find_model_name,
+        "find_model_version": find_model_version,
+        "find_prompt_version": find_prompt_version,
+        "find_prompt_hash": find_prompt_hash,
+        "find_generation_config": find_generation_config,
+        "find_code_commit_sha": find_code_commit_sha,
+        "verification_verdict": verification_verdict,
+        "verification_insufficient_information": verification_insufficient_information,
+        "verification_content_incomplete": verification_content_incomplete,
+        "verification_explanation": verification_explanation,
+        "verify_model_name": verify_model_name,
+        "verify_model_version": verify_model_version,
+        "verify_prompt_version": verify_prompt_version,
+        "verify_prompt_hash": verify_prompt_hash,
+        "verify_generation_config": verify_generation_config,
+        "verify_code_commit_sha": verify_code_commit_sha,
+        "status": status,
+        "failure_stage": failure_stage,
+        "failure_reason": failure_reason,
+    }
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{settings.ddp_broker_api_base}/api/bill-organization-positions/",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the BillOrganizationPosition write "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    logger.info(
+        "BillOrganizationPosition written",
+        bill_openstates_id=bill_openstates_id,
+        org_name=org_name,
+        verification_verdict=verification_verdict,
+        position_id=result.get("id"),
+    )
+    return result
+
+
 async def get_latest_bill_version(bill_openstates_id: str) -> dict | None:
     """Read the latest version ddp-broker-py has recorded for a bill —
     Phase 4's replacement for a Redis lookup.
