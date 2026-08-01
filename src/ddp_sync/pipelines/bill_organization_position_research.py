@@ -99,7 +99,16 @@ async def generate_and_store_bill_organization_positions(
     invocation_id = str(uuid.uuid4())
     resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
 
-    find_result = await dispatch_bill_question(resolved_bill_source, "find_bill_positions")
+    # Longer timeout than dispatch_bill_question's own 120s default --
+    # empirically justified, not a guess: a real live validation run against
+    # FL SJR 2F (2026-08-01) completed in ~119s server-side, right at the
+    # edge of that default, and a client-side spurious timeout fired before
+    # the result could be read. find_bill_positions does real web search
+    # (potentially several searches), unlike the single-reasoning-call
+    # question types that default was calibrated for.
+    find_result = await dispatch_bill_question(
+        resolved_bill_source, "find_bill_positions", timeout_seconds=240.0
+    )
     find_answer = find_result["answer"]
     find_model_name = find_result.get("backend")
 
