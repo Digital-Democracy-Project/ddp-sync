@@ -14,6 +14,7 @@ from ddp_sync.services.broker_client import (
     get_concept_statement_set,
     get_latest_bill_version,
     write_bill_artifact,
+    write_bill_organization_position,
     write_bill_version,
 )
 
@@ -79,6 +80,74 @@ async def test_happy_path_posts_expected_payload_and_returns_result():
     assert call.kwargs["json"]["bill_openstates_id"] == "abc"
     assert call.kwargs["json"]["artifact_type"] == "bill_summary"
     assert call.kwargs["json"]["model_name"] == "mlx"
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_position_posts_expected_payload():
+    """PLAN-bill-document-provenance.md's Organization Position Research
+    addition (approved 2026-08-01)."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 42}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await write_bill_organization_position(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            invocation_id="11111111-1111-1111-1111-111111111111",
+            org_name="Sierra Club",
+            position="support",
+            citation_url="https://example.invalid/statement",
+            citation_excerpt="We support this bill.",
+            find_model_name="openai",
+            verification_verdict="confirmed",
+            verify_model_name="openai",
+            status="complete",
+        )
+
+    assert result == {"id": 42}
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-organization-positions/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    payload = call.kwargs["json"]
+    assert payload["org_name"] == "Sierra Club"
+    assert payload["position"] == "support"
+    assert payload["verification_verdict"] == "confirmed"
+    assert payload["invocation_id"] == "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_position_error_status_raises():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"org_name": ["This field is required."]}'
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError):
+            await write_bill_organization_position(
+                bill_openstates_id="abc",
+                jurisdiction="FL",
+                session_code="2026",
+                version_date="2026-01-05",
+                version_note="Introduced",
+                invocation_id="11111111-1111-1111-1111-111111111111",
+                org_name="",
+                position="support",
+                citation_url="https://example.invalid/statement",
+            )
 
 
 @pytest.mark.asyncio

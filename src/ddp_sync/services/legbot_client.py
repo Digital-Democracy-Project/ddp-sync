@@ -130,6 +130,48 @@ async def dispatch_bill_changelog(
     )
 
 
+async def dispatch_bill_position_verification(
+    url: str,
+    claim: str,
+    *,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict:
+    """Dispatch a verify_bill_position task to LegBot and return its
+    structured answer — ddp-infra's PLAN-bill-document-provenance.md Phase 8,
+    "Organization Position Research" (approved 2026-08-01).
+
+    Args:
+        url: the citation URL to check the claim against. LegBot fetches
+            this itself (a deliberate, documented exception to its general
+            fetch-removal — see ddp-agents' legbot/handlers.py:191-230) —
+            the caller does not pre-fetch page text.
+        claim: a plain-language statement to judge against the fetched page,
+            e.g. an organization name + position + bill identity.
+        timeout_seconds: how long to poll before giving up.
+
+    Returns:
+        See _dispatch_and_await. answer contains "verdict"
+        ("confirmed"/"not_confirmed"), "insufficient_information",
+        "content_looks_incomplete", and "explanation" — no
+        "citation_excerpt"/"page_text" field exists in this payload or
+        answer at all.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't
+            be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "url": url,
+            "claim": claim,
+            "question_type": "verify_bill_position",
+            "caller": "ddp_sync",
+        },
+        question_type="verify_bill_position",
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _dispatch_and_await(
     payload: dict,
     *,

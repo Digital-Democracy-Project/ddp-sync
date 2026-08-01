@@ -11,6 +11,7 @@ import pytest
 from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     dispatch_bill_changelog,
+    dispatch_bill_position_verification,
     dispatch_bill_question,
 )
 
@@ -89,6 +90,46 @@ async def test_happy_path_returns_answer(tmp_path):
     assert post_call.kwargs["json"]["task_type"] == "analyze_bill"
     assert post_call.kwargs["json"]["payload"]["question_type"] == "summary_500char"
     assert post_call.kwargs["json"]["payload"]["caller"] == "ddp_sync"
+
+
+@pytest.mark.asyncio
+async def test_verify_bill_position_sends_url_and_claim_only(tmp_path):
+    """PLAN-bill-document-provenance.md's Organization Position Research
+    addition -- the payload must be exactly {url, claim, question_type,
+    caller}. No citation_excerpt/page_text field exists in this payload at
+    all (ddp-agents' handlers.py:194-198 requires only url and claim)."""
+    task_id = "verify789"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {
+        "verdict": "confirmed",
+        "insufficient_information": False,
+        "content_looks_incomplete": False,
+        "explanation": "The page confirms the organization's stated position.",
+    }
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "openai"})
+    )
+
+    mock_client = _mock_client(statuses=["queued", "completed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        result = await dispatch_bill_position_verification(
+            "https://example.invalid/org-statement", "Sierra Club supports HB123"
+        )
+
+    assert result == {"answer": answer, "backend": "openai"}
+    payload = mock_client.post.await_args.kwargs["json"]["payload"]
+    assert payload == {
+        "url": "https://example.invalid/org-statement",
+        "claim": "Sierra Club supports HB123",
+        "question_type": "verify_bill_position",
+        "caller": "ddp_sync",
+    }
 
 
 @pytest.mark.asyncio
