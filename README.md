@@ -38,7 +38,7 @@ nginx (:80/443)
         └── DDP-Sync (:8001) — Data pipelines (this service)
 ```
 
-DDP-Sync is not exposed externally. All external traffic goes through DDP-API's catch-all proxy (`/votebot/sync/*`, `/votebot/trigger/*`).
+DDP-Sync is not exposed externally. All external traffic goes through DDP-API's catch-all proxy (`/sync/*`, `/trigger/*`).
 
 ### Pub/sub events
 
@@ -90,7 +90,7 @@ All endpoints are prefixed with `/ddp-sync/v1` (set in `src/ddp_sync/app.py` as 
 
 For example, the unified sync endpoint:
 - **From localhost on EC2**: `http://localhost:8001/ddp-sync/v1/sync/unified`
-- **From the public proxy** (DDP-API strips its own `/votebot/sync/` prefix and forwards): `https://api.digitaldemocracyproject.org/votebot/sync/unified`
+- **From the public proxy** (DDP-API forwards to `/ddp-sync/v1/sync/{path}`): `https://api.digitaldemocracyproject.org/sync/unified`
 
 ### Sync Endpoints
 
