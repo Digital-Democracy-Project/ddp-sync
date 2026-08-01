@@ -157,11 +157,17 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
             get_archived_bill_text.
 
     Returns:
-        {"old_bill_source": str, "diff_source": str} if both are archived and non-empty, else
-        None -- covering every "not available" case identically (fewer than two versions,
-        latest not archived, previous not archived, no diff computed yet e.g. previous was the
-        first version ever archived, local api-v3 unreachable/rejecting/non-JSON, or the bill
-        not found at all). Deliberately never raises, same posture as get_archived_bill_text:
+        {"old_bill_source": str, "diff_source": str, "old_version_date": str,
+        "old_version_note": str, "latest_version_date": str, "latest_version_note": str} if
+        old_bill_source and diff_source are both archived and non-empty, else None -- covering
+        every "not available" case identically (fewer than two versions, latest not archived,
+        previous not archived, no diff computed yet e.g. previous was the first version ever
+        archived, local api-v3 unreachable/rejecting/non-JSON, or the bill not found at all).
+        The four *_date/*_note fields are the same values already used internally to sort and
+        pick "latest"/"previous" (ddp-infra's bill_changelog design, added 2026-08-01) --
+        surfaced so a caller can verify it's generating a changelog for the version this
+        function actually resolved as latest, not a stale or different one; previously computed
+        here and discarded. Deliberately never raises, same posture as get_archived_bill_text:
         this is a pre-check for an optimization, not a required read -- any failure here must
         fall back to bill_version.py's existing live-refetch-and-diff path exactly as if this
         function didn't exist, never abort changelog generation.
@@ -222,7 +228,14 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
     if not old_bill_source:
         return None
 
-    return {"old_bill_source": old_bill_source, "diff_source": diff_source}
+    return {
+        "old_bill_source": old_bill_source,
+        "diff_source": diff_source,
+        "old_version_date": previous.get("date", ""),
+        "old_version_note": previous.get("note", ""),
+        "latest_version_date": latest.get("date", ""),
+        "latest_version_note": latest.get("note", ""),
+    }
 
 
 async def list_current_session_bill_candidates(

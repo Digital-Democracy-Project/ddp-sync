@@ -336,6 +336,10 @@ async def test_changelog_inputs_happy_path():
     assert result == {
         "old_bill_source": "Archived introduced text.",
         "diff_source": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
+        "old_version_date": "2026-01-01",
+        "old_version_note": "Introduced",
+        "latest_version_date": "2026-02-01",
+        "latest_version_note": "Engrossed",
     }
     call = mock_client.get.await_args
     assert call.args[0] == (

@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ddp_sync.pipelines.bill_artifact_generation import generate_and_store_bill_artifact
+from ddp_sync.pipelines.bill_artifact_generation import (
+    ArchivedVersionMismatchError,
+    generate_and_store_bill_artifact,
+    generate_and_store_bill_changelog,
+)
+from ddp_sync.services.broker_client import BrokerClientError
 
 _COMMON_KWARGS = dict(
     bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
@@ -309,3 +314,186 @@ async def test_archived_text_not_found_falls_back_to_live_url_bill_source(
     assert result == {"id": 8, "created": True}
     no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "summary_500char")
+
+
+_CHANGELOG_KWARGS = dict(
+    bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
+    jurisdiction="FL",
+    session_code="2026",
+    version_date="2026-02-01",
+    version_note="Engrossed",
+)
+
+_ARCHIVED = {
+    "old_bill_source": "Archived introduced text.",
+    "diff_source": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
+    "old_version_date": "2026-01-01",
+    "old_version_note": "Introduced",
+    "latest_version_date": "2026-02-01",
+    "latest_version_note": "Engrossed",
+}
+
+
+@pytest.mark.asyncio
+async def test_changelog_no_archived_inputs_writes_failed_row():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 1, "created": True}
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["failure_reason"] == "no_archived_changelog_inputs"
+    assert write_kwargs["content"] == ""
+    assert "compare_version_date" not in write_kwargs
+
+
+@pytest.mark.asyncio
+async def test_changelog_version_mismatch_raises_and_writes_nothing():
+    """The most important test in this design (round 4's catch): a stale or
+    mismatched caller must never write anything at all -- not a failed row,
+    not a successful one -- since write_bill_artifact's own upsert key
+    resolves from this call's own (stale) version_date/version_note and
+    could otherwise silently overwrite an already-correct row for that
+    version.
+    """
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_write:
+        with pytest.raises(ArchivedVersionMismatchError):
+            await generate_and_store_bill_changelog(
+                **{**_CHANGELOG_KWARGS, "version_date": "1999-01-01", "version_note": "Stale"}
+            )
+
+    mock_dispatch.assert_not_called()
+    mock_pipeline_cls.assert_not_called()
+    mock_write.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changelog_happy_path_writes_broker_and_pinecone_with_compare_version():
+    dispatch_result = {
+        "answer": {
+            "insufficient_information": False,
+            "sections_added": ["A new section on fees."],
+            "sections_removed": [],
+            "sections_modified": ["Section 3 reworded."],
+            "policy_implications": "Increases administrative cost.",
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ) as mock_write:
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 2, "created": True}
+    mock_dispatch.assert_awaited_once_with(
+        old_bill_source="Archived introduced text.",
+        diff_source="--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    mock_pipeline_cls.return_value.ingest_document.assert_awaited_once()
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "complete"
+    assert write_kwargs["model_name"] == "mlx"
+    assert write_kwargs["pinecone_synced_at"] is not None
+    assert write_kwargs["compare_version_date"] == "2026-01-01"
+    assert write_kwargs["compare_version_note"] == "Introduced"
+    content = write_kwargs["content"]
+    assert "## What Changed" not in content  # no bill_title param -- see design note
+    assert "**From:** Introduced" in content
+    assert "**To:** Engrossed" in content
+    assert "### Sections Added" in content
+    assert "- A new section on fees." in content
+    assert "### Sections Removed" in content
+    assert "- None" in content
+    assert "### Sections Modified" in content
+    assert "### Key Policy Implications" in content
+    assert "Increases administrative cost." in content
+
+
+@pytest.mark.asyncio
+async def test_changelog_insufficient_information_writes_failed_row_with_compare_version():
+    dispatch_result = {
+        "answer": {"insufficient_information": True, "reason": "diff_too_ambiguous"},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 3, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 3, "created": True}
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["failure_reason"] == "diff_too_ambiguous"
+    assert write_kwargs["content"] == ""
+    # compare_version is still real, known provenance even on this failure
+    # path -- only the "nothing archived at all" and version-mismatch cases
+    # write with no compare_version.
+    assert write_kwargs["compare_version_date"] == "2026-01-01"
+    assert write_kwargs["compare_version_note"] == "Introduced"
+
+
+@pytest.mark.asyncio
+async def test_changelog_broker_write_failure_after_pinecone_success_propagates():
+    dispatch_result = {
+        "answer": {
+            "insufficient_information": False,
+            "sections_added": [],
+            "sections_removed": [],
+            "sections_modified": [],
+            "policy_implications": "",
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
+    ) as mock_pipeline_cls, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("compare_version FK resolution failed")),
+    ):
+        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
+
+        with pytest.raises(BrokerClientError):
+            await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    mock_pipeline_cls.return_value.ingest_document.assert_awaited_once()

@@ -80,6 +80,37 @@ async def test_happy_path_posts_expected_payload_and_returns_result():
     assert call.kwargs["json"]["bill_openstates_id"] == "abc"
     assert call.kwargs["json"]["artifact_type"] == "bill_summary"
     assert call.kwargs["json"]["model_name"] == "mlx"
+    assert call.kwargs["json"]["compare_version_date"] is None
+    assert call.kwargs["json"]["compare_version_note"] is None
+
+
+@pytest.mark.asyncio
+async def test_compare_version_fields_pass_through_the_payload():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 9, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-02-01",
+            version_note="Engrossed",
+            artifact_type="bill_changelog",
+            content="## What changed...",
+            compare_version_date="2026-01-01",
+            compare_version_note="Introduced",
+        )
+
+    call = mock_client.post.await_args
+    assert call.kwargs["json"]["compare_version_date"] == "2026-01-01"
+    assert call.kwargs["json"]["compare_version_note"] == "Introduced"
 
 
 @pytest.mark.asyncio
