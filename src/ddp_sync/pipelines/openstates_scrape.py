@@ -16,12 +16,14 @@ at 01:00 UTC handles apply-local-patches.sh before the 02:00 UTC scrapes.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any
 
+import requests
 import structlog
 
 logger = structlog.get_logger()
@@ -39,6 +41,63 @@ SCRAPE_TIMEOUT_S: dict[str, int] = {
 
 def _get_root(config: dict | None) -> str:
     return (config or {}).get("openstates_root", DEFAULT_OPENSTATES_ROOT)
+
+
+def _alert_scrape_failure(label: str, error: str, duration_seconds: float) -> None:
+    """Best-effort Slack + CAMS alert for a scrape that ddp-sync itself gave up on.
+
+    run-scrape.sh has its own Slack/CAMS alerting (run-scrape.sh's on_failure()), but that
+    only fires from *inside* the script's own process — a ddp-sync subprocess.run(timeout=...)
+    kill (subprocess.TimeoutExpired) or any other exception here happens outside that process
+    entirely, so run-scrape.sh never gets a chance to alert on it. Before this, a timeout-kill
+    was 100% silent: logged at ERROR and written to a Redis flow-status key that health.py
+    doesn't even surface. Found live 2026-08-01 while scoping a scrape auto-retry feature —
+    MA's own ~5h failure was close enough to its 6h default timeout that a retry wrapper could
+    plausibly hit this exact silent path. Never raises — same convention as every other
+    alerting call site in this codebase (push_health_alert, run-scrape.sh's on_failure).
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if token:
+        channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
+        text = (
+            f":red_circle: *OpenStates scrape failed: {label}* — {error} "
+            f"(after {duration_seconds:.0f}s) — check ddp-sync logs / scraper.log"
+        )
+        try:
+            resp = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"channel": channel, "text": text},
+                timeout=15,
+            )
+            if not (resp.ok and resp.json().get("ok")):
+                logger.error("openstates_scrape: Slack alert failed", response=resp.text[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.error("openstates_scrape: Slack alert error", error=str(e))
+    else:
+        logger.warning("openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on scrape failure")
+
+    cams_token = os.getenv("CAMS_API_TOKEN", "")
+    if cams_token:
+        cams_url = os.getenv("CAMS_BASE_URL", "http://localhost:8000")
+        payload = {
+            "v": 1,
+            "service": "ddp-sync",
+            "error_type": "ScrapeTimeoutOrSubprocessError",
+            "message": f"scrape failed for {label}: {error} (after {duration_seconds:.0f}s)",
+            "metadata": {"jurisdiction": label},
+        }
+        try:
+            resp = requests.post(
+                f"{cams_url}/api/v1/failures",
+                headers={"Authorization": f"Bearer {cams_token}", "Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=10,
+            )
+            if not resp.ok:
+                logger.error("openstates_scrape: CAMS report failed", status=resp.status_code)
+        except Exception as e:  # noqa: BLE001
+            logger.error("openstates_scrape: CAMS report error", error=str(e))
 
 
 async def _run_scrape(
@@ -92,6 +151,11 @@ async def _run_scrape(
                 stderr_tail=stderr_tail,
                 duration_seconds=duration,
             )
+            # Not alerting here: run-scrape.sh's own on_failure() already fired its Slack/CAMS
+            # alert from inside the process before exiting nonzero — alerting again here would
+            # double-page for the exact same failure. The three paths below are different: they
+            # all happen *outside* run-scrape.sh's own process (killed by us, or we never even
+            # got a chance to run it), so it never got to alert on its own.
             return {
                 "success": False,
                 "error": f"exit_code_{result.returncode}",
@@ -116,6 +180,10 @@ async def _run_scrape(
             timeout_s=timeout,
             duration_seconds=duration,
         )
+        # Killed the whole process tree (start_new_session=True) before run-scrape.sh's own
+        # ERR trap ever got a chance to run — it never alerted on this one. We're the only ones
+        # who know it happened, so we're the only ones who can alert.
+        _alert_scrape_failure(label, f"timed out after {timeout}s", duration)
         return {
             "success": False,
             "error": "timeout",
@@ -131,6 +199,10 @@ async def _run_scrape(
             error=str(e),
             duration_seconds=duration,
         )
+        # Something failed before/while invoking the subprocess itself (e.g. the script or
+        # openstates_root path doesn't exist) — run-scrape.sh never started, so it never had a
+        # chance to alert either.
+        _alert_scrape_failure(label, str(e), duration)
         return {
             "success": False,
             "error": str(e),
