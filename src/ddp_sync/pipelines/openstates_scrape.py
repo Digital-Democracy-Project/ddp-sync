@@ -101,6 +101,84 @@ def _alert_scrape_failure(label: str, error: str, duration_seconds: float) -> No
             logger.error("openstates_scrape: CAMS report error", error=str(e))
 
 
+def _alert_sustained_block(jurisdiction: str, blocked_count: int, window: int) -> None:
+    """Distinctly-worded Slack alert for a *sustained* blocking pattern (OPEN-22 AC2) --
+    separate from _alert_scrape_failure's per-run failure alert, so a human notices the
+    pattern (e.g. "MI has been blocked 3 of the last 4 weekly runs") without having to
+    reconstruct it manually from past per-run alerts/logs. Same channel/token convention as
+    _alert_scrape_failure -- no new secret/webhook for what's still #automation-errors.
+    Never raises, same convention as every other alerting call site in this module.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        logger.warning(
+            "openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on sustained block",
+            jurisdiction=jurisdiction,
+        )
+        return
+    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
+    text = (
+        f":rotating_light: *{jurisdiction} has been blocked {blocked_count} of the last "
+        f"{window} weekly runs* — likely a sustained reputation-blocking window, not a "
+        f"one-off failure. See OPEN-22 / README.md."
+    )
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": channel, "text": text},
+            timeout=15,
+        )
+        if not (resp.ok and resp.json().get("ok")):
+            logger.error(
+                "openstates_scrape: sustained-block Slack alert failed", response=resp.text[:200]
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.error("openstates_scrape: sustained-block Slack alert error", error=str(e))
+
+
+# Substring markers matched against a failed run's stderr tail to classify *why* it failed
+# (OPEN-22 AC0b), so a sustained WAF-block pattern can be told apart from an unrelated network
+# blip or code bug. Matched against this same GitHub org's own first-party ScrapeError message
+# text (scrapers/mi/_waf_circuit_breaker.py's MAX_CONSECUTIVE_WAF_BLOCKS abort message, OPEN-18/
+# OPEN-22 AC7) -- a stable, versioned string this codebase controls, not free-form third-party
+# prose, so this is a narrow literal match rather than the kind of generic text-parsing
+# reuse-before-reinvent.md warns against.
+WAF_BLOCK_MARKERS = ("consecutive waf blocks detected", "waf block detected")
+
+
+def classify_failure_reason(error: str, stderr_tail: str) -> str:
+    """Classify a failed run's reason for OPEN-22's sustained-pattern escalation.
+
+    Returns one of "waf_block", "timeout", "network_error", "nonzero_exit_other". Best-effort:
+    good enough to distinguish the one thing OPEN-22's escalation looks for (a WAF-block-
+    classified failure) from everything else, not an exhaustive failure taxonomy.
+    """
+    if error == "timeout":
+        return "timeout"
+    haystack = stderr_tail.lower()
+    if any(marker in haystack for marker in WAF_BLOCK_MARKERS):
+        return "waf_block"
+    if error.startswith("exit_code_"):
+        return "nonzero_exit_other"
+    return "network_error"
+
+
+def should_escalate(history: list[dict], window: int, threshold: int) -> bool:
+    """Pure function (OPEN-22 AC1-3): has this jurisdiction been WAF-blocked in most/all of
+    its last `window` recorded runs?
+
+    Stateless by design -- recomputed from the rolling history every time, no separate streak
+    counter to keep in sync. AC5's "a recovered run resets the streak cleanly" falls out for
+    free: a success anywhere in the window changes the ratio automatically, with no second
+    piece of state that could be forgotten. AC3's "a single bad run must not escalate" holds
+    because `threshold` (>1) can't be reached by one failure alone.
+    """
+    recent = history[-window:]
+    blocked = sum(1 for r in recent if r.get("failure_reason") == "waf_block")
+    return blocked >= threshold
+
+
 def _run_with_group_kill(
     cmd: list[str], env: dict, timeout: int
 ) -> tuple[int, bytes, bytes, bool]:
@@ -182,6 +260,7 @@ async def _run_scrape(
             return {
                 "success": False,
                 "error": "timeout",
+                "failure_reason": classify_failure_reason("timeout", ""),
                 "jurisdiction": label,
                 "duration_seconds": duration,
             }
@@ -207,9 +286,11 @@ async def _run_scrape(
             # else (positive returncode): run-scrape.sh's own on_failure() already fired its
             # Slack/CAMS alert from inside the process before exiting nonzero — alerting again
             # here would double-page for the exact same failure.
+            error = f"exit_code_{returncode}"
             return {
                 "success": False,
-                "error": f"exit_code_{returncode}",
+                "error": error,
+                "failure_reason": classify_failure_reason(error, stderr_tail),
                 "jurisdiction": label,
                 "duration_seconds": duration,
             }
@@ -235,9 +316,11 @@ async def _run_scrape(
         # openstates_root path doesn't exist) — run-scrape.sh never started, so it never had a
         # chance to alert either.
         _alert_scrape_failure(label, str(e), duration)
+        error = str(e)
         return {
             "success": False,
-            "error": str(e),
+            "error": error,
+            "failure_reason": classify_failure_reason(error, ""),
             "jurisdiction": label,
             "duration_seconds": duration,
         }
@@ -251,6 +334,67 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
         await redis_store.set_flow_status(flow_key, status)
     except Exception as e:
         logger.warning("openstates_scrape: redis write failed", flow=flow_key, error=str(e))
+
+
+# Defaults if sync_schedule.yaml's secondary.escalation block is absent -- deliberately
+# "most, not all" (3 of 4): a single bad run (AC3) must never escalate, but escalating only on
+# a full 4-for-4 streak would delay detection by an extra week versus catching it at 3.
+DEFAULT_ESCALATION_WINDOW = 4
+DEFAULT_ESCALATION_THRESHOLD = 3
+
+
+async def _check_sustained_blocking(
+    flow_key: str,
+    jurisdictions: list[str],
+    results: list[dict[str, Any]],
+    config: dict | None,
+) -> None:
+    """Record this run's outcome into each jurisdiction's rolling history and escalate if a
+    sustained WAF-blocking pattern shows up (OPEN-22 AC0-AC5). Best-effort: a Redis hiccup
+    here must never fail the scrape job itself, same convention as _write_flow_status.
+    """
+    escalation_cfg = (config or {}).get("secondary", {}).get("escalation", {})
+    window = escalation_cfg.get("window_size", DEFAULT_ESCALATION_WINDOW)
+    threshold = escalation_cfg.get("threshold", DEFAULT_ESCALATION_THRESHOLD)
+
+    try:
+        from ddp_sync.services.redis_store import get_redis_store
+        redis_store = get_redis_store()
+    except Exception as e:
+        logger.warning("openstates_scrape: redis unavailable for history tracking", error=str(e))
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    for jurisdiction, result in zip(jurisdictions, results):
+        record = {
+            "timestamp": now,
+            "success": result["success"],
+            "failure_reason": result.get("failure_reason"),
+        }
+        try:
+            await redis_store.append_run_history(
+                flow_key, jurisdiction, record, max_len=max(window, 20)
+            )
+            history = await redis_store.get_run_history(flow_key, jurisdiction)
+        except Exception as e:
+            logger.warning(
+                "openstates_scrape: run-history tracking failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+            continue
+
+        if should_escalate(history, window, threshold):
+            recent = history[-window:]
+            blocked = sum(1 for r in recent if r.get("failure_reason") == "waf_block")
+            logger.error(
+                "openstates_scrape: sustained blocking pattern detected",
+                jurisdiction=jurisdiction,
+                blocked=blocked,
+                window=window,
+                threshold=threshold,
+            )
+            _alert_sustained_block(jurisdiction, blocked, window)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +617,10 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
         total=len(results),
         failed=len(failed),
         duration_seconds=duration,
+    )
+
+    await _check_sustained_blocking(
+        "openstates_secondary_scrapes", jurisdictions, results, config
     )
 
     await _write_flow_status("openstates_secondary_scrapes", {

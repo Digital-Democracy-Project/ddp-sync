@@ -267,6 +267,20 @@ openstates_scrape:
       - ut
       - az
 
+    # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
+    # WAF block from MI having been blocked for a month straight -- every weekly failure got
+    # the same per-run alert either way. Checks each jurisdiction's own rolling history of the
+    # last `window_size` runs and fires a separate, distinctly-worded Slack alert if at least
+    # `threshold` of them were WAF-block-classified failures (only MI produces that
+    # classification today; this is jurisdiction-agnostic so any future jurisdiction with the
+    # same failure mode is covered automatically). Deliberately does NOT skip or delay a
+    # scheduled run based on this history -- see OPEN-22's own AC5 scope note: MI already only
+    # runs weekly, so skipping a scheduled attempt has unproven value and would mean less data
+    # on whether the block has actually cleared.
+    escalation:
+      window_size: 4    # look at each jurisdiction's last N weekly runs
+      threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
+
   people_refresh:
     enabled: true
     sync_day: sunday

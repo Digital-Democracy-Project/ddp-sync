@@ -305,6 +305,67 @@ class RedisStore:
             logger.error("Redis: failed to get flow status", flow_name=flow_name, error=str(e))
         return None
 
+    # -- Flow run history tracking (rolling window, OPEN-22 AC0) --
+    #
+    # set_flow_status/get_flow_status above is a plain SET/GET that every weekly run
+    # overwrites -- there is no history to check a sustained pattern against. Deliberately
+    # additive rather than changing that primitive in place: it has other callers
+    # (scheduler.py's daily_bill_sync/webflow_status, openstates_archive.py, votebot_eval.py,
+    # health.py's status-page read) this module has no way to verify the full blast radius
+    # of, so a capped rolling-history list lives under its own key instead.
+
+    RUN_HISTORY_PREFIX = "ddp:flow_history:"
+    RUN_HISTORY_TTL = 86400 * 30  # 30 days -- comfortable margin over the weekly cadence this
+    # exists for (a window of the last 3-4 runs), so a slow/delayed run doesn't age out early.
+
+    async def append_run_history(
+        self, flow_name: str, jurisdiction: str, record: dict, max_len: int = 20
+    ) -> None:
+        """Append one run's outcome to a capped rolling history (Redis List: RPUSH + LTRIM).
+
+        Args:
+            flow_name: Flow identifier (e.g. 'openstates_secondary_scrapes')
+            jurisdiction: Jurisdiction code the record is for (e.g. 'mi')
+            record: JSON-serializable outcome, e.g. {"timestamp": ..., "success": bool,
+                "failure_reason": str | None}
+            max_len: Cap on retained history length (oldest entries drop off first)
+        """
+        if not self._client:
+            return
+        try:
+            key = f"{self.RUN_HISTORY_PREFIX}{flow_name}:{jurisdiction}"
+            await self._client.rpush(key, json.dumps(record))
+            await self._client.ltrim(key, -max_len, -1)
+            await self._client.expire(key, self.RUN_HISTORY_TTL)
+        except Exception as e:
+            logger.error(
+                "Redis: failed to append run history",
+                flow_name=flow_name,
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+
+    async def get_run_history(self, flow_name: str, jurisdiction: str) -> list[dict]:
+        """Get the rolling history of past run outcomes for a jurisdiction, oldest first.
+
+        Returns:
+            List of previously-appended records (empty list if none/unavailable)
+        """
+        if not self._client:
+            return []
+        try:
+            key = f"{self.RUN_HISTORY_PREFIX}{flow_name}:{jurisdiction}"
+            raw = await self._client.lrange(key, 0, -1)
+            return [json.loads(r) for r in raw]
+        except Exception as e:
+            logger.error(
+                "Redis: failed to get run history",
+                flow_name=flow_name,
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+            return []
+
 
 # Singleton
 _redis_store: Optional[RedisStore] = None
