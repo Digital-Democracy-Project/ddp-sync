@@ -502,3 +502,174 @@ async def create_concept_statement_set(
         set_id=result.get("id"),
     )
     return result
+
+
+async def get_bill_artifacts(*, jurisdiction: str, session_code: str, gov_id: str) -> dict | None:
+    """Read BillArtifact coverage (any status, including failed) for a bill —
+    PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
+    2026-08-01 after 3 rounds of /pm-review).
+
+    Calls GET /api/bill-artifacts/status/, NOT the public .../current/
+    endpoint — that one only ever returns status=complete rows, so it
+    can't tell "has a failed row" apart from "has no row at all" (a real
+    gap found implementing this design, not anticipated by it as written).
+    Service-token-authenticated, mirroring the auth split between this
+    app's public reads and service-only writes/status checks.
+
+    Returns:
+        None if no Bill/BillVersion exists for this identity yet (the
+        {"found": false} case) -- mirrors get_latest_bill_version's/
+        get_concept_statement_set's exact pattern. Otherwise
+        {"bill_version_id": int, "artifacts": {artifact_type: {"status": str}}}
+        -- every artifact_type with any row at all for this bill's current
+        version, keyed by type, regardless of status.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request or was
+            unreachable — a real failure, distinct from "not found."
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot read BillArtifact status."
+        )
+
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{settings.ddp_broker_api_base}/api/bill-artifacts/status/",
+                headers=headers,
+                params={"jurisdiction": jurisdiction, "session": session_code, "gov_id": gov_id},
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the BillArtifact status read "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    if not result.pop("found", False):
+        return None
+    return result
+
+
+async def get_bill_organization_positions_status(*, bill_openstates_id: str) -> dict:
+    """Check whether a bill's organization positions have been researched at
+    all yet — PLAN-bill-document-provenance.md's "Step 1, scoped version"
+    (approved 2026-08-01 after 3 rounds of /pm-review).
+
+    Calls GET /api/bill-organization-positions/status/. Keyed by
+    bill_openstates_id alone (globally unique), not the
+    (jurisdiction, session, gov_id) triple most other reads in this module
+    use — this status check isn't BillVersion-scoped, see
+    BillOrganizationResearchRun's own model docstring for why.
+
+    Returns:
+        {"has_rows": bool, "row_count": int}. has_rows is true if this bill
+        has ever had a completed find_bill_positions run (regardless of how
+        many organizations it found) OR already has real
+        BillOrganizationPosition rows from before this tracking existed.
+        There's no "not found" case here, unlike get_bill_artifacts/
+        get_latest_bill_version — a bill with no research at all simply
+        reads {"has_rows": False, "row_count": 0}.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request or was
+            unreachable.
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot read organization-research status."
+        )
+
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{settings.ddp_broker_api_base}/api/bill-organization-positions/status/",
+                headers=headers,
+                params={"bill_openstates_id": bill_openstates_id},
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the organization-research status read "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    return resp.json()
+
+
+async def write_bill_organization_research_run(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    invocation_id: str,
+    positions_found_count: int,
+) -> dict:
+    """Record that organization-position research was attempted for a bill —
+    PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
+    2026-08-01 after 3 rounds of /pm-review).
+
+    Called by generate_and_store_bill_organization_positions right after
+    find_bill_positions returns a real answer, whether it reports zero
+    organizations or many — never called if that dispatch itself fails or
+    times out, so a transient failure is never mistaken for "researched,
+    found nothing."
+
+    Returns:
+        {"id": <int>} — the created row's id.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the write or was
+            unreachable.
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot write BillOrganizationResearchRun."
+        )
+
+    payload = {
+        "bill_openstates_id": bill_openstates_id,
+        "jurisdiction": jurisdiction,
+        "session_code": session_code,
+        "invocation_id": invocation_id,
+        "positions_found_count": positions_found_count,
+    }
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{settings.ddp_broker_api_base}/api/bill-organization-research-runs/",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the BillOrganizationResearchRun write "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    logger.info(
+        "BillOrganizationResearchRun written",
+        bill_openstates_id=bill_openstates_id,
+        run_id=result.get("id"),
+        positions_found_count=positions_found_count,
+    )
+    return result

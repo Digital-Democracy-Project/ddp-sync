@@ -37,6 +37,19 @@ def no_archived_text_by_default():
         yield
 
 
+@pytest.fixture(autouse=True)
+def mock_research_run_write():
+    """PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
+    2026-08-01): every test in this file gets this mocked by default so
+    existing tests don't need to know about it -- specific tests below
+    assert on its call args directly."""
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_research_run",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_run:
+        yield mock_run
+
+
 def _find_result(positions, insufficient_information=False):
     return {
         "answer": {"positions": positions, "insufficient_information": insufficient_information},
@@ -57,7 +70,7 @@ def _verify_result(verdict="confirmed", insufficient_information=False, content_
 
 
 @pytest.mark.asyncio
-async def test_no_positions_found_writes_nothing():
+async def test_no_positions_found_writes_nothing(mock_research_run_write):
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(return_value=_find_result([])),
@@ -69,10 +82,15 @@ async def test_no_positions_found_writes_nothing():
 
     assert result == []
     mock_write.assert_not_awaited()
+    # The tracking record IS still written -- this is the whole point of
+    # BillOrganizationResearchRun: distinguish "researched, found nothing"
+    # from "never touched."
+    mock_research_run_write.assert_awaited_once()
+    assert mock_research_run_write.await_args.kwargs["positions_found_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_insufficient_information_writes_nothing():
+async def test_insufficient_information_writes_nothing(mock_research_run_write):
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(
@@ -89,6 +107,69 @@ async def test_insufficient_information_writes_nothing():
 
     assert result == []
     mock_write.assert_not_awaited()
+    mock_research_run_write.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_never_writes_research_run(mock_research_run_write):
+    """A transient dispatch failure (LegBotDispatchError) must never be
+    mistaken for "researched, found nothing" -- no BillOrganizationResearchRun
+    row, so the bill stays correctly eligible for a retry."""
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(side_effect=LegBotDispatchError("timed out")),
+    ):
+        with pytest.raises(LegBotDispatchError):
+            await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    mock_research_run_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_happy_path_records_positions_found_count(mock_research_run_write):
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(side_effect=[{"id": 1}, {"id": 2}]),
+    ):
+        await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    mock_research_run_write.assert_awaited_once()
+    assert mock_research_run_write.await_args.kwargs["positions_found_count"] == 2
+    assert mock_research_run_write.await_args.kwargs["bill_openstates_id"] == _COMMON_KWARGS["bill_openstates_id"]
+
+
+@pytest.mark.asyncio
+async def test_research_run_write_failure_does_not_abort_the_rest(mock_research_run_write):
+    """A failure recording the tracking record is isolated, not fatal -- the
+    real organization findings below still get researched and written."""
+    mock_research_run_write.side_effect = BrokerClientError("unreachable")
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ):
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 1
+    assert result[0]["outcome"] == "written"
 
 
 @pytest.mark.asyncio

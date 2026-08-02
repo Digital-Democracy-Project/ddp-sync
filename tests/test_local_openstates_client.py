@@ -15,6 +15,7 @@ import pytest
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
     get_archived_changelog_inputs,
+    get_current_version_identity,
     list_current_session_bill_candidates,
 )
 
@@ -95,7 +96,10 @@ async def test_happy_path_returns_gov_id_session_and_live_url():
     ]
     call = mock_client.get.await_args
     assert call.args[0] == "http://localhost:8002/bills"
-    assert call.kwargs["params"]["jurisdiction"] == "fl"
+    # Real bug fix, 2026-08-01: api-v3's jurisdiction filter is
+    # case-sensitive for 2-letter codes (routes through the `us` package's
+    # lookup(abbr=...)) -- lowercase "fl" silently matched nothing, live.
+    assert call.kwargs["params"]["jurisdiction"] == "FL"
     assert call.kwargs["params"]["session"] == "2026"
 
 
@@ -148,6 +152,98 @@ async def test_truncates_to_limit():
         result = await list_current_session_bill_candidates("fl", limit=2)
 
     assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_code_skips_current_session_resolution():
+    """Step 1's own real need (session-targeted, not just 'current') --
+    supplying session_code bypasses get_current_session_identifier entirely,
+    and that value is what's sent as the session query param and stamped
+    on every returned candidate."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "results": [{
+            "id": "ocd-bill/a3afb726-fac4-41e7-b428-0cae1f4ddada",
+            "identifier": "SJR 2F",
+            "sources": [{"url": "https://flsenate.gov/bill/x.pdf"}],
+        }]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.ingestion.sources.openstates.OpenStatesSource.get_current_session_identifier",
+        new=AsyncMock(side_effect=AssertionError("should not be called when session_code is supplied")),
+    ):
+        result = await list_current_session_bill_candidates("fl", session_code="2026F", limit=10)
+
+    assert result[0]["session_code"] == "2026F"
+    assert mock_client.get.await_args.kwargs["params"]["session"] == "2026F"
+
+
+@pytest.mark.asyncio
+async def test_pagination_collects_across_pages_up_to_limit():
+    """Real bug fix, 2026-08-01: per_page=limit used to be sent as a single
+    request's page size -- silently under-covering any session with more
+    bills than `limit`. This asserts a real multi-page loop happens,
+    capped at the API's own max per_page (20)."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 25},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20, 25)
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 25},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    assert len(result) == 25
+    assert mock_client.get.await_count == 2
+    first_call_params = mock_client.get.await_args_list[0].kwargs["params"]
+    second_call_params = mock_client.get.await_args_list[1].kwargs["params"]
+    assert first_call_params["per_page"] == "20"
+    assert first_call_params["page"] == "1"
+    assert second_call_params["page"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_per_page_never_exceeds_api_max_even_when_limit_is_larger():
+    """api-v3 itself rejects per_page > 20 (confirmed live) -- this must
+    never be sent even when the caller's limit is much larger."""
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"results": [], "pagination": {"max_page": 1}}
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        await list_current_session_bill_candidates("fl", limit=500)
+
+    assert mock_client.get.await_args.kwargs["params"]["per_page"] == "20"
 
 
 @pytest.mark.asyncio
@@ -468,5 +564,63 @@ async def test_changelog_inputs_none_when_no_local_api_base_configured():
         return_value=_FakeSettings(local_openstates_api_base=""),
     ):
         result = await get_archived_changelog_inputs("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_current_version_identity_picks_latest_and_title():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "title": "Save our Homes from Excessive Property Taxes",
+        "versions": [
+            {"note": "Engrossed", "date": "2026-02-01", "links": []},
+            {"note": "Introduced", "date": "2026-01-01", "links": []},
+        ],
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_current_version_identity("some-uuid")
+
+    assert result == {
+        "version_date": "2026-02-01",
+        "version_note": "Engrossed",
+        "bill_title": "Save our Homes from Excessive Property Taxes",
+    }
+
+
+@pytest.mark.asyncio
+async def test_current_version_identity_none_when_no_versions():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"title": "A bill", "versions": []}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_current_version_identity("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_current_version_identity_none_on_unreachable_api():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_current_version_identity("some-uuid")
 
     assert result is None

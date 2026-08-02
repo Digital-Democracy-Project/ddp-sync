@@ -11,10 +11,13 @@ import pytest
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     create_concept_statement_set,
+    get_bill_artifacts,
+    get_bill_organization_positions_status,
     get_concept_statement_set,
     get_latest_bill_version,
     write_bill_artifact,
     write_bill_organization_position,
+    write_bill_organization_research_run,
     write_bill_version,
 )
 
@@ -489,4 +492,154 @@ async def test_create_concept_statement_set_raises_when_unreachable():
                 jurisdiction_iso2="FL",
                 session_code="2026",
                 statements=["A statement."],
+            )
+
+
+@pytest.mark.asyncio
+async def test_get_bill_artifacts_returns_none_when_not_found():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"found": False}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_artifacts(jurisdiction="FL", session_code="2026F", gov_id="SJR 2F")
+
+    assert result is None
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-artifacts/status/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert call.kwargs["params"] == {
+        "jurisdiction": "FL", "session": "2026F", "gov_id": "SJR 2F",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_bill_artifacts_returns_status_including_failed_rows():
+    """The whole reason this function calls .../status/ and not .../current/
+    -- a failed row must be visible here."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "found": True,
+        "bill_version_id": 2,
+        "artifacts": {
+            "bill_summary": {"status": "complete"},
+            "bill_pros_cons": {"status": "failed"},
+        },
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_artifacts(jurisdiction="FL", session_code="2026F", gov_id="SJR 2F")
+
+    assert result["artifacts"]["bill_pros_cons"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_get_bill_artifacts_raises_on_error_status():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 401
+    response.text = '{"detail": "Authentication credentials were not provided."}'
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="401"):
+            await get_bill_artifacts(jurisdiction="FL", session_code="2026F", gov_id="SJR 2F")
+
+
+@pytest.mark.asyncio
+async def test_get_bill_organization_positions_status_posts_bill_openstates_id_only():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"has_rows": True, "row_count": 7}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_organization_positions_status(bill_openstates_id="abc")
+
+    assert result == {"has_rows": True, "row_count": 7}
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-organization-positions/status/"
+    assert call.kwargs["params"] == {"bill_openstates_id": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_get_bill_organization_positions_status_raises_on_error():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"detail": "bill_openstates_id is required"}'
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="400"):
+            await get_bill_organization_positions_status(bill_openstates_id="abc")
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_research_run_posts_expected_payload():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 9}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await write_bill_organization_research_run(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026F",
+            invocation_id="11111111-0000-0000-0000-000000000001",
+            positions_found_count=0,
+        )
+
+    assert result == {"id": 9}
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-organization-research-runs/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert call.kwargs["json"]["positions_found_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_research_run_raises_on_error_status():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"detail": "invalid payload"}'
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="400"):
+            await write_bill_organization_research_run(
+                bill_openstates_id="abc",
+                jurisdiction="FL",
+                session_code="2026F",
+                invocation_id="11111111-0000-0000-0000-000000000001",
+                positions_found_count=0,
             )

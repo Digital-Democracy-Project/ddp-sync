@@ -30,7 +30,11 @@ import structlog
 # _resolve_bill_source() from bill_artifact_generation.py unchanged, rather
 # than duplicating its archived-text-preferred logic in this module too.
 from ddp_sync.pipelines.bill_artifact_generation import _resolve_bill_source
-from ddp_sync.services.broker_client import BrokerClientError, write_bill_organization_position
+from ddp_sync.services.broker_client import (
+    BrokerClientError,
+    write_bill_organization_position,
+    write_bill_organization_research_run,
+)
 from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     dispatch_bill_position_verification,
@@ -111,6 +115,32 @@ async def generate_and_store_bill_organization_positions(
     )
     find_answer = find_result["answer"]
     find_model_name = find_result.get("backend")
+
+    # PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
+    # 2026-08-01): record that research was attempted, right after
+    # find_bill_positions returns a real answer -- whether it reports zero
+    # organizations or many. Never written if the dispatch above raises
+    # instead of reaching this line, so a transient dispatch failure is
+    # never mistaken for "researched, found nothing." A failure writing
+    # this tracking record itself is isolated, not fatal -- it's a
+    # supplementary "has this been checked" marker, not required for the
+    # organization findings below to be correct.
+    positions_found_count = len(find_answer.get("positions") or [])
+    try:
+        await write_bill_organization_research_run(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            invocation_id=invocation_id,
+            positions_found_count=positions_found_count,
+        )
+    except BrokerClientError as exc:
+        logger.warning(
+            "Failed to record BillOrganizationResearchRun -- continuing anyway",
+            bill_openstates_id=bill_openstates_id,
+            invocation_id=invocation_id,
+            error=str(exc),
+        )
 
     if find_answer.get("insufficient_information") or not find_answer.get("positions"):
         logger.info(
