@@ -282,8 +282,9 @@ openstates_scrape:
       threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
 
     scrapebot_fallback:
-      enabled: false  # flip true once a jurisdiction is ready to opt in
-      jurisdictions: []  # e.g. ["mi"]
+      enabled: true  # flipped 2026-08-03 after Phase 3 live validation (real mint + concurrency smoke test both passed)
+      jurisdictions: ["mi"]
+
   people_refresh:
     enabled: true
     sync_day: sunday
