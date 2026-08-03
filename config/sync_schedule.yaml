@@ -281,6 +281,9 @@ openstates_scrape:
       window_size: 4    # look at each jurisdiction's last N weekly runs
       threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
 
+    scrapebot_fallback:
+      enabled: false  # flip true once a jurisdiction is ready to opt in
+      jurisdictions: []  # e.g. ["mi"]
   people_refresh:
     enabled: true
     sync_day: sunday

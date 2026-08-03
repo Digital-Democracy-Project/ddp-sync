@@ -27,6 +27,8 @@ from typing import Any
 import requests
 import structlog
 
+from ddp_sync.services import scrapebot_client
+
 logger = structlog.get_logger()
 
 DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
@@ -177,6 +179,62 @@ def should_escalate(history: list[dict], window: int, threshold: int) -> bool:
     recent = history[-window:]
     blocked = sum(1 for r in recent if r.get("failure_reason") == "waf_block")
     return blocked >= threshold
+
+
+def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """Is this jurisdiction opted into ScrapeBot cookie-mint fallback (PLAN-scrapebot.md §3.7)?
+
+    Config-gated per jurisdiction under secondary.scrapebot_fallback in
+    sync_schedule.yaml -- absent/disabled by default, so adding ScrapeBot never
+    changes behavior for a jurisdiction that hasn't explicitly opted in.
+    """
+    fallback_cfg = (config or {}).get("secondary", {}).get("scrapebot_fallback", {})
+    if not fallback_cfg.get("enabled", False):
+        return False
+    return jurisdiction in fallback_cfg.get("jurisdictions", [])
+
+
+async def _maybe_seed_scrapebot_cookies(
+    jurisdictions: list[str],
+    results: list[dict[str, Any]],
+    config: dict | None,
+    openstates_root: str,
+) -> None:
+    """Opportunistically mint fresh WAF-passing cookies for any jurisdiction that
+    just failed with a waf_block classification and is opted into
+    scrapebot_fallback (PLAN-scrapebot.md §3.7).
+
+    Deliberately does NOT retry the run that just failed -- run-scrape-retrying.sh's
+    existing MI carve-out (MAX_SCRAPE_ATTEMPTS=1) established the precedent that
+    retrying a live WAF block immediately is the wrong move. This only seeds
+    CookieProvider's on-disk cache so the *next* scheduled run starts with fresh
+    cookies. Best-effort: a mint failure here must never fail this job.
+    """
+    for jurisdiction, result in zip(jurisdictions, results):
+        if result.get("failure_reason") != "waf_block":
+            continue
+        if not _scrapebot_eligible(jurisdiction, config):
+            continue
+        try:
+            mint_result = await scrapebot_client.dispatch_mint_cookies(jurisdiction)
+            cache_path = scrapebot_client.cache_path_for(jurisdiction, openstates_root)
+            scrapebot_client.write_cookie_cache(
+                cache_path,
+                cookies=mint_result["cookies"],
+                user_agent=mint_result["user_agent"],
+            )
+            logger.info(
+                "openstates_scrape: ScrapeBot seeded fresh cookies ahead of the next "
+                "scheduled run (not retrying now -- see PLAN-scrapebot.md §3.7)",
+                jurisdiction=jurisdiction,
+                cache_path=cache_path,
+            )
+        except scrapebot_client.ScrapeBotDispatchError as e:
+            logger.warning(
+                "openstates_scrape: ScrapeBot mint failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
 
 
 def _run_with_group_kill(
@@ -629,6 +687,13 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
     await _check_sustained_blocking(
         "openstates_secondary_scrapes", jurisdictions, results, config
     )
+
+    # PLAN-scrapebot.md §3.7 -- opportunistically seed fresh cookies for any
+    # jurisdiction that just failed with a WAF-block classification and is
+    # opted into scrapebot_fallback. Never retries the run that just failed
+    # (see that function's own docstring for why); best-effort, never fails
+    # this job.
+    await _maybe_seed_scrapebot_cookies(jurisdictions, results, config, openstates_root)
 
     await _write_flow_status("openstates_secondary_scrapes", {
         "flow": "openstates_secondary_scrapes",
