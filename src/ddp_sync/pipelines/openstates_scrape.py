@@ -603,6 +603,13 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
 
     logger.info("openstates_secondary_scrapes: starting", jurisdictions=jurisdictions)
 
+    # session_arg=None is deliberate, not a gap -- do not "fix" this to pass an explicit
+    # session per jurisdiction without re-reading OPEN-24 first. openstates-core's do_scrape()
+    # scrapes every currently-active session when none is given; VA and UT have had two
+    # sessions simultaneously active at once (confirmed live 2026-08-02: VA had 2026S1 + 2027,
+    # UT had 2026 + 2025S2). Passing a single hardcoded/resolved session per jurisdiction
+    # (mirroring fl/usa's own sessions: config, which OPEN-24 originally proposed) would
+    # silently drop whichever second active session doesn't get picked, for exactly those two.
     results: list[dict[str, Any]] = await asyncio.gather(
         *[_run_scrape(j, None, openstates_root) for j in jurisdictions]
     )
