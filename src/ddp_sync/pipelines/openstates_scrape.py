@@ -719,9 +719,24 @@ async def run_single_scrape_job(
     jurisdiction: str,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint."""
+    """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint.
+
+    Was a thin wrapper with no ScrapeBot fallback at all -- run_secondary_scrapes_job()
+    had the PLAN-scrapebot.md §3.7 cookie-seed call, this didn't, so a jurisdiction
+    triggered standalone (e.g. `/trigger/openstates-scrape/mi`) never got the same
+    fallback a jurisdiction triggered as part of the full secondary batch did. Same
+    call, same semantics, just scoped to this one jurisdiction/result pair.
+    """
     openstates_root = _get_root(config)
-    return await _run_scrape(jurisdiction, None, openstates_root)
+    result = await _run_scrape(jurisdiction, None, openstates_root)
+
+    # PLAN-scrapebot.md §3.7 -- opportunistically seed fresh cookies for this
+    # jurisdiction if it just failed with a WAF-block classification and is opted
+    # into scrapebot_fallback. Never retries the run that just failed (see that
+    # function's own docstring for why); best-effort, never fails this job.
+    await _maybe_seed_scrapebot_cookies([jurisdiction], [result], config, openstates_root)
+
+    return result
 
 
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
