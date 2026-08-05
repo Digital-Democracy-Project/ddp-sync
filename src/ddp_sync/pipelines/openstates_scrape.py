@@ -194,47 +194,51 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in fallback_cfg.get("jurisdictions", [])
 
 
-async def _maybe_seed_scrapebot_cookies(
-    jurisdictions: list[str],
-    results: list[dict[str, Any]],
+async def _maybe_preseed_scrapebot_cookies(
+    jurisdiction: str,
     config: dict | None,
     openstates_root: str,
 ) -> None:
-    """Opportunistically mint fresh WAF-passing cookies for any jurisdiction that
-    just failed with a waf_block classification and is opted into
-    scrapebot_fallback (PLAN-scrapebot.md §3.7).
+    """Proactively mint fresh WAF-passing cookies via ScrapeBot before scraping a
+    jurisdiction opted into scrapebot_fallback (PLAN-scrapebot.md §3.7, revised
+    2026-08-05), rather than reactively after a failure.
 
-    Deliberately does NOT retry the run that just failed -- run-scrape-retrying.sh's
-    existing MI carve-out (MAX_SCRAPE_ATTEMPTS=1) established the precedent that
-    retrying a live WAF block immediately is the wrong move. This only seeds
-    CookieProvider's on-disk cache so the *next* scheduled run starts with fresh
-    cookies. Best-effort: a mint failure here must never fail this job.
+    Reactive seeding (mint only after a run classified its own failure as
+    waf_block) never actually fired against a real production run: the detailed
+    WafBlockDetected error only ever reaches scraper.log (redirected there inside
+    run-scrape.sh's own scrape_attempt() tee pipeline), never run-scrape.sh's
+    external stdout/stderr -- the only thing classify_failure_reason() can see.
+    So a real MI WAF block always classified as nonzero_exit_other, never
+    waf_block, and the reactive fallback silently never triggered. Proactive
+    minting sidesteps that gap entirely: always start with fresh cookies, never
+    depend on detecting the failure after the fact.
+
+    Best-effort: a mint failure here must never block or fail the actual scrape
+    that follows -- it just proceeds with whatever's already cached, or
+    CookieProvider's own self-warm.
     """
-    for jurisdiction, result in zip(jurisdictions, results):
-        if result.get("failure_reason") != "waf_block":
-            continue
-        if not _scrapebot_eligible(jurisdiction, config):
-            continue
-        try:
-            mint_result = await scrapebot_client.dispatch_mint_cookies(jurisdiction)
-            cache_path = scrapebot_client.cache_path_for(jurisdiction, openstates_root)
-            scrapebot_client.write_cookie_cache(
-                cache_path,
-                cookies=mint_result["cookies"],
-                user_agent=mint_result["user_agent"],
-            )
-            logger.info(
-                "openstates_scrape: ScrapeBot seeded fresh cookies ahead of the next "
-                "scheduled run (not retrying now -- see PLAN-scrapebot.md §3.7)",
-                jurisdiction=jurisdiction,
-                cache_path=cache_path,
-            )
-        except scrapebot_client.ScrapeBotDispatchError as e:
-            logger.warning(
-                "openstates_scrape: ScrapeBot mint failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
+    if not _scrapebot_eligible(jurisdiction, config):
+        return
+    try:
+        mint_result = await scrapebot_client.dispatch_mint_cookies(jurisdiction)
+        cache_path = scrapebot_client.cache_path_for(jurisdiction, openstates_root)
+        scrapebot_client.write_cookie_cache(
+            cache_path,
+            cookies=mint_result["cookies"],
+            user_agent=mint_result["user_agent"],
+        )
+        logger.info(
+            "openstates_scrape: ScrapeBot pre-seeded fresh cookies before scrape",
+            jurisdiction=jurisdiction,
+            cache_path=cache_path,
+        )
+    except scrapebot_client.ScrapeBotDispatchError as e:
+        logger.warning(
+            "openstates_scrape: ScrapeBot pre-seed mint failed, proceeding with "
+            "existing/self-warmed cookies",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
 
 
 def _run_with_group_kill(
@@ -272,6 +276,7 @@ async def _run_scrape(
     session_arg: str | None,
     openstates_root: str,
     timeout_s: int | None = None,
+    config: dict | None = None,
 ) -> dict[str, Any]:
     """Run run-scrape.sh for one jurisdiction off the event loop.
 
@@ -279,7 +284,15 @@ async def _run_scrape(
     both at 02:00 UTC) don't block each other in the event loop.
     SKIP_PATCHES=1 is set so apply-local-patches.sh is not re-run for every
     jurisdiction — the patch_refresh job owns that step.
+
+    Pre-seeds ScrapeBot cookies first (PLAN-scrapebot.md §3.7) for any
+    jurisdiction opted into scrapebot_fallback -- see
+    _maybe_preseed_scrapebot_cookies()'s own docstring for why this is proactive
+    now rather than reactive-after-failure. A no-op for every jurisdiction not
+    opted in (config defaults to None, in which case it's always a no-op).
     """
+    await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
+
     script = os.path.join(openstates_root, "run-scrape.sh")
     cmd = ["/bin/bash", script, jurisdiction]
     if session_arg:
@@ -541,7 +554,7 @@ async def run_fl_scrapes_job(config: dict | None = None) -> dict[str, Any]:
     results = []
     for session in sessions:
         result = await _run_scrape(
-            "fl", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["fl"]
+            "fl", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["fl"], config
         )
         results.append(result)
 
@@ -582,7 +595,7 @@ async def run_wa_scrape_job(config: dict | None = None) -> dict[str, Any]:
     openstates_root = _get_root(config)
     start_time = datetime.now(timezone.utc)
 
-    result = await _run_scrape("wa", None, openstates_root, SCRAPE_TIMEOUT_S["wa"])
+    result = await _run_scrape("wa", None, openstates_root, SCRAPE_TIMEOUT_S["wa"], config)
 
     await _write_flow_status("openstates_wa_scrape", {
         "flow": "openstates_wa_scrape",
@@ -609,7 +622,7 @@ async def run_usa_scrapes_job(config: dict | None = None) -> dict[str, Any]:
     results = []
     for session in sessions:
         result = await _run_scrape(
-            "usa", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["usa"]
+            "usa", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["usa"], config
         )
         results.append(result)
 
@@ -669,7 +682,7 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
     # (mirroring fl/usa's own sessions: config, which OPEN-24 originally proposed) would
     # silently drop whichever second active session doesn't get picked, for exactly those two.
     results: list[dict[str, Any]] = await asyncio.gather(
-        *[_run_scrape(j, None, openstates_root) for j in jurisdictions]
+        *[_run_scrape(j, None, openstates_root, config=config) for j in jurisdictions]
     )
 
     duration = round(time.monotonic() - t, 1)
@@ -687,13 +700,6 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
     await _check_sustained_blocking(
         "openstates_secondary_scrapes", jurisdictions, results, config
     )
-
-    # PLAN-scrapebot.md §3.7 -- opportunistically seed fresh cookies for any
-    # jurisdiction that just failed with a WAF-block classification and is
-    # opted into scrapebot_fallback. Never retries the run that just failed
-    # (see that function's own docstring for why); best-effort, never fails
-    # this job.
-    await _maybe_seed_scrapebot_cookies(jurisdictions, results, config, openstates_root)
 
     await _write_flow_status("openstates_secondary_scrapes", {
         "flow": "openstates_secondary_scrapes",
@@ -721,22 +727,13 @@ async def run_single_scrape_job(
 ) -> dict[str, Any]:
     """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint.
 
-    Was a thin wrapper with no ScrapeBot fallback at all -- run_secondary_scrapes_job()
-    had the PLAN-scrapebot.md §3.7 cookie-seed call, this didn't, so a jurisdiction
-    triggered standalone (e.g. `/trigger/openstates-scrape/mi`) never got the same
-    fallback a jurisdiction triggered as part of the full secondary batch did. Same
-    call, same semantics, just scoped to this one jurisdiction/result pair.
+    ScrapeBot pre-seeding (PLAN-scrapebot.md §3.7) happens inside _run_scrape()
+    itself now, keyed off the same config passed through here -- a jurisdiction
+    triggered standalone gets the identical treatment as one triggered as part
+    of the full secondary batch, with no separate call needed at this level.
     """
     openstates_root = _get_root(config)
-    result = await _run_scrape(jurisdiction, None, openstates_root)
-
-    # PLAN-scrapebot.md §3.7 -- opportunistically seed fresh cookies for this
-    # jurisdiction if it just failed with a WAF-block classification and is opted
-    # into scrapebot_fallback. Never retries the run that just failed (see that
-    # function's own docstring for why); best-effort, never fails this job.
-    await _maybe_seed_scrapebot_cookies([jurisdiction], [result], config, openstates_root)
-
-    return result
+    return await _run_scrape(jurisdiction, None, openstates_root, config=config)
 
 
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
