@@ -152,7 +152,7 @@ async def test_timeout_raises_without_hanging_forever(tmp_path):
         "ddp_sync.services.scrapebot_client.asyncio.sleep", new_callable=AsyncMock
     ), patch(
         "ddp_sync.services.scrapebot_client.time.monotonic",
-        side_effect=[0.0, 0.0, 200.0],  # exceeds the default 90s timeout on the 2nd poll check
+        side_effect=[0.0, 0.0, 300.0],  # exceeds the default 240s timeout on the 2nd poll check
     ):
         with pytest.raises(ScrapeBotDispatchError, match="did not finish within"):
             await dispatch_mint_cookies("mi")
