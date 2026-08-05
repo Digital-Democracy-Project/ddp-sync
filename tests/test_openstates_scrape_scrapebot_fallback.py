@@ -15,6 +15,7 @@ import pytest
 from ddp_sync.pipelines.openstates_scrape import (
     _maybe_seed_scrapebot_cookies,
     _scrapebot_eligible,
+    run_single_scrape_job,
 )
 from ddp_sync.services.scrapebot_client import ScrapeBotDispatchError
 
@@ -113,3 +114,49 @@ async def test_seed_never_raises_when_dispatch_fails():
         # Must not raise -- this is a best-effort cache seed (PLAN §3.7), never
         # something the caller's own job outcome should depend on.
         await _maybe_seed_scrapebot_cookies(jurisdictions, results, config, "/fake/root")
+
+
+@pytest.mark.asyncio
+async def test_run_single_scrape_job_seeds_scrapebot_on_waf_block():
+    """run_single_scrape_job() (the manual /trigger/openstates-scrape/mi path) used
+    to have no ScrapeBot fallback at all -- only run_secondary_scrapes_job() did.
+    A jurisdiction triggered standalone must get the same fallback."""
+    config = _config()
+    with patch(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape",
+        new_callable=AsyncMock,
+        return_value={"success": False, "failure_reason": "waf_block"},
+    ), patch(
+        "ddp_sync.pipelines.openstates_scrape.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+        return_value={
+            "cookies": [{"name": "x", "value": "y", "expires": 0}],
+            "user_agent": "ua",
+        },
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.openstates_scrape.scrapebot_client.write_cookie_cache"
+    ) as mock_write, patch(
+        "ddp_sync.pipelines.openstates_scrape.scrapebot_client.cache_path_for",
+        return_value="/fake/_cache/mi_waf_cookies.json",
+    ):
+        result = await run_single_scrape_job("mi", config)
+
+    mock_dispatch.assert_awaited_once_with("mi")
+    mock_write.assert_called_once()
+    assert result["success"] is False  # the seed call doesn't change the job's own outcome
+
+
+@pytest.mark.asyncio
+async def test_run_single_scrape_job_skips_scrapebot_when_not_opted_in():
+    config = _config(jurisdictions=("va",))  # mi not opted in
+    with patch(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape",
+        new_callable=AsyncMock,
+        return_value={"success": False, "failure_reason": "waf_block"},
+    ), patch(
+        "ddp_sync.pipelines.openstates_scrape.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+    ) as mock_dispatch:
+        await run_single_scrape_job("mi", config)
+
+    mock_dispatch.assert_not_awaited()
