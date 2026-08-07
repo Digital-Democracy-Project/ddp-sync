@@ -29,11 +29,16 @@ from ddp_sync.config import get_settings
 logger = structlog.get_logger()
 
 _POLL_INTERVAL_SECONDS = 5
-# A single page load + a possible CAPTCHA attempt is much smaller than
-# LegBot's own single reasoning call estimate (120s default) — 90s was
-# chosen (PLAN §3.3, PM-review round 3 fold) after 60s proved tight
-# against navigation + up to 2 CAPTCHA attempts.
-_DEFAULT_TIMEOUT_SECONDS = 90.0
+# 90s (PLAN §3.3, PM-review round 3 fold) was sized against ScrapeBot's
+# original MoE model. ddp-agents' PLAN-scrapebot.md §9.3.2 (2026-08-05
+# benchmark data): the dense model that replaced it as mint_cookies'
+# default took 103.4s for a trivial 2-iter, no-CAPTCHA mint alone -- already
+# over 90s. A real read/type/submit/re-check CAPTCHA loop plausibly adds
+# 2-4 more iterations at a similar per-iteration cost, so total time can
+# reasonably reach 200-300s+. Bumped to 240s as a conservative interim
+# estimate, not a final number -- revisit once a real CAPTCHA-solve dispatch
+# has actually been measured end to end.
+_DEFAULT_TIMEOUT_SECONDS = 240.0
 _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 # CookieProvider's own session-cookie TTL fallback (openstates-core's
