@@ -311,6 +311,14 @@ openstates_archive:
     - wa
     - va
     - mi
+  # Same ScrapeBot cookie pre-seed the scrape jobs get (secondary.scrapebot_fallback above),
+  # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
+  # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed
+  # left in the cache file. Best-effort — a failed mint logs a warning and the archive run
+  # proceeds with existing/self-warmed cookies.
+  scrapebot_fallback:
+    enabled: true
+    jurisdictions: ["mi"]
 
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's

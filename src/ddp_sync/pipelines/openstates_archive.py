@@ -30,6 +30,8 @@ from typing import Any
 
 import structlog
 
+from ddp_sync.services import scrapebot_client
+
 logger = structlog.get_logger()
 
 DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
@@ -48,12 +50,83 @@ def _get_root(config: dict | None) -> str:
     return (config or {}).get("openstates_root", DEFAULT_OPENSTATES_ROOT)
 
 
+def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """Is this jurisdiction opted into ScrapeBot cookie pre-seeding for archive runs?
+
+    Config-gated per jurisdiction under openstates_archive.scrapebot_fallback in
+    sync_schedule.yaml -- absent/disabled by default, so adding this never changes
+    behavior for a jurisdiction that hasn't explicitly opted in. Same shape as the
+    scrape pipeline's secondary.scrapebot_fallback block (openstates_scrape.py), but
+    keyed inside this pipeline's own config subtree: run_archive_jobs() receives the
+    openstates_archive: section directly, so there is no "secondary" level here.
+    """
+    fallback_cfg = (config or {}).get("scrapebot_fallback", {})
+    if not fallback_cfg.get("enabled", False):
+        return False
+    return jurisdiction in fallback_cfg.get("jurisdictions", [])
+
+
+async def _maybe_preseed_scrapebot_cookies(
+    jurisdiction: str,
+    config: dict | None,
+    openstates_root: str,
+) -> None:
+    """Proactively mint fresh WAF-passing cookies via ScrapeBot before archiving a
+    jurisdiction opted into scrapebot_fallback -- the same proactive pre-seed the
+    scrape pipeline has done since 2026-08-04 (openstates_scrape.py,
+    PLAN-scrapebot.md §3.7), which this pipeline never got when archiving was split
+    out of run-scrape.sh on 2026-07-31.
+
+    Without it, an archive run depends on whatever cookies the last scrape's
+    pre-seed left in the cache file; once a mid-run WAF block invalidates that
+    cache, CookieProvider falls back to its own local Playwright self-warm --
+    observed 2026-08-07/08: a MI archive run ground through ~24h at a 30s warm-up
+    timeout per document, with the WAF refusing to issue the required cookies to
+    the local headless browser at all.
+
+    Best-effort: a mint failure here must never block or fail the archive run that
+    follows -- it just proceeds with whatever's already cached, or CookieProvider's
+    own self-warm.
+    """
+    if not _scrapebot_eligible(jurisdiction, config):
+        return
+    try:
+        mint_result = await scrapebot_client.dispatch_mint_cookies(jurisdiction)
+        cache_path = scrapebot_client.cache_path_for(jurisdiction, openstates_root)
+        scrapebot_client.write_cookie_cache(
+            cache_path,
+            cookies=mint_result["cookies"],
+            user_agent=mint_result["user_agent"],
+        )
+        logger.info(
+            "openstates_archive: ScrapeBot pre-seeded fresh cookies before archive",
+            jurisdiction=jurisdiction,
+            cache_path=cache_path,
+        )
+    except scrapebot_client.ScrapeBotDispatchError as e:
+        logger.warning(
+            "openstates_archive: ScrapeBot pre-seed mint failed, proceeding with "
+            "existing/self-warmed cookies",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
+
+
 async def _run_archive(
     jurisdiction: str,
     openstates_root: str,
     timeout_s: int | None = None,
+    config: dict | None = None,
 ) -> dict[str, Any]:
-    """Run run-archive.sh for one jurisdiction off the event loop."""
+    """Run run-archive.sh for one jurisdiction off the event loop.
+
+    Pre-seeds ScrapeBot cookies first for any jurisdiction opted into
+    scrapebot_fallback -- see _maybe_preseed_scrapebot_cookies()'s docstring. A
+    no-op for every jurisdiction not opted in (config defaults to None, in which
+    case it's always a no-op).
+    """
+    await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
+
     script = os.path.join(openstates_root, "run-archive.sh")
     cmd = ["/bin/bash", script, jurisdiction]
 
@@ -153,7 +226,7 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     logger.info("openstates_archive: starting batch", jurisdictions=jurisdictions)
 
     results: list[dict[str, Any]] = await asyncio.gather(
-        *[_run_archive(j, openstates_root) for j in jurisdictions]
+        *[_run_archive(j, openstates_root, config=config) for j in jurisdictions]
     )
 
     duration = round(time.monotonic() - t, 1)
@@ -194,4 +267,4 @@ async def run_single_archive_job(
 ) -> dict[str, Any]:
     """Archive a single arbitrary jurisdiction. Used by the manual trigger endpoint."""
     openstates_root = _get_root(config)
-    return await _run_archive(jurisdiction, openstates_root)
+    return await _run_archive(jurisdiction, openstates_root, config=config)
