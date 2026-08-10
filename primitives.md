@@ -62,6 +62,8 @@ grep -rn "class <Name>\|def <name>" src/ddp_sync/
 
 **Retrieval isolation**: `bill-text-history` and `bill-changelog` are structurally invisible to VoteBot's normal retrieval phases (which filter by explicit `document_type`). Do not add unfiltered fallback queries.
 
+**LegBot's `BillArtifact` generation does NOT use this pipeline** (`pipelines/bill_artifact_generation.py` — `generate_and_store_bill_artifact`/`generate_and_store_bill_changelog`, ddp-infra's `PLAN-bill-document-provenance.md` Phase 8). Decided 2026-08-10 (Ramon): LegBot's output already lands in queryable `BillArtifact` rows VoteBot can read directly, so re-embedding LegBot's own summary into Pinecone would duplicate the original "embed the full bill document" design intent for a different purpose (deep full-text query, not structured artifact lookup) without serving either well. These two functions used to call `IngestionPipeline`/`DocumentMetadata` directly (document types `bill-artifact-{artifact_type}` / `bill-artifact-bill_changelog`, never added to the table above) — removed, not just made optional. If VoteBot needs full-bill-text Pinecone search over archived bill text, that belongs in a new task or an extension of `ddp-open-states`' bill archiver (which already owns the full archived text), reusing `IngestionPipeline`/`DocumentMetadata` below — not revived inside LegBot's artifact-generation path.
+
 ## Bill version pipeline (`pipelines/bill_version.py`)
 
 The daily bill sync entry point. **Do not reinvent these methods.**

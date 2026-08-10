@@ -3,9 +3,21 @@
 Connects two pieces that already existed separately but were never wired
 together: LegBot dispatch (services/legbot_client.py, shipped 2026-07-21,
 dispatch-and-return only) and the BillArtifact ledger (ddp-broker-py Phase 6,
-merged 2026-07-26). This module is the plan's step 4: "write the result to
-both ddp-broker-py AND Pinecone — both writes are required for the job to
-count as done, not ddp-broker-py with Pinecone as an optional follow-up."
+merged 2026-07-26). This module is the plan's step 4: write LegBot's result
+to ddp-broker-py.
+
+Decided 2026-08-10 (Ramon): this module does NOT also ingest into Pinecone.
+LegBot's output already lands in queryable BillArtifact rows VoteBot can
+read directly -- re-embedding LegBot's own summary would duplicate the
+original "embed the full bill document" design intent for a different
+purpose (deep full-text query, not structured artifact lookup) without
+serving either well. If VoteBot needs full-bill-text Pinecone search, that
+belongs in a new task or an extension of ddp-open-states' bill archiver
+(which already owns the full archived text this module's LegBot dispatch
+also reads via bill_source resolution below) -- not duplicated here. The
+Pinecone primitives (IngestionPipeline, DocumentMetadata, EmbeddingService)
+are untouched and still cataloged in primitives.md; this module simply
+doesn't call them.
 
 bill_summary/bill_pros_cons/bill_vote_yes_frame/bill_vote_no_frame/
 bill_supporting_orgs/bill_opposing_orgs/bill_impact_analysis all dispatch
@@ -46,12 +58,9 @@ fetch fallback at all -- see that function's own docstring).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
 import structlog
 
-from ddp_sync.ingestion.metadata import DocumentMetadata
-from ddp_sync.ingestion.pipeline import IngestionPipeline
 from ddp_sync.services.broker_client import BrokerClientError, write_bill_artifact
 from ddp_sync.services.legbot_client import dispatch_bill_changelog, dispatch_bill_question
 from ddp_sync.services.local_openstates_client import (
@@ -183,14 +192,12 @@ async def generate_and_store_bill_artifact(
     bill_source: str,
     artifact_type: str,
 ) -> dict:
-    """Dispatch to LegBot, then persist the result to ddp-broker-py and Pinecone.
+    """Dispatch to LegBot, then persist the result to ddp-broker-py.
 
-    A Pinecone failure does NOT abort the write — it's recorded as
-    pinecone_synced_at=None on the BillArtifact row instead (Phase 6's
-    "stale for search" state), so a health-monitor/re-sync pass can retry
-    without regenerating content. A LegBot answer flagged
-    insufficient_information is recorded as a failed row (failure_stage=
-    generation), not silently dropped, per Phase 6's failure-tracking design.
+    Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
+    docstring. A LegBot answer flagged insufficient_information is recorded
+    as a failed row (failure_stage=generation), not silently dropped, per
+    Phase 6's failure-tracking design.
 
     Genuinely unrecoverable failures — LegBot unreachable/timed out
     (LegBotDispatchError), or ddp-broker-py rejecting/unreachable
@@ -233,28 +240,6 @@ async def generate_and_store_bill_artifact(
 
     content = _content_from_answer(artifact_type, answer)
 
-    pinecone_synced_at = None
-    try:
-        pipeline = IngestionPipeline()
-        metadata = DocumentMetadata(
-            document_id=f"bill-artifact-{artifact_type}-{bill_openstates_id}-{version_date}",
-            document_type=f"bill-artifact-{artifact_type}",
-            source="Digital Democracy Project",
-            jurisdiction=jurisdiction,
-            bill_id=bill_openstates_id,
-            extra={"session_code": session_code, "version_note": version_note},
-        )
-        await pipeline.ingest_document(content=content, metadata=metadata, skip_duplicates=False)
-        pinecone_synced_at = datetime.now(timezone.utc).isoformat()
-    except Exception:
-        logger.exception(
-            "Pinecone ingest failed for bill artifact — writing to ddp-broker-py "
-            "anyway (pinecone_synced_at stays null, so it's visible as stale "
-            "and re-syncable rather than silently missing)",
-            bill_openstates_id=bill_openstates_id,
-            artifact_type=artifact_type,
-        )
-
     return await write_bill_artifact(
         bill_openstates_id=bill_openstates_id,
         jurisdiction=jurisdiction,
@@ -265,7 +250,6 @@ async def generate_and_store_bill_artifact(
         content=content,
         status="complete",
         model_name=model_name,
-        pinecone_synced_at=pinecone_synced_at,
     )
 
 
@@ -278,9 +262,12 @@ async def generate_and_store_bill_changelog(
     version_note: str,
 ) -> dict:
     """Dispatch bill_changelog to LegBot, then persist the result to
-    ddp-broker-py and Pinecone -- the 8th BillArtifact type, not part of
+    ddp-broker-py -- the 8th BillArtifact type, not part of
     generate_and_store_bill_artifact above because it needs a prior
     version's text plus a precomputed diff, not a single bill_source.
+
+    Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
+    docstring.
 
     ddp-infra's PLAN-bill-document-provenance.md, "bill_changelog's missing
     BillArtifact write path" (approved 2026-08-01 after 5 rounds of
@@ -399,27 +386,6 @@ async def generate_and_store_bill_changelog(
         new_version_note=version_note,
     )
 
-    pinecone_synced_at = None
-    try:
-        pipeline = IngestionPipeline()
-        metadata = DocumentMetadata(
-            document_id=f"bill-artifact-bill_changelog-{bill_openstates_id}-{version_date}",
-            document_type="bill-artifact-bill_changelog",
-            source="Digital Democracy Project",
-            jurisdiction=jurisdiction,
-            bill_id=bill_openstates_id,
-            extra={"session_code": session_code, "version_note": version_note},
-        )
-        await pipeline.ingest_document(content=content, metadata=metadata, skip_duplicates=False)
-        pinecone_synced_at = datetime.now(timezone.utc).isoformat()
-    except Exception:
-        logger.exception(
-            "Pinecone ingest failed for bill_changelog -- writing to "
-            "ddp-broker-py anyway (pinecone_synced_at stays null, so it's "
-            "visible as stale and re-syncable rather than silently missing)",
-            bill_openstates_id=bill_openstates_id,
-        )
-
     try:
         return await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
@@ -431,7 +397,6 @@ async def generate_and_store_bill_changelog(
             content=content,
             status="complete",
             model_name=model_name,
-            pinecone_synced_at=pinecone_synced_at,
             compare_version_date=archived["old_version_date"],
             compare_version_note=archived["old_version_note"],
         )
@@ -440,8 +405,7 @@ async def generate_and_store_bill_changelog(
         # review: includes the compare_version fields that were attempted,
         # so an operator can tell a compare_version FK-resolution failure
         # (api-v3 has archived a version ddp-broker-py's BillVersion table
-        # hasn't synced yet -- rare) apart from any other rejection, and can
-        # find/investigate the orphaned Pinecone document this leaves behind.
+        # hasn't synced yet -- rare) apart from any other rejection.
         logger.exception(
             "bill_changelog_write_failed",
             bill_openstates_id=bill_openstates_id,

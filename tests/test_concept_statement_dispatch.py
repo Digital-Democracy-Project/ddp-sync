@@ -381,13 +381,9 @@ async def test_bill_artifact_generation_bill_summary_dispatch_still_works_unchan
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 1, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
             jurisdiction="FL",
