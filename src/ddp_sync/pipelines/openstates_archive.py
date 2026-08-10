@@ -36,6 +36,13 @@ logger = structlog.get_logger()
 
 DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 
+# Same jurisdiction list as ddp-open-states's ARCHIVE_ENABLED_STATES (activate.sh) and
+# openstates_archive.jurisdictions in sync_schedule.yaml. Exported so callers (the manual
+# trigger endpoint, run_archive_jobs' own default) share one definition instead of each
+# hardcoding their own copy -- triggers.py's copy silently went stale when ma/al/us were
+# added here 2026-08-10, exactly the class of bug a single shared constant prevents.
+DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us"]
+
 # Per-jurisdiction archive timeouts. Downloads + extracts every not-yet-captured
 # document, so these scale with total historical bill count, not just what
 # changed recently — sized generously, matching the scrape timeouts' shape.
@@ -223,7 +230,7 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     """
     openstates_root = _get_root(config)
     jurisdictions: list[str] = (config or {}).get(
-        "jurisdictions", ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us"]
+        "jurisdictions", DEFAULT_ARCHIVE_JURISDICTIONS
     )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()
