@@ -622,7 +622,7 @@ class UpdateScheduler:
             )
 
     def _register_openstates_archive_jobs(self) -> None:
-        """Register the OpenStates bill-document archive job.
+        """Register one weekly APScheduler job per OpenStates archive jurisdiction.
 
         Split out of the scrape jobs (2026-07-31, ddp-open-states
         PLAN-open-states.md's incremental-scraping section): archiving to
@@ -630,14 +630,30 @@ class UpdateScheduler:
         script's incremental-cutoff marker write on the archive step
         finishing too — a run whose archive step ran long or died left the
         cutoff stuck, making the next run slower and more likely to also
-        miss its own archive window. Archiving is now a fully independent
-        job, fanning out to every ARCHIVE_ENABLED_STATE jurisdiction
-        concurrently on its own schedule, with no relationship to when or
-        whether that jurisdiction's own scrape last ran.
+        miss its own archive window.
+
+        Originally registered as a single daily job fanning out to every
+        ARCHIVE_ENABLED_STATE jurisdiction concurrently. Changed 2026-08-10
+        to one job per jurisdiction, each on its own weekly day (see the
+        `schedule` map in openstates_archive's config block): `us` alone has
+        two orders of magnitude more never-archived documents than any state
+        jurisdiction, so running it daily alongside everything else let its
+        fetch+extract volume dominate shared CPU/network/DDP-HOT I/O and
+        starve the smaller jurisdictions' own runs.
         """
-        from ddp_sync.pipelines.openstates_archive import run_archive_jobs
+        from ddp_sync.pipelines.openstates_archive import run_single_archive_job
 
         config = self._sync_config.get("openstates_archive", {})
+
+        # The old code registered a single "openstates_archive" job covering every
+        # jurisdiction. Clean it up so a process that re-registers jobs from a reloaded
+        # config doesn't end up with both the old batch job and the new per-jurisdiction
+        # ones (same defensive shape as the legislator_bio_sync round-17 fix above).
+        try:
+            self.scheduler.remove_job("openstates_archive")
+        except Exception:  # noqa: BLE001 — JobLookupError variant
+            pass
+
         if not config.get("enabled", False):
             logger.info("openstates_archive: disabled in config — skipping")
             return
@@ -649,30 +665,32 @@ class UpdateScheduler:
 
         archive_time = config.get("sync_time_utc", "05:00")
         ah, am = map(int, archive_time.split(":"))
-        archive_day = config.get("sync_day")
-        trigger_kwargs = {"hour": ah, "minute": am, "timezone": _UTC}
-        if archive_day:
-            trigger_kwargs["day_of_week"] = day_map.get(archive_day.lower(), "sun")
+        schedule_cfg = config.get("schedule", {})
+        jurisdictions: list[str] = config.get("jurisdictions", [])
 
-        async def _archive_wrapper():
-            return await run_archive_jobs(config)
+        for jurisdiction in jurisdictions:
+            sync_day = (schedule_cfg.get(jurisdiction) or "sunday").lower()
+            day_of_week = day_map.get(sync_day, "sun")
 
-        self.scheduler.add_job(
-            _archive_wrapper,
-            trigger=CronTrigger(**trigger_kwargs),
-            id="openstates_archive",
-            name="OpenStates: bill-document archive",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=3600,
-        )
-        logger.info(
-            "openstates_archive: registered",
-            jurisdictions=config.get("jurisdictions"),
-            sync_day=archive_day or "daily",
-            sync_time=archive_time,
-        )
+            async def _archive_wrapper(_jurisdiction: str = jurisdiction):
+                return await run_single_archive_job(_jurisdiction, config)
+
+            self.scheduler.add_job(
+                _archive_wrapper,
+                trigger=CronTrigger(day_of_week=day_of_week, hour=ah, minute=am, timezone=_UTC),
+                id=f"openstates_archive_{jurisdiction}",
+                name=f"OpenStates: bill-document archive ({jurisdiction})",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "openstates_archive: registered",
+                jurisdiction=jurisdiction,
+                sync_day=sync_day,
+                sync_time=archive_time,
+            )
 
     def _register_concept_statement_dispatch_job(self) -> None:
         """Register the concept-statement dispatch batch job (ddp-infra
