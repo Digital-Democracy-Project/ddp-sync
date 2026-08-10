@@ -432,12 +432,6 @@ async def trigger_openstates_scrape(
     )
 
 
-# Jurisdictions with bill-document archiving enabled — same list as ddp-open-states's
-# ARCHIVE_ENABLED_STATES (activate.sh) and openstates_archive.jurisdictions in
-# sync_schedule.yaml. Keep in sync if that list ever changes.
-_OPENSTATES_ARCHIVE_JURISDICTIONS = {"fl", "ut", "az", "wa", "va", "mi"}
-
-
 @router.post("/trigger/openstates-archive/{target}")
 async def trigger_openstates_archive(
     target: str,
@@ -453,24 +447,33 @@ async def trigger_openstates_archive(
     status is written to Redis under ddp:flow:openstates_archive.
 
     Targets:
-        all                        — every jurisdiction in ARCHIVE_ENABLED_STATES, concurrently
-        fl|ut|az|wa|va|mi          — a single jurisdiction
+        all                — every jurisdiction in openstates_archive.jurisdictions, concurrently
+        <jurisdiction abbr> — a single jurisdiction from that same list (see sync_schedule.yaml)
     """
-    from ddp_sync.pipelines.openstates_archive import run_archive_jobs, run_single_archive_job
+    from ddp_sync.pipelines.openstates_archive import (
+        DEFAULT_ARCHIVE_JURISDICTIONS,
+        run_archive_jobs,
+        run_single_archive_job,
+    )
     from ddp_sync.scheduler import get_scheduler
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    # Read from config rather than a separate hardcoded set here -- a second copy of this
+    # list silently went stale when ma/al/us were added to config 2026-08-10 (this endpoint
+    # kept 404ing on them while the scheduler and run_archive_jobs' own default both knew
+    # about the new jurisdictions already).
+    jurisdictions = set(config.get("jurisdictions", DEFAULT_ARCHIVE_JURISDICTIONS))
 
     if target == "all":
         background_tasks.add_task(run_archive_jobs, config)
         return {"status": "started", "target": target}
 
-    if target in _OPENSTATES_ARCHIVE_JURISDICTIONS:
+    if target in jurisdictions:
         background_tasks.add_task(run_single_archive_job, target, config)
         return {"status": "started", "target": target}
 
-    available = sorted(_OPENSTATES_ARCHIVE_JURISDICTIONS | {"all"})
+    available = sorted(jurisdictions | {"all"})
     raise HTTPException(
         status_code=404,
         detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
