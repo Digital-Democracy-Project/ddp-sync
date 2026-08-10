@@ -39,9 +39,14 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # Per-jurisdiction archive timeouts. Downloads + extracts every not-yet-captured
 # document, so these scale with total historical bill count, not just what
 # changed recently — sized generously, matching the scrape timeouts' shape.
+# `us` has ~83k never-archived documents as of 2026-08-10 (vs. low
+# thousands/tens-of-thousands for the state jurisdictions) — its first several
+# weekly runs are a cold backfill, not steady-state, so it gets the longest
+# runway here.
 ARCHIVE_TIMEOUT_S: dict[str, int] = {
     "fl": 16 * 3600,
     "wa": 8 * 3600,
+    "us": 24 * 3600,
     "default": 4 * 3600,
 }
 
@@ -218,7 +223,7 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     """
     openstates_root = _get_root(config)
     jurisdictions: list[str] = (config or {}).get(
-        "jurisdictions", ["fl", "ut", "az", "wa", "va", "mi"]
+        "jurisdictions", ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us"]
     )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()

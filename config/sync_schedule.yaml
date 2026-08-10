@@ -295,15 +295,23 @@ openstates_scrape:
 # the archive step finishing too. A run whose archive step ran long or died left the cutoff
 # stuck, making the next run slower and more likely to also miss its own archive window —
 # observed live: a WA run still archiving 1h45m+ after scrape+import had already finished
-# cleanly. Now fully independent: runs every jurisdiction in `jurisdictions` concurrently, on its
-# own schedule, with no relationship to when/whether that jurisdiction's own scrape last ran.
+# cleanly. Fully independent: each jurisdiction below archives on its own schedule, with no
+# relationship to when/whether that jurisdiction's own scrape last ran.
 # Same jurisdiction list as ddp-open-states's ARCHIVE_ENABLED_STATES (activate.sh) — keep in
 # sync if that list ever changes.
+#
+# Changed 2026-08-10: each jurisdiction now runs once a week, on its own day, instead of every
+# jurisdiction running concurrently every day. `us` alone has ~83k never-archived documents —
+# two orders of magnitude more than any state jurisdiction — so a daily all-jurisdictions run
+# let federal's fetch+extract volume dominate shared CPU/network/DDP-HOT I/O and starve the
+# smaller jurisdictions' own runs. `us` gets a day entirely to itself; fl+ut and wa+va share a
+# day since both pairs are already ~fully archived and do almost no work once caught up.
 openstates_archive:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
-  sync_time_utc: "05:00"   # daily; well clear of the 01:00-03:00 scrape-job start times, though
-                           # overlap with a live scrape is safe by design (natural-key skip check)
+  sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
+                           # 01:00-03:00 scrape-job start times, though overlap with a live
+                           # scrape is safe by design (natural-key skip check)
   jurisdictions:
     - fl
     - ut
@@ -311,6 +319,19 @@ openstates_archive:
     - wa
     - va
     - mi
+    - ma
+    - al
+    - us
+  schedule:
+    fl: monday
+    ut: monday
+    az: tuesday
+    wa: wednesday
+    va: wednesday
+    mi: thursday
+    ma: friday
+    al: saturday
+    us: sunday
   # Same ScrapeBot cookie pre-seed the scrape jobs get (secondary.scrapebot_fallback above),
   # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
   # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed
