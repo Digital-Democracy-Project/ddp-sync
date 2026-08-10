@@ -1,5 +1,7 @@
 """Tests for the Phase 8 write path (ddp-infra PLAN-bill-document-provenance.md):
-connecting LegBot dispatch to the BillArtifact ledger + Pinecone.
+connecting LegBot dispatch to the BillArtifact ledger. Does not touch
+Pinecone -- decoupled 2026-08-10, see bill_artifact_generation.py's own
+module docstring.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ async def test_rejects_unsupported_artifact_type():
 
 
 @pytest.mark.asyncio
-async def test_happy_path_writes_broker_and_pinecone():
+async def test_happy_path_writes_broker():
     dispatch_result = {
         "answer": {"text": "A plain-language summary.", "insufficient_information": False},
         "backend": "mlx",
@@ -59,28 +61,23 @@ async def test_happy_path_writes_broker_and_pinecone():
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 1, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
     assert result == {"id": 1, "created": True}
-    mock_pipeline_cls.return_value.ingest_document.assert_awaited_once()
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "A plain-language summary."
     assert write_kwargs["status"] == "complete"
     assert write_kwargs["model_name"] == "mlx"
-    assert write_kwargs["pinecone_synced_at"] is not None
+    assert "pinecone_synced_at" not in write_kwargs
 
 
 @pytest.mark.asyncio
-async def test_pros_cons_content_is_json_and_still_writes_on_pinecone_failure():
+async def test_pros_cons_content_is_json():
     dispatch_result = {
         "answer": {
             "pros": ["Expands access."],
@@ -93,15 +90,9 @@ async def test_pros_cons_content_is_json_and_still_writes_on_pinecone_failure():
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 2, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock(
-            side_effect=RuntimeError("pinecone is down")
-        )
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_pros_cons"
         )
@@ -110,8 +101,6 @@ async def test_pros_cons_content_is_json_and_still_writes_on_pinecone_failure():
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == '{"pros": ["Expands access."], "cons": ["Costly to implement."]}'
     assert write_kwargs["status"] == "complete"
-    # Pinecone failed -- must not be silently treated as synced.
-    assert write_kwargs["pinecone_synced_at"] is None
 
 
 @pytest.mark.parametrize(
@@ -119,7 +108,7 @@ async def test_pros_cons_content_is_json_and_still_writes_on_pinecone_failure():
     [("bill_vote_yes_frame", "vote_yes_frame"), ("bill_vote_no_frame", "vote_no_frame")],
 )
 @pytest.mark.asyncio
-async def test_vote_frame_happy_path_writes_broker_and_pinecone(artifact_type, question_type):
+async def test_vote_frame_happy_path_writes_broker(artifact_type, question_type):
     dispatch_result = {
         "answer": {"text": "Vote yes if you want...", "insufficient_information": False},
         "backend": "mlx",
@@ -128,13 +117,9 @@ async def test_vote_frame_happy_path_writes_broker_and_pinecone(artifact_type, q
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 4, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type=artifact_type
         )
@@ -151,7 +136,7 @@ async def test_vote_frame_happy_path_writes_broker_and_pinecone(artifact_type, q
     [("bill_supporting_orgs", "supporting_orgs"), ("bill_opposing_orgs", "opposing_orgs")],
 )
 @pytest.mark.asyncio
-async def test_org_types_happy_path_writes_broker_and_pinecone(artifact_type, question_type):
+async def test_org_types_happy_path_writes_broker(artifact_type, question_type):
     dispatch_result = {
         "answer": {
             "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}],
@@ -163,13 +148,9 @@ async def test_org_types_happy_path_writes_broker_and_pinecone(artifact_type, qu
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 5, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type=artifact_type
         )
@@ -184,7 +165,7 @@ async def test_org_types_happy_path_writes_broker_and_pinecone(artifact_type, qu
 
 
 @pytest.mark.asyncio
-async def test_impact_analysis_happy_path_writes_broker_and_pinecone():
+async def test_impact_analysis_happy_path_writes_broker():
     dispatch_result = {
         "answer": {
             "affected_parties": [{"party": "small businesses", "effect": "new licensing fee"}],
@@ -198,13 +179,9 @@ async def test_impact_analysis_happy_path_writes_broker_and_pinecone():
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 6, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_impact_analysis"
         )
@@ -221,7 +198,7 @@ async def test_impact_analysis_happy_path_writes_broker_and_pinecone():
 
 
 @pytest.mark.asyncio
-async def test_insufficient_information_is_recorded_as_a_failed_artifact_no_pinecone_attempt():
+async def test_insufficient_information_is_recorded_as_a_failed_artifact():
     dispatch_result = {
         "answer": {"text": "", "insufficient_information": True},
         "backend": "mlx",
@@ -230,8 +207,6 @@ async def test_insufficient_information_is_recorded_as_a_failed_artifact_no_pine
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 3, "created": True}),
     ) as mock_write:
@@ -240,7 +215,6 @@ async def test_insufficient_information_is_recorded_as_a_failed_artifact_no_pine
         )
 
     assert result == {"id": 3, "created": True}
-    mock_pipeline_cls.return_value.ingest_document.assert_not_called()
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "failed"
     assert write_kwargs["failure_stage"] == "generation"
@@ -267,13 +241,9 @@ async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 7, "created": True}),
     ):
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
@@ -300,13 +270,9 @@ async def test_archived_text_not_found_falls_back_to_live_url_bill_source(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 8, "created": True}),
     ):
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
@@ -369,8 +335,6 @@ async def test_changelog_version_mismatch_raises_and_writes_nothing():
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(),
     ) as mock_write:
@@ -380,12 +344,11 @@ async def test_changelog_version_mismatch_raises_and_writes_nothing():
             )
 
     mock_dispatch.assert_not_called()
-    mock_pipeline_cls.assert_not_called()
     mock_write.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_changelog_happy_path_writes_broker_and_pinecone_with_compare_version():
+async def test_changelog_happy_path_writes_broker_with_compare_version():
     dispatch_result = {
         "answer": {
             "insufficient_information": False,
@@ -403,13 +366,9 @@ async def test_changelog_happy_path_writes_broker_and_pinecone_with_compare_vers
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 2, "created": True}),
     ) as mock_write:
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
     assert result == {"id": 2, "created": True}
@@ -417,11 +376,10 @@ async def test_changelog_happy_path_writes_broker_and_pinecone_with_compare_vers
         old_bill_source="Archived introduced text.",
         diff_source="--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
     )
-    mock_pipeline_cls.return_value.ingest_document.assert_awaited_once()
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "complete"
     assert write_kwargs["model_name"] == "mlx"
-    assert write_kwargs["pinecone_synced_at"] is not None
+    assert "pinecone_synced_at" not in write_kwargs
     assert write_kwargs["compare_version_date"] == "2026-01-01"
     assert write_kwargs["compare_version_note"] == "Introduced"
     content = write_kwargs["content"]
@@ -468,7 +426,7 @@ async def test_changelog_insufficient_information_writes_failed_row_with_compare
 
 
 @pytest.mark.asyncio
-async def test_changelog_broker_write_failure_after_pinecone_success_propagates():
+async def test_changelog_broker_write_failure_propagates():
     dispatch_result = {
         "answer": {
             "insufficient_information": False,
@@ -486,14 +444,8 @@ async def test_changelog_broker_write_failure_after_pinecone_success_propagates(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
     ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.IngestionPipeline"
-    ) as mock_pipeline_cls, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(side_effect=BrokerClientError("compare_version FK resolution failed")),
     ):
-        mock_pipeline_cls.return_value.ingest_document = AsyncMock()
-
         with pytest.raises(BrokerClientError):
             await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
-
-    mock_pipeline_cls.return_value.ingest_document.assert_awaited_once()
