@@ -23,6 +23,18 @@ Design choices:
 
 - Always passes the full `include` set documented as needed by the
   bio-sync schema (other_identifiers, links, sources, offices, other_names).
+
+SYNC-8 (2026-08-12) added jurisdiction-scoped local-replica routing to
+iter_jurisdiction() only, mirroring BillSyncService._get_api_base_and_key()
+(pipelines/bill_sync.py, SYNC-6) and the equivalent helpers added the same day
+to OpenStatesSource and LegislatorSyncService: jurisdictions listed in
+ddp_openstates_jurisdictions route to local_openstates_api_base/
+local_openstates_api_key instead of the public API. fetch_by_id() looks up a
+single person by opaque OpenStates ID with no jurisdiction in scope, so it's
+unchanged -- always the public API. Deliberately still no `Settings`
+dependency here (see "Design choices" above) -- the caller
+(legislator_bio.py's BioSyncOrchestrator, scripts/backfill_legislator_party.py)
+threads the relevant settings fields through as constructor kwargs instead.
 """
 
 from __future__ import annotations
@@ -197,7 +209,30 @@ class OpenStatesPeopleClient:
         per_page: int = DEFAULT_PER_PAGE,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_pages: int = DEFAULT_MAX_PAGES,
+        openstates_api_base: str | None = None,
+        local_openstates_api_base: str | None = None,
+        local_openstates_api_key: str | None = None,
+        ddp_openstates_jurisdictions: list[str] | None = None,
     ):
+        """
+        Args:
+            openstates_api_base: Public v3.openstates.org API base. Defaults
+                to BASE_URL, preserving today's behavior for callers that
+                don't pass it. Kept as a plain string rather than a `Settings`
+                dependency -- this client is deliberately thin (see module
+                docstring); the caller (e.g. legislator_bio.py's
+                BioSyncOrchestrator) threads its own `settings.
+                openstates_api_base` through.
+            local_openstates_api_base: Local OpenStates replica base
+                (settings.local_openstates_api_base). Only used for
+                jurisdictions listed in `ddp_openstates_jurisdictions`.
+            local_openstates_api_key: API key for the local replica
+                (settings.local_openstates_api_key).
+            ddp_openstates_jurisdictions: Jurisdictions to route to the local
+                replica instead of the public API (SYNC-8, mirrors
+                BillSyncService._get_api_base_and_key() from SYNC-6). Empty by
+                default -- always public API, same as before this existed.
+        """
         if not api_key:
             raise ValueError("api_key is required")
         self.api_key = api_key
@@ -206,6 +241,41 @@ class OpenStatesPeopleClient:
         self.per_page = per_page
         self.timeout_seconds = timeout_seconds
         self.max_pages = max_pages
+        self.openstates_api_base = openstates_api_base or self.BASE_URL
+        self.local_openstates_api_base = local_openstates_api_base or ""
+        self.local_openstates_api_key = local_openstates_api_key or ""
+        self.ddp_openstates_jurisdictions = ddp_openstates_jurisdictions or []
+
+    def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
+        """
+        Choose which OpenStates-compatible backend to hit for this jurisdiction.
+
+        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
+        SYNC-6) and the equivalent helpers added to OpenStatesSource and
+        LegislatorSyncService (SYNC-8): jurisdictions listed in
+        self.ddp_openstates_jurisdictions are routed to the local OpenStates
+        replica instead of the public v3.openstates.org API.
+
+        Only used by iter_jurisdiction() -- fetch_by_id() looks up a single
+        person by opaque OpenStates ID with no jurisdiction available, so it
+        always uses the public API base (see its docstring).
+
+        Returns:
+            (api_base, api_key, is_local_replica) tuple. is_local_replica is
+            True when the local api-v3 instance's apikey_auth scheme applies --
+            it authenticates via an `apikey` query param, not the public API's
+            `x-api-key` header scheme.
+        """
+        replica_jurisdictions = {j.upper() for j in self.ddp_openstates_jurisdictions}
+        if jurisdiction.upper() in replica_jurisdictions:
+            logger.debug(
+                "Routing jurisdiction to local OpenStates replica",
+                jurisdiction=jurisdiction,
+                api_base=self.local_openstates_api_base,
+            )
+            return self.local_openstates_api_base, self.local_openstates_api_key, True
+
+        return self.openstates_api_base, self.api_key, False
 
     # ---------- Public API ----------
 
@@ -215,6 +285,10 @@ class OpenStatesPeopleClient:
         Returns the parsed record on 2xx, or ``None`` on 404 (the well-defined
         "not in OpenStates" signal — bio-sync uses this to trigger the
         bioguide-id fallback for departed federal members).
+
+        Single-ID lookup by opaque OpenStates ID -- no jurisdiction is
+        available here to route to the local replica (SYNC-8), so this always
+        uses the public API base.
 
         Raises:
             OpenStatesRateLimitError: 429 persists after the retry budget.
@@ -261,7 +335,7 @@ class OpenStatesPeopleClient:
                 ("page", page),
             ] + [("include", p) for p in self.INCLUDE_PARAMS]
 
-            data = await self._get_json("/people", params)
+            data = await self._get_json("/people", params, jurisdiction=jurisdiction)
             if not data:
                 break
             results = data.get("results") or []
@@ -312,18 +386,37 @@ class OpenStatesPeopleClient:
         params: list[tuple[str, Any]],
         *,
         allow_404: bool = False,
+        jurisdiction: str | None = None,
     ) -> dict | None:
         """GET with rate-limit + 429-retry. Returns the JSON body on 2xx.
 
         Returns None for 404 only when ``allow_404`` is True. Raises
         OpenStatesRateLimitError on persistent 429; OpenStatesError on
         any other non-2xx or transport failure that exhausts retries.
+
+        When ``jurisdiction`` is given, routes to the local OpenStates
+        replica instead of the public API if that jurisdiction is listed in
+        self.ddp_openstates_jurisdictions (SYNC-8) -- see
+        _get_api_base_and_key(). Callers with no jurisdiction in scope
+        (fetch_by_id) omit it and always get the public API.
         """
-        url = f"{self.BASE_URL}{path}"
-        headers = {
-            "x-api-key": self.api_key,
-            "accept": "application/json",
-        }
+        if jurisdiction is not None:
+            api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        else:
+            api_base, api_key, is_local_replica = self.openstates_api_base, self.api_key, False
+
+        url = f"{api_base}{path}"
+        if is_local_replica:
+            # Local api-v3's apikey_auth is a query param, not the public
+            # API's x-api-key header.
+            headers = {"accept": "application/json"}
+            if api_key:
+                params = list(params) + [("apikey", api_key)]
+        else:
+            headers = {
+                "x-api-key": api_key,
+                "accept": "application/json",
+            }
         last_resp: httpx.Response | None = None
         last_exc: Exception | None = None
 

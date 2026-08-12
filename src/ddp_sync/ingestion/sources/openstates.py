@@ -108,8 +108,6 @@ class OpenStatesSource:
     - Legislators
     """
 
-    BASE_URL = "https://v3.openstates.org"
-
     # Mapping of jurisdiction codes to human-readable source names
     JURISDICTION_SOURCE_NAMES = {
         "us": "US Congress",
@@ -160,6 +158,43 @@ class OpenStatesSource:
             f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature"
         )
 
+    def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
+        """
+        Choose which OpenStates-compatible backend to hit for this jurisdiction.
+
+        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
+        SYNC-6): jurisdictions listed in settings.ddp_openstates_jurisdictions
+        (the same DDP_OPENSTATES_JURISDICTIONS env var ddp-broker-py reads) are
+        routed to the local OpenStates replica instead of the public
+        v3.openstates.org API (SYNC-8), so the two services never diverge on
+        which jurisdictions are "on the replica".
+
+        Only used by call sites that actually have a jurisdiction in scope
+        (fetch_jurisdiction, fetch, fetch_legislators) -- fetch_bill() and
+        fetch_legislator_by_id() look up a single record by opaque OpenStates
+        ID with no jurisdiction available, so they always use the public API
+        base (see their docstrings).
+
+        Args:
+            jurisdiction: State code (e.g., 'fl', 'us', 'va')
+
+        Returns:
+            (api_base, api_key, is_local_replica) tuple. is_local_replica is
+            True when the local api-v3 instance's apikey_auth scheme applies --
+            it authenticates via an `apikey` query param, not the public API's
+            `X-API-Key` header scheme.
+        """
+        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
+        if jurisdiction.upper() in replica_jurisdictions:
+            logger.debug(
+                "Routing jurisdiction to local OpenStates replica",
+                jurisdiction=jurisdiction,
+                api_base=self.settings.local_openstates_api_base,
+            )
+            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
+
+        return self.settings.openstates_api_base, self.api_key, False
+
     async def fetch_jurisdiction(
         self,
         jurisdiction: str,
@@ -178,21 +213,29 @@ class OpenStatesSource:
         Returns:
             JurisdictionInfo or None if not found
         """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {
-                "accept": "application/json",
-                "X-API-Key": self.api_key,
-            }
+        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
 
-            # Include all available data
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Local api-v3's apikey_auth is a query param, not the public
+            # API's X-API-Key header (SYNC-8, mirrors bill_sync.py's SYNC-6
+            # routing).
             include_params = [
                 "organizations",
                 "legislative_sessions",
                 "latest_runs",
             ]
             params = [("include", p) for p in include_params]
+            if is_local_replica:
+                headers = {"accept": "application/json"}
+                if api_key:
+                    params.append(("apikey", api_key))
+            else:
+                headers = {
+                    "accept": "application/json",
+                    "X-API-Key": api_key,
+                }
 
-            url = f"{self.BASE_URL}/jurisdictions/{jurisdiction.lower()}"
+            url = f"{api_base}/jurisdictions/{jurisdiction.lower()}"
 
             logger.debug(
                 "Fetching jurisdiction from OpenStates",
@@ -419,8 +462,20 @@ class OpenStatesSource:
         # Build legislator mapping for sponsor DDP links
         await self._build_legislator_mapping()
 
+        # Route to the local OpenStates replica when a jurisdiction is given
+        # and it's flipped in settings.ddp_openstates_jurisdictions (SYNC-8).
+        # With no jurisdiction (multi-jurisdiction crawl), there's nothing to
+        # route on, so this always uses the public API.
+        if jurisdiction:
+            api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        else:
+            api_base, api_key, is_local_replica = self.settings.openstates_api_base, self.api_key, False
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {"X-API-Key": self.api_key}
+            if is_local_replica:
+                headers = {"accept": "application/json"}
+            else:
+                headers = {"X-API-Key": api_key}
 
             # Build query parameters
             params = {
@@ -430,17 +485,20 @@ class OpenStatesSource:
                 params["jurisdiction"] = jurisdiction
             if session:
                 params["session"] = session
+            if is_local_replica and api_key:
+                params["apikey"] = api_key
 
             logger.info(
                 "Fetching bills from OpenStates",
                 jurisdiction=jurisdiction,
                 session=session,
                 limit=limit,
+                api_base=api_base,
             )
 
             try:
                 response = await client.get(
-                    f"{self.BASE_URL}/bills",
+                    f"{api_base}/bills",
                     params=params,
                     headers=headers,
                 )
@@ -459,8 +517,9 @@ class OpenStatesSource:
                     bill_id = bill.get("id")
                     if bill_id:
                         detail_response = await client.get(
-                            f"{self.BASE_URL}/bills/{bill_id}",
+                            f"{api_base}/bills/{bill_id}",
                             headers=headers,
+                            params={"apikey": api_key} if is_local_replica and api_key else None,
                         )
                         detail_response.raise_for_status()
                         bill_detail = detail_response.json()
@@ -508,12 +567,15 @@ class OpenStatesSource:
         Returns:
             DocumentSource or None if not found
         """
+        # Single bill lookup by opaque OpenStates ID -- no jurisdiction is
+        # available here to route to the local replica (SYNC-8), so this
+        # always uses the public API base.
         async with httpx.AsyncClient(timeout=30.0) as client:
             headers = {"X-API-Key": self.api_key}
 
             try:
                 response = await client.get(
-                    f"{self.BASE_URL}/bills/{bill_id}",
+                    f"{self.settings.openstates_api_base}/bills/{bill_id}",
                     headers=headers,
                 )
                 response.raise_for_status()
@@ -559,12 +621,9 @@ class OpenStatesSource:
         Yields:
             DocumentSource objects for each legislator
         """
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {
-                "accept": "application/json",
-                "X-API-Key": self.api_key,
-            }
+        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
 
+        async with httpx.AsyncClient(timeout=30.0) as client:
             # Include all available data for legislators
             include_params = [
                 "other_names",
@@ -578,14 +637,27 @@ class OpenStatesSource:
                 ("per_page", min(limit, 50)),
             ] + [("include", p) for p in include_params]
 
+            if is_local_replica:
+                # Local api-v3's apikey_auth is a query param, not the public
+                # API's X-API-Key header (SYNC-8, mirrors SYNC-6's routing).
+                headers = {"accept": "application/json"}
+                if api_key:
+                    params.append(("apikey", api_key))
+            else:
+                headers = {
+                    "accept": "application/json",
+                    "X-API-Key": api_key,
+                }
+
             logger.info(
                 "Fetching legislators from OpenStates",
                 jurisdiction=jurisdiction,
+                api_base=api_base,
             )
 
             try:
                 response = await client.get(
-                    f"{self.BASE_URL}/people",
+                    f"{api_base}/people",
                     params=params,
                     headers=headers,
                 )
@@ -647,13 +719,16 @@ class OpenStatesSource:
         Returns:
             DocumentSource or None if not found
         """
+        # Single legislator lookup by opaque OpenStates ID -- no jurisdiction
+        # is available here to route to the local replica (SYNC-8), so this
+        # always uses the public API base.
         async with httpx.AsyncClient(timeout=30.0) as client:
             headers = {
                 "accept": "application/json",
                 "X-API-Key": self.api_key,
             }
             # OpenStates v3 API uses query param, not path param
-            url = f"{self.BASE_URL}/people"
+            url = f"{self.settings.openstates_api_base}/people"
 
             # Include all available data for legislators
             include_params = [

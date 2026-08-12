@@ -625,6 +625,10 @@ class LegislatorBioPipeline:
             self.openstates = OpenStatesPeopleClient(
                 api_key,
                 openstates_rate_limiter or RateLimiter(),
+                openstates_api_base=self.settings.openstates_api_base,
+                local_openstates_api_base=self.settings.local_openstates_api_base,
+                local_openstates_api_key=self.settings.local_openstates_api_key,
+                ddp_openstates_jurisdictions=self.settings.ddp_openstates_jurisdictions,
             )
         else:
             self.openstates = openstates

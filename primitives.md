@@ -104,6 +104,10 @@ The daily bill sync entry point. **Do not reinvent these methods.**
 - **`SyncBatchResult`** ⚠️ — `total_bills, successful, failed, chunks_created, errors`. **Name collision**: `pipelines/legislator_sync.py` also defines a class called `SyncBatchResult` with different fields. Always import from the correct module. Don't add a third `SyncBatchResult` — rename any new one to something specific (e.g. `OrgSyncBatchResult`).
 - **`OpenStatesUrl`** — `jurisdiction, session, bill_id, original_url`
 
+## Legislator sync service (`pipelines/legislator_sync.py`)
+
+- **`LegislatorSyncService`** — legislator sponsored-bills + voting-record sync (`legislator-bills`/`legislator-votes` documents). Key methods: `fetch_sponsored_bills(person_id, jurisdiction, ...)`, `fetch_legislator_votes(person_id, jurisdiction, session, ...)`, `sync_legislator(legislator, ...)`, `sync_all_legislators(legislators, ...)`. `_get_sponsor_name(person_id)` is a single opaque-ID lookup with no jurisdiction available, so it always uses the public API. `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` routes `fetch_sponsored_bills`/`fetch_legislator_votes` to the local OpenStates replica when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8).
+
 ## Rate limiter (`services/rate_limiter.py`)
 
 - **`RateLimiter`** — `asyncio.Lock`-guarded token-bucket. Method: `apply() -> None` (sleeps if needed). `enforced_sleeps` counter for observability.
@@ -177,7 +181,13 @@ Pub/sub channels (hardcoded strings in callers):
   - `_process_bill_item(item, include_pdfs) -> AsyncIterator[DocumentSource]`
   - `_process_legislator_item(item) -> DocumentSource | None`
   - `_process_organization_item(item) -> DocumentSource | None`
-- **`OpenStatesSource`** — `fetch_jurisdiction(jurisdiction) -> JurisdictionInfo | None`
+- **`OpenStatesSource`** — general ingestion pipeline (jurisdiction/session fetch, bill fetch, legislator fetch/batch-fetch). Key methods:
+  - `fetch_jurisdiction(jurisdiction) -> JurisdictionInfo | None`
+  - `fetch(jurisdiction, session, limit) -> AsyncIterator[DocumentSource]` — bill search + detail
+  - `fetch_legislators(jurisdiction, limit) -> AsyncIterator[DocumentSource]`
+  - `fetch_bill(bill_id) -> DocumentSource | None` / `fetch_legislator_by_id(person_id) -> DocumentSource | None` — single opaque-ID lookups, always public API (no jurisdiction to route on)
+  - `fetch_legislators_batch(person_ids) -> AsyncIterator[DocumentSource]`
+  - `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` — routes `fetch_jurisdiction`/`fetch`/`fetch_legislators` to the local OpenStates replica (`settings.local_openstates_api_base`/`local_openstates_api_key`) instead of the public API (`settings.openstates_api_base`/`openstates_api_key`) when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8)
 - **`JurisdictionInfo`** — `jurisdiction_id, name, sessions: list[LegislativeSession], latest_bill_update`. Method: `get_current_session() -> LegislativeSession | None`
 - **`LegislativeSession`** — `identifier, name, start_date, end_date, active`
 - **`PDFSource`** — `process_url(url, max_pages) -> DocumentSource | None`
@@ -197,7 +207,7 @@ Pub/sub channels (hardcoded strings in callers):
 
 ## OpenStates People client (`services/openstates_people.py`)
 
-- **`OpenStatesPeopleClient`** — person lookups for bio sync. Methods: `get_person(person_id)`, `search_people(name, jurisdiction, ...)`
+- **`OpenStatesPeopleClient`** — person lookups for bio sync. Methods: `fetch_by_id(openstates_id) -> OpenStatesPerson | None` (single opaque-ID lookup, always public API — no jurisdiction to route on), `iter_jurisdiction(jurisdiction) -> AsyncIterator[OpenStatesPerson]`. Deliberately thin — no `Settings` dependency; takes `openstates_api_base`/`local_openstates_api_base`/`local_openstates_api_key`/`ddp_openstates_jurisdictions` as constructor kwargs instead. `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` routes `iter_jurisdiction` to the local OpenStates replica when `jurisdiction` is in `ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8). Callers: `pipelines/legislator_bio.py`'s `BioSyncOrchestrator`, `scripts/backfill_legislator_party.py`.
 - **`OpenStatesPerson`** — bio data shape
 - **`OpenStatesError`** / **`OpenStatesRateLimitError`** — exception hierarchy
 
@@ -253,7 +263,7 @@ Pub/sub channels (hardcoded strings in callers):
 
 ## Federal legislator cache (`sync/federal_legislator_cache.py`)
 
-- **`FederalLegislatorCache`** — in-memory cache of 538 Congress members. `lookup_with_info(name) -> dict | None` — returns `{person_id, name, party, state}`. Used to enrich federal vote records with stable OpenStates person IDs.
+- **`FederalLegislatorCache`** — in-memory cache of 538 Congress members. `lookup_with_info(name) -> dict | None` — returns `{person_id, name, party, state}`. Used to enrich federal vote records with stable OpenStates person IDs. `refresh()` always fetches jurisdiction "us"; `_get_api_base_and_key("us") -> tuple[str, str, bool]` routes it to the local OpenStates replica instead of the public API when `"US"` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8).
 
 ## Webflow API tokens (two, not interchangeable)
 
