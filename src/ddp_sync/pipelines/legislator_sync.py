@@ -74,8 +74,6 @@ class LegislatorSyncService:
     - "What is Representative Jones's voting record?"
     """
 
-    OPENSTATES_API_BASE = "https://v3.openstates.org"
-
     # Mapping of jurisdiction codes to human-readable source names
     JURISDICTION_SOURCE_NAMES = {
         "us": "US Congress",
@@ -124,6 +122,42 @@ class LegislatorSyncService:
             jurisdiction_lower,
             f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature"
         )
+
+    def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
+        """
+        Choose which OpenStates-compatible backend to hit for this jurisdiction.
+
+        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
+        SYNC-6): jurisdictions listed in settings.ddp_openstates_jurisdictions
+        (the same DDP_OPENSTATES_JURISDICTIONS env var ddp-broker-py reads) are
+        routed to the local OpenStates replica instead of the public
+        v3.openstates.org API (SYNC-8), so the two services never diverge on
+        which jurisdictions are "on the replica".
+
+        Only used by call sites that have a jurisdiction in scope
+        (fetch_sponsored_bills, fetch_legislator_votes) -- _get_sponsor_name()
+        looks up a single person by opaque OpenStates ID with no jurisdiction
+        available, so it always uses the public API base (see its docstring).
+
+        Args:
+            jurisdiction: State code (e.g., 'fl', 'us', 'va')
+
+        Returns:
+            (api_base, api_key, is_local_replica) tuple. is_local_replica is
+            True when the local api-v3 instance's apikey_auth scheme applies --
+            it authenticates via an `apikey` query param, not the public API's
+            `x-api-key` header scheme.
+        """
+        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
+        if jurisdiction.upper() in replica_jurisdictions:
+            logger.debug(
+                "Routing jurisdiction to local OpenStates replica",
+                jurisdiction=jurisdiction,
+                api_base=self.settings.local_openstates_api_base,
+            )
+            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
+
+        return self.settings.openstates_api_base, self.api_key, False
 
     async def _build_bill_mapping(self) -> None:
         """
@@ -231,6 +265,9 @@ class LegislatorSyncService:
         """
         await self._apply_rate_limit()
 
+        # Single person lookup by opaque OpenStates ID -- no jurisdiction is
+        # available here to route to the local replica (SYNC-8), so this
+        # always uses the public API base.
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 headers = {
@@ -247,7 +284,7 @@ class LegislatorSyncService:
                 ]
                 params = [("id", person_id)] + [("include", p) for p in include_params]
                 response = await client.get(
-                    f"{self.OPENSTATES_API_BASE}/people",
+                    f"{self.settings.openstates_api_base}/people",
                     headers=headers,
                     params=params,
                 )
@@ -298,6 +335,8 @@ class LegislatorSyncService:
                 logger.warning(f"Could not determine sponsor name for {person_id}")
                 return []
 
+        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+
         all_bills = []
         page = 1
 
@@ -306,7 +345,6 @@ class LegislatorSyncService:
 
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    headers = {"x-api-key": self.api_key}
                     params = {
                         "sponsor": sponsor_name,
                         "jurisdiction": jurisdiction,
@@ -314,9 +352,18 @@ class LegislatorSyncService:
                         "page": page,
                         "include": "sponsorships",
                     }
+                    if is_local_replica:
+                        # Local api-v3's apikey_auth is a query param, not the
+                        # public API's x-api-key header (SYNC-8, mirrors
+                        # SYNC-6's routing).
+                        headers = {}
+                        if api_key:
+                            params["apikey"] = api_key
+                    else:
+                        headers = {"x-api-key": api_key}
 
                     response = await client.get(
-                        f"{self.OPENSTATES_API_BASE}/bills",
+                        f"{api_base}/bills",
                         headers=headers,
                         params=params,
                     )
@@ -383,6 +430,8 @@ class LegislatorSyncService:
         Returns:
             List of LegislatorVote objects
         """
+        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+
         all_votes: list[LegislatorVote] = []
         page = 1
         bills_fetched = 0
@@ -393,6 +442,7 @@ class LegislatorSyncService:
             jurisdiction=jurisdiction,
             session=session,
             max_bills=max_bills,
+            api_base=api_base,
         )
 
         while bills_fetched < max_bills:
@@ -400,8 +450,6 @@ class LegislatorSyncService:
 
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    headers = {"x-api-key": self.api_key}
-
                     # First, get list of bills (votes not included in list endpoint)
                     # Note: OpenStates API limits per_page to 20
                     list_params: dict[str, Any] = {
@@ -411,9 +459,17 @@ class LegislatorSyncService:
                     }
                     if session:
                         list_params["session"] = session
+                    if is_local_replica:
+                        # Local api-v3's apikey_auth is a query param, not the
+                        # public API's x-api-key header (SYNC-8).
+                        headers = {}
+                        if api_key:
+                            list_params["apikey"] = api_key
+                    else:
+                        headers = {"x-api-key": api_key}
 
                     response = await client.get(
-                        f"{self.OPENSTATES_API_BASE}/bills",
+                        f"{api_base}/bills",
                         headers=headers,
                         params=list_params,
                     )
@@ -444,11 +500,15 @@ class LegislatorSyncService:
                         # Rate limit between individual bill fetches
                         await self._apply_rate_limit()
 
-                        # Fetch full bill with votes
+                        # Fetch full bill with votes (same resolved api_base/
+                        # key as the list call above -- same jurisdiction).
+                        detail_params: list[tuple[str, Any]] = [("include", "votes")]
+                        if is_local_replica and api_key:
+                            detail_params.append(("apikey", api_key))
                         bill_response = await client.get(
-                            f"{self.OPENSTATES_API_BASE}/bills/{bill_id}",
+                            f"{api_base}/bills/{bill_id}",
                             headers=headers,
-                            params=[("include", "votes")],
+                            params=detail_params,
                         )
 
                         if bill_response.status_code != 200:
