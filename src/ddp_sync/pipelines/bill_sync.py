@@ -66,8 +66,6 @@ class BillSyncService:
     - Sponsorship information
     """
 
-    OPENSTATES_API_BASE = "https://v3.openstates.org"
-
     # Mapping of Webflow jurisdiction IDs to OpenStates jurisdiction codes
     JURISDICTION_MAP = {
         "655288ef928edb128306745f": "fl",
@@ -324,6 +322,39 @@ class BillSyncService:
         """
         await self.rate_limiter.apply()
 
+    def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
+        """
+        Choose which OpenStates-compatible backend to hit for this jurisdiction.
+
+        Mirrors ddp-broker-py's OpenStatesService._get_client_for_jurisdiction():
+        jurisdictions listed in settings.ddp_openstates_jurisdictions (the same
+        DDP_OPENSTATES_JURISDICTIONS env var broker reads) are routed to the
+        local OpenStates replica instead of the public v3.openstates.org API,
+        so the two services never diverge on which jurisdictions are "on the
+        replica" vs "on the public API".
+
+        Args:
+            jurisdiction: State code (e.g., 'fl', 'us', 'va')
+
+        Returns:
+            (api_base, api_key, is_local_replica) tuple. is_local_replica is
+            True when the local api-v3 instance's apikey_auth scheme applies --
+            it authenticates via an `apikey` query param, not the public API's
+            `x-api-key` header (same convention local_openstates_client.py
+            already uses against this same instance) -- see
+            fetch_bill_from_openstates() for where that distinction is used.
+        """
+        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
+        if jurisdiction.upper() in replica_jurisdictions:
+            logger.debug(
+                "Routing jurisdiction to local OpenStates replica",
+                jurisdiction=jurisdiction,
+                api_base=self.settings.local_openstates_api_base,
+            )
+            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
+
+        return self.settings.openstates_api_base, self.api_key, False
+
     async def fetch_bill_from_openstates(
         self,
         jurisdiction: str,
@@ -332,6 +363,10 @@ class BillSyncService:
     ) -> dict[str, Any] | None:
         """
         Fetch bill details from OpenStates API with retry logic.
+
+        Routes to the local OpenStates replica instead of the public API for
+        jurisdictions listed in settings.ddp_openstates_jurisdictions (SYNC-6) --
+        see _get_api_base_and_key().
 
         Args:
             jurisdiction: State code (e.g., 'fl', 'wa')
@@ -343,7 +378,8 @@ class BillSyncService:
         """
         # Remove spaces from bill_id (OpenStates expects "HB363" not "HB 363" or "HB%20363")
         clean_bill_id = bill_id.replace(" ", "")
-        url = f"{self.OPENSTATES_API_BASE}/bills/{jurisdiction}/{session}/{clean_bill_id}"
+        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        url = f"{api_base}/bills/{jurisdiction}/{session}/{clean_bill_id}"
 
         logger.info(
             "Fetching bill from OpenStates",
@@ -352,6 +388,7 @@ class BillSyncService:
             session=session,
             original_bill_id=bill_id,
             clean_bill_id=clean_bill_id,
+            api_base=api_base,
         )
 
         last_error: Exception | None = None
@@ -362,7 +399,7 @@ class BillSyncService:
                 attempt=attempt + 1,
                 max_attempts=self.rate_limit.max_retry_attempts,
                 url=url,
-                api_key_prefix=self.api_key[:8] + "..." if self.api_key else "MISSING",
+                api_key_prefix=api_key[:8] + "..." if api_key else "MISSING",
             )
 
             # Apply rate limiting before each request
@@ -384,12 +421,21 @@ class BillSyncService:
                         "votes",
                         "related_bills",
                     ]
-                    # Use header-based auth (more secure than query param)
-                    headers = {
-                        "accept": "application/json",
-                        "x-api-key": self.api_key,
-                    }
                     params = [("include", p) for p in include_params]
+                    if is_local_replica:
+                        # Local api-v3's apikey_auth is a query param, not a
+                        # header (SYNC-6) -- matches local_openstates_client.py's
+                        # convention against this same instance; api-v3 does not
+                        # accept the public API's x-api-key header scheme.
+                        headers = {"accept": "application/json"}
+                        if api_key:
+                            params.append(("apikey", api_key))
+                    else:
+                        # Public API: header-based auth (more secure than query param)
+                        headers = {
+                            "accept": "application/json",
+                            "x-api-key": api_key,
+                        }
                     response = await client.get(url, headers=headers, params=params)
 
                     # Log the response for debugging

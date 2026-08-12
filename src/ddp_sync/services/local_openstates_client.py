@@ -22,6 +22,18 @@ second client pointed at a local OpenStates instance for one purpose"
 fetch/interfaces/OpenStates/openstates_service.py:1282-1296) without reusing
 any of that (different repo, different auth) — just the same shape.
 
+SYNC-6 (2026-08-11) added a second, narrower reuse of that same shape:
+BillSyncService.fetch_bill_from_openstates() (pipelines/bill_sync.py) now
+also routes to settings.local_openstates_api_base/local_openstates_api_key
+directly (not through this module — different endpoint shape,
+/bills/{jurisdiction}/{session}/{bill_id} vs this module's
+/bills/ocd-bill/{uuid}), but only for jurisdictions listed in
+settings.ddp_openstates_jurisdictions, mirroring
+_get_client_for_jurisdiction() itself rather than this module's narrower
+archived-text lookup. Still not the universal cutover this docstring
+originally disclaimed — just one more jurisdiction-scoped caller of the
+same local replica.
+
 Caveat inherited directly from OPEN-13's own scope (api-v3/api/bills.py's
 BillPagination.postprocess_includes): raw_text is only populated for a
 bill's *latest* version, and only on this single-bill detail endpoint

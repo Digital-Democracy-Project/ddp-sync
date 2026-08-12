@@ -92,7 +92,7 @@ The daily bill sync entry point. **Do not reinvent these methods.**
   - `sync_current_session_bills(bills, heartbeat_callback) -> SyncBatchResult`
   - `backload_all_bills(bills) -> SyncBatchResult` — ignores session filter
   - `sync_bill(openstates_url, webflow_bill_id, bill_title, jurisdiction_name, bill_slug) -> BillSyncResult`
-  - `fetch_bill_from_openstates(jurisdiction, session, bill_id) -> dict | None` — rate-limited, retried; includes all `?include=` params
+  - `fetch_bill_from_openstates(jurisdiction, session, bill_id) -> dict | None` — rate-limited, retried; includes all `?include=` params. Routes to the local OpenStates replica (`settings.local_openstates_api_base`/`local_openstates_api_key`) instead of the public API (`settings.openstates_api_base`/`openstates_api_key`) when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` (env `DDP_OPENSTATES_JURISDICTIONS`) — mirrors ddp-broker-py's `OpenStatesService._get_client_for_jurisdiction()`; see `_get_api_base_and_key(jurisdiction)` (SYNC-6)
   - `parse_openstates_url(url) -> OpenStatesUrl | None`
   - `resolve_jurisdiction_code(jurisdiction_id, openstates_url) -> str` — JURISDICTION_MAP first, OpenStates URL fallback
   - `is_current_session_async(session_year, session_code, jurisdiction) -> bool` — prefers live OpenStates session data

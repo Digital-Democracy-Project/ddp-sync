@@ -43,6 +43,23 @@ class SyncSettings:
     # External APIs
     openstates_api_key: str = ""
     congress_api_key: str = ""
+    # Public v3.openstates.org API base. Configurable so it matches the
+    # local_openstates_api_base pattern below -- SYNC-6 needs this to be
+    # overridable so BillSyncService.fetch_bill_from_openstates() can be
+    # pointed at a different base in tests without patching a class
+    # constant.
+    openstates_api_base: str = "https://v3.openstates.org"
+    # Jurisdictions to route to the local OpenStates replica instead of the
+    # public API (SYNC-6). Deliberately the *same* env var name
+    # ddp-broker-py's settings.py reads (DDP_OPENSTATES_JURISDICTIONS) so
+    # both services can be pointed at one shared value -- ddp-sync does NOT
+    # hardcode its own default jurisdiction list here, to avoid drifting
+    # from whatever broker is actually routing. Empty by default (unlike
+    # broker's hard-required env var): this is a new var for ddp-sync, and
+    # until ops sets it to match broker's value, falling back to "always
+    # public API" is the same behavior as before this change existed --
+    # safer than refusing to boot.
+    ddp_openstates_jurisdictions: list = field(default_factory=list)
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -103,8 +120,16 @@ class SyncSettings:
     # (docker-compose.ddp.yml maps its container to host port 8002 on the
     # Mac Studio, same box ddp-sync's LegBot dispatch already runs on — see
     # cams_base_url above), NOT the same thing as openstates_api_key/the
-    # public v3.openstates.org API bill_sync.py calls, and NOT the site-wide
-    # OPENSTATES_API_BASE cutover PLAN-local-openstates-migration.md scopes.
+    # public v3.openstates.org API bill_sync.py calls by default.
+    # Originally NOT the site-wide OPENSTATES_API_BASE cutover
+    # PLAN-local-openstates-migration.md scopes (Pinecone re-keying,
+    # VoteBot, universal ingestion) -- that migration is still out of
+    # scope. SYNC-6 (2026-08-11) *does* now reuse this same base/key pair
+    # for BillSyncService.fetch_bill_from_openstates(), but only for
+    # jurisdictions listed in ddp_openstates_jurisdictions below -- a
+    # narrow, jurisdiction-scoped routing decision mirroring
+    # ddp-broker-py's _get_client_for_jurisdiction(), not the universal
+    # cutover.
     # No default key — api-v3's apikey_auth has no dev bypass; must be set
     # (the local dev stack's seeded Profile key is the well-known
     # 00000000-0000-0000-0000-000000000001 sentinel used elsewhere in this
@@ -163,6 +188,12 @@ def _load_from_env() -> dict:
         "pinecone_namespace": os.getenv("PINECONE_NAMESPACE", "default"),
         "openstates_api_key": os.getenv("OPENSTATES_API_KEY", ""),
         "congress_api_key": os.getenv("CONGRESS_API_KEY", ""),
+        "openstates_api_base": os.getenv("OPENSTATES_API_BASE", "https://v3.openstates.org"),
+        "ddp_openstates_jurisdictions": [
+            j.strip().upper()
+            for j in os.getenv("DDP_OPENSTATES_JURISDICTIONS", "").split(",")
+            if j.strip()
+        ],
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),
