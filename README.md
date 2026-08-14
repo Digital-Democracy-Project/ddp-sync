@@ -111,6 +111,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 |--------|------|-------------|
 | POST | `/trigger/bill-version-check` | Trigger daily bill sync (Flow 1 + Flow 2) |
 | POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
+| POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
@@ -120,6 +121,16 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 `/trigger/openstates-scrape/{target}` — valid targets: `patches`, `fl`, `wa`, `usa`, `secondary`, `people`, `va`, `mi`, `ma`, `ut`, `az`
 
 `/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
+
+`/trigger/bill-artifact-generation` (SYNC-9) is `run_legbot_pipeline`'s (`pipelines/session_pipeline_runner.py`)
+first real production caller — it fills in whatever `BillArtifact` types are missing for every bill in one
+jurisdiction/session. Takes a JSON body, not query params: `jurisdiction_iso2`, `session_code`, `artifact_types`
+(list, e.g. `["bill_summary", "bill_pros_cons"]`), `include_org_research` (bool), `limit` (int), `dry_run` (bool,
+default `false`) — no field has a default except `dry_run`, matching `run_legbot_pipeline`'s own "no silent
+defaults for cost-relevant params" discipline. `limit` is capped at 25: ddp-infra's Phase 8 concurrency
+cap/prioritization isn't live yet (verified against `PLAN-legbot.md`/`PLAN-bill-document-provenance.md` directly,
+2026-08-14 — still a plain sequential loop, no semaphore), so this route is deliberately kept to small, reviewable
+batches until that ships. Start with a small `artifact_types` subset, not all 8 at once.
 
 `/trigger/legislator-bio-sync` accepts query params:
 - `dry_run` (bool) — preview the diff without writing

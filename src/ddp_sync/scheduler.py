@@ -277,6 +277,9 @@ class UpdateScheduler:
         # PLAN-bill-concept-polling.md §0.4) ---
         self._register_concept_statement_dispatch_job()
 
+        # --- Session-targeted BillArtifact batch job (SYNC-9) ---
+        self._register_session_pipeline_batch_job()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -787,6 +790,88 @@ class UpdateScheduler:
                 sync_day=sync_day,
                 jurisdictions=jurisdictions,
             )
+
+    def _register_session_pipeline_batch_job(self) -> None:
+        """Register the session-targeted BillArtifact batch job (SYNC-9).
+
+        Reads YAML block ``session_pipeline_batch``, mirroring
+        ``concept_statement_dispatch``'s own ``enabled``/``frequency``/
+        ``sync_day``/``sync_time_utc`` shape. Shipped ``enabled: false`` in
+        sync_schedule.yaml -- see that block's own comment for why
+        (ddp-infra's Phase 8 concurrency cap/prioritization isn't live yet,
+        verified 2026-08-14 directly against PLAN-legbot.md and
+        PLAN-bill-document-provenance.md).
+
+        Unlike ``concept_statement_dispatch``'s all-optional block, this
+        job has genuinely required fields with no sensible default
+        (jurisdiction_iso2, session_code, artifact_types, limit) --
+        validated here, before registration, same gate style
+        ``votebot_eval`` uses for its own required config. An ``enabled:
+        true`` block missing one of these skips registration (logged as an
+        error) rather than registering a job that would fail every time it
+        fires.
+        """
+        from ddp_sync.pipelines.session_pipeline_runner import (
+            _REQUIRED_BATCH_CONFIG_KEYS,
+            run_scheduled_session_pipeline,
+        )
+
+        config = self._sync_config.get("session_pipeline_batch", {})
+
+        if not config.get("enabled", False):
+            logger.info("session_pipeline_batch: disabled in config — skipping")
+            return
+
+        missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]
+        if missing:
+            logger.error(
+                "session_pipeline_batch: missing required config keys — skipping registration",
+                missing_keys=missing,
+            )
+            return
+
+        sync_time_str = config.get("sync_time_utc", "13:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        frequency = config.get("frequency", "weekly")
+
+        async def _session_pipeline_batch_wrapper():
+            return await run_scheduled_session_pipeline(config)
+
+        if frequency == "daily":
+            trigger = CronTrigger(hour=hour, minute=minute, timezone=_UTC)
+            cadence_str = f"daily at {sync_time_str} UTC"
+        else:
+            day_map = {
+                "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+                "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
+            }
+            sync_day = config.get("sync_day", "sunday").lower()
+            trigger = CronTrigger(
+                day_of_week=day_map.get(sync_day, "sun"),
+                hour=hour,
+                minute=minute,
+                timezone=_UTC,
+            )
+            cadence_str = f"weekly {sync_day} {sync_time_str} UTC"
+
+        self.scheduler.add_job(
+            _session_pipeline_batch_wrapper,
+            trigger=trigger,
+            id="session_pipeline_batch",
+            name="Session-targeted BillArtifact batch (SYNC-9)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            "session_pipeline_batch: registered",
+            cadence=cadence_str,
+            jurisdiction_iso2=config.get("jurisdiction_iso2"),
+            session_code=config.get("session_code"),
+            artifact_types=config.get("artifact_types"),
+            limit=config.get("limit"),
+        )
 
     def stop(self) -> None:
         """Stop the scheduler."""

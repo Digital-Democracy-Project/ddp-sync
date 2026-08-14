@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
+from ddp_sync.pipelines.session_pipeline_runner import (
+    run_scheduled_session_pipeline,
+    run_legbot_pipeline,
+)
 from ddp_sync.services.broker_client import BrokerClientError
 
 _CANDIDATE = {
@@ -364,3 +367,83 @@ async def test_org_research_not_requested_is_never_checked():
     mock_status.assert_not_awaited()
     assert result["results"][0]["org_research_dispatched"] is False
     assert result["results"][0]["org_research_skipped_reason"] is None
+
+
+# --- run_scheduled_session_pipeline (SYNC-9 scheduler wrapper) -------------
+
+_VALID_BATCH_CONFIG = {
+    "jurisdiction_iso2": "FL",
+    "session_code": "2026F",
+    "artifact_types": ["bill_summary", "bill_pros_cons"],
+    "limit": 10,
+}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_maps_full_config_to_run_legbot_pipeline():
+    config = dict(_VALID_BATCH_CONFIG, include_org_research=True, dry_run=True)
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 2}),
+    ) as mock_run:
+        result = await run_scheduled_session_pipeline(config)
+
+    mock_run.assert_awaited_once_with(
+        "FL", "2026F", ["bill_summary", "bill_pros_cons"], True, 10, dry_run=True
+    )
+    assert result == {"bills_considered": 2}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_defaults_org_research_and_dry_run_when_absent():
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={}),
+    ) as mock_run:
+        await run_scheduled_session_pipeline(_VALID_BATCH_CONFIG)
+
+    mock_run.assert_awaited_once_with(
+        "FL", "2026F", ["bill_summary", "bill_pros_cons"], False, 10, dry_run=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_missing_required_key_returns_invalid_config():
+    config = {k: v for k, v in _VALID_BATCH_CONFIG.items() if k != "artifact_types"}
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        result = await run_scheduled_session_pipeline(config)
+
+    mock_run.assert_not_awaited()
+    assert result["success"] is False
+    assert result["error"] == "invalid_config"
+    assert "artifact_types" in result["missing_keys"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_zero_limit_treated_as_missing():
+    config = dict(_VALID_BATCH_CONFIG, limit=0)
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        result = await run_scheduled_session_pipeline(config)
+
+    mock_run.assert_not_awaited()
+    assert result["error"] == "invalid_config"
+    assert "limit" in result["missing_keys"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_value_error_from_pipeline_is_caught():
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(side_effect=ValueError("Unrecognized artifact_types: ['bogus']")),
+    ):
+        result = await run_scheduled_session_pipeline(_VALID_BATCH_CONFIG)
+
+    assert result["success"] is False
+    assert result["error"] == "invalid_config"
+    assert "Unrecognized artifact_types" in result["detail"]

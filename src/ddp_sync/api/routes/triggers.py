@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from ddp_sync.api.auth import api_key_auth
 
@@ -83,6 +84,96 @@ async def trigger_bill_status_sync(
         raise
     except Exception as e:
         logger.error(f"Bill status sync trigger failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Hard ceiling on `limit` for this on-demand route -- ddp-infra's Phase 8
+# concurrency cap/prioritization (PLAN-legbot.md, PLAN-bill-document-
+# provenance.md) is not yet built (verified 2026-08-14 against those plan
+# docs directly: the real current state is still a plain sequential loop,
+# no semaphore, anywhere in this pipeline). This route is production's only
+# real caller of run_legbot_pipeline (SYNC-9) until that concurrency work
+# ships, so it deliberately keeps every call to a small, reviewable batch
+# rather than allowing unbounded volume against a shared, uncapped
+# CAMS/LegBot backend. Raise this once ddp-infra's Phase 8 lands.
+_BILL_ARTIFACT_GENERATION_MAX_LIMIT = 25
+
+
+class BillArtifactGenerationRequest(BaseModel):
+    """Request body for POST /trigger/bill-artifact-generation.
+
+    No field has a default -- every cost-relevant parameter must be an
+    explicit, reviewed choice per call, mirroring run_legbot_pipeline's own
+    "no silent defaults" discipline (pipelines/session_pipeline_runner.py).
+    """
+
+    jurisdiction_iso2: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
+    session_code: str = Field(..., description="Legislative session identifier, e.g. '2026F'.")
+    artifact_types: list[str] = Field(
+        ...,
+        description=(
+            "BillArtifact types to fill in for this run (from the 8 types "
+            "session_pipeline_runner.ALL_8_ARTIFACT_TYPES supports -- "
+            "bill_summary, bill_pros_cons, bill_changelog, etc.). Start "
+            "with a small subset, not all of them at once."
+        ),
+    )
+    include_org_research: bool = Field(
+        ...,
+        description=(
+            "Whether to also dispatch Organization Position Research for "
+            "bills not yet researched."
+        ),
+    )
+    limit: int = Field(
+        ...,
+        description=f"Max bills to consider this run (1-{_BILL_ARTIFACT_GENERATION_MAX_LIMIT}).",
+    )
+    dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
+
+
+@router.post("/trigger/bill-artifact-generation")
+async def trigger_bill_artifact_generation(
+    body: BillArtifactGenerationRequest,
+    token: str = Depends(api_key_auth),
+):
+    """Fill in missing BillArtifact rows for every bill in one jurisdiction/session.
+
+    run_legbot_pipeline's (pipelines/session_pipeline_runner.py) first real
+    production caller (SYNC-9) -- ddp-infra's PLAN-bill-document-
+    provenance.md "Step 1, scoped version". Synchronous, like
+    /trigger/bill-version-check: returns the full result payload so an
+    operator can review exactly what was generated/skipped/failed before
+    running a broader batch.
+
+    `limit` is capped at _BILL_ARTIFACT_GENERATION_MAX_LIMIT -- see that
+    constant's own comment for why.
+    """
+    if not (1 <= body.limit <= _BILL_ARTIFACT_GENERATION_MAX_LIMIT):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"limit must be in [1, {_BILL_ARTIFACT_GENERATION_MAX_LIMIT}], "
+                f"got {body.limit}. ddp-infra's Phase 8 concurrency cap isn't "
+                "live yet -- keep batches small until it is."
+            ),
+        )
+
+    from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
+
+    try:
+        return await run_legbot_pipeline(
+            body.jurisdiction_iso2,
+            body.session_code,
+            body.artifact_types,
+            body.include_org_research,
+            body.limit,
+            dry_run=body.dry_run,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Bill artifact generation trigger failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

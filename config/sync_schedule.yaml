@@ -385,3 +385,46 @@ concept_statement_dispatch:
   max_bills_per_run: 25       # bounds real per-run LegBot-dispatch + broker-write cost
   # jurisdictions:             # absent/null = reuse active_jurisdictions above
   #   - FL
+
+# Session-Targeted BillArtifact Batch (SYNC-9)
+# =============================================
+# Scheduled batch job for run_legbot_pipeline (pipelines/session_pipeline_runner.py,
+# ddp-infra PLAN-bill-document-provenance.md "Step 1, scoped version") -- fills in
+# whichever of the 8 BillArtifact types (bill_summary, bill_pros_cons, etc.) are
+# missing for every bill in one jurisdiction/session, plus optional Organization
+# Position Research. The on-demand route POST /trigger/bill-artifact-generation
+# (api/routes/triggers.py) is this pipeline's other real caller and works
+# regardless of this block's `enabled` value.
+#
+# Disabled by default, deliberately -- verified 2026-08-14 directly against
+# ddp-infra's PLAN-legbot.md and PLAN-bill-document-provenance.md:
+#   - Phase 6 (BillArtifact dedup key): LIVE. Merged to ddp-broker-py `main`
+#     2026-07-26, production RDS confirmed up to date the same day. Writes
+#     from this job are safe.
+#   - Phase 8 (concurrency cap, prioritization vs. interactive Agent Smith
+#     traffic): NOT BUILT. The plan doc's own corrected note (2026-07-22) is
+#     explicit -- there is no max_concurrent_requests cap anywhere in this
+#     pipeline today, just a plain sequential loop (effective concurrency of
+#     1). Nothing since the plan's last update (2026-08-10) indicates this
+#     shipped.
+# Flip `enabled: true` only after ddp-infra's Phase 8 concurrency work is
+# confirmed live -- until then, use the on-demand trigger route for any real
+# batch, which caps `limit` to 25 for the same reason.
+#
+# jurisdiction_iso2/session_code are a single, specific state/session (not
+# "current session" auto-detection, not "all jurisdictions") and
+# artifact_types is a small subset, not all 8 -- a deliberately narrow first
+# scope per the plan's own "start with a small reviewed batch" rollout note,
+# same spirit as concept_statement_dispatch's own max_bills_per_run cap above.
+session_pipeline_batch:
+  enabled: false
+  frequency: weekly
+  sync_day: sunday
+  sync_time_utc: "13:00"       # after votebot_eval (12:00)
+  jurisdiction_iso2: "FL"
+  session_code: "2026F"
+  artifact_types:
+    - bill_summary
+    - bill_pros_cons
+  include_org_research: false
+  limit: 10
