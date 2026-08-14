@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ddp_sync.pipelines.session_pipeline_runner import run_session_pipeline
+from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
 from ddp_sync.services.broker_client import BrokerClientError
 
 _CANDIDATE = {
@@ -59,31 +59,31 @@ def _patch_version(result=_VERSION_IDENTITY):
 @pytest.mark.asyncio
 async def test_rejects_empty_jurisdiction():
     with pytest.raises(ValueError, match="jurisdiction_iso2"):
-        await run_session_pipeline("", "2026F", ["bill_summary"], False, 10)
+        await run_legbot_pipeline("", "2026F", ["bill_summary"], False, 10)
 
 
 @pytest.mark.asyncio
 async def test_rejects_empty_session_code():
     with pytest.raises(ValueError, match="session_code"):
-        await run_session_pipeline("fl", "", ["bill_summary"], False, 10)
+        await run_legbot_pipeline("fl", "", ["bill_summary"], False, 10)
 
 
 @pytest.mark.asyncio
 async def test_rejects_non_positive_limit():
     with pytest.raises(ValueError, match="limit"):
-        await run_session_pipeline("fl", "2026F", ["bill_summary"], False, 0)
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, 0)
 
 
 @pytest.mark.asyncio
 async def test_rejects_empty_artifact_types():
     with pytest.raises(ValueError, match="artifact_types"):
-        await run_session_pipeline("fl", "2026F", [], False, 10)
+        await run_legbot_pipeline("fl", "2026F", [], False, 10)
 
 
 @pytest.mark.asyncio
 async def test_rejects_unrecognized_artifact_type():
     with pytest.raises(ValueError, match="Unrecognized"):
-        await run_session_pipeline("fl", "2026F", ["not_a_real_type"], False, 10)
+        await run_legbot_pipeline("fl", "2026F", ["not_a_real_type"], False, 10)
 
 
 @pytest.mark.asyncio
@@ -92,7 +92,7 @@ async def test_none_of_the_three_required_args_have_defaults():
     conscious choice, not just artifact_types/include_org_research but
     limit too."""
     import inspect
-    sig = inspect.signature(run_session_pipeline)
+    sig = inspect.signature(run_legbot_pipeline)
     for name in ("artifact_types", "include_org_research", "limit"):
         assert sig.parameters[name].default is inspect.Parameter.empty
 
@@ -106,7 +106,7 @@ async def test_truncated_is_true_when_more_candidates_exist_than_limit():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1}),
     ):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2
         )
 
@@ -122,7 +122,7 @@ async def test_truncated_is_false_when_exactly_limit_candidates_exist():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1}),
     ):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2
         )
 
@@ -133,7 +133,7 @@ async def test_truncated_is_false_when_exactly_limit_candidates_exist():
 @pytest.mark.asyncio
 async def test_lister_called_with_limit_plus_one():
     with _patch_lister([]) as mock_lister:
-        await run_session_pipeline("fl", "2026F", ["bill_summary"], False, limit=5)
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, limit=5)
 
     mock_lister.assert_awaited_once_with("fl", session_code="2026F", limit=6)
 
@@ -152,7 +152,7 @@ async def test_dry_run_dispatches_nothing():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
         new=AsyncMock(),
     ) as mock_org:
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_changelog"], True, limit=10, dry_run=True
         )
 
@@ -174,7 +174,7 @@ async def test_present_complete_row_is_skipped_not_regenerated():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(),
     ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 3}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -192,7 +192,7 @@ async def test_previously_failed_row_is_skipped_not_retried():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(),
     ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -208,7 +208,7 @@ async def test_missing_row_is_dispatched():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1}),
     ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -230,7 +230,7 @@ async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_arti
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
         new=AsyncMock(return_value={"id": 1}),
     ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10
         )
 
@@ -248,7 +248,7 @@ async def test_one_artifact_type_failure_does_not_abort_the_bill_or_batch():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(side_effect=[Exception("dispatch failed"), {"id": 2}]),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10
         )
 
@@ -268,7 +268,7 @@ async def test_a_version_mismatch_exception_is_caught_the_same_as_any_other():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
         new=AsyncMock(side_effect=ArchivedVersionMismatchError("stale version")),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10
         )
 
@@ -285,7 +285,7 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -300,7 +300,7 @@ async def test_missing_version_identity_fails_the_needed_artifacts_not_the_whole
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(None), _patch_org_status(
         {"has_rows": True, "row_count": 0}
     ):
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -319,7 +319,7 @@ async def test_org_research_skipped_when_already_researched():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
         new=AsyncMock(),
     ) as mock_org:
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -337,7 +337,7 @@ async def test_org_research_dispatched_when_not_yet_researched():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
         new=AsyncMock(return_value=[{"org_name": "Sierra Club", "outcome": "written"}]),
     ) as mock_org:
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10
         )
 
@@ -357,7 +357,7 @@ async def test_org_research_not_requested_is_never_checked():
         "ddp_sync.pipelines.session_pipeline_runner.get_bill_organization_positions_status",
         new=AsyncMock(),
     ) as mock_status:
-        result = await run_session_pipeline(
+        result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10
         )
 
