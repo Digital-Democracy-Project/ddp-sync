@@ -223,7 +223,7 @@ async def _process_bill(
     return result
 
 
-async def run_session_pipeline(
+async def run_legbot_pipeline(
     jurisdiction_iso2: str,
     session_code: str,
     artifact_types: list[str],
