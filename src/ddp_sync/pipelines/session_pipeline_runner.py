@@ -12,9 +12,23 @@ Motivated directly by trying to do exactly that against FL's real 2026F
 session (2026-08-01) and finding the answer was no.
 
 Sequential, no concurrency control -- matches this pipeline's actual state
-everywhere else. Manually invocable only -- no scheduler registration, not
-wired into sync_schedule.yaml, same as every other piece of this pipeline.
-Fills only absent rows -- no freshness/version-currency check.
+everywhere else. Fills only absent rows -- no freshness/version-currency
+check.
+
+Two real callers now (SYNC-9): the on-demand API route
+(``POST /trigger/bill-artifact-generation``, api/routes/triggers.py) and
+``run_scheduled_session_pipeline`` below, registered as the
+``session_pipeline_batch`` APScheduler job (scheduler.py) -- shipped
+``enabled: false`` in sync_schedule.yaml pending ddp-infra's own Phase 8
+(concurrency cap, prioritization vs. interactive Agent Smith traffic):
+verified 2026-08-14 directly against ``PLAN-legbot.md`` and
+``PLAN-bill-document-provenance.md`` that this still doesn't exist anywhere
+in that pipeline (a plain sequential loop, no semaphore) -- see
+``session_pipeline_batch``'s own YAML comment for the full status. Phase 6
+(``BillArtifact`` dedup key) is separately confirmed live since 2026-07-26,
+so this pipeline's actual writes are safe; what's gated is unattended
+*broad* production batch volume specifically, not this module's existence
+as a real caller.
 """
 
 from __future__ import annotations
@@ -353,3 +367,49 @@ async def run_legbot_pipeline(
         peak_memory_mb=summary["peak_memory_mb"],
     )
     return summary
+
+
+# Required session_pipeline_batch YAML keys -- deliberately no defaults
+# invented here either, same "every cost-relevant param is a conscious
+# choice" discipline as run_legbot_pipeline's own signature above. A
+# scheduled run missing any of these fails loudly (logged + returned as a
+# failure dict), rather than silently falling back to "every bill, every
+# artifact type."
+_REQUIRED_BATCH_CONFIG_KEYS = ("jurisdiction_iso2", "session_code", "artifact_types", "limit")
+
+
+async def run_scheduled_session_pipeline(config: dict) -> dict:
+    """Scheduler-driven wrapper around run_legbot_pipeline -- the
+    ``session_pipeline_batch`` YAML block's own scheduled batch job (SYNC-9).
+
+    Args:
+        config: this job's own ``session_pipeline_batch`` block
+            (sync_schedule.yaml). Required keys: jurisdiction_iso2,
+            session_code, artifact_types, limit. Optional:
+            include_org_research (default False), dry_run (default False).
+
+    Returns:
+        run_legbot_pipeline's own result dict on success. On a missing
+        required key or a value run_legbot_pipeline itself rejects (e.g.
+        an unrecognized artifact_type), returns
+        ``{"success": False, "error": "invalid_config", ...}`` instead --
+        never raises, so a misconfigured YAML block can't crash the
+        scheduler process or take down other scheduled jobs with it.
+    """
+    missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]
+    if missing:
+        logger.error("session_pipeline_batch_invalid_config", missing_keys=missing)
+        return {"success": False, "error": "invalid_config", "missing_keys": missing}
+
+    try:
+        return await run_legbot_pipeline(
+            config["jurisdiction_iso2"],
+            config["session_code"],
+            config["artifact_types"],
+            config.get("include_org_research", False),
+            config["limit"],
+            dry_run=config.get("dry_run", False),
+        )
+    except ValueError as exc:
+        logger.error("session_pipeline_batch_invalid_config", error=str(exc))
+        return {"success": False, "error": "invalid_config", "detail": str(exc)}
