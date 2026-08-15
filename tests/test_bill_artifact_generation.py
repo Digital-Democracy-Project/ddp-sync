@@ -26,21 +26,32 @@ _COMMON_KWARGS = dict(
     session_code="2026",
     version_date="2026-01-05",
     version_note="Introduced",
-    bill_source="https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
 )
+
+# Only used by dispatch_and_record_bill_artifact tests (_ONDEMAND_KWARGS
+# below) -- that wrapper still accepts bill_source for API-shape stability,
+# even though it no longer passes it through. generate_and_store_bill_artifact
+# itself has no bill_source parameter anymore.
+_BILL_SOURCE_URL = "https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF"
+
+# What get_archived_bill_text returns by default (see the fixture below) --
+# _resolve_bill_source has no live-URL fallback anymore, so every happy-path
+# test needs real archived text to reach dispatch at all.
+_ARCHIVED_TEXT = "ARCHIVED BILL TEXT FOR TESTING"
 
 
 @pytest.fixture(autouse=True)
-def no_archived_text_by_default():
-    """Every test in this file gets the "not archived" fallback path by
-    default (get_archived_bill_text returns None), matching what today's
-    behavior looks like for every non-FL bill / not-yet-archived FL bill --
-    the common case. Tests exercising the archived-text-found path override
-    this explicitly. Never makes a real HTTP call either way.
+def archived_text_by_default():
+    """Every test in this file gets real archived bill text by default
+    (get_archived_bill_text returns _ARCHIVED_TEXT) -- _resolve_bill_source
+    no longer falls back to a live URL when nothing is archived, so this is
+    the only way a test reaches a dispatch call at all. Tests exercising the
+    "nothing archived" skip/failed-row path override this to return None.
+    Never makes a real HTTP call either way.
     """
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.get_archived_bill_text",
-        new=AsyncMock(return_value=None),
+        new=AsyncMock(return_value=_ARCHIVED_TEXT),
     ) as mock_lookup:
         yield mock_lookup
 
@@ -127,7 +138,7 @@ async def test_vote_frame_happy_path_writes_broker(artifact_type, question_type)
         )
 
     assert result == {"id": 4, "created": True}
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], question_type)
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "Vote yes if you want..."
     assert write_kwargs["status"] == "complete"
@@ -158,7 +169,7 @@ async def test_org_types_happy_path_writes_broker(artifact_type, question_type):
         )
 
     assert result == {"id": 5, "created": True}
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], question_type)
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
         "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}]
@@ -189,7 +200,7 @@ async def test_impact_analysis_happy_path_writes_broker():
         )
 
     assert result == {"id": 6, "created": True}
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "impact_analysis")
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "impact_analysis")
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
         "affected_parties": [{"party": "small businesses", "effect": "new licensing fee"}],
@@ -256,7 +267,7 @@ async def test_bill_topics_happy_path_writes_broker():
         )
 
     assert result == {"id": 8, "created": True}
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "bill_topics")
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "bill_topics")
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "**Primary:** Criminal Justice\n\n- Criminal Justice\n- Drugs"
     assert write_kwargs["status"] == "complete"
@@ -370,17 +381,17 @@ async def test_bill_topics_zero_survivors_is_recorded_as_a_failed_artifact():
 
 
 # ---------------------------------------------------------------------------
-# bill_source resolution (ddp-infra "Real gap found 2026-07-29/30" -- prefer
-# ddp-open-states' archived text over a live-fetch URL, OPEN-13)
+# bill_source resolution (ddp-infra "Real gap found 2026-07-29/30", later
+# hardened to drop the live-URL fallback entirely -- ddp-open-states'
+# archived text is the only source LegBot ever sees, OPEN-13 / OPEN-48)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_by_default):
-    """When the local api-v3 instance already has archived text for this
-    bill's latest version, LegBot is dispatched with that text directly --
-    never the live URL bill_source would otherwise have been.
+async def test_archived_text_found_is_used_for_dispatch(archived_text_by_default):
+    """LegBot is dispatched with the bill's own archived text -- there is no
+    live-URL fallback for _resolve_bill_source to ever fall back to.
     """
-    no_archived_text_by_default.return_value = "ARCHIVED FULL BILL TEXT"
+    archived_text_by_default.return_value = "ARCHIVED FULL BILL TEXT"
     dispatch_result = {
         "answer": {"text": "A plain-language summary.", "insufficient_information": False},
         "backend": "mlx",
@@ -397,37 +408,37 @@ async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_
         )
 
     assert result == {"id": 7, "created": True}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "summary_500char")
 
 
 @pytest.mark.asyncio
-async def test_archived_text_not_found_falls_back_to_live_url_bill_source(
-    no_archived_text_by_default,
-):
-    """When the local api-v3 instance has no archived text (the common case
-    today -- a non-FL bill, or an FL bill not yet archived), LegBot is
-    dispatched with the caller-supplied live URL exactly as before this
-    change -- fallback behavior, not a regression.
+async def test_no_archived_text_skips_dispatch_and_writes_failed_row(archived_text_by_default):
+    """When ddp-open-states has nothing archived for this bill, LegBot is
+    never dispatched at all -- no live-URL fallback exists anymore (removed
+    specifically so a missing archive can never silently undo OPEN-48's
+    data-quality work) -- and a failed BillArtifact row is written instead.
     """
-    dispatch_result = {
-        "answer": {"text": "A plain-language summary.", "insufficient_information": False},
-        "backend": "mlx",
-    }
+    archived_text_by_default.return_value = None
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
-        new=AsyncMock(return_value=dispatch_result),
+        new=AsyncMock(),
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 8, "created": True}),
-    ):
+    ) as mock_write:
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
     assert result == {"id": 8, "created": True}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "summary_500char")
+    archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    mock_dispatch.assert_not_awaited()
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == ""
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["failure_stage"] == "generation"
+    assert write_kwargs["failure_reason"] == "no_archived_bill_text"
 
 
 _CHANGELOG_KWARGS = dict(
@@ -605,6 +616,7 @@ async def test_changelog_broker_write_failure_propagates():
 
 _ONDEMAND_KWARGS = dict(
     **_COMMON_KWARGS,
+    bill_source=_BILL_SOURCE_URL,
     broker_api_base="http://localhost:8080",
     broker_api_token="dev-token",
 )
@@ -642,7 +654,7 @@ async def test_happy_path_delegates_to_generate_and_store_bill_artifact_with_bro
 
     call_kwargs = mock_generate.await_args.kwargs
     assert call_kwargs["artifact_type"] == "bill_pros_cons"
-    assert call_kwargs["bill_source"] == _COMMON_KWARGS["bill_source"]
+    assert "bill_source" not in call_kwargs
     assert call_kwargs["broker_api_base"] == "http://localhost:8080"
     assert call_kwargs["broker_api_token"] == "dev-token"
 

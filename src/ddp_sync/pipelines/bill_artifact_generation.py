@@ -267,24 +267,35 @@ def _content_from_answer(artifact_type: str, answer: dict) -> str:
     raise ValueError(f"Unsupported artifact_type for content extraction: {artifact_type}")
 
 
-async def _resolve_bill_source(bill_openstates_id: str, live_url_fallback: str) -> str:
-    """Prefer ddp-open-states' already-archived text over a live-fetch URL.
+async def _resolve_bill_source(bill_openstates_id: str) -> str | None:
+    """Resolve a bill's current text from ddp-open-states' own archive --
+    the only source. No live-URL fallback anymore.
 
     Checks the local api-v3 instance for already-archived, already-extracted
-    text for this bill's latest version (OPEN-13). If present, LegBot is
-    handed that text directly instead of a URL it would otherwise have to
-    download and extract itself. Falls back to live_url_fallback --
-    ddp-sync's existing behavior -- when no archived text is available,
-    exactly as if this function didn't exist.
+    text for this bill's latest version (OPEN-13). Returns that text if
+    present, so LegBot is always handed real, already-quality-verified
+    content -- never a bare URL it would have to fetch and extract itself.
+
+    Removed the previous live_url_fallback behavior (falling back to a
+    caller-supplied URL when nothing was archived): LegBot has no business
+    ever reaching out to the public internet on its own, and every hour of
+    OPEN-48 data-quality work (OPEN-15/33/34/76/85 and whatever lands after)
+    exists specifically to make ddp-open-states' Postgres archive the one
+    trustworthy source of bill text -- a silent fallback to an unverified
+    live fetch would undo that guarantee for exactly the bills that need it
+    most (the ones not yet backfilled). Returns None when nothing is
+    archived; every caller must skip/fail gracefully rather than dispatch
+    with no real text, the same posture generate_and_store_bill_changelog's
+    get_archived_changelog_inputs already has.
     """
     archived_text = await get_archived_bill_text(bill_openstates_id)
     if archived_text:
         logger.info(
-            "Using ddp-open-states' archived bill text -- skipping LegBot live fetch",
+            "Using ddp-open-states' archived bill text",
             bill_openstates_id=bill_openstates_id,
         )
         return archived_text
-    return live_url_fallback
+    return None
 
 
 async def generate_and_store_bill_artifact(
@@ -294,12 +305,18 @@ async def generate_and_store_bill_artifact(
     session_code: str,
     version_date: str,
     version_note: str,
-    bill_source: str,
     artifact_type: str,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
     """Dispatch to LegBot, then persist the result to ddp-broker-py.
+
+    No bill_source parameter -- removed along with _resolve_bill_source's
+    live-URL fallback (see that function's own docstring). This function
+    only ever hands LegBot text ddp-open-states has already archived and
+    quality-verified; if nothing is archived, it records a failed row
+    without ever dispatching, rather than accepting a caller-supplied URL
+    it would otherwise fall back to.
 
     Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
     docstring. A LegBot answer flagged insufficient_information is recorded
@@ -325,7 +342,28 @@ async def generate_and_store_bill_artifact(
         raise ValueError(f"Unsupported artifact_type for Phase 8 dispatch: {artifact_type}")
 
     question_type = _ARTIFACT_TYPE_TO_QUESTION_TYPE[artifact_type]
-    resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
+    resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
+    if resolved_bill_source is None:
+        logger.info(
+            "No archived bill text -- recording a failed artifact",
+            bill_openstates_id=bill_openstates_id,
+            artifact_type=artifact_type,
+        )
+        return await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type=artifact_type,
+            content="",
+            status="failed",
+            failure_stage="generation",
+            failure_reason="no_archived_bill_text",
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+
     dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
@@ -580,6 +618,12 @@ async def dispatch_and_record_bill_artifact(
     (SYNC-10) -- ddp-infra's PLAN-bill-document-provenance.md, extended for
     on-demand dispatch triggered via ddp-next -> ddp-api -> ddp-sync.
 
+    bill_source is accepted for API-shape stability (the public request
+    body still requires it) but no longer passed through to
+    generate_and_store_bill_artifact, which dropped its own bill_source
+    parameter entirely once _resolve_bill_source stopped falling back to a
+    live URL -- see that function's own docstring for why.
+
     Writes an initial `pending` BillArtifact row before dispatching to
     LegBot, then lets generate_and_store_bill_artifact/
     generate_and_store_bill_changelog update the *same* row (via
@@ -646,7 +690,6 @@ async def dispatch_and_record_bill_artifact(
                 session_code=session_code,
                 version_date=version_date,
                 version_note=version_note,
-                bill_source=bill_source,
                 artifact_type=artifact_type,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,

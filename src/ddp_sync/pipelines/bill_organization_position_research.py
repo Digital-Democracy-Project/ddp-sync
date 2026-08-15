@@ -69,7 +69,6 @@ async def generate_and_store_bill_organization_positions(
     session_code: str,
     version_date: str,
     version_note: str,
-    bill_source: str,
     gov_id: str,
     bill_title: str,
     broker_api_base: str | None = None,
@@ -80,6 +79,11 @@ async def generate_and_store_bill_organization_positions(
     Manually invocable only — no scheduler registration, matching the
     approved design's "on-demand only" decision.
 
+    No bill_source parameter -- removed along with _resolve_bill_source's
+    live-URL fallback (see that function's own docstring). If nothing is
+    archived for this bill, this returns an empty list without ever
+    dispatching find_bill_positions, same as the "found nothing" case below.
+
     broker_api_base/broker_api_token: optional per-call override threaded to
     every broker_client write below, same shape as
     generate_and_store_bill_artifact's own (SYNC-10) -- None (the default)
@@ -88,8 +92,9 @@ async def generate_and_store_bill_organization_positions(
     instance the other artifact types do.
 
     Flow:
-      1. Resolve bill_source (prefers ddp-open-states' archived text, same
-         as the other 8 artifact types).
+      1. Resolve bill_source from ddp-open-states' own archive -- the only
+         source, same as the other 8 artifact types. Returns early if
+         nothing is archived.
       2. Dispatch find_bill_positions once. If it reports
          insufficient_information or an empty positions list, return an
          empty list immediately — no rows written, no "checked, found
@@ -110,7 +115,13 @@ async def generate_and_store_bill_organization_positions(
         "verification_failed" | "broker_write_failed", "position_id": int | None}.
     """
     invocation_id = str(uuid.uuid4())
-    resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
+    resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
+    if resolved_bill_source is None:
+        logger.info(
+            "No archived bill text -- skipping org research entirely, no dispatch",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return []
 
     # Longer timeout than dispatch_bill_question's own 120s default --
     # empirically justified, not a guess: a real live validation run against
