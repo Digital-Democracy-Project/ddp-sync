@@ -112,6 +112,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/bill-version-check` | Trigger daily bill sync (Flow 1 + Flow 2) |
 | POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
 | POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session |
+| POST | `/trigger/legbot-analyze-bill` | On-demand single-bill LegBot analysis, for ddp-next's interactive UX |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
@@ -131,6 +132,29 @@ defaults for cost-relevant params" discipline. `limit` is capped at 25: ddp-infr
 cap/prioritization isn't live yet (verified against `PLAN-legbot.md`/`PLAN-bill-document-provenance.md` directly,
 2026-08-14 — still a plain sequential loop, no semaphore), so this route is deliberately kept to small, reviewable
 batches until that ships. Start with a small `artifact_types` subset, not all 8 at once.
+
+`/trigger/legbot-analyze-bill` (SYNC-10) is the on-demand, single-bill counterpart to
+`/trigger/bill-artifact-generation` above — ddp-next's interactive "explain this bill"/"pros and cons" UX,
+reusing the exact same dispatch → ddp-broker-py write path (`bill_artifact_generation.py`) just for one bill
+instead of a whole session batch. Body: `bill_openstates_id`, `jurisdiction`, `session_code`, `bill_source`,
+`artifact_type` — no field has a default. Requires an `X-DDP-Environment: dev|prod` header, which `ddp-api`'s
+`/trigger/*` proxy stamps onto the forwarded request based on which API key made the call (API-5) — never a
+value trusted from the caller's own request body — so the right `ddp-broker-py` instance gets the result even
+though this same `ddp-sync` process serves both the dev and prod `ddp-next` deployments. Returns `202` with
+`{"status": "pending", ...}` immediately: it writes an initial `pending` `BillArtifact` row, dispatches to
+LegBot in the background, and updates the *same* row once a real answer comes back (via `write_bill_artifact`'s
+existing upsert-by-natural-key semantics) — `ddp-next` polls `ddp-broker-py` (via `ddp-api`'s existing
+`/broker` proxy) for that row until `status` is no longer `pending`, rather than blocking on LegBot's own
+response time or polling CAMS directly.
+
+**Mac-Studio-only by construction:** CAMS/LegBot dispatch is a same-box call — `legbot_client.py` reads
+LegBot's result off the local filesystem, with no network equivalent — so this endpoint only works correctly
+when `ddp-sync` itself runs on the same host as CAMS. Host-guards on `CAMS_BASE_URL`/`CAMS_ARTIFACTS_DIR`
+being configured (`503`, not a confusing stack trace) rather than assuming the caller reached the right
+instance. **Known cross-repo gap:** `ddp-api`'s `/trigger/*` catch-all currently forwards to the EC2-co-located
+`ddp-sync` instance by default, not Mac Studio — this endpoint needs a scoped routing override on the
+`ddp-api` side to actually be reachable through the real proxy path in production (tracked separately, not
+yet built).
 
 `/trigger/legislator-bio-sync` accepts query params:
 - `dry_run` (bool) — preview the diff without writing
