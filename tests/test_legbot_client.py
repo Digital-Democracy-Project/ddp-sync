@@ -21,6 +21,7 @@ class _FakeSettings:
     cams_base_url: str = "http://localhost:8000"
     cams_api_token: str = "test-token"
     cams_artifacts_dir: str = ""
+    legbot_dispatch_timeout_seconds: float = 1200.0
 
 
 def _mock_client(*, statuses, task_id="abc123"):
@@ -193,7 +194,39 @@ async def test_timeout_raises_without_hanging_forever(tmp_path):
         "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
     ), patch(
         "ddp_sync.services.legbot_client.time.monotonic",
-        side_effect=[0.0, 0.0, 200.0],  # exceeds the default 120s timeout on the 2nd poll check
+        side_effect=[0.0, 0.0, 200.0],  # exceeds the explicit 120s timeout on the 2nd poll check
     ):
         with pytest.raises(LegBotDispatchError, match="did not finish within"):
-            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+            await dispatch_bill_question(
+                "https://example.com/bill.pdf", "pros_cons", timeout_seconds=120.0
+            )
+
+
+@pytest.mark.asyncio
+async def test_timeout_seconds_none_resolves_from_settings(tmp_path):
+    """A caller passing no explicit timeout_seconds gets
+    settings.legbot_dispatch_timeout_seconds dynamically, not a hardcoded
+    module constant -- confirmed by setting a distinctly small value on
+    _FakeSettings and asserting the poll loop actually times out at that
+    value specifically, not some other fixed number.
+
+    MLX/local-model dispatches have no per-call cost the way cloud API
+    tokens do, so the real default (1200s, see config.py) is deliberately
+    generous rather than a tight guardrail -- found live 2026-08-15 when a
+    hardcoded 120s cut off 4 of 8 real bill-artifact dispatches under
+    back-to-back sequential load.
+    """
+    mock_client = _mock_client(statuses=["queued", "running", "running"])
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(
+            cams_artifacts_dir=str(tmp_path), legbot_dispatch_timeout_seconds=7.0
+        ),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ), patch(
+        "ddp_sync.services.legbot_client.time.monotonic",
+        side_effect=[0.0, 0.0, 8.0],  # exceeds the settings-resolved 7s deadline
+    ):
+        with pytest.raises(LegBotDispatchError, match="did not finish within 7.0s"):
+            await dispatch_bill_question("https://example.com/bill.pdf", "summary_500char")

@@ -154,6 +154,17 @@ class SyncSettings:
     local_openstates_api_base: str = "http://localhost:8002"
     local_openstates_api_key: str = ""
 
+    # How long legbot_client.py's _dispatch_and_await polls before giving up on a
+    # LegBot task. Generous by design, not a tight deadline -- MLX/local-model
+    # compute has no per-call cost the way cloud API tokens do, so there's no
+    # cost-control reason to cut a still-running task off early. Raised from a
+    # hardcoded 120s (LegBot's own latency_estimate is ~60s, so 120s looked like
+    # reasonable headroom on paper) after a real 2026-08-15 dev run found 4 of 8
+    # bill-artifact dispatches timing out at exactly 120s under back-to-back
+    # sequential load on the same local backend -- a guardrail that cost real
+    # data (four artifacts silently failed) for no actual cost savings.
+    legbot_dispatch_timeout_seconds: float = 1200.0
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -244,6 +255,9 @@ def _load_from_env() -> dict:
         "ondemand_broker_api_token_prod": os.getenv("ONDEMAND_BROKER_API_TOKEN_PROD", ""),
         "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
         "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
+        "legbot_dispatch_timeout_seconds": float(
+            os.getenv("LEGBOT_DISPATCH_TIMEOUT_SECONDS", "1200")
+        ),
     }
 
 
