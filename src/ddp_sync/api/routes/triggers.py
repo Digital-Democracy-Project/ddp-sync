@@ -88,18 +88,6 @@ async def trigger_bill_status_sync(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Hard ceiling on `limit` for this on-demand route -- ddp-infra's Phase 8
-# concurrency cap/prioritization (PLAN-legbot.md, PLAN-bill-document-
-# provenance.md) is not yet built (verified 2026-08-14 against those plan
-# docs directly: the real current state is still a plain sequential loop,
-# no semaphore, anywhere in this pipeline). This route is production's only
-# real caller of run_legbot_pipeline (SYNC-9) until that concurrency work
-# ships, so it deliberately keeps every call to a small, reviewable batch
-# rather than allowing unbounded volume against a shared, uncapped
-# CAMS/LegBot backend. Raise this once ddp-infra's Phase 8 lands.
-_BILL_ARTIFACT_GENERATION_MAX_LIMIT = 25
-
-
 class BillArtifactGenerationRequest(BaseModel):
     """Request body for POST /trigger/bill-artifact-generation.
 
@@ -128,7 +116,19 @@ class BillArtifactGenerationRequest(BaseModel):
     )
     limit: int = Field(
         ...,
-        description=f"Max bills to consider this run (1-{_BILL_ARTIFACT_GENERATION_MAX_LIMIT}).",
+        description=(
+            "Max bills to consider this run (must be >= 1). No upper ceiling: "
+            "run_legbot_pipeline dispatches sequentially anyway, and real "
+            "concurrent-load protection for MLX already exists one layer "
+            "down -- CAMS's own _mlx_semaphore (ddp-agents/src/legbot/"
+            "reasoning.py, shipped 2026-08-04) serializes every MLX call it "
+            "receives from any caller, this batch included, so simultaneous "
+            "requests queue safely instead of contending for the GPU. This "
+            "endpoint is still synchronous, though (see the route's own "
+            "docstring): a very large limit means a very long-held HTTP "
+            "request, which is a timeout consideration for the caller, not "
+            "a cost or concurrency one."
+        ),
     )
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
 
@@ -147,17 +147,22 @@ async def trigger_bill_artifact_generation(
     operator can review exactly what was generated/skipped/failed before
     running a broader batch.
 
-    `limit` is capped at _BILL_ARTIFACT_GENERATION_MAX_LIMIT -- see that
-    constant's own comment for why.
+    `limit` has no upper ceiling (removed 2026-08-15 -- the previous hard
+    cap of 25 was meant to protect against concurrent load on a shared
+    CAMS/LegBot/MLX backend, but that protection already exists one layer
+    down (CAMS's own `_mlx_semaphore`, `ddp-agents/src/legbot/reasoning.py`,
+    shipped 2026-08-04, serializes every MLX call it receives regardless of
+    caller) and this pipeline dispatches sequentially anyway; MLX inference
+    also has no per-call cost, unlike a metered cloud API. See `limit`'s own
+    field description above for what remains a real consideration -- this
+    endpoint's synchronous request/response shape means a very large
+    `limit` is a client/proxy timeout question, not a cost or concurrency
+    one.
     """
-    if not (1 <= body.limit <= _BILL_ARTIFACT_GENERATION_MAX_LIMIT):
+    if body.limit < 1:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"limit must be in [1, {_BILL_ARTIFACT_GENERATION_MAX_LIMIT}], "
-                f"got {body.limit}. ddp-infra's Phase 8 concurrency cap isn't "
-                "live yet -- keep batches small until it is."
-            ),
+            detail=f"limit must be >= 1, got {body.limit}.",
         )
 
     from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline

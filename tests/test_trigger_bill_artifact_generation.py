@@ -56,19 +56,24 @@ def test_missing_required_field_returns_422():
     assert response.status_code == 422
 
 
-def test_limit_above_ceiling_returns_400_without_calling_pipeline():
+def test_limit_above_former_ceiling_now_passes_through_uncapped():
+    """The old hard cap of 25 was removed 2026-08-15 -- run_legbot_pipeline
+    dispatches sequentially regardless, and real MLX concurrency protection
+    lives in CAMS's own semaphore (ddp-agents), not here. A large limit
+    should reach the pipeline unmodified, not get rejected."""
     client = _make_authed_client()
-    payload = dict(_VALID_PAYLOAD, limit=26)
+    payload = dict(_VALID_PAYLOAD, limit=500)
 
     with patch(
         "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={"bills_considered": 500, "results": []}),
     ) as mock_run:
         response = client.post("/trigger/bill-artifact-generation", json=payload)
 
-    assert response.status_code == 400
-    assert "limit must be in" in response.json()["detail"]
-    mock_run.assert_not_awaited()
+    assert response.status_code == 200
+    mock_run.assert_awaited_once_with(
+        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500, dry_run=False
+    )
 
 
 def test_limit_zero_returns_400_without_calling_pipeline():

@@ -129,10 +129,13 @@ first real production caller — it fills in whatever `BillArtifact` types are m
 jurisdiction/session. Takes a JSON body, not query params: `jurisdiction_iso2`, `session_code`, `artifact_types`
 (list, e.g. `["bill_summary", "bill_pros_cons"]`), `include_org_research` (bool), `limit` (int), `dry_run` (bool,
 default `false`) — no field has a default except `dry_run`, matching `run_legbot_pipeline`'s own "no silent
-defaults for cost-relevant params" discipline. `limit` is capped at 25: ddp-infra's Phase 8 concurrency
-cap/prioritization isn't live yet (verified against `PLAN-legbot.md`/`PLAN-bill-document-provenance.md` directly,
-2026-08-14 — still a plain sequential loop, no semaphore), so this route is deliberately kept to small, reviewable
-batches until that ships. Start with a small `artifact_types` subset, not all 8 at once.
+defaults for cost-relevant params" discipline. `limit` has no upper ceiling (removed 2026-08-15 — the previous
+hard cap of 25 assumed there was no concurrency protection for a shared CAMS/LegBot/MLX backend, but that
+protection already exists one layer down (CAMS's own `_mlx_semaphore`, `ddp-agents/src/legbot/reasoning.py`,
+shipped 2026-08-04, serializes every MLX call regardless of caller), and this pipeline dispatches sequentially
+anyway; MLX inference also has no per-call cost, unlike a metered cloud API. This route is still synchronous,
+though, so a very large `limit` means a very long-held HTTP request — a client/proxy timeout consideration, not
+a cost or concurrency one. Start with a small `artifact_types` subset, not all 8 at once.
 
 `/trigger/legbot-analyze-bill` (SYNC-10) is the on-demand, single-bill counterpart to
 `/trigger/bill-artifact-generation` above — ddp-next's interactive "explain this bill"/"pros and cons" UX,
