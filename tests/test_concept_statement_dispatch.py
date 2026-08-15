@@ -30,10 +30,15 @@ _COMMON_KWARGS = dict(
 )
 
 
+# _resolve_bill_source has no live-URL fallback anymore -- every test gets
+# real archived text by default so it reaches dispatch at all.
+_ARCHIVED_TEXT = "ARCHIVED BILL TEXT FOR TESTING"
+
+
 @pytest.fixture(autouse=True)
-def no_archived_text_by_default():
-    """Every test in this file gets the "not archived" fallback path by
-    default -- matches test_bill_artifact_generation.py's own fixture.
+def archived_text_by_default():
+    """Every test in this file gets real archived bill text by default --
+    matches test_bill_artifact_generation.py's own fixture.
     dispatch_and_store_concept_statements reuses _resolve_bill_source
     (and, through it, get_archived_bill_text) directly rather than
     reimplementing it, so patching it at its one real definition site
@@ -41,7 +46,7 @@ def no_archived_text_by_default():
     """
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.get_archived_bill_text",
-        new=AsyncMock(return_value=None),
+        new=AsyncMock(return_value=_ARCHIVED_TEXT),
     ) as mock_lookup:
         yield mock_lookup
 
@@ -78,7 +83,7 @@ async def test_happy_path_creates_row_via_new_endpoint():
         result = await dispatch_and_store_concept_statements(**_COMMON_KWARGS)
 
     assert result == created_row
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "concept_statements")
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "concept_statements")
     mock_create.assert_awaited_once_with(
         gov_id=_COMMON_KWARGS["gov_id"],
         jurisdiction_iso2="FL",
@@ -109,8 +114,8 @@ async def test_insufficient_information_no_create_call_and_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_by_default):
-    no_archived_text_by_default.return_value = "ARCHIVED FULL BILL TEXT"
+async def test_archived_text_found_is_used_for_dispatch(archived_text_by_default):
+    archived_text_by_default.return_value = "ARCHIVED FULL BILL TEXT"
     dispatch_result = {
         "answer": {"statements": ["A statement."], "insufficient_information": False},
         "backend": "mlx",
@@ -125,28 +130,29 @@ async def test_archived_text_found_is_used_instead_of_live_url(no_archived_text_
         result = await dispatch_and_store_concept_statements(**_COMMON_KWARGS)
 
     assert result == {"id": 1}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "concept_statements")
 
 
 @pytest.mark.asyncio
-async def test_archived_text_not_found_falls_back_to_live_url(no_archived_text_by_default):
-    dispatch_result = {
-        "answer": {"statements": ["A statement."], "insufficient_information": False},
-        "backend": "mlx",
-    }
+async def test_no_archived_text_skips_dispatch_and_returns_none(archived_text_by_default):
+    """No live-URL fallback anymore -- when nothing is archived,
+    concept_statements is never dispatched at all, matching
+    generate_and_store_bill_artifact's own no-archived-text posture."""
+    archived_text_by_default.return_value = None
     with patch(
         "ddp_sync.pipelines.concept_statement_dispatch.dispatch_bill_question",
-        new=AsyncMock(return_value=dispatch_result),
+        new=AsyncMock(),
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.concept_statement_dispatch.create_concept_statement_set",
-        new=AsyncMock(return_value={"id": 2}),
-    ):
+        new=AsyncMock(),
+    ) as mock_create:
         result = await dispatch_and_store_concept_statements(**_COMMON_KWARGS)
 
-    assert result == {"id": 2}
-    no_archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
-    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "concept_statements")
+    assert result is None
+    archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
+    mock_dispatch.assert_not_awaited()
+    mock_create.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -391,7 +397,6 @@ async def test_bill_artifact_generation_bill_summary_dispatch_still_works_unchan
             session_code="2026",
             version_date="2026-01-05",
             version_note="Introduced",
-            bill_source="https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
             artifact_type="bill_summary",
         )
 

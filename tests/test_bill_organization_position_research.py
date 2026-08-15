@@ -22,19 +22,24 @@ _COMMON_KWARGS = dict(
     session_code="2026",
     version_date="2026-01-05",
     version_note="Introduced",
-    bill_source="https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
     gov_id="HB123",
     bill_title="An act relating to test fixtures",
 )
 
+# _resolve_bill_source has no live-URL fallback anymore -- it either returns
+# ddp-open-states' own archived text or None. Every test in this file gets
+# archived text by default so it reaches dispatch; tests exercising the
+# "nothing archived" path override this to return None instead.
+_ARCHIVED_TEXT = "ARCHIVED BILL TEXT FOR TESTING"
+
 
 @pytest.fixture(autouse=True)
-def no_archived_text_by_default():
+def archived_text_by_default():
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research._resolve_bill_source",
-        new=AsyncMock(side_effect=lambda bill_openstates_id, live_url_fallback: live_url_fallback),
-    ):
-        yield
+        new=AsyncMock(return_value=_ARCHIVED_TEXT),
+    ) as mock_resolve:
+        yield mock_resolve
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +113,30 @@ async def test_insufficient_information_writes_nothing(mock_research_run_write):
     assert result == []
     mock_write.assert_not_awaited()
     mock_research_run_write.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_archived_text_skips_entirely_no_dispatch(
+    archived_text_by_default, mock_research_run_write
+):
+    """When ddp-open-states has nothing archived for this bill,
+    find_bill_positions is never dispatched at all -- no live-URL fallback,
+    no tracking row, no organization rows. Matches
+    generate_and_store_bill_artifact's own no-archived-text posture."""
+    archived_text_by_default.return_value = None
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert result == []
+    mock_dispatch.assert_not_awaited()
+    mock_write.assert_not_awaited()
+    mock_research_run_write.assert_not_awaited()
 
 
 @pytest.mark.asyncio

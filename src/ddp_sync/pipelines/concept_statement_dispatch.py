@@ -120,18 +120,21 @@ async def dispatch_and_store_concept_statements(
             used only to check ddp-open-states' archive, never stored.
         jurisdiction_iso2: two-letter state code (e.g. "FL").
         session_code: the bill's legislative session identifier.
-        bill_source: URL to the bill's PDF/HTML (the live-fetch fallback,
-            and also the value stored as ConceptStatementSet.
-            source_document_url -- a denormalized snapshot of *which*
-            document this set represents, independent of whether the
-            archived text or this URL was what LegBot actually read).
+        bill_source: URL to the bill's PDF/HTML. No longer used as a
+            live-fetch fallback for LegBot dispatch (_resolve_bill_source
+            dropped that behavior entirely -- see its own docstring); kept
+            here purely as the value stored as ConceptStatementSet.
+            source_document_url, a denormalized citation of which document
+            this set represents.
 
     Returns:
         The created ConceptStatementSet row as ddp-broker-py's API reports
-        it, or None when LegBot reported insufficient_information -- there
-        is nothing to publish in that case (see this module's docstring),
-        and no row is created at all (unlike BillArtifact's own "failed"
-        status, which ConceptStatementSet has no equivalent of).
+        it, or None when LegBot reported insufficient_information, or when
+        nothing is archived for this bill at all (no dispatch attempted in
+        that case) -- there is nothing to publish either way (see this
+        module's docstring), and no row is created at all (unlike
+        BillArtifact's own "failed" status, which ConceptStatementSet has
+        no equivalent of).
 
     Raises:
         LegBotDispatchError: LegBot dispatch failed to produce a usable
@@ -141,7 +144,15 @@ async def dispatch_and_store_concept_statements(
             ConceptStatementSet row to record a failure on (unlike
             BillArtifact's "failed" status write path).
     """
-    resolved_bill_source = await _resolve_bill_source(bill_openstates_id, bill_source)
+    resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
+    if resolved_bill_source is None:
+        logger.info(
+            "No archived bill text -- skipping concept_statements entirely, no dispatch",
+            bill_openstates_id=bill_openstates_id,
+            gov_id=gov_id,
+        )
+        return None
+
     dispatch_result = await dispatch_bill_question(resolved_bill_source, _QUESTION_TYPE)
     answer = dispatch_result["answer"]
 
