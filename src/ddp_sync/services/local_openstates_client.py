@@ -138,12 +138,16 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
     # preferred link AND (since the bill_changelog fix, 2026-07-30) the version
     # immediately before it -- so this can no longer just return the first non-empty
     # raw_text found across any version, that risks returning the *previous* version's
-    # text instead of latest's. Explicitly pick the latest version by (date, note),
-    # same ordering convention used everywhere else in this plan.
+    # text instead of latest's. SYNC-16: api-v3 now resolves and orders "latest"/
+    # "previous" itself via openstates-core's audited stage classifier (OPEN-92) and
+    # returns `versions` with the correctly-ordered entries last -- take versions[-1]
+    # directly rather than re-deriving order here via a naive (date, note) sort (the
+    # naive sort silently agreed with api-v3's own former bug, OPEN-92's own
+    # discovery -- neither side had actually verified the other).
     versions = data.get("versions") or []
     if not versions:
         return None
-    latest = max(versions, key=lambda v: (v.get("date", ""), v.get("note", "")))
+    latest = versions[-1]
     for link in latest.get("links") or []:
         raw_text = link.get("raw_text")
         if raw_text:
@@ -166,7 +170,7 @@ async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
     argument (the natural key they write against), and
     generate_and_store_bill_organization_positions needs bill_title for its
     claim template -- none of which the lister returns. Rather than
-    duplicate get_archived_bill_text's own "pick latest by (date, note)"
+    duplicate get_archived_bill_text's own "take versions[-1] as latest"
     logic a third time in this file, this is a small, separate function
     reusing the identical fetch, computing the same `latest` this module
     already computes twice elsewhere, just exposing different fields off it.
@@ -221,7 +225,9 @@ async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
     versions = data.get("versions") or []
     if not versions:
         return None
-    latest = max(versions, key=lambda v: (v.get("date", ""), v.get("note", "")))
+    # SYNC-16: api-v3 orders `versions` with the correctly-resolved latest entry last
+    # (OPEN-92) -- take it directly rather than re-deriving order here.
+    latest = versions[-1]
 
     return {
         "version_date": latest.get("date", ""),
@@ -253,11 +259,12 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
         every "not available" case identically (fewer than two versions, latest not archived,
         previous not archived, no diff computed yet e.g. previous was the first version ever
         archived, local api-v3 unreachable/rejecting/non-JSON, or the bill not found at all).
-        The four *_date/*_note fields are the same values already used internally to sort and
-        pick "latest"/"previous" (ddp-infra's bill_changelog design, added 2026-08-01) --
-        surfaced so a caller can verify it's generating a changelog for the version this
-        function actually resolved as latest, not a stale or different one; previously computed
-        here and discarded. Deliberately never raises, same posture as get_archived_bill_text:
+        The four *_date/*_note fields are the same values api-v3 already resolved as
+        "latest"/"previous" (ddp-infra's bill_changelog design, added 2026-08-01; SYNC-16
+        stopped re-deriving that resolution on this side) -- surfaced so a caller can
+        verify it's generating a changelog for the version api-v3 actually resolved as
+        latest, not a stale or different one. Deliberately never raises, same posture as
+        get_archived_bill_text:
         this is a pre-check for an optimization, not a required read -- any failure here must
         fall back to bill_version.py's existing live-refetch-and-diff path exactly as if this
         function didn't exist, never abort changelog generation.
@@ -302,8 +309,11 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
     if len(versions) < 2:
         return None
 
-    ordered = sorted(versions, key=lambda v: (v.get("date", ""), v.get("note", "")))
-    latest, previous = ordered[-1], ordered[-2]
+    # SYNC-16: api-v3 resolves and orders "latest"/"previous" itself via
+    # openstates-core's audited stage classifier (OPEN-92) and returns `versions`
+    # with those two entries last, in order -- take them directly rather than
+    # re-deriving order here via a naive (date, note) sort.
+    latest, previous = versions[-1], versions[-2]
 
     diff_source = latest.get("diff_from_previous_version")
     if not diff_source:

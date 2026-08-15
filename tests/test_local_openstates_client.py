@@ -348,15 +348,15 @@ async def test_returns_empty_list_when_no_local_api_base_configured():
 
 @pytest.mark.asyncio
 async def test_archived_bill_text_picks_latest_not_first_with_raw_text():
-    """Regression guard for the bill_changelog diff-endpoint fix (2026-07-30): api-v3 now
-    attaches raw_text to both the latest version AND the one immediately before it, so this
-    must explicitly pick latest by (date, note) rather than returning the first non-empty
-    raw_text encountered -- which, depending on api-v3's list order, could be the *previous*
-    version's text instead."""
+    """Regression guard for the bill_changelog diff-endpoint fix (2026-07-30): api-v3
+    attaches raw_text to both the latest version AND the one immediately before it, so
+    this must pick the *last* entry (api-v3's own guaranteed latest, SYNC-16/OPEN-92)
+    rather than the first non-empty raw_text encountered -- which would be the
+    *previous* version's text here, since it's listed first."""
     mock_client = AsyncMock()
     response = MagicMock()
     response.status_code = 200
-    # Previous version listed first, on purpose -- proves this isn't relying on list order.
+    # Previous version listed first, latest last -- the real api-v3 ordering contract.
     response.json.return_value = {
         "versions": [
             {
@@ -387,9 +387,10 @@ async def test_archived_bill_text_picks_latest_not_first_with_raw_text():
 # ---------------------------------------------------------------------------
 
 def _versions_response(*, introduced_raw_text=None, engrossed_raw_text=None, engrossed_diff=None):
-    """A two-version api-v3 bill-detail response, deliberately listed out of (date, note)
-    order -- get_archived_changelog_inputs must sort by (date, note) itself, not trust
-    the API's own list order."""
+    """A two-version api-v3 bill-detail response, in the order api-v3 itself now
+    guarantees (SYNC-16/OPEN-92): correctly stage-ordered, latest last --
+    get_archived_changelog_inputs trusts versions[-1]/versions[-2] directly rather
+    than re-deriving order itself."""
     engrossed = {
         "note": "Engrossed",
         "date": "2026-02-01",
@@ -408,7 +409,7 @@ def _versions_response(*, introduced_raw_text=None, engrossed_raw_text=None, eng
     if introduced_raw_text is not None:
         introduced["links"][0]["raw_text"] = introduced_raw_text
 
-    return {"versions": [engrossed, introduced]}
+    return {"versions": [introduced, engrossed]}
 
 
 @pytest.mark.asyncio
@@ -575,9 +576,11 @@ async def test_current_version_identity_picks_latest_and_title():
     response.status_code = 200
     response.json.return_value = {
         "title": "Save our Homes from Excessive Property Taxes",
+        # api-v3 now guarantees this ordering itself (latest last, SYNC-16/OPEN-92) --
+        # get_current_version_identity trusts versions[-1] directly.
         "versions": [
-            {"note": "Engrossed", "date": "2026-02-01", "links": []},
             {"note": "Introduced", "date": "2026-01-01", "links": []},
+            {"note": "Engrossed", "date": "2026-02-01", "links": []},
         ],
     }
     mock_client.get = AsyncMock(return_value=response)
