@@ -114,6 +114,23 @@ class SyncSettings:
     ddp_broker_api_base: str = "http://localhost:8080"
     ddp_broker_api_token: str = ""
 
+    # On-demand single-bill dispatch dev/prod broker routing (SYNC-10).
+    # Distinct from ddp_broker_api_base above -- every other caller in this
+    # process (SYNC-9's batch pipeline, concept-statement dispatch) targets
+    # one process-wide broker via that setting. This endpoint is the one
+    # call path that must pick between *two* ddp-broker-py instances per
+    # request, depending on which environment the original ddp-next caller
+    # belongs to (a trusted signal ddp-api stamps onto the forwarded
+    # request -- see API-5 -- not something this endpoint trusts from the
+    # caller's own request body). Dev defaults to the same local Mac Studio
+    # broker ddp_broker_api_base already defaults to, since that's where the
+    # real dev ddp-broker-py instance runs today. Prod has no default --
+    # must be set explicitly once a real production ddp-broker-py exists.
+    ondemand_broker_api_base_dev: str = "http://localhost:8080"
+    ondemand_broker_api_token_dev: str = ""
+    ondemand_broker_api_base_prod: str = ""
+    ondemand_broker_api_token_prod: str = ""
+
     # Local api-v3 archived-text lookup (ddp-infra PLAN-bill-document-
     # provenance.md, "Real gap found 2026-07-29/30" — OPEN-13). A small,
     # dedicated read against ddp-open-states' own local api-v3 instance
@@ -221,6 +238,10 @@ def _load_from_env() -> dict:
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
         "ddp_broker_api_base": os.getenv("DDP_BROKER_API_BASE", "http://localhost:8080"),
         "ddp_broker_api_token": os.getenv("DDP_BROKER_API_TOKEN", ""),
+        "ondemand_broker_api_base_dev": os.getenv("ONDEMAND_BROKER_API_BASE_DEV", "http://localhost:8080"),
+        "ondemand_broker_api_token_dev": os.getenv("ONDEMAND_BROKER_API_TOKEN_DEV", ""),
+        "ondemand_broker_api_base_prod": os.getenv("ONDEMAND_BROKER_API_BASE_PROD", ""),
+        "ondemand_broker_api_token_prod": os.getenv("ONDEMAND_BROKER_API_TOKEN_PROD", ""),
         "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
         "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
     }

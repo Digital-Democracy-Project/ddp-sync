@@ -5,10 +5,11 @@ import logging
 from dataclasses import asdict
 from datetime import date
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ddp_sync.api.auth import api_key_auth
+from ddp_sync.config import get_settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -175,6 +176,149 @@ async def trigger_bill_artifact_generation(
     except Exception as e:
         logger.error(f"Bill artifact generation trigger failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Which of the two configured ddp-broker-py instances (dev vs. prod) an
+# on-demand single-bill dispatch writes its BillArtifact to (SYNC-10) --
+# keyed by the trusted X-DDP-Environment header ddp-api's /trigger/* proxy
+# stamps onto the forwarded request based on which API key made the call
+# (API-5), never a value trusted from the caller's own request body.
+def _resolve_ondemand_broker_target(environment: str | None) -> tuple[str, str]:
+    if environment not in ("dev", "prod"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing or invalid X-DDP-Environment header (must be 'dev' or "
+                "'prod') -- this endpoint only accepts calls forwarded through "
+                "ddp-api's proxy, which stamps this header from the calling "
+                "API key's own environment tag (see API-5)."
+            ),
+        )
+    settings = get_settings()
+    if environment == "dev":
+        return settings.ondemand_broker_api_base_dev, settings.ondemand_broker_api_token_dev
+    if not settings.ondemand_broker_api_base_prod:
+        raise HTTPException(
+            status_code=503,
+            detail="ONDEMAND_BROKER_API_BASE_PROD is not configured -- production "
+            "ddp-broker-py routing isn't set up on this instance yet.",
+        )
+    return settings.ondemand_broker_api_base_prod, settings.ondemand_broker_api_token_prod
+
+
+class LegBotAnalyzeBillRequest(BaseModel):
+    """Request body for POST /trigger/legbot-analyze-bill.
+
+    No field has a default -- same "every consequential param is a
+    conscious choice" discipline as BillArtifactGenerationRequest above.
+    bill_source is caller-supplied here (unlike the batch pipeline, where it
+    always comes from trusted internal candidate-listing code) -- ddp-sync
+    itself never fetches it; it's passed straight through to CAMS/LegBot's
+    task API as a plain string, the same as every other dispatch in this
+    codebase. Any URL-fetch safety for it is CAMS/LegBot's own ingest-path
+    responsibility (already shared across every analyze_bill caller), not
+    something this endpoint duplicates.
+    """
+
+    bill_openstates_id: str = Field(..., description="OpenStates bill ID.")
+    jurisdiction: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
+    session_code: str = Field(..., description="Legislative session identifier, e.g. '2026F'.")
+    bill_source: str = Field(..., description="URL to the bill's PDF/HTML, or its raw text.")
+    artifact_type: str = Field(
+        ...,
+        description=(
+            "One of the 8 BillArtifact types "
+            "(session_pipeline_runner.ALL_8_ARTIFACT_TYPES) -- bill_summary, "
+            "bill_pros_cons, bill_changelog, etc."
+        ),
+    )
+
+
+@router.post("/trigger/legbot-analyze-bill", status_code=202)
+async def trigger_legbot_analyze_bill(
+    body: LegBotAnalyzeBillRequest,
+    background_tasks: BackgroundTasks,
+    x_ddp_environment: str | None = Header(default=None),
+    token: str = Depends(api_key_auth),
+):
+    """Dispatch an on-demand single-bill LegBot analysis (SYNC-10).
+
+    ddp-next's interactive "explain this bill"/"pros and cons" UX --
+    distinct from /trigger/bill-artifact-generation above, which fills in a
+    whole jurisdiction/session batch. Reuses the exact same dispatch ->
+    ddp-broker-py write path as that batch pipeline
+    (bill_artifact_generation.py), just for one bill.
+
+    Mac-Studio-only by construction: CAMS/LegBot dispatch is a same-box
+    call (legbot_client.py reads CAMS's result off the local filesystem,
+    with no network equivalent), so this endpoint only ever works correctly
+    when ddp-sync itself is running on the same host as CAMS. Host-guards
+    on CAMS_BASE_URL/CAMS_ARTIFACTS_DIR being configured (503, not a
+    confusing stack trace) rather than assuming the caller reached the
+    right instance -- see ddp-api's own routing-fix ticket (the
+    /trigger/legbot-analyze-bill path needs a scoped override to reach this
+    instance specifically; not yet built, tracked separately).
+
+    Async, pending-row + background-task shape: writes an initial `pending`
+    BillArtifact row via dispatch_and_record_bill_artifact, then dispatches
+    to LegBot in the background and returns 202 immediately -- ddp-next
+    polls ddp-broker-py's BillArtifact row (via ddp-api's existing /broker
+    proxy) until status is no longer pending, rather than blocking this
+    request on LegBot's own response time.
+    """
+    settings = get_settings()
+    if not settings.cams_base_url or not settings.cams_artifacts_dir:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CAMS_BASE_URL/CAMS_ARTIFACTS_DIR not configured on this "
+                "instance -- this endpoint only works on the same host as "
+                "CAMS (Mac Studio), not a co-located ddp-sync instance "
+                "elsewhere."
+            ),
+        )
+
+    from ddp_sync.pipelines.session_pipeline_runner import ALL_8_ARTIFACT_TYPES
+
+    if body.artifact_type not in ALL_8_ARTIFACT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unrecognized artifact_type: {body.artifact_type!r}. "
+            f"Must be one of {sorted(ALL_8_ARTIFACT_TYPES)}.",
+        )
+
+    broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
+
+    from ddp_sync.services.local_openstates_client import get_current_version_identity
+
+    version = await get_current_version_identity(body.bill_openstates_id)
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No archived version found for bill_openstates_id={body.bill_openstates_id!r}.",
+        )
+
+    from ddp_sync.pipelines.bill_artifact_generation import dispatch_and_record_bill_artifact
+
+    background_tasks.add_task(
+        dispatch_and_record_bill_artifact,
+        bill_openstates_id=body.bill_openstates_id,
+        jurisdiction=body.jurisdiction,
+        session_code=body.session_code,
+        version_date=version["version_date"],
+        version_note=version["version_note"],
+        bill_source=body.bill_source,
+        artifact_type=body.artifact_type,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+    return {
+        "status": "pending",
+        "bill_openstates_id": body.bill_openstates_id,
+        "artifact_type": body.artifact_type,
+        "environment": x_ddp_environment,
+    }
 
 
 @router.post("/trigger/legislator-bio-sync")

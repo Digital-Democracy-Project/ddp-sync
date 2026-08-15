@@ -60,6 +60,8 @@ async def write_bill_artifact(
     pinecone_synced_at: str | None = None,
     compare_version_date: str | None = None,
     compare_version_note: str | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Create or update a BillArtifact row in ddp-broker-py.
 
@@ -78,6 +80,14 @@ async def write_bill_artifact(
     rejected with a 400, surfacing here as BrokerClientError same as any
     other rejected write — no special handling needed for it.
 
+    broker_api_base/broker_api_token override the process-wide
+    settings.ddp_broker_api_base/ddp_broker_api_token for this one call —
+    added for SYNC-10's on-demand single-bill endpoint, which is the one
+    caller that must target one of two different ddp-broker-py instances
+    (dev vs. prod) per request rather than whichever broker this process is
+    configured for. None (the default) preserves every existing caller's
+    behavior unchanged.
+
     Returns:
         The written row as ddp-broker-py's API reports it, e.g.
         {"id": 42, "created": True}.
@@ -86,7 +96,9 @@ async def write_bill_artifact(
         BrokerClientError: ddp-broker-py rejected the write or was unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write BillArtifact."
         )
@@ -113,12 +125,12 @@ async def write_bill_artifact(
         "compare_version_date": compare_version_date,
         "compare_version_note": compare_version_note,
     }
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/bill-artifacts/",
+                f"{resolved_api_base}/api/bill-artifacts/",
                 headers=headers,
                 json=payload,
             )
