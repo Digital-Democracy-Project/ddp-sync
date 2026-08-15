@@ -363,6 +363,7 @@ def test_bill_artifact_generation_dispatch_map_is_unchanged():
         "bill_supporting_orgs": "supporting_orgs",
         "bill_opposing_orgs": "opposing_orgs",
         "bill_impact_analysis": "impact_analysis",
+        "bill_topics": "bill_topics",
     }
 
 

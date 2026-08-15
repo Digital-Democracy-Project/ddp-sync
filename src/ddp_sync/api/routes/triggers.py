@@ -113,7 +113,7 @@ class BillArtifactGenerationRequest(BaseModel):
     artifact_types: list[str] = Field(
         ...,
         description=(
-            "BillArtifact types to fill in for this run (from the 8 types "
+            "BillArtifact types to fill in for this run (from the types "
             "session_pipeline_runner.ALL_8_ARTIFACT_TYPES supports -- "
             "bill_summary, bill_pros_cons, bill_changelog, etc.). Start "
             "with a small subset, not all of them at once."
@@ -227,7 +227,7 @@ class LegBotAnalyzeBillRequest(BaseModel):
     artifact_type: str = Field(
         ...,
         description=(
-            "One of the 8 BillArtifact types "
+            "One of the BillArtifact types "
             "(session_pipeline_runner.ALL_8_ARTIFACT_TYPES) -- bill_summary, "
             "bill_pros_cons, bill_changelog, etc."
         ),

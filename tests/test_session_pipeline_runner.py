@@ -90,6 +90,26 @@ async def test_rejects_unrecognized_artifact_type():
 
 
 @pytest.mark.asyncio
+async def test_bill_topics_is_a_recognized_artifact_type():
+    """SYNC-1: bill_topics must be dispatchable through this real caller,
+    not just accepted by generate_and_store_bill_artifact directly -- the
+    gap the first implementation attempt (PR #39) missed. dry_run=True
+    proves ALL_8_ARTIFACT_TYPES's own recognition check passes without
+    ever needing a real LegBot/broker call."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_topics"], False, limit=10, dry_run=True
+        )
+
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_topics"]
+
+
+@pytest.mark.asyncio
 async def test_none_of_the_three_required_args_have_defaults():
     """Round 2 of /pm-review's own point: every cost-relevant argument is a
     conscious choice, not just artifact_types/include_org_research but

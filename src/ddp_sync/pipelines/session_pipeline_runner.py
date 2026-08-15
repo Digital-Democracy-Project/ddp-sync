@@ -59,11 +59,17 @@ from ddp_sync.services.local_openstates_client import (
 
 logger = structlog.get_logger()
 
-# The 8 real BillArtifact types this plan ships -- matches
+# The recognized BillArtifact types this plan ships -- matches
 # bill_artifact_generation.py's own _ARTIFACT_TYPE_TO_QUESTION_TYPE keys
-# (7 types) plus bill_changelog, which dispatches through a separate
-# function (generate_and_store_bill_changelog) because it needs a prior
-# version's text + diff, not a single bill_source.
+# (8 types, including bill_topics -- SYNC-1) plus bill_changelog, which
+# dispatches through a separate function (generate_and_store_bill_changelog)
+# because it needs a prior version's text + diff, not a single bill_source.
+# Name kept as ALL_8_ARTIFACT_TYPES (not renamed to ALL_9) -- SYNC-1's own
+# ticket ties any rename to the future default-artifact-set flip, not to
+# this recognition-gate fix; bill_topics is deliberately NOT part of any
+# default artifact_types list yet (see config/sync_schedule.yaml's
+# session_pipeline_batch, which hand-picks its own small subset -- nothing
+# here auto-widens to "every recognized type").
 ALL_8_ARTIFACT_TYPES = frozenset({
     "bill_summary",
     "bill_pros_cons",
@@ -72,6 +78,7 @@ ALL_8_ARTIFACT_TYPES = frozenset({
     "bill_supporting_orgs",
     "bill_opposing_orgs",
     "bill_impact_analysis",
+    "bill_topics",
     "bill_changelog",
 })
 
@@ -250,7 +257,7 @@ async def run_legbot_pipeline(
 
     artifact_types, include_org_research, and limit all have NO default --
     the caller must decide explicitly, for every parameter with real cost
-    implications. One call can trigger up to 9 real dispatches (8 artifacts
+    implications. One call can trigger up to 10 real dispatches (9 artifacts
     + org research) per bill.
 
     dry_run=True runs the same coverage checks as a real run but skips every
