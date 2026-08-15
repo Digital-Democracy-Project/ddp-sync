@@ -34,10 +34,6 @@ from ddp_sync.config import get_settings
 logger = structlog.get_logger()
 
 _POLL_INTERVAL_SECONDS = 5
-# LegBot's own Capability.metadata.latency_estimate is ~60s (a single
-# reasoning call, no browser loop) — this leaves real headroom above that,
-# not a tight deadline.
-_DEFAULT_TIMEOUT_SECONDS = 120.0
 _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
@@ -53,7 +49,7 @@ async def dispatch_bill_question(
     bill_source: str,
     question_type: str,
     *,
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> dict:
     """Dispatch an analyze_bill task to LegBot and return its structured answer.
 
@@ -61,7 +57,9 @@ async def dispatch_bill_question(
         bill_source: URL to the bill's PDF/HTML, or the raw bill text.
         question_type: one of LegBot's existing question types
             (e.g. "summary_500char", "pros_cons").
-        timeout_seconds: how long to poll before giving up.
+        timeout_seconds: how long to poll before giving up. None (the
+            default) resolves to settings.legbot_dispatch_timeout_seconds
+            at call time.
 
     Returns:
         See _dispatch_and_await.
@@ -86,7 +84,7 @@ async def dispatch_bill_changelog(
     diff_source: str,
     *,
     diff_format: str = "unified_diff_v1",
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> dict:
     """Dispatch a bill_changelog task to LegBot and return its structured answer.
 
@@ -103,7 +101,9 @@ async def dispatch_bill_changelog(
             ("unified_diff_v1" — the literal output of Python's
             difflib.unified_diff(), unvalidated against a real fixture
             corpus yet; see PLAN-legbot.md AC11a, deliberately deferred).
-        timeout_seconds: how long to poll before giving up.
+        timeout_seconds: how long to poll before giving up. None (the
+            default) resolves to settings.legbot_dispatch_timeout_seconds
+            at call time.
 
     Returns:
         See _dispatch_and_await. answer["insufficient_information"] is True
@@ -134,7 +134,7 @@ async def dispatch_bill_position_verification(
     url: str,
     claim: str,
     *,
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> dict:
     """Dispatch a verify_bill_position task to LegBot and return its
     structured answer — ddp-infra's PLAN-bill-document-provenance.md Phase 8,
@@ -147,7 +147,9 @@ async def dispatch_bill_position_verification(
             the caller does not pre-fetch page text.
         claim: a plain-language statement to judge against the fetched page,
             e.g. an organization name + position + bill identity.
-        timeout_seconds: how long to poll before giving up.
+        timeout_seconds: how long to poll before giving up. None (the
+            default) resolves to settings.legbot_dispatch_timeout_seconds
+            at call time.
 
     Returns:
         See _dispatch_and_await. answer contains "verdict"
@@ -176,7 +178,7 @@ async def _dispatch_and_await(
     payload: dict,
     *,
     question_type: str,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
 ) -> dict:
     """Shared dispatch/poll/read-result mechanics for any analyze_bill payload.
 
@@ -202,6 +204,8 @@ async def _dispatch_and_await(
         raise LegBotDispatchError(
             "CAMS_ARTIFACTS_DIR is not configured — cannot read LegBot's result."
         )
+    if timeout_seconds is None:
+        timeout_seconds = settings.legbot_dispatch_timeout_seconds
 
     headers = {"Authorization": f"Bearer {settings.cams_api_token}"}
     create_payload = {
