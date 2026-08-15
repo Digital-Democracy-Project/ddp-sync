@@ -224,6 +224,152 @@ async def test_insufficient_information_is_recorded_as_a_failed_artifact():
 
 
 # ---------------------------------------------------------------------------
+# bill_topics (ddp-infra's PLAN-legbot.md §27) -- deterministic filter/flatten
+# of LegBot's primary_topic/topics answer shape against the 33-name taxonomy.
+# ---------------------------------------------------------------------------
+
+def _bill_topics_dispatch_result(*, primary_topic, topics):
+    return {
+        "answer": {
+            "primary_topic": primary_topic,
+            "topics": topics,
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_happy_path_writes_broker():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Criminal Justice", topics=["Criminal Justice", "Drugs"]
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 8, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_topics"
+        )
+
+    assert result == {"id": 8, "created": True}
+    mock_dispatch.assert_awaited_once_with(_COMMON_KWARGS["bill_source"], "bill_topics")
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == "**Primary:** Criminal Justice\n\n- Criminal Justice\n- Drugs"
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_drops_invalid_topic():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Criminal Justice",
+        topics=["Criminal Justice", "Not A Real Topic", "Drugs"],
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 9, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_topics")
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == "**Primary:** Criminal Justice\n\n- Criminal Justice\n- Drugs"
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_prepends_valid_primary_missing_from_topics():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Education", topics=["Drugs", "Guns"]
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 10, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_topics")
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == "**Primary:** Education\n\n- Education\n- Drugs\n- Guns"
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_promotes_first_surviving_topic_when_primary_invalid():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Not A Real Topic", topics=["Drugs", "Guns"]
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 11, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_topics")
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == "**Primary:** Drugs\n\n- Drugs\n- Guns"
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_over_cap_truncates_but_keeps_primary():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Guns",
+        topics=["Animals", "Arts", "Business", "Civil Rights", "Guns"],
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 12, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_topics")
+
+    write_kwargs = mock_write.await_args.kwargs
+    content = write_kwargs["content"]
+    assert content.startswith("**Primary:** Guns\n\n")
+    bullets = content.split("\n\n", 1)[1].splitlines()
+    assert len(bullets) == 4
+    assert "- Guns" in bullets
+    assert "- Civil Rights" not in bullets
+    assert write_kwargs["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_bill_topics_zero_survivors_is_recorded_as_a_failed_artifact():
+    dispatch_result = _bill_topics_dispatch_result(
+        primary_topic="Not A Real Topic", topics=["Also Not Real", "Nope"]
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 13, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_topics"
+        )
+
+    assert result == {"id": 13, "created": True}
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["content"] == ""
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["failure_stage"] == "generation"
+    assert write_kwargs["failure_reason"] == "no_valid_topics"
+
+
+# ---------------------------------------------------------------------------
 # bill_source resolution (ddp-infra "Real gap found 2026-07-29/30" -- prefer
 # ddp-open-states' archived text over a live-fetch URL, OPEN-13)
 # ---------------------------------------------------------------------------

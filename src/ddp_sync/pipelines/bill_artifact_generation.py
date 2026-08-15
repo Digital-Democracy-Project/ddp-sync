@@ -83,6 +83,7 @@ _ARTIFACT_TYPE_TO_QUESTION_TYPE = {
     "bill_supporting_orgs": "supporting_orgs",
     "bill_opposing_orgs": "opposing_orgs",
     "bill_impact_analysis": "impact_analysis",
+    "bill_topics": "bill_topics",
 }
 
 # artifact_types whose answer is already plain text under an answer["text"]
@@ -92,6 +93,24 @@ _TEXT_ANSWER_ARTIFACT_TYPES = {"bill_summary", "bill_vote_yes_frame", "bill_vote
 # artifact_types whose answer is a single list under answer["org_types"]
 # ([{type, reason}, ...], config/legbot_questions.yaml) — flattened identically.
 _ORG_TYPES_ANSWER_ARTIFACT_TYPES = {"bill_supporting_orgs", "bill_opposing_orgs"}
+
+# bill_topics' 33-name taxonomy (ddp-infra's PLAN-legbot.md §27, approved
+# 2026-08-07; Priority Bill and Disney excluded) -- copied verbatim from
+# ddp-agents' config/legbot_questions.yaml bill_topics entry. Maintenance
+# rule: any future Webflow category change updates that YAML list and these
+# two constants together.
+_BILL_TOPICS_TAXONOMY = (
+    "Animals", "Arts", "Business", "Civil Rights", "Criminal Justice",
+    "Culture", "Drugs", "Economy", "Education", "Elections", "Employment",
+    "Energy", "Environment", "Government", "Guns", "Housing", "Immigration",
+    "International Relations", "LGBT", "Marriage", "Media", "Medical",
+    "Military and Veterans", "National Security", "Natural Disasters",
+    "Public Records", "Public Safety", "Social Welfare", "Sports",
+    "State Parks", "Taxes", "Technology", "Transportation",
+)
+_BILL_TOPICS_MAX = 4  # matches the YAML's max_topics
+
+_BILL_TOPICS_CANONICAL_BY_FOLD = {name.casefold(): name for name in _BILL_TOPICS_TAXONOMY}
 
 
 class ArchivedVersionMismatchError(Exception):
@@ -140,6 +159,88 @@ def _bill_changelog_content_from_answer(
 
 ### Key Policy Implications
 {answer.get("policy_implications") or "None noted."}"""
+
+
+def _canonicalize_bill_topic(raw_topic: str) -> str | None:
+    """Match a raw topic string (trimmed, case-insensitive) to its canonical
+    _BILL_TOPICS_TAXONOMY name, or None if it isn't a member.
+    """
+    return _BILL_TOPICS_CANONICAL_BY_FOLD.get(raw_topic.strip().casefold())
+
+
+def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, list[str]] | None:
+    """Deterministic filter/flatten for bill_topics' answer shape (ddp-infra's
+    PLAN-legbot.md §27), in the plan's specified order:
+
+    1. canonicalize every raw topic (trimmed, case-insensitive); drop
+       duplicates and non-members (each drop logged).
+    2. if primary_topic is a valid member absent from the surviving topics,
+       prepend it (logged).
+    3. cap at _BILL_TOPICS_MAX, keeping the primary when one was established
+       in step 2.
+    4. if primary_topic itself was dropped as a non-member, promote the
+       first surviving topic to primary (logged).
+
+    Returns:
+        (primary, topics) with primary always a member of topics, or None if
+        zero topics survive (the caller records a failed artifact row for
+        that case rather than writing empty/misleading content).
+    """
+    topics: list[str] = []
+    seen: set[str] = set()
+    for raw_topic in answer.get("topics") or []:
+        canonical = _canonicalize_bill_topic(raw_topic)
+        if canonical is None:
+            logger.info(
+                "bill_topics_dropped_non_member",
+                bill_openstates_id=bill_openstates_id, raw_topic=raw_topic,
+            )
+            continue
+        if canonical in seen:
+            logger.info(
+                "bill_topics_dropped_duplicate",
+                bill_openstates_id=bill_openstates_id, topic=canonical,
+            )
+            continue
+        seen.add(canonical)
+        topics.append(canonical)
+
+    raw_primary = answer.get("primary_topic")
+    primary = _canonicalize_bill_topic(raw_primary) if raw_primary else None
+
+    if primary is not None and primary not in topics:
+        topics.insert(0, primary)
+        logger.info(
+            "bill_topics_primary_prepended",
+            bill_openstates_id=bill_openstates_id, primary_topic=primary,
+        )
+
+    if len(topics) > _BILL_TOPICS_MAX:
+        if primary is not None:
+            topics = [primary] + [t for t in topics if t != primary][: _BILL_TOPICS_MAX - 1]
+        else:
+            topics = topics[:_BILL_TOPICS_MAX]
+        logger.info(
+            "bill_topics_truncated",
+            bill_openstates_id=bill_openstates_id, kept_topics=topics,
+        )
+
+    if primary is None and raw_primary and topics:
+        primary = topics[0]
+        logger.info(
+            "bill_topics_primary_promoted",
+            bill_openstates_id=bill_openstates_id, promoted_topic=primary,
+            dropped_primary_topic=raw_primary,
+        )
+
+    if not topics:
+        return None
+
+    return primary or topics[0], topics
+
+
+def _bill_topics_content(primary: str, topics: list[str]) -> str:
+    return f"**Primary:** {primary}\n\n{_bullet_list(topics)}"
 
 
 def _content_from_answer(artifact_type: str, answer: dict) -> str:
@@ -251,7 +352,32 @@ async def generate_and_store_bill_artifact(
             broker_api_token=broker_api_token,
         )
 
-    content = _content_from_answer(artifact_type, answer)
+    if artifact_type == "bill_topics":
+        filtered = _filter_bill_topics(answer, bill_openstates_id=bill_openstates_id)
+        if filtered is None:
+            logger.info(
+                "bill_topics had zero valid topics -- recording a failed artifact",
+                bill_openstates_id=bill_openstates_id,
+            )
+            return await write_bill_artifact(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                artifact_type=artifact_type,
+                content="",
+                status="failed",
+                failure_stage="generation",
+                failure_reason="no_valid_topics",
+                model_name=model_name,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        primary, topics = filtered
+        content = _bill_topics_content(primary, topics)
+    else:
+        content = _content_from_answer(artifact_type, answer)
 
     return await write_bill_artifact(
         bill_openstates_id=bill_openstates_id,
