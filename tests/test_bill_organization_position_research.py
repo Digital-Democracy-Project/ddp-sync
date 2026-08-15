@@ -209,6 +209,36 @@ async def test_happy_path_verifies_and_writes_each_organization():
 
 
 @pytest.mark.asyncio
+async def test_broker_override_threaded_to_both_write_calls(mock_research_run_write):
+    """SYNC-15: a dev-tagged single-bill full-run call must have its org
+    research land on the same dev/prod broker instance as the other
+    artifact types, not the shared default."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        await generate_and_store_bill_organization_positions(
+            **_COMMON_KWARGS,
+            broker_api_base="http://dev-broker:8080",
+            broker_api_token="dev-token",
+        )
+
+    assert mock_research_run_write.await_args.kwargs["broker_api_base"] == "http://dev-broker:8080"
+    assert mock_research_run_write.await_args.kwargs["broker_api_token"] == "dev-token"
+    assert mock_write.await_args.kwargs["broker_api_base"] == "http://dev-broker:8080"
+    assert mock_write.await_args.kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
 async def test_truncates_to_cap_and_logs():
     many_positions = [
         {"org_name": f"Org {i}", "position": "support", "citation_url": f"https://{i}.invalid"}

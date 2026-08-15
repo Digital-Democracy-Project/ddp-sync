@@ -643,3 +643,115 @@ async def test_write_bill_organization_research_run_raises_on_error_status():
                 invocation_id="11111111-0000-0000-0000-000000000001",
                 positions_found_count=0,
             )
+
+
+# --- broker_api_base/broker_api_token per-call overrides (SYNC-15) --------
+#
+# get_bill_artifacts, get_bill_organization_positions_status,
+# write_bill_organization_position, and write_bill_organization_research_run
+# didn't support this before -- only write_bill_artifact (SYNC-10) did.
+# SYNC-15's single-bill full-run endpoint needs every one of these to land
+# on the same dev/prod broker instance its writes do, so all four gained
+# the same optional-override shape write_bill_artifact already established.
+# One test each confirms the override wins over settings; the "None
+# preserves default" half is already covered by every existing test above,
+# which all call these functions without passing an override at all.
+
+@pytest.mark.asyncio
+async def test_get_bill_artifacts_override_wins_over_settings():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"found": False}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base="http://prod-broker:8080", ddp_broker_api_token="prod-token"),
+    ), _patch_async_client(mock_client):
+        await get_bill_artifacts(
+            jurisdiction="FL", session_code="2026F", gov_id="SJR 2F",
+            broker_api_base="http://dev-broker:8080", broker_api_token="dev-token",
+        )
+
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://dev-broker:8080/api/bill-artifacts/status/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
+
+
+@pytest.mark.asyncio
+async def test_get_bill_organization_positions_status_override_wins_over_settings():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"has_rows": False, "row_count": 0}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base="http://prod-broker:8080", ddp_broker_api_token="prod-token"),
+    ), _patch_async_client(mock_client):
+        await get_bill_organization_positions_status(
+            bill_openstates_id="abc",
+            broker_api_base="http://dev-broker:8080", broker_api_token="dev-token",
+        )
+
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://dev-broker:8080/api/bill-organization-positions/status/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_position_override_wins_over_settings():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 42}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base="http://prod-broker:8080", ddp_broker_api_token="prod-token"),
+    ), _patch_async_client(mock_client):
+        await write_bill_organization_position(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            invocation_id="11111111-1111-1111-1111-111111111111",
+            org_name="Sierra Club",
+            position="support",
+            citation_url="https://example.invalid/statement",
+            broker_api_base="http://dev-broker:8080", broker_api_token="dev-token",
+        )
+
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://dev-broker:8080/api/bill-organization-positions/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
+
+
+@pytest.mark.asyncio
+async def test_write_bill_organization_research_run_override_wins_over_settings():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 9}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base="http://prod-broker:8080", ddp_broker_api_token="prod-token"),
+    ), _patch_async_client(mock_client):
+        await write_bill_organization_research_run(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026F",
+            invocation_id="11111111-0000-0000-0000-000000000001",
+            positions_found_count=0,
+            broker_api_base="http://dev-broker:8080", broker_api_token="dev-token",
+        )
+
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://dev-broker:8080/api/bill-organization-research-runs/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"

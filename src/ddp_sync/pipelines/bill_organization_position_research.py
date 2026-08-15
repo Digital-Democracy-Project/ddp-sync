@@ -72,11 +72,20 @@ async def generate_and_store_bill_organization_positions(
     bill_source: str,
     gov_id: str,
     bill_title: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> list[dict]:
     """Research and store real, named-organization positions for one bill.
 
     Manually invocable only — no scheduler registration, matching the
     approved design's "on-demand only" decision.
+
+    broker_api_base/broker_api_token: optional per-call override threaded to
+    every broker_client write below, same shape as
+    generate_and_store_bill_artifact's own (SYNC-10) -- None (the default)
+    preserves existing behavior; SYNC-15's single-bill full-run endpoint
+    passes these through so org research lands on the same dev/prod broker
+    instance the other artifact types do.
 
     Flow:
       1. Resolve bill_source (prefers ddp-open-states' archived text, same
@@ -133,6 +142,8 @@ async def generate_and_store_bill_organization_positions(
             session_code=session_code,
             invocation_id=invocation_id,
             positions_found_count=positions_found_count,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
     except BrokerClientError as exc:
         logger.warning(
@@ -215,6 +226,8 @@ async def generate_and_store_bill_organization_positions(
             status=write_status,
             failure_stage=failure_stage,
             failure_reason=failure_reason,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
         if verify_answer is not None:
             write_kwargs.update(
