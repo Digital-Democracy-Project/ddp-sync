@@ -240,3 +240,20 @@ def test_bill_changelog_artifact_type_is_accepted():
 
     assert response.status_code == 202
     assert mock_dispatch.await_args.kwargs["artifact_type"] == "bill_changelog"
+
+
+def test_bill_topics_artifact_type_is_accepted():
+    """SYNC-1: bill_topics must be dispatchable through this second real
+    caller too, not just run_legbot_pipeline -- both import the same
+    ALL_8_ARTIFACT_TYPES recognition gate."""
+    client = _make_authed_client()
+    payload = dict(_VALID_PAYLOAD, artifact_type="bill_topics")
+
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_configured_settings()), \
+            _patch_version_identity(), _patch_dispatch() as mock_dispatch:
+        response = client.post(
+            "/trigger/legbot-analyze-bill", json=payload, headers={"X-DDP-Environment": "dev"},
+        )
+
+    assert response.status_code == 202
+    assert mock_dispatch.await_args.kwargs["artifact_type"] == "bill_topics"
