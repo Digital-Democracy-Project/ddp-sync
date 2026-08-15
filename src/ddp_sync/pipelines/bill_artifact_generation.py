@@ -62,7 +62,11 @@ import json
 import structlog
 
 from ddp_sync.services.broker_client import BrokerClientError, write_bill_artifact
-from ddp_sync.services.legbot_client import dispatch_bill_changelog, dispatch_bill_question
+from ddp_sync.services.legbot_client import (
+    LegBotDispatchError,
+    dispatch_bill_changelog,
+    dispatch_bill_question,
+)
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
     get_archived_changelog_inputs,
@@ -191,6 +195,8 @@ async def generate_and_store_bill_artifact(
     version_note: str,
     bill_source: str,
     artifact_type: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Dispatch to LegBot, then persist the result to ddp-broker-py.
 
@@ -205,6 +211,11 @@ async def generate_and_store_bill_artifact(
     swallowed; there's no BillArtifact row to record them on in the second
     case, and no point creating a placeholder failed row from a dispatch
     that produced no answer at all in the first.
+
+    broker_api_base/broker_api_token pass straight through to
+    write_bill_artifact -- see that function's own docstring; None (the
+    default) preserves this function's existing behavior for every caller
+    that doesn't need per-call broker routing (SYNC-9's batch pipeline).
 
     Returns:
         The BillArtifact row as ddp-broker-py's API reports it.
@@ -236,6 +247,8 @@ async def generate_and_store_bill_artifact(
             failure_stage="generation",
             failure_reason="insufficient_information",
             model_name=model_name,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
 
     content = _content_from_answer(artifact_type, answer)
@@ -250,6 +263,8 @@ async def generate_and_store_bill_artifact(
         content=content,
         status="complete",
         model_name=model_name,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
     )
 
 
@@ -260,6 +275,8 @@ async def generate_and_store_bill_changelog(
     session_code: str,
     version_date: str,
     version_note: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Dispatch bill_changelog to LegBot, then persist the result to
     ddp-broker-py -- the 8th BillArtifact type, not part of
@@ -328,6 +345,8 @@ async def generate_and_store_bill_changelog(
             status="failed",
             failure_stage="generation",
             failure_reason="no_archived_changelog_inputs",
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
 
     if (
@@ -378,6 +397,8 @@ async def generate_and_store_bill_changelog(
             model_name=model_name,
             compare_version_date=archived["old_version_date"],
             compare_version_note=archived["old_version_note"],
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
 
     content = _bill_changelog_content_from_answer(
@@ -399,6 +420,8 @@ async def generate_and_store_bill_changelog(
             model_name=model_name,
             compare_version_date=archived["old_version_date"],
             compare_version_note=archived["old_version_note"],
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
     except BrokerClientError:
         # Distinguishable from other write failures, per this design's own
@@ -413,3 +436,120 @@ async def generate_and_store_bill_changelog(
             compare_version_note=archived["old_version_note"],
         )
         raise
+
+
+async def dispatch_and_record_bill_artifact(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    version_date: str,
+    version_note: str,
+    bill_source: str,
+    artifact_type: str,
+    broker_api_base: str,
+    broker_api_token: str,
+) -> None:
+    """Background-task wrapper for the on-demand single-bill endpoint
+    (SYNC-10) -- ddp-infra's PLAN-bill-document-provenance.md, extended for
+    on-demand dispatch triggered via ddp-next -> ddp-api -> ddp-sync.
+
+    Writes an initial `pending` BillArtifact row before dispatching to
+    LegBot, then lets generate_and_store_bill_artifact/
+    generate_and_store_bill_changelog update the *same* row (via
+    write_bill_artifact's existing upsert-by-natural-key semantics) once a
+    real answer comes back -- so ddp-next can poll ddp-broker-py and
+    observe a real pending -> complete/failed transition, per this ticket's
+    AC #3. The pending write and the eventual complete/failed write always
+    target the same broker_api_base/broker_api_token pair passed in here,
+    so the upsert resolves against one broker's own database throughout --
+    never split across the dev/prod pair.
+
+    Never raises: this runs as a fire-and-forget FastAPI BackgroundTasks
+    callback with no caller left to propagate an exception to by the time
+    it executes. LegBotDispatchError (LegBot unreachable/timed out),
+    BrokerClientError (ddp-broker-py rejected the write or was
+    unreachable), and ArchivedVersionMismatchError (bill_changelog only --
+    normally raised *without* writing anything, to protect a possibly-good
+    pre-existing row under the same natural key; that concern doesn't apply
+    here, since the only row under this key is the pending placeholder this
+    same call just wrote) are all caught and turned into a terminal
+    `failed` row instead -- without one, the pending row would be stuck
+    forever with nothing left to update it.
+    """
+    try:
+        await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type=artifact_type,
+            content="",
+            status="pending",
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+    except BrokerClientError as exc:
+        # Nothing to update later -- the caller's poll will simply never
+        # see a row for this bill+artifact_type, same as if this call had
+        # never been dispatched at all.
+        logger.exception(
+            "dispatch_and_record_bill_artifact_pending_write_failed",
+            bill_openstates_id=bill_openstates_id,
+            artifact_type=artifact_type,
+            error=str(exc),
+        )
+        return
+
+    try:
+        if artifact_type == "bill_changelog":
+            await generate_and_store_bill_changelog(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        else:
+            await generate_and_store_bill_artifact(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                bill_source=bill_source,
+                artifact_type=artifact_type,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+    except (LegBotDispatchError, BrokerClientError, ArchivedVersionMismatchError) as exc:
+        logger.warning(
+            "dispatch_and_record_bill_artifact_dispatch_failed",
+            bill_openstates_id=bill_openstates_id,
+            artifact_type=artifact_type,
+            error=str(exc),
+        )
+        try:
+            await write_bill_artifact(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                artifact_type=artifact_type,
+                content="",
+                status="failed",
+                failure_stage="dispatch_error",
+                failure_reason=str(exc)[:100],
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        except BrokerClientError:
+            logger.exception(
+                "dispatch_and_record_bill_artifact_failed_write_also_failed",
+                bill_openstates_id=bill_openstates_id,
+                artifact_type=artifact_type,
+            )
