@@ -13,10 +13,12 @@ import pytest
 
 from ddp_sync.pipelines.bill_artifact_generation import (
     ArchivedVersionMismatchError,
+    dispatch_and_record_bill_artifact,
     generate_and_store_bill_artifact,
     generate_and_store_bill_changelog,
 )
 from ddp_sync.services.broker_client import BrokerClientError
+from ddp_sync.services.legbot_client import LegBotDispatchError
 
 _COMMON_KWARGS = dict(
     bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
@@ -449,3 +451,169 @@ async def test_changelog_broker_write_failure_propagates():
     ):
         with pytest.raises(BrokerClientError):
             await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_and_record_bill_artifact -- on-demand single-bill endpoint (SYNC-10)
+# ---------------------------------------------------------------------------
+
+_ONDEMAND_KWARGS = dict(
+    **_COMMON_KWARGS,
+    broker_api_base="http://localhost:8080",
+    broker_api_token="dev-token",
+)
+
+
+@pytest.mark.asyncio
+async def test_writes_pending_row_before_dispatching():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": False}),
+    ) as mock_generate:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
+
+    pending_kwargs = mock_write.await_args.kwargs
+    assert pending_kwargs["status"] == "pending"
+    assert pending_kwargs["content"] == ""
+    assert pending_kwargs["broker_api_base"] == "http://localhost:8080"
+    assert pending_kwargs["broker_api_token"] == "dev-token"
+    mock_generate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_happy_path_delegates_to_generate_and_store_bill_artifact_with_broker_target():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": False}),
+    ) as mock_generate:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_pros_cons")
+
+    call_kwargs = mock_generate.await_args.kwargs
+    assert call_kwargs["artifact_type"] == "bill_pros_cons"
+    assert call_kwargs["bill_source"] == _COMMON_KWARGS["bill_source"]
+    assert call_kwargs["broker_api_base"] == "http://localhost:8080"
+    assert call_kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_routes_to_changelog_function_not_artifact_one():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 1, "created": False}),
+    ) as mock_changelog:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    mock_artifact.assert_not_awaited()
+    mock_changelog.assert_awaited_once()
+    call_kwargs = mock_changelog.await_args.kwargs
+    assert "bill_source" not in call_kwargs
+    assert call_kwargs["broker_api_base"] == "http://localhost:8080"
+    assert call_kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
+async def test_pending_write_failure_never_dispatches():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("broker unreachable")),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_generate:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
+
+    mock_generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legbot_dispatch_error_writes_a_failed_row():
+    mock_write = AsyncMock(side_effect=[{"id": 1, "created": True}, {"id": 1, "created": False}])
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=LegBotDispatchError("LegBot task timed out")),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
+
+    assert mock_write.await_count == 2
+    failed_kwargs = mock_write.await_args_list[1].kwargs
+    assert failed_kwargs["status"] == "failed"
+    assert failed_kwargs["failure_stage"] == "dispatch_error"
+    assert "LegBot task timed out" in failed_kwargs["failure_reason"]
+    assert failed_kwargs["broker_api_base"] == "http://localhost:8080"
+
+
+@pytest.mark.asyncio
+async def test_broker_error_during_dispatch_writes_a_failed_row():
+    """generate_and_store_bill_artifact's own internal write can fail
+    (BrokerClientError) after LegBot already answered -- this must still
+    resolve the pending row, not leave it stuck."""
+    mock_write = AsyncMock(side_effect=[{"id": 1, "created": True}, {"id": 1, "created": False}])
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("ddp-broker-py rejected the write")),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
+
+    assert mock_write.await_count == 2
+    assert mock_write.await_args_list[1].kwargs["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_archived_version_mismatch_writes_a_failed_row_unlike_generate_and_store():
+    """Unlike generate_and_store_bill_changelog's own ArchivedVersionMismatchError
+    handling (writes nothing, to protect a possibly-good pre-existing row),
+    this wrapper resolves its own just-written pending row instead -- the
+    only row under this natural key at this point is the pending placeholder
+    this same call created, not an arbitrary pre-existing one."""
+    mock_write = AsyncMock(side_effect=[{"id": 1, "created": True}, {"id": 1, "created": False}])
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(side_effect=ArchivedVersionMismatchError("stale version")),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    assert mock_write.await_count == 2
+    assert mock_write.await_args_list[1].kwargs["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failed_row_write_itself_failing_is_swallowed_not_raised():
+    """Never raises, even in the worst case -- this runs as a fire-and-forget
+    BackgroundTasks callback with no caller left to catch anything."""
+    mock_write = AsyncMock(
+        side_effect=[
+            {"id": 1, "created": True},
+            BrokerClientError("ddp-broker-py unreachable"),
+        ]
+    )
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=LegBotDispatchError("timed out")),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
+
+    assert mock_write.await_count == 2
