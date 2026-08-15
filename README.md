@@ -113,6 +113,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
 | POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session |
 | POST | `/trigger/legbot-analyze-bill` | On-demand single-bill LegBot analysis, for ddp-next's interactive UX |
+| POST | `/trigger/legbot-analyze-bill-full` | Run every requested artifact type (default: all 8) plus org research for one bill, in a single call |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
@@ -155,6 +156,26 @@ instance. **Known cross-repo gap:** `ddp-api`'s `/trigger/*` catch-all currently
 `ddp-sync` instance by default, not Mac Studio — this endpoint needs a scoped routing override on the
 `ddp-api` side to actually be reachable through the real proxy path in production (tracked separately, not
 yet built).
+
+`/trigger/legbot-analyze-bill-full` (SYNC-15) is the single-parameter "run everything for this bill"
+counterpart to `/trigger/legbot-analyze-bill` above — one call for every requested `BillArtifact` type
+(default: all of `ALL_8_ARTIFACT_TYPES`) plus optional org position research, instead of 8+ separate calls.
+Reuses `session_pipeline_runner.py`'s `_process_bill()` directly (the same per-bill unit
+`run_legbot_pipeline`'s batch loop already calls) via a new `run_single_bill_full()` wrapper that skips the
+jurisdiction/session candidate-listing step entirely, since the caller already knows exactly which bill they
+want. Body: `bill_openstates_id`, `jurisdiction`, `session_code`, `gov_id` (required — the coverage check is
+keyed by `(jurisdiction, session, gov_id)`, not `bill_openstates_id` alone), `bill_source`, `artifact_types`
+(optional list — omit or pass `null` for all 8), `include_org_research` (no default, same "every cost-relevant
+param is a conscious choice" discipline as everything else in this file), `dry_run` (default `false`).
+
+**Synchronous, unlike `/trigger/legbot-analyze-bill`'s async/202 shape** — returns the full per-bill result
+payload directly. That endpoint's dispatch-and-poll design exists specifically because it's ddp-next's
+public-facing interactive UX with a real user waiting; this one is operator/backfill-facing (at most 10 real
+dispatches — 9 artifact types + org research — for one bill), which fits the same synchronous convention
+`/trigger/bill-artifact-generation` already established for potentially many more dispatches than that.
+Reuses `_process_bill`'s existing coverage-check skip logic unchanged — already-present artifacts are still
+skipped, this is not a force-regenerate mode. Same `X-DDP-Environment: dev|prod` header requirement and
+Mac-Studio-only construction as `/trigger/legbot-analyze-bill` above.
 
 `/trigger/legislator-bio-sync` accepts query params:
 - `dry_run` (bool) — preview the diff without writing

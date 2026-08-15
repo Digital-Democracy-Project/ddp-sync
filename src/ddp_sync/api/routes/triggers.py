@@ -321,6 +321,98 @@ async def trigger_legbot_analyze_bill(
     }
 
 
+class LegBotAnalyzeBillFullRequest(BaseModel):
+    """Request body for POST /trigger/legbot-analyze-bill-full (SYNC-15).
+
+    The single-parameter "run everything for this bill" counterpart to
+    LegBotAnalyzeBillRequest above -- one call for all 8 artifact types plus
+    org position research, instead of 8+ separate calls. gov_id has no
+    default (required, unlike artifact_types) -- see
+    run_single_bill_full's own docstring for why it can't be derived or
+    skipped. include_org_research still has no default, matching this
+    codebase's "every cost-relevant parameter is a conscious choice"
+    discipline used everywhere else in this file -- only artifact_types
+    gets a real default (all of them), since that's this endpoint's whole
+    reason to exist.
+    """
+
+    bill_openstates_id: str = Field(..., description="OpenStates bill ID.")
+    jurisdiction: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
+    session_code: str = Field(..., description="Legislative session identifier, e.g. '2026F'.")
+    gov_id: str = Field(..., description="Bill's gov_id, e.g. 'SB2B' -- required for the broker coverage check.")
+    bill_source: str = Field(..., description="URL to the bill's PDF/HTML, or its raw text.")
+    artifact_types: list[str] | None = Field(
+        None,
+        description=(
+            "BillArtifact types to run for this bill. Omit or pass null "
+            "for all of ALL_8_ARTIFACT_TYPES -- this endpoint's whole "
+            "point is not having to enumerate them."
+        ),
+    )
+    include_org_research: bool = Field(
+        ..., description="Whether to also dispatch Organization Position Research for this bill."
+    )
+    dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
+
+
+@router.post("/trigger/legbot-analyze-bill-full")
+async def trigger_legbot_analyze_bill_full(
+    body: LegBotAnalyzeBillFullRequest,
+    x_ddp_environment: str | None = Header(default=None),
+    token: str = Depends(api_key_auth),
+):
+    """Run every requested artifact type (default: all 8) plus optional org
+    research for one bill, in a single call (SYNC-15).
+
+    Synchronous, like /trigger/bill-artifact-generation -- returns the full
+    per-bill result payload rather than the dispatch-and-poll shape
+    /trigger/legbot-analyze-bill uses. That endpoint's async/202 design
+    exists because it's ddp-next's public-facing interactive UX with a real
+    user waiting; this one is operator/backfill-facing (at most 10 real
+    dispatches -- 9 artifact types + org research -- for one bill), which
+    comfortably fits the same synchronous convention the batch endpoint
+    already established for potentially many more dispatches than that.
+
+    Same Mac-Studio-only construction as /trigger/legbot-analyze-bill --
+    see that endpoint's own docstring for why (CAMS/LegBot dispatch reads
+    results off local disk, no network equivalent).
+    """
+    settings = get_settings()
+    if not settings.cams_base_url or not settings.cams_artifacts_dir:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CAMS_BASE_URL/CAMS_ARTIFACTS_DIR not configured on this "
+                "instance -- this endpoint only works on the same host as "
+                "CAMS (Mac Studio), not a co-located ddp-sync instance "
+                "elsewhere."
+            ),
+        )
+
+    broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
+
+    from ddp_sync.pipelines.session_pipeline_runner import run_single_bill_full
+
+    try:
+        result = await run_single_bill_full(
+            bill_openstates_id=body.bill_openstates_id,
+            jurisdiction_iso2=body.jurisdiction,
+            session_code=body.session_code,
+            gov_id=body.gov_id,
+            bill_source=body.bill_source,
+            artifact_types=body.artifact_types,
+            include_org_research=body.include_org_research,
+            dry_run=body.dry_run,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result["environment"] = x_ddp_environment
+    return result
+
+
 @router.post("/trigger/legislator-bio-sync")
 async def trigger_legislator_bio_sync(
     request: Request,

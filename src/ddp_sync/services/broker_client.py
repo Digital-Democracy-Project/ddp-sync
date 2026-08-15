@@ -185,6 +185,8 @@ async def write_bill_organization_position(
     status: str = "complete",
     failure_stage: str | None = None,
     failure_reason: str | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Create a BillOrganizationPosition row in ddp-broker-py — ddp-infra's
     PLAN-bill-document-provenance.md Phase 8, "Organization Position
@@ -195,6 +197,9 @@ async def write_bill_organization_position(
     new row — never an upsert. Every dispatch is a new finding; a history
     of individual findings, not a single current-value slot.
 
+    broker_api_base/broker_api_token: optional per-call override, see
+    get_bill_artifacts' own docstring for why (SYNC-15).
+
     Returns:
         {"id": <int>} — the created row's id.
 
@@ -203,7 +208,9 @@ async def write_bill_organization_position(
             unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write BillOrganizationPosition."
         )
@@ -239,12 +246,12 @@ async def write_bill_organization_position(
         "failure_stage": failure_stage,
         "failure_reason": failure_reason,
     }
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/bill-organization-positions/",
+                f"{resolved_api_base}/api/bill-organization-positions/",
                 headers=headers,
                 json=payload,
             )
@@ -516,7 +523,14 @@ async def create_concept_statement_set(
     return result
 
 
-async def get_bill_artifacts(*, jurisdiction: str, session_code: str, gov_id: str) -> dict | None:
+async def get_bill_artifacts(
+    *,
+    jurisdiction: str,
+    session_code: str,
+    gov_id: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict | None:
     """Read BillArtifact coverage (any status, including failed) for a bill —
     PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
     2026-08-01 after 3 rounds of /pm-review).
@@ -527,6 +541,13 @@ async def get_bill_artifacts(*, jurisdiction: str, session_code: str, gov_id: st
     gap found implementing this design, not anticipated by it as written).
     Service-token-authenticated, mirroring the auth split between this
     app's public reads and service-only writes/status checks.
+
+    broker_api_base/broker_api_token: optional per-call override, same shape
+    as write_bill_artifact's own (SYNC-10) -- None (the default) preserves
+    existing behavior for every caller that doesn't need per-call broker
+    routing (SYNC-9's batch pipeline); SYNC-15's single-bill full-run
+    endpoint passes these through so its coverage check lands on the same
+    dev/prod broker instance its writes do.
 
     Returns:
         None if no Bill/BillVersion exists for this identity yet (the
@@ -541,17 +562,19 @@ async def get_bill_artifacts(*, jurisdiction: str, session_code: str, gov_id: st
             unreachable — a real failure, distinct from "not found."
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot read BillArtifact status."
         )
 
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
-                f"{settings.ddp_broker_api_base}/api/bill-artifacts/status/",
+                f"{resolved_api_base}/api/bill-artifacts/status/",
                 headers=headers,
                 params={"jurisdiction": jurisdiction, "session": session_code, "gov_id": gov_id},
             )
@@ -570,7 +593,12 @@ async def get_bill_artifacts(*, jurisdiction: str, session_code: str, gov_id: st
     return result
 
 
-async def get_bill_organization_positions_status(*, bill_openstates_id: str) -> dict:
+async def get_bill_organization_positions_status(
+    *,
+    bill_openstates_id: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
     """Check whether a bill's organization positions have been researched at
     all yet — PLAN-bill-document-provenance.md's "Step 1, scoped version"
     (approved 2026-08-01 after 3 rounds of /pm-review).
@@ -580,6 +608,9 @@ async def get_bill_organization_positions_status(*, bill_openstates_id: str) -> 
     (jurisdiction, session, gov_id) triple most other reads in this module
     use — this status check isn't BillVersion-scoped, see
     BillOrganizationResearchRun's own model docstring for why.
+
+    broker_api_base/broker_api_token: optional per-call override, see
+    get_bill_artifacts' own docstring for why (SYNC-15).
 
     Returns:
         {"has_rows": bool, "row_count": int}. has_rows is true if this bill
@@ -595,17 +626,19 @@ async def get_bill_organization_positions_status(*, bill_openstates_id: str) -> 
             unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot read organization-research status."
         )
 
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
-                f"{settings.ddp_broker_api_base}/api/bill-organization-positions/status/",
+                f"{resolved_api_base}/api/bill-organization-positions/status/",
                 headers=headers,
                 params={"bill_openstates_id": bill_openstates_id},
             )
@@ -628,6 +661,8 @@ async def write_bill_organization_research_run(
     session_code: str,
     invocation_id: str,
     positions_found_count: int,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Record that organization-position research was attempted for a bill —
     PLAN-bill-document-provenance.md's "Step 1, scoped version" (approved
@@ -639,6 +674,9 @@ async def write_bill_organization_research_run(
     times out, so a transient failure is never mistaken for "researched,
     found nothing."
 
+    broker_api_base/broker_api_token: optional per-call override, see
+    get_bill_artifacts' own docstring for why (SYNC-15).
+
     Returns:
         {"id": <int>} — the created row's id.
 
@@ -647,7 +685,9 @@ async def write_bill_organization_research_run(
             unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write BillOrganizationResearchRun."
         )
@@ -659,12 +699,12 @@ async def write_bill_organization_research_run(
         "invocation_id": invocation_id,
         "positions_found_count": positions_found_count,
     }
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/bill-organization-research-runs/",
+                f"{resolved_api_base}/api/bill-organization-research-runs/",
                 headers=headers,
                 json=payload,
             )

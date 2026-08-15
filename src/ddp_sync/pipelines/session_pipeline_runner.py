@@ -101,6 +101,8 @@ async def _process_bill(
     include_org_research: bool,
     dry_run: bool,
     run_id: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     gov_id = candidate["gov_id"]
     bill_openstates_id = candidate["bill_openstates_id"]
@@ -121,7 +123,11 @@ async def _process_bill(
 
     try:
         coverage = await get_bill_artifacts(
-            jurisdiction=jurisdiction_iso2, session_code=session_code, gov_id=gov_id
+            jurisdiction=jurisdiction_iso2,
+            session_code=session_code,
+            gov_id=gov_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
     except BrokerClientError as exc:
         # A coverage-check failure for one bill shouldn't abort the batch --
@@ -170,6 +176,8 @@ async def _process_bill(
                     session_code=session_code,
                     version_date=version["version_date"],
                     version_note=version["version_note"],
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
                 )
             else:
                 await generate_and_store_bill_artifact(
@@ -180,6 +188,8 @@ async def _process_bill(
                     version_note=version["version_note"],
                     bill_source=candidate["live_url_fallback"],
                     artifact_type=artifact_type,
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
                 )
             result["artifacts_generated"].append(artifact_type)
         except Exception as exc:
@@ -203,7 +213,9 @@ async def _process_bill(
     if include_org_research:
         try:
             org_status = await get_bill_organization_positions_status(
-                bill_openstates_id=bill_openstates_id
+                bill_openstates_id=bill_openstates_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
             )
         except BrokerClientError as exc:
             result["org_research_skipped_reason"] = f"status_check_failed: {exc}"
@@ -226,6 +238,8 @@ async def _process_bill(
                         bill_source=candidate["live_url_fallback"],
                         gov_id=gov_id,
                         bill_title=version["bill_title"],
+                        broker_api_base=broker_api_base,
+                        broker_api_token=broker_api_token,
                     )
                     result["org_research_dispatched"] = True
                 except Exception as exc:
@@ -252,6 +266,8 @@ async def run_legbot_pipeline(
     limit: int,
     *,
     dry_run: bool = False,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
 
@@ -259,6 +275,13 @@ async def run_legbot_pipeline(
     the caller must decide explicitly, for every parameter with real cost
     implications. One call can trigger up to 10 real dispatches (9 artifacts
     + org research) per bill.
+
+    broker_api_base/broker_api_token: optional per-call override threaded to
+    every bill's _process_bill call. None (the default) preserves this
+    function's existing behavior for its only real caller today (SYNC-9's
+    batch pipeline, which always targets the one shared broker instance via
+    settings) -- SYNC-15's single-bill full-run endpoint is the first caller
+    to pass these explicitly.
 
     dry_run=True runs the same coverage checks as a real run but skips every
     dispatch call, returning the same result shape with nothing actually
@@ -352,6 +375,8 @@ async def run_legbot_pipeline(
             include_org_research=include_org_research,
             dry_run=dry_run,
             run_id=run_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
         results.append(bill_result)
         logger.info("session_pipeline_bill_complete", run_id=run_id, **bill_result)
@@ -374,6 +399,106 @@ async def run_legbot_pipeline(
         peak_memory_mb=summary["peak_memory_mb"],
     )
     return summary
+
+
+async def run_single_bill_full(
+    *,
+    bill_openstates_id: str,
+    jurisdiction_iso2: str,
+    session_code: str,
+    gov_id: str,
+    bill_source: str,
+    artifact_types: list[str] | None,
+    include_org_research: bool,
+    dry_run: bool = False,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Run every requested artifact type (default: all of
+    ALL_8_ARTIFACT_TYPES) plus optional org research for ONE caller-specified
+    bill, in a single call -- SYNC-15.
+
+    The single-bill counterpart to run_legbot_pipeline: that function lists
+    candidates across a whole jurisdiction/session and loops _process_bill
+    over each; this function skips the listing step entirely and calls
+    _process_bill directly with one caller-built candidate, since the caller
+    already knows exactly which bill they want. Reuses _process_bill's
+    existing coverage-check skip logic unchanged -- this is not a
+    force-regenerate mode, already-present artifacts are still skipped.
+
+    artifact_types: None means "all of them" (ALL_8_ARTIFACT_TYPES) -- the
+    one place in this module a missing value gets a real default rather than
+    being rejected, since "run everything for this bill" is this function's
+    whole reason to exist. An empty list is still rejected, same as
+    run_legbot_pipeline, since that's never a meaningful request either way.
+
+    gov_id: required, not derived from bill_openstates_id -- _process_bill's
+    coverage check (get_bill_artifacts) is keyed by (jurisdiction, session,
+    gov_id), not by bill_openstates_id alone, so this can't be skipped or
+    inferred without an extra lookup this function deliberately avoids (the
+    caller already has this from wherever they got bill_openstates_id).
+
+    Raises:
+        ValueError: bill_openstates_id/jurisdiction_iso2/session_code/gov_id/
+            bill_source empty, or artifact_types contains an unrecognized
+            type -- same signature-hygiene discipline as run_legbot_pipeline.
+
+    Returns:
+        _process_bill's own per-bill result dict (see run_legbot_pipeline's
+        docstring for its shape) plus "run_id".
+    """
+    if not bill_openstates_id:
+        raise ValueError("bill_openstates_id is required")
+    if not jurisdiction_iso2:
+        raise ValueError("jurisdiction_iso2 is required")
+    if not session_code:
+        raise ValueError("session_code is required")
+    if not gov_id:
+        raise ValueError("gov_id is required")
+    if not bill_source:
+        raise ValueError("bill_source is required")
+
+    resolved_artifact_types = (
+        list(ALL_8_ARTIFACT_TYPES) if artifact_types is None else artifact_types
+    )
+    if not resolved_artifact_types:
+        raise ValueError("artifact_types must be non-empty")
+    unrecognized = set(resolved_artifact_types) - ALL_8_ARTIFACT_TYPES
+    if unrecognized:
+        raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
+
+    run_id = str(uuid.uuid4())
+    logger.info(
+        "single_bill_full_run_start",
+        run_id=run_id,
+        bill_openstates_id=bill_openstates_id,
+        jurisdiction_iso2=jurisdiction_iso2,
+        session_code=session_code,
+        gov_id=gov_id,
+        artifact_types=resolved_artifact_types,
+        include_org_research=include_org_research,
+        dry_run=dry_run,
+    )
+
+    candidate = {
+        "gov_id": gov_id,
+        "bill_openstates_id": bill_openstates_id,
+        "live_url_fallback": bill_source,
+    }
+    result = await _process_bill(
+        candidate,
+        jurisdiction_iso2=jurisdiction_iso2,
+        session_code=session_code,
+        artifact_types=resolved_artifact_types,
+        include_org_research=include_org_research,
+        dry_run=dry_run,
+        run_id=run_id,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+    result["run_id"] = run_id
+    logger.info("single_bill_full_run_end", run_id=run_id, **{k: v for k, v in result.items() if k != "run_id"})
+    return result
 
 
 # Required session_pipeline_batch YAML keys -- deliberately no defaults

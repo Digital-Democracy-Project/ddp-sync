@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ddp_sync.pipelines.session_pipeline_runner import (
+    ALL_8_ARTIFACT_TYPES,
     run_scheduled_session_pipeline,
     run_legbot_pipeline,
+    run_single_bill_full,
 )
 from ddp_sync.services.broker_client import BrokerClientError
 
@@ -467,3 +469,198 @@ async def test_scheduled_wrapper_value_error_from_pipeline_is_caught():
     assert result["success"] is False
     assert result["error"] == "invalid_config"
     assert "Unrecognized artifact_types" in result["detail"]
+
+
+# --- run_single_bill_full (SYNC-15) ----------------------------------------
+#
+# The single-bill counterpart to run_legbot_pipeline -- one caller-specified
+# bill instead of a jurisdiction/session-wide candidate listing. Reuses
+# _process_bill directly, so its coverage-skip/dispatch/failure-isolation
+# behavior is already covered above via run_legbot_pipeline's own tests;
+# these tests focus on what's actually new: no candidate listing, the
+# artifact_types=None default-to-all behavior, required-field validation,
+# and broker_api_base/token threading.
+
+_SINGLE_BILL_KWARGS = dict(
+    bill_openstates_id=_CANDIDATE["bill_openstates_id"],
+    jurisdiction_iso2="fl",
+    session_code="2026F",
+    gov_id=_CANDIDATE["gov_id"],
+    bill_source=_CANDIDATE["live_url_fallback"],
+    include_org_research=False,
+)
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_bill_openstates_id():
+    with pytest.raises(ValueError, match="bill_openstates_id"):
+        await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, "bill_openstates_id": ""}, artifact_types=["bill_summary"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_jurisdiction():
+    with pytest.raises(ValueError, match="jurisdiction_iso2"):
+        await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, "jurisdiction_iso2": ""}, artifact_types=["bill_summary"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_session_code():
+    with pytest.raises(ValueError, match="session_code"):
+        await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, "session_code": ""}, artifact_types=["bill_summary"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_gov_id():
+    with pytest.raises(ValueError, match="gov_id"):
+        await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, "gov_id": ""}, artifact_types=["bill_summary"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_bill_source():
+    with pytest.raises(ValueError, match="bill_source"):
+        await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, "bill_source": ""}, artifact_types=["bill_summary"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_empty_artifact_types_list():
+    """An explicit empty list is still rejected -- only None means 'all'."""
+    with pytest.raises(ValueError, match="artifact_types"):
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=[])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_rejects_unrecognized_artifact_type():
+    with pytest.raises(ValueError, match="Unrecognized"):
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["not_a_real_type"])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_none_artifact_types_defaults_to_all_8():
+    """The one real default in this module -- omitting artifact_types (None)
+    means 'run everything', which is this function's whole reason to
+    exist."""
+    with _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 1}),
+    ):
+        result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=None, dry_run=True)
+
+    assert set(result["artifacts_generated"]) == ALL_8_ARTIFACT_TYPES
+
+
+@pytest.mark.asyncio
+async def test_single_bill_never_lists_candidates():
+    """The defining difference from run_legbot_pipeline: no
+    jurisdiction/session-wide listing call at all -- the caller already
+    knows exactly which bill they want."""
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.list_current_session_bill_candidates",
+        new=AsyncMock(),
+    ) as mock_lister, _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ):
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
+
+    mock_lister.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_bill_dry_run_dispatches_nothing():
+    with _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_single_bill_full(
+            **_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"], dry_run=True
+        )
+
+    mock_artifact.assert_not_awaited()
+    assert result["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_single_bill_already_present_artifact_is_skipped_not_regenerated():
+    """This is not a force-regenerate mode -- reuses _process_bill's own
+    coverage-check skip logic unchanged."""
+    with _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
+
+    mock_artifact.assert_not_awaited()
+    assert result["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_single_bill_includes_org_research_when_requested():
+    with _patch_coverage(None), _patch_version(), _patch_org_status(
+        {"has_rows": False, "row_count": 0}
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
+        new=AsyncMock(return_value=[{"org_name": "Sierra Club", "outcome": "written"}]),
+    ) as mock_org:
+        result = await run_single_bill_full(
+            **{**_SINGLE_BILL_KWARGS, "include_org_research": True},
+            artifact_types=["bill_summary"],
+        )
+
+    mock_org.assert_awaited_once()
+    assert result["org_research_dispatched"] is True
+
+
+@pytest.mark.asyncio
+async def test_single_bill_result_includes_run_id():
+    with _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ):
+        result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
+
+    assert result["run_id"]
+    assert isinstance(result["run_id"], str)
+
+
+@pytest.mark.asyncio
+async def test_single_bill_threads_broker_override_to_coverage_check_and_dispatch():
+    """The whole point of adding broker_api_base/token here -- a dev-tagged
+    caller's coverage check and its dispatch must land on the same broker
+    instance, not the shared default."""
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(return_value=None),
+    ) as mock_coverage, _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_artifact:
+        await run_single_bill_full(
+            **_SINGLE_BILL_KWARGS,
+            artifact_types=["bill_summary"],
+            broker_api_base="http://dev-broker:8080",
+            broker_api_token="dev-token",
+        )
+
+    assert mock_coverage.await_args.kwargs["broker_api_base"] == "http://dev-broker:8080"
+    assert mock_coverage.await_args.kwargs["broker_api_token"] == "dev-token"
+    assert mock_artifact.await_args.kwargs["broker_api_base"] == "http://dev-broker:8080"
+    assert mock_artifact.await_args.kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
+async def test_single_bill_broker_override_defaults_to_none_preserving_batch_behavior():
+    """run_legbot_pipeline's own existing caller (SYNC-9) never passes these
+    -- confirm the default stays None, i.e. unchanged behavior, when a
+    caller doesn't opt in."""
+    import inspect
+    sig = inspect.signature(run_legbot_pipeline)
+    assert sig.parameters["broker_api_base"].default is None
+    assert sig.parameters["broker_api_token"].default is None
