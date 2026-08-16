@@ -29,6 +29,7 @@ import structlog
 # oversight -- the approved design explicitly calls for reusing
 # _resolve_bill_source() from bill_artifact_generation.py unchanged, rather
 # than duplicating its archived-text-preferred logic in this module too.
+from ddp_sync.config import get_settings
 from ddp_sync.pipelines.bill_artifact_generation import _resolve_bill_source
 from ddp_sync.services.broker_client import (
     BrokerClientError,
@@ -42,13 +43,6 @@ from ddp_sync.services.legbot_client import (
 )
 
 logger = structlog.get_logger()
-
-# Cap, not a rate-limiter — guards against a malformed or unexpectedly broad
-# LegBot response driving an unbounded number of verify_bill_position calls
-# in one manual run. The one real live validation to date found 6
-# organizations for one bill; 20 is a generous multiple, not a tight
-# production-tuned figure.
-_MAX_ORGANIZATIONS_PER_INVOCATION = 20
 
 
 def _build_claim(*, org_name: str, position: str, gov_id: str, bill_title: str, jurisdiction: str, session_code: str) -> str:
@@ -99,7 +93,8 @@ async def generate_and_store_bill_organization_positions(
          insufficient_information or an empty positions list, return an
          empty list immediately — no rows written, no "checked, found
          nothing" marker for this on-demand phase.
-      3. Cap to the first _MAX_ORGANIZATIONS_PER_INVOCATION positions found.
+      3. Cap to the first settings.org_research_max_organizations positions
+         found.
       4. For each organization: dispatch verify_bill_position, then write one
          BillOrganizationPosition row. A verify-dispatch failure or a
          broker-write failure for one organization is isolated to that
@@ -173,15 +168,16 @@ async def generate_and_store_bill_organization_positions(
         return []
 
     positions = find_answer["positions"]
-    if len(positions) > _MAX_ORGANIZATIONS_PER_INVOCATION:
+    max_organizations = get_settings().org_research_max_organizations
+    if len(positions) > max_organizations:
         logger.warning(
             "find_bill_positions returned more organizations than the cap — truncating",
             bill_openstates_id=bill_openstates_id,
             invocation_id=invocation_id,
             returned_count=len(positions),
-            cap=_MAX_ORGANIZATIONS_PER_INVOCATION,
+            cap=max_organizations,
         )
-        positions = positions[:_MAX_ORGANIZATIONS_PER_INVOCATION]
+        positions = positions[:max_organizations]
 
     results = []
     for finding in positions:

@@ -165,6 +165,18 @@ class SyncSettings:
     # data (four artifacts silently failed) for no actual cost savings.
     legbot_dispatch_timeout_seconds: float = 1200.0
 
+    # Cap on how many organizations bill_organization_position_research.py's
+    # generate_and_store_bill_organization_positions will verify/write per
+    # invocation -- a safety valve against a malformed or hallucinated
+    # find_bill_positions response driving an unbounded number of
+    # verify_bill_position calls, not a realistic per-bill estimate. Raised
+    # from a hardcoded 20 (picked from the one real validation run to date,
+    # which found 6 organizations for one bill) after a real report that some
+    # bills draw hundreds of real supporting/opposing organizations -- the old
+    # cap would have silently discarded the vast majority of a high-profile
+    # bill's real positions with only a log warning to show for it.
+    org_research_max_organizations: int = 500
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -257,6 +269,9 @@ def _load_from_env() -> dict:
         "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
         "legbot_dispatch_timeout_seconds": float(
             os.getenv("LEGBOT_DISPATCH_TIMEOUT_SECONDS", "1200")
+        ),
+        "org_research_max_organizations": int(
+            os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
     }
 
