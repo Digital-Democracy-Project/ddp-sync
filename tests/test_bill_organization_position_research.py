@@ -5,12 +5,12 @@ of /pm-review): find_bill_positions -> per-org verify_bill_position -> write.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from ddp_sync.pipelines.bill_organization_position_research import (
-    _MAX_ORGANIZATIONS_PER_INVOCATION,
     generate_and_store_bill_organization_positions,
 )
 from ddp_sync.services.broker_client import BrokerClientError
@@ -269,11 +269,20 @@ async def test_broker_override_threaded_to_both_write_calls(mock_research_run_wr
 
 @pytest.mark.asyncio
 async def test_truncates_to_cap_and_logs():
+    """The cap is settings-driven (org_research_max_organizations, default
+    500 -- raised from a hardcoded 20 after a real report that some bills
+    draw hundreds of real supporting/opposing organizations), not a fixed
+    module constant -- patch a small value here so the test doesn't need to
+    construct hundreds of fake positions."""
+    test_cap = 20
     many_positions = [
         {"org_name": f"Org {i}", "position": "support", "citation_url": f"https://{i}.invalid"}
-        for i in range(_MAX_ORGANIZATIONS_PER_INVOCATION + 5)
+        for i in range(test_cap + 5)
     ]
     with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.get_settings",
+        return_value=SimpleNamespace(org_research_max_organizations=test_cap),
+    ), patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(return_value=_find_result(many_positions)),
     ), patch(
@@ -285,8 +294,8 @@ async def test_truncates_to_cap_and_logs():
     ) as mock_write:
         result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
 
-    assert len(result) == _MAX_ORGANIZATIONS_PER_INVOCATION
-    assert mock_write.await_count == _MAX_ORGANIZATIONS_PER_INVOCATION
+    assert len(result) == test_cap
+    assert mock_write.await_count == test_cap
 
 
 @pytest.mark.asyncio
