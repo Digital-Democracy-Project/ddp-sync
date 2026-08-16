@@ -66,7 +66,9 @@ async def dispatch_bill_question(
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't
-            be read from disk.
+            be read from disk. A timeout also triggers a best-effort
+            DELETE of the CAMS task before raising (SYNC-20) -- see
+            _dispatch_and_await's own docstring.
     """
     return await _dispatch_and_await(
         {
@@ -115,7 +117,9 @@ async def dispatch_bill_changelog(
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't
-            be read from disk.
+            be read from disk. A timeout also triggers a best-effort
+            DELETE of the CAMS task before raising (SYNC-20) -- see
+            _dispatch_and_await's own docstring.
     """
     return await _dispatch_and_await(
         {
@@ -160,7 +164,9 @@ async def dispatch_bill_position_verification(
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't
-            be read from disk.
+            be read from disk. A timeout also triggers a best-effort
+            DELETE of the CAMS task before raising (SYNC-20) -- see
+            _dispatch_and_await's own docstring.
     """
     return await _dispatch_and_await(
         {
@@ -181,6 +187,18 @@ async def _dispatch_and_await(
     timeout_seconds: float | None,
 ) -> dict:
     """Shared dispatch/poll/read-result mechanics for any analyze_bill payload.
+
+    SYNC-20: if the poll loop gives up on timeout, this attempts a
+    best-effort DELETE /api/v1/tasks/{task_id} on CAMS before raising --
+    without it, the CAMS task keeps running as an orphan no one is
+    watching, indefinitely occupying a worker (and, for LegBot, the
+    shared MLX slot) even though this caller has already moved on. A
+    cancel-call failure is logged but never masks or replaces the
+    original LegBotDispatchError. Whether the cancel actually stops the
+    work immediately (rather than just updating Redis bookkeeping)
+    depends on CAMS's own implementation of that endpoint (ddp-agents'
+    AGENTS-16) -- this module doesn't need to know either way, since a
+    best-effort cancel is strictly better than none regardless.
 
     Returns:
         A dict with two keys:
@@ -236,6 +254,31 @@ async def _dispatch_and_await(
                 break
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         else:
+            # SYNC-20: giving up here must not just walk away from the CAMS
+            # task -- without this, it keeps running as an orphan no one is
+            # watching, indefinitely occupying a worker (and, for LegBot,
+            # the shared MLX slot) even though this caller has already
+            # decided to treat it as failed. Confirmed live 2026-08-15/16:
+            # 4 abandoned tasks sat RUNNING for 45+ minutes and starved a
+            # later, correctly-dispatched run's own tasks of worker
+            # capacity. Best-effort: a cancel-call failure must never mask
+            # or replace the real error this function is about to raise.
+            try:
+                cancel_resp = await client.delete(
+                    f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
+                )
+                cancel_resp.raise_for_status()
+                logger.warning(
+                    "LegBot task timed out client-side -- cancelled on CAMS",
+                    task_id=task_id, question_type=question_type,
+                )
+            except httpx.HTTPError as cancel_exc:
+                logger.warning(
+                    "LegBot task timed out client-side -- cancel request "
+                    "itself failed, task may still be running orphaned",
+                    task_id=task_id, question_type=question_type,
+                    error=str(cancel_exc),
+                )
             raise LegBotDispatchError(
                 f"LegBot task {task_id} did not finish within {timeout_seconds}s "
                 f"(last status: {status})"

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from ddp_sync.services.legbot_client import (
@@ -24,9 +25,10 @@ class _FakeSettings:
     legbot_dispatch_timeout_seconds: float = 1200.0
 
 
-def _mock_client(*, statuses, task_id="abc123"):
+def _mock_client(*, statuses, task_id="abc123", delete_should_fail=False):
     """Build a mock httpx.AsyncClient whose GET calls return `statuses` in
-    order, then keep returning the last one."""
+    order, then keep returning the last one. `delete_should_fail` controls
+    the mocked DELETE /tasks/{id} cancel call SYNC-20 makes on timeout."""
     client = AsyncMock()
     post_response = MagicMock()
     post_response.json.return_value = {"task_id": task_id}
@@ -43,6 +45,14 @@ def _mock_client(*, statuses, task_id="abc123"):
         return resp
 
     client.get = AsyncMock(side_effect=_get)
+
+    if delete_should_fail:
+        client.delete = AsyncMock(side_effect=httpx.HTTPError("cancel request failed"))
+    else:
+        delete_response = MagicMock()
+        delete_response.raise_for_status.return_value = None
+        client.delete = AsyncMock(return_value=delete_response)
+
     return client
 
 
@@ -230,3 +240,58 @@ async def test_timeout_seconds_none_resolves_from_settings(tmp_path):
     ):
         with pytest.raises(LegBotDispatchError, match="did not finish within 7.0s"):
             await dispatch_bill_question("https://example.com/bill.pdf", "summary_500char")
+
+
+@pytest.mark.asyncio
+async def test_timeout_cancels_the_orphaned_cams_task(tmp_path):
+    """SYNC-20: giving up on a task must not just walk away from it -- the
+    CAMS task keeps running orphaned otherwise, indefinitely occupying a
+    worker (and, for LegBot, the shared MLX slot). Confirms the DELETE
+    call actually happens, with the right task_id and auth header."""
+    mock_client = _mock_client(
+        statuses=["queued", "running", "running", "running"], task_id="task-to-cancel",
+    )
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(tmp_path)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ), patch(
+        "ddp_sync.services.legbot_client.time.monotonic",
+        side_effect=[0.0, 0.0, 200.0],
+    ):
+        with pytest.raises(LegBotDispatchError, match="did not finish within"):
+            await dispatch_bill_question(
+                "https://example.com/bill.pdf", "pros_cons", timeout_seconds=120.0
+            )
+
+    mock_client.delete.assert_awaited_once_with(
+        "http://localhost:8000/api/v1/tasks/task-to-cancel",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_failure_does_not_mask_the_original_timeout_error(tmp_path):
+    """A cancel-call failure (CAMS unreachable, 404, etc.) must be logged,
+    never raised in place of -- or swallowing -- the real
+    LegBotDispatchError this function was already about to raise."""
+    mock_client = _mock_client(
+        statuses=["queued", "running", "running", "running"],
+        delete_should_fail=True,
+    )
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(tmp_path)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ), patch(
+        "ddp_sync.services.legbot_client.time.monotonic",
+        side_effect=[0.0, 0.0, 200.0],
+    ):
+        with pytest.raises(LegBotDispatchError, match="did not finish within"):
+            await dispatch_bill_question(
+                "https://example.com/bill.pdf", "pros_cons", timeout_seconds=120.0
+            )
+
+    mock_client.delete.assert_awaited_once()
