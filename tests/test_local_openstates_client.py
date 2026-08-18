@@ -13,7 +13,6 @@ import httpx
 import pytest
 
 from ddp_sync.services.local_openstates_client import (
-    get_all_versions,
     get_archived_bill_text,
     get_archived_changelog_inputs,
     get_current_version_identity,
@@ -847,75 +846,5 @@ async def test_current_version_identity_none_on_unreachable_api():
         return_value=_FakeSettings(),
     ), _patch_async_client(mock_client):
         result = await get_current_version_identity("some-uuid")
-
-    assert result is None
-
-
-# --- get_all_versions (SYNC-26) ---------------------------------------------
-
-@pytest.mark.asyncio
-async def test_get_all_versions_returns_full_versions_list():
-    mock_client = AsyncMock()
-    response = MagicMock()
-    response.status_code = 200
-    response.json.return_value = {
-        "title": "A fast-moving bill",
-        "versions": [
-            {"note": "Filed", "date": "2026-08-01", "links": []},
-            {"note": "e1", "date": "2026-08-05", "links": [{"url": "https://example.gov/e1.pdf", "media_type": "application/pdf"}]},
-            {"note": "er", "date": "2026-08-10", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
-        ],
-    }
-    mock_client.get = AsyncMock(return_value=response)
-
-    with patch(
-        "ddp_sync.services.local_openstates_client.get_settings",
-        return_value=_FakeSettings(),
-    ), _patch_async_client(mock_client):
-        result = await get_all_versions("some-uuid")
-
-    assert result is not None
-    assert len(result) == 3
-    assert [v["note"] for v in result] == ["Filed", "e1", "er"]
-
-
-@pytest.mark.asyncio
-async def test_get_all_versions_none_when_no_versions():
-    mock_client = AsyncMock()
-    response = MagicMock()
-    response.status_code = 200
-    response.json.return_value = {"title": "A bill", "versions": []}
-    mock_client.get = AsyncMock(return_value=response)
-
-    with patch(
-        "ddp_sync.services.local_openstates_client.get_settings",
-        return_value=_FakeSettings(),
-    ), _patch_async_client(mock_client):
-        result = await get_all_versions("some-uuid")
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_get_all_versions_none_on_unreachable_api():
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
-
-    with patch(
-        "ddp_sync.services.local_openstates_client.get_settings",
-        return_value=_FakeSettings(),
-    ), _patch_async_client(mock_client):
-        result = await get_all_versions("some-uuid")
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_get_all_versions_none_when_api_base_not_configured():
-    with patch(
-        "ddp_sync.services.local_openstates_client.get_settings",
-        return_value=_FakeSettings(local_openstates_api_base=""),
-    ):
-        result = await get_all_versions("some-uuid")
 
     assert result is None
