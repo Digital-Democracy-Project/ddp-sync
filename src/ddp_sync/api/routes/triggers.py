@@ -133,9 +133,42 @@ class BillArtifactGenerationRequest(BaseModel):
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
 
 
+def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, str | None]:
+    """Resolve /trigger/bill-artifact-generation's own broker target from an
+    optional X-DDP-Environment header -- distinct from
+    _resolve_ondemand_broker_target below (used by the on-demand single-bill
+    endpoints), which requires the header and is meant only for calls
+    forwarded through ddp-api's own trusted proxy. This endpoint predates
+    that header entirely and has real existing callers (the
+    session_pipeline_batch scheduled job, direct operator calls) that never
+    set it -- a missing/omitted header must keep this endpoint's original
+    behavior (None, None), letting run_legbot_pipeline fall through to
+    whatever DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN are globally
+    configured, rather than erroring the way the on-demand endpoints do.
+    """
+    if environment is None:
+        return None, None
+    if environment not in ("dev", "prod"):
+        raise HTTPException(
+            status_code=400,
+            detail="X-DDP-Environment, if set, must be 'dev' or 'prod'.",
+        )
+    settings = get_settings()
+    if environment == "dev":
+        return settings.ondemand_broker_api_base_dev, settings.ondemand_broker_api_token_dev
+    if not settings.ondemand_broker_api_base_prod:
+        raise HTTPException(
+            status_code=503,
+            detail="ONDEMAND_BROKER_API_BASE_PROD is not configured -- production "
+            "ddp-broker-py routing isn't set up on this instance yet.",
+        )
+    return settings.ondemand_broker_api_base_prod, settings.ondemand_broker_api_token_prod
+
+
 @router.post("/trigger/bill-artifact-generation")
 async def trigger_bill_artifact_generation(
     body: BillArtifactGenerationRequest,
+    x_ddp_environment: str | None = Header(default=None),
     token: str = Depends(api_key_auth),
 ):
     """Fill in missing BillArtifact rows for every bill in one jurisdiction/session.
@@ -158,12 +191,25 @@ async def trigger_bill_artifact_generation(
     endpoint's synchronous request/response shape means a very large
     `limit` is a client/proxy timeout question, not a cost or concurrency
     one.
+
+    x_ddp_environment: optional 'dev'/'prod' X-DDP-Environment header --
+    mirrors the on-demand single-bill endpoints' own environment switch
+    (_resolve_ondemand_broker_target below), so a caller can point one run
+    at dev ddp-broker-py without touching this instance's global
+    DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN, which every OTHER broker-
+    writing path in this service also reads (including real scheduled
+    production jobs) -- added after a live incident where testing a full
+    session run required a manual, global .env swap to avoid writing to
+    production, with no per-request way to ask for dev instead. Omitted
+    (the default) preserves this endpoint's original behavior unchanged.
     """
     if body.limit < 1:
         raise HTTPException(
             status_code=400,
             detail=f"limit must be >= 1, got {body.limit}.",
         )
+
+    broker_api_base, broker_api_token = _resolve_batch_broker_target(x_ddp_environment)
 
     from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
 
@@ -175,6 +221,8 @@ async def trigger_bill_artifact_generation(
             body.include_org_research,
             body.limit,
             dry_run=body.dry_run,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
