@@ -290,21 +290,22 @@ async def test_per_page_stays_fixed_across_pages_regression():
     assert len(result) == 22
 
 
-@pytest.mark.asyncio
-async def test_duplicate_bill_across_pages_is_deduplicated_regression():
-    """SYNC-23, found live 2026-08-18: a real run against FL's 2026E session
-    (limit=25) came back with 25 entries for only 20 real unique bills -- 5
-    gov_ids each appearing twice. Simulates that exact shape directly: page
-    2 repeats page 1's last bill (api-v3's default sort has no secondary
-    tiebreaker key, so a tied-sort-value bill can land on two pages even
-    with per_page held fixed) -- the repeated bill_openstates_id must only
-    appear once in the returned candidate list.
+def _duplicate_across_pages_fixture():
+    """22 real distinct bills (ids "0".."21") -- total_items=22, per_page=20
+    genuinely yields max_page=ceil(22/20)=2 per api-v3's own formula
+    (api-v3/api/pagination.py), so page 1 legitimately returns a full 20
+    items (ids 0-19).
 
-    Pagination metadata is internally consistent with api-v3's own formula
-    (api-v3/api/pagination.py: num_pages = ceil(total_items / per_page)) --
-    a full 20-item page 1 plus a real 21st bill means total_items=21,
-    per_page=20 genuinely yields max_page=2, not an arbitrary mocked value
-    the real server could never actually return."""
+    Page 2's own LIMIT/OFFSET query re-runs api-v3's ORDER BY independently
+    of page 1's -- with no secondary tiebreaker key on a tied sort value,
+    that query has no guarantee of picking up exactly "whatever's left" from
+    page 1's perspective. This simulates the real, worse consequence of that
+    instability: page 2 returns id "19" again (a tie re-surfacing an
+    already-seen bill) and id "21", but never returns id "20" at all -- a
+    real, distinct bill that existed (it's counted in total_items=22) but
+    was silently displaced by the tie and never appears in either page's
+    results. Dedup can only drop the visible duplicate ("19" appearing
+    twice); it cannot recover "20", which this client never even saw."""
     page_1 = MagicMock()
     page_1.status_code = 200
     page_1.json.return_value = {
@@ -312,21 +313,38 @@ async def test_duplicate_bill_across_pages_is_deduplicated_regression():
             {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
             for n in range(20)
         ],
-        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 21},
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 22},
     }
     page_2 = MagicMock()
     page_2.status_code = 200
     page_2.json.return_value = {
         "results": [
-            # Same bill as page 1's last result -- a real sort-order tie
-            # landing it on both pages -- plus the genuinely new 21st bill.
             {"id": "ocd-bill/19", "identifier": "HB 19", "sources": []},
-            {"id": "ocd-bill/20", "identifier": "HB 20", "sources": []},
+            {"id": "ocd-bill/21", "identifier": "HB 21", "sources": []},
         ],
-        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 21},
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 22},
     }
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+    return mock_client
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bill_across_pages_is_deduplicated_regression():
+    """SYNC-23, found live 2026-08-18: a real run against FL's 2026E session
+    (limit=25) came back with 25 entries for only 20 real unique bills -- 5
+    gov_ids each appearing twice. The repeated bill_openstates_id must only
+    appear once in the returned candidate list.
+
+    This also makes the residual risk explicit rather than hiding it: 22
+    real distinct bills exist (see _duplicate_across_pages_fixture), but the
+    same instability that produces the visible duplicate ("19") also
+    silently displaces a genuinely distinct bill ("20") that this client
+    never observes at all -- so the result has 21 candidates, not the 22
+    that actually exist. Dedup fixes the duplicate; it cannot fix a bill it
+    was never shown. That gap is exactly why the new warning log below
+    matters -- it's the only signal this happened at all."""
+    mock_client = _duplicate_across_pages_fixture()
 
     with patch(
         "ddp_sync.services.local_openstates_client.get_settings",
@@ -336,8 +354,9 @@ async def test_duplicate_bill_across_pages_is_deduplicated_regression():
 
     bill_openstates_ids = [c["bill_openstates_id"] for c in result]
     assert bill_openstates_ids.count("19") == 1
-    assert len(result) == 21
-    assert set(bill_openstates_ids) == {str(n) for n in range(21)}
+    assert "20" not in bill_openstates_ids  # displaced -- never recoverable client-side
+    assert len(result) == 21  # 22 real bills exist; only 21 were ever observed
+    assert set(bill_openstates_ids) == {str(n) for n in range(20)} | {"21"}
 
 
 @pytest.mark.asyncio
@@ -345,27 +364,9 @@ async def test_dropped_duplicates_are_logged_for_observability():
     """A dedup that silently returns fewer than `limit` unique candidates,
     with no other signal that api-v3's pagination produced an overlap,
     would be invisible in production -- this must log so the team can tell
-    whether the residual sort-tie case is actually occurring live."""
-    page_1 = MagicMock()
-    page_1.status_code = 200
-    page_1.json.return_value = {
-        "results": [
-            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
-            for n in range(20)
-        ],
-        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 21},
-    }
-    page_2 = MagicMock()
-    page_2.status_code = 200
-    page_2.json.return_value = {
-        "results": [
-            {"id": "ocd-bill/19", "identifier": "HB 19", "sources": []},
-            {"id": "ocd-bill/20", "identifier": "HB 20", "sources": []},
-        ],
-        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 21},
-    }
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+    whether the residual sort-tie case (including a genuinely displaced
+    bill, per the test above) is actually occurring live."""
+    mock_client = _duplicate_across_pages_fixture()
 
     with patch(
         "ddp_sync.services.local_openstates_client.get_settings",

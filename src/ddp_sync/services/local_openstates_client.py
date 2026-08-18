@@ -428,7 +428,13 @@ async def list_current_session_bill_candidates(
         (fixed below) -- this dedup is a second, independent safety net
         against api-v3's default sort having no secondary tiebreaker key,
         which could still land a tied-sort-value bill on two pages even with
-        per_page held fixed.
+        per_page held fixed. Dedup only removes a visible duplicate -- if the
+        same tie displaces a different, genuinely distinct bill off of every
+        page entirely, this function has no way to know that bill exists at
+        all, and the returned list can be shorter than `limit` even when
+        that many unique bills really exist. `duplicates_dropped` is logged
+        as a warning specifically so that residual case is observable rather
+        than silent.
 
         Never raises: any failure (no current session resolvable, local
         api-v3 unreachable/rejecting/non-JSON) returns an empty list, same
