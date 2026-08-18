@@ -247,6 +247,93 @@ async def test_per_page_never_exceeds_api_max_even_when_limit_is_larger():
 
 
 @pytest.mark.asyncio
+async def test_per_page_stays_fixed_across_pages_regression():
+    """SYNC-23 real bug, found live 2026-08-18: per_page used to be
+    recomputed each iteration as `limit - len(candidates)`, shrinking on
+    later pages (e.g. 20 then 5 for limit=25). api-v3 computes each
+    request's offset as (page - 1) * per_page and max_page from that same
+    request's per_page (api-v3/api/pagination.py) -- varying per_page while
+    treating `page` as a stable cursor breaks that offset math and
+    re-fetches bills already collected on an earlier page as if they were
+    new. per_page must be decided once and held fixed for every page."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 22},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20, 22)
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 22},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    first_call_params = mock_client.get.await_args_list[0].kwargs["params"]
+    second_call_params = mock_client.get.await_args_list[1].kwargs["params"]
+    assert first_call_params["per_page"] == "20"
+    assert second_call_params["per_page"] == "20"
+    assert len(result) == 22
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bill_across_pages_is_deduplicated_regression():
+    """SYNC-23, found live 2026-08-18: a real run against FL's 2026E session
+    (limit=25) came back with 25 entries for only 20 real unique bills -- 5
+    gov_ids each appearing twice. Simulates that exact shape directly: page
+    2 repeats one of page 1's bills (api-v3's default sort has no secondary
+    tiebreaker key, so a tied-sort-value bill can land on two pages even
+    with per_page held fixed) -- the repeated bill_openstates_id must only
+    appear once in the returned candidate list."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": "ocd-bill/dup-id", "identifier": "HB5003E", "sources": []},
+            {"id": "ocd-bill/unique-1", "identifier": "HB100", "sources": []},
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 3},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            # Same bill as page 1's first result -- a real sort-order tie
+            # landing it on both pages.
+            {"id": "ocd-bill/dup-id", "identifier": "HB5003E", "sources": []},
+            {"id": "ocd-bill/unique-2", "identifier": "HB200", "sources": []},
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 3},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    bill_openstates_ids = [c["bill_openstates_id"] for c in result]
+    assert bill_openstates_ids.count("dup-id") == 1
+    assert sorted(bill_openstates_ids) == ["dup-id", "unique-1", "unique-2"]
+
+
+@pytest.mark.asyncio
 async def test_missing_sources_yields_empty_live_url_fallback_not_a_crash():
     mock_client = AsyncMock()
     response = MagicMock()
