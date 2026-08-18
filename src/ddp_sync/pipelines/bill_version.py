@@ -731,6 +731,8 @@ class BillVersionSyncService:
         session_code: str,
         versions: list[dict],
         latest_version: dict,
+        broker_api_base: str | None = None,
+        broker_api_token: str | None = None,
     ) -> int:
         """SYNC-26: record a ledger-only BillVersion row for every version
         in `versions` other than `latest_version` (which the caller already
@@ -744,6 +746,15 @@ class BillVersionSyncService:
         BillArtifact write can resolve compare_version against it. Safe to
         call repeatedly -- write_bill_version is idempotent, so a version
         already recorded here (or previously) is just a no-op create=False.
+
+        broker_api_base/broker_api_token override the process-wide broker
+        config for this one call, same convention as write_bill_artifact's
+        own override (SYNC-10) -- added so bill_artifact_generation's own
+        reuse of this method (SYNC-26 follow-up, generate_and_store_
+        bill_changelog's compare_version backfill) can target the same dev/
+        prod broker its caller already resolved via X-DDP-Environment, not
+        this process's global config. None (the default) preserves this
+        method's original caller (check_and_reingest_version) unchanged.
 
         Never raises: best-effort, one bad version shouldn't block the
         caller's own handling of `latest_version` -- logs and continues.
@@ -784,6 +795,8 @@ class BillVersionSyncService:
                     # signature never changing its own defaults.
                     chunk_count=0,
                     pinecone_ingested=False,
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
                 )
                 if write_result.get("created"):
                     backfilled += 1

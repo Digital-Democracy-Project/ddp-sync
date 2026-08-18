@@ -61,7 +61,11 @@ import json
 
 import structlog
 
-from ddp_sync.services.broker_client import BrokerClientError, write_bill_artifact
+from ddp_sync.services.broker_client import (
+    BrokerClientError,
+    get_latest_bill_version,
+    write_bill_artifact,
+)
 from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     dispatch_bill_changelog,
@@ -532,6 +536,51 @@ async def generate_and_store_bill_changelog(
             f"{archived['latest_version_date']!r}/{archived['latest_version_note']!r} "
             "-- refusing to write a changelog under a stale or mismatched "
             "version identity."
+        )
+
+    # SYNC-26 follow-up: run_legbot_pipeline (this call's own caller) never
+    # goes through check_and_reingest_version, so a bill this pipeline is
+    # generating artifacts for can hit the exact compare_version-FK-
+    # resolution 400 SYNC-26 fixed for the daily bill_version_check job --
+    # confirmed live against FL 2026E, where run_legbot_pipeline was the
+    # actual caller that surfaced the bug report. Mirrors that fix's own
+    # safety scoping precisely (reuses the same primitive rather than a new
+    # one, per this codebase's own "don't reinvent" convention for this
+    # module): only backfill when ddp-broker-py's ledger has no row at all
+    # yet for this bill (a genuine first sighting from this process's own
+    # point of view), never when a `latest` row already exists. BillVersion.
+    # created_at is auto_now_add and ddp-broker-py's own latest_bill_version
+    # resolves by -created_at, not version_date -- backfilling an older
+    # version after a newer one's row already exists would invert that
+    # ordering (the exact, still-open risk PR #54's own body documents for
+    # its now-removed one-off repair script). A bill that already has a
+    # ledger row is exactly the "already broken" case that still needs the
+    # separate, not-yet-built ddp-broker-py-side management command, not
+    # something safe to patch from here.
+    try:
+        already_has_ledger_row = await get_latest_bill_version(
+            bill_openstates_id, broker_api_base=broker_api_base,
+        ) is not None
+    except BrokerClientError:
+        # Ambiguous -- can't tell if this is a genuine first sighting.
+        # Skip the backfill attempt rather than guess; the write below
+        # will surface its own error if the ledger really is the cause.
+        already_has_ledger_row = True
+
+    if not already_has_ledger_row:
+        from ddp_sync.pipelines.bill_version import BillVersionSyncService
+
+        await BillVersionSyncService._backfill_missing_versions(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction_code=jurisdiction,
+            session_code=session_code,
+            versions=[
+                {"date": archived["old_version_date"], "note": archived["old_version_note"]},
+                {"date": version_date, "note": version_note},
+            ],
+            latest_version={"date": version_date, "note": version_note},
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
 
     dispatch_result = await dispatch_bill_changelog(
