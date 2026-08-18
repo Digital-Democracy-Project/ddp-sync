@@ -391,9 +391,32 @@ async def test_ensure_called_when_archived_text_exists_and_dispatch_proceeds():
     assert call_kwargs["title"] == "Save our Homes from Excessive Property Taxes"
     assert call_kwargs["chamber_classification"] == "lower"
     assert call_kwargs["jurisdiction_classification"] == "state"
+    assert call_kwargs["bill_openstates_id"] == "a3afb726-0000-0000-0000-000000000001"
     bill_result = result["results"][0]
     assert bill_result["artifacts_generated"] == ["bill_summary"]
     assert bill_result["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_called_with_this_bills_own_openstates_id_not_a_stale_one():
+    """SYNC-22 (PLAN-local-openstates-migration.md §3.6, BROKER-81's paired
+    fix): ensure_bill_exists must be called with THIS candidate's own
+    bill_openstates_id, not a hardcoded or leftover value from another bill
+    -- without this, ddp-broker-py has no way to backfill
+    primary_openstates_id on the stub it creates/matches, so a later Voatz/
+    Webflow curation pass can't match its own OpenStates lookup back to the
+    stub and creates a duplicate Bill row instead of promoting this one."""
+    other_candidate = {**_CANDIDATE, "bill_openstates_id": "b4b4b4b4-1111-1111-1111-111111111111"}
+    with _patch_lister([other_candidate]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
+         patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10)
+
+    mock_ensure.assert_awaited_once()
+    assert mock_ensure.await_args.kwargs["bill_openstates_id"] == "b4b4b4b4-1111-1111-1111-111111111111"
 
 
 @pytest.mark.asyncio

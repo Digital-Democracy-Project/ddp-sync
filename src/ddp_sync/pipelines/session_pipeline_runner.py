@@ -188,6 +188,7 @@ async def _process_bill(
                     title=version["bill_title"],
                     chamber_classification=version["chamber_classification"],
                     jurisdiction_classification=version["jurisdiction_classification"],
+                    bill_openstates_id=bill_openstates_id,
                     broker_api_base=broker_api_base,
                     broker_api_token=broker_api_token,
                 )

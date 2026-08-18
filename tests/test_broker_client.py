@@ -244,6 +244,7 @@ async def test_ensure_bill_exists_missing_base_url_raises_immediately():
                 title="A bill",
                 chamber_classification="lower",
                 jurisdiction_classification="state",
+                bill_openstates_id="11111111-1111-1111-1111-111111111111",
             )
 
 
@@ -266,6 +267,7 @@ async def test_ensure_bill_exists_posts_expected_payload_and_returns_result():
             title="A bill",
             chamber_classification="lower",
             jurisdiction_classification="state",
+            bill_openstates_id="11111111-1111-1111-1111-111111111111",
         )
 
     assert result == {"bill_id": 42, "created": True}
@@ -279,6 +281,7 @@ async def test_ensure_bill_exists_posts_expected_payload_and_returns_result():
         "title": "A bill",
         "chamber_classification": "lower",
         "jurisdiction_classification": "state",
+        "bill_openstates_id": "11111111-1111-1111-1111-111111111111",
     }
 
 
@@ -302,6 +305,7 @@ async def test_ensure_bill_exists_error_status_raises_broker_client_error():
                 title="A bill",
                 chamber_classification="bogus",
                 jurisdiction_classification="state",
+                bill_openstates_id="11111111-1111-1111-1111-111111111111",
             )
 
 
@@ -322,6 +326,7 @@ async def test_ensure_bill_exists_unreachable_broker_raises_broker_client_error(
                 title="A bill",
                 chamber_classification="lower",
                 jurisdiction_classification="state",
+                bill_openstates_id="11111111-1111-1111-1111-111111111111",
             )
 
 

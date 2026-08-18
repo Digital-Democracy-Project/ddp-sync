@@ -166,6 +166,7 @@ async def ensure_bill_exists(
     title: str,
     chamber_classification: str,
     jurisdiction_classification: str,
+    bill_openstates_id: str,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -184,6 +185,13 @@ async def ensure_bill_exists(
     either independently brings the same bill in, with no special handling
     needed on either side (verified directly against both call sites during
     this design's own review).
+
+    bill_openstates_id: bare OpenStates bill UUID (no `ocd-bill/` prefix),
+    stored on the created/matched Bill row as `primary_openstates_id` --
+    SYNC-22/BROKER-81. Without this, a Voatz/Webflow curation pass that
+    later brings the same bill in via its own OpenStates lookup has no way
+    to match it back to the stub this call created, and creates a duplicate
+    Bill row instead of promoting the existing one to tracked=True.
 
     broker_api_base/broker_api_token: optional per-call override, same shape
     as write_bill_artifact's identical parameters.
@@ -213,6 +221,7 @@ async def ensure_bill_exists(
         "title": title,
         "chamber_classification": chamber_classification,
         "jurisdiction_classification": jurisdiction_classification,
+        "bill_openstates_id": bill_openstates_id,
     }
     headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
