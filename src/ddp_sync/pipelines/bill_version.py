@@ -521,6 +521,24 @@ class BillVersionSyncService:
         if bill_openstates_id:
             try:
                 cached = await get_latest_bill_version(bill_openstates_id)
+                if cached is None and len(versions) > 1:
+                    # SYNC-26: this is the first time ddp-sync has ever seen
+                    # this bill, but it already has more than one version --
+                    # a fast-moving bill can outrun this job's poll cadence
+                    # and arrive already several stages ahead. Without this,
+                    # only `latest_version` (written at the end of this
+                    # function) ever gets a ledger row -- every earlier
+                    # version silently never does, which later breaks
+                    # bill_changelog's compare_version FK resolution even
+                    # though api-v3 itself has every version archived
+                    # correctly (SYNC-26's own root-cause finding).
+                    await self._backfill_missing_versions(
+                        bill_openstates_id=bill_openstates_id,
+                        jurisdiction_code=jurisdiction_code,
+                        session_code=fields.get("session-code", ""),
+                        versions=versions,
+                        latest_version=latest_version,
+                    )
             except BrokerClientError as e:
                 # Can't tell if this is genuinely new -- skip this bill this
                 # run rather than risk re-processing (and re-billing OpenAI/
@@ -704,6 +722,66 @@ class BillVersionSyncService:
                 )
 
         return result
+
+    @staticmethod
+    async def _backfill_missing_versions(
+        *,
+        bill_openstates_id: str,
+        jurisdiction_code: str,
+        session_code: str,
+        versions: list[dict],
+        latest_version: dict,
+    ) -> int:
+        """SYNC-26: record a ledger-only BillVersion row for every version
+        in `versions` other than `latest_version` (which the caller already
+        writes in full, with real text_url/chunk_count/pinecone_ingested,
+        once ingestion finishes).
+
+        Ledger-only on purpose -- chunk_count=0, pinecone_ingested=False:
+        this does not download or ingest the older version's text into
+        Pinecone, it only ensures write_bill_version's natural key
+        (bill + version_date + version_note) exists so ddp-broker-py's
+        BillArtifact write can resolve compare_version against it. Safe to
+        call repeatedly -- write_bill_version is idempotent, so a version
+        already recorded here (or previously) is just a no-op create=False.
+
+        Never raises: best-effort, one bad version shouldn't block the
+        caller's own handling of `latest_version` -- logs and continues.
+
+        Returns the number of versions successfully backfilled.
+        """
+        from ddp_sync.services.broker_client import BrokerClientError, write_bill_version
+
+        backfilled = 0
+        for version in versions:
+            if version is latest_version:
+                continue
+            version_note = version.get("note", "")
+            if not version_note:
+                continue
+            url_info = BillVersionSyncService._get_best_text_url(version)
+            text_url, media_type = url_info if url_info else ("", "")
+            try:
+                await write_bill_version(
+                    bill_openstates_id=bill_openstates_id,
+                    jurisdiction=jurisdiction_code,
+                    session_code=session_code,
+                    version_date=version.get("date", ""),
+                    version_note=version_note,
+                    text_url=text_url,
+                    media_type=media_type,
+                )
+                backfilled += 1
+            except BrokerClientError as e:
+                logger.warning(
+                    "SYNC-26: failed to backfill an older BillVersion -- "
+                    "changelog generation may still fail for this version pair",
+                    bill_openstates_id=bill_openstates_id,
+                    version_date=version.get("date", ""),
+                    version_note=version_note,
+                    error=str(e),
+                )
+        return backfilled
 
     @staticmethod
     async def _refresh_slug_cache(webflow_id: str, bill_slug: str, latest_version: dict) -> None:
