@@ -11,11 +11,21 @@ api-v3 itself has every version and diff archived correctly. The standing fix
 forward; this script repairs bills already stuck in that state.
 
 Walks api-v3's already-correct versions[] for every bill in a jurisdiction/
-session and calls write_bill_version() for any version missing from the
-ledger -- idempotent (natural-keyed on bill + version_date + version_note),
-safe to re-run.
+session and calls write_bill_version() for each version -- idempotent
+(natural-keyed on bill + version_date + version_note), safe to re-run.
+Already-present versions are a safe no-op (write_bill_version reports
+created=False); this script never needs to know in advance which versions
+are already recorded.
 
-Safe by default: runs in dry-run mode until --write is passed.
+Fetches at most 500 bills per run (api-v3 pagination limit passed through to
+list_current_session_bill_candidates) -- pass --limit to raise this for a
+larger session.
+
+Dry-run mode (the default) only lists what WOULD be attempted -- it cannot
+tell which of those are already present without actually writing, since
+ddp-broker-py only exposes a "read the latest version" lookup, not a "list
+every version already recorded" one. Safe by default regardless: runs in
+dry-run mode until --write is passed.
 
 Usage:
     .venv/bin/python scripts/backfill_bill_versions.py --jurisdiction FL --session 2026E [--write] [--limit N]
@@ -36,10 +46,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_DEFAULT_LIMIT = 500
+
 
 @dataclass
 class BackfillResult:
-    backfilled: list[tuple[str, str, str]] = field(default_factory=list)  # (gov_id, date, note)
+    attempted: list[tuple[str, str, str]] = field(default_factory=list)  # (gov_id, date, note) -- dry-run only
+    created: list[tuple[str, str, str]] = field(default_factory=list)  # (gov_id, date, note) -- --write only
     already_present: int = 0
     skipped_single_version: list[str] = field(default_factory=list)
     skipped_no_versions: list[str] = field(default_factory=list)
@@ -47,6 +60,7 @@ class BackfillResult:
 
 
 async def run(*, jurisdiction: str, session: str, dry_run: bool, limit: int | None) -> BackfillResult:
+    from ddp_sync.pipelines.bill_version import BillVersionSyncService
     from ddp_sync.services.broker_client import BrokerClientError, write_bill_version
     from ddp_sync.services.local_openstates_client import (
         get_all_versions,
@@ -59,7 +73,7 @@ async def run(*, jurisdiction: str, session: str, dry_run: bool, limit: int | No
         f"{'[DRY RUN] ' if dry_run else ''}Listing {jurisdiction} {session} bills…\n"
     )
     candidates = await list_current_session_bill_candidates(
-        jurisdiction, session_code=session, limit=limit or 500
+        jurisdiction, session_code=session, limit=limit or _DEFAULT_LIMIT
     )
 
     for candidate in candidates:
@@ -85,8 +99,14 @@ async def run(*, jurisdiction: str, session: str, dry_run: bool, limit: int | No
             print(f"  {action:7s} {gov_id!r:12s} {version_note!r}")
 
             if dry_run:
-                result.backfilled.append((gov_id, version_date, version_note))
+                result.attempted.append((gov_id, version_date, version_note))
                 continue
+
+            # Same "prefer PDF over HTML" link selection the standing fix
+            # uses -- reused rather than re-implemented (BillVersionSyncService
+            # is this script's own sibling, not a cross-package boundary).
+            url_info = BillVersionSyncService._get_best_text_url(version)
+            text_url, media_type = url_info if url_info else ("", "")
 
             try:
                 write_result = await write_bill_version(
@@ -95,9 +115,11 @@ async def run(*, jurisdiction: str, session: str, dry_run: bool, limit: int | No
                     session_code=session,
                     version_date=version_date,
                     version_note=version_note,
+                    text_url=text_url,
+                    media_type=media_type,
                 )
                 if write_result.get("created"):
-                    result.backfilled.append((gov_id, version_date, version_note))
+                    result.created.append((gov_id, version_date, version_note))
                 else:
                     result.already_present += 1
             except BrokerClientError as e:
@@ -112,8 +134,13 @@ def print_summary(result: BackfillResult, *, dry_run: bool) -> None:
     print(f"\n{'─' * 55}")
     print(f"{prefix}Summary")
     print(f"{'─' * 55}")
-    print(f"  {'Would backfill' if dry_run else 'Backfilled'}:       {len(result.backfilled)}")
-    if not dry_run:
+    if dry_run:
+        print(f"  Would attempt to write:  {len(result.attempted)}")
+        print("    (some of these may already be recorded -- dry-run can't")
+        print("     tell without actually writing; re-run with --write to")
+        print("     see the real created-vs-already-present split)")
+    else:
+        print(f"  Newly created:       {len(result.created)}")
         print(f"  Already present:     {result.already_present}")
     print(f"  Single-version bills (nothing to do): {len(result.skipped_single_version)}")
     print(f"  No versions in api-v3:                {len(result.skipped_no_versions)}")
@@ -138,7 +165,7 @@ def main() -> None:
         "--limit",
         type=int,
         metavar="N",
-        help="Process at most N bills (useful for testing). Default: 500.",
+        help=f"Process at most N bills. Default: {_DEFAULT_LIMIT} -- raise this for a larger session.",
     )
     args = parser.parse_args()
 

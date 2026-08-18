@@ -748,13 +748,21 @@ class BillVersionSyncService:
         Never raises: best-effort, one bad version shouldn't block the
         caller's own handling of `latest_version` -- logs and continues.
 
-        Returns the number of versions successfully backfilled.
+        Returns the number of versions actually newly created (matches
+        write_bill_version's own create=True/False, not just attempted).
         """
         from ddp_sync.services.broker_client import BrokerClientError, write_bill_version
 
+        # Compared by natural key (date, note) -- the same key
+        # write_bill_version itself upserts on -- rather than object
+        # identity. _get_latest_version's sorted()/[0] happens to return the
+        # same object reference today, but that's an implementation detail
+        # of a different function this one shouldn't have to assume holds.
+        latest_key = (latest_version.get("date", ""), latest_version.get("note", ""))
+
         backfilled = 0
         for version in versions:
-            if version is latest_version:
+            if (version.get("date", ""), version.get("note", "")) == latest_key:
                 continue
             version_note = version.get("note", "")
             if not version_note:
@@ -762,7 +770,7 @@ class BillVersionSyncService:
             url_info = BillVersionSyncService._get_best_text_url(version)
             text_url, media_type = url_info if url_info else ("", "")
             try:
-                await write_bill_version(
+                write_result = await write_bill_version(
                     bill_openstates_id=bill_openstates_id,
                     jurisdiction=jurisdiction_code,
                     session_code=session_code,
@@ -771,7 +779,8 @@ class BillVersionSyncService:
                     text_url=text_url,
                     media_type=media_type,
                 )
-                backfilled += 1
+                if write_result.get("created"):
+                    backfilled += 1
             except BrokerClientError as e:
                 logger.warning(
                     "SYNC-26: failed to backfill an older BillVersion -- "

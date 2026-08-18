@@ -963,6 +963,68 @@ async def test_backfill_one_bad_version_does_not_block_the_others():
     assert written_notes == {"Filed", "e1", "er"}
 
 
+async def test_backfill_excludes_latest_by_natural_key_not_object_identity():
+    """_backfill_missing_versions must skip `latest_version` by matching
+    (date, note), not by Python object identity -- a caller that resolves
+    latest_version independently (e.g. a freshly-constructed dict with the
+    same values, not the exact same object _get_latest_version happened to
+    return) must still get the same correct exclusion, not an accidental
+    duplicate backfill of the latest version itself."""
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
+
+    versions = [
+        {"date": "2026-08-01", "note": "Filed", "links": []},
+        {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
+    ]
+    # A distinct dict object, not `versions[1]` itself, but equal by (date, note).
+    latest_version_copy = {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]}
+    assert latest_version_copy is not versions[1]
+
+    with patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version):
+        backfilled = await BillVersionSyncService._backfill_missing_versions(
+            bill_openstates_id="natural-key-test",
+            jurisdiction_code="FL",
+            session_code="2026E",
+            versions=versions,
+            latest_version=latest_version_copy,
+        )
+
+    mock_write_bill_version.assert_awaited_once()
+    assert mock_write_bill_version.await_args.kwargs["version_note"] == "Filed"
+    assert backfilled == 1
+
+
+async def test_backfill_return_count_excludes_already_present_versions():
+    """The returned count reflects versions actually newly created
+    (create=True), not just attempted -- a version write_bill_version
+    reports as already-present (create=False) shouldn't inflate it."""
+    async def _write_side_effect(**kwargs):
+        if kwargs["version_note"] == "Filed":
+            return {"id": 1, "created": False}  # already recorded previously
+        return {"id": 2, "created": True}
+
+    mock_write_bill_version = AsyncMock(side_effect=_write_side_effect)
+
+    versions = [
+        {"date": "2026-08-01", "note": "Filed", "links": []},
+        {"date": "2026-08-05", "note": "e1", "links": []},
+        {"date": "2026-08-10", "note": "er", "links": []},
+    ]
+
+    with patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version):
+        backfilled = await BillVersionSyncService._backfill_missing_versions(
+            bill_openstates_id="count-test",
+            jurisdiction_code="FL",
+            session_code="2026E",
+            versions=versions,
+            latest_version=versions[2],  # "er"
+        )
+
+    # Both "Filed" and "e1" were attempted; only "e1" was actually new.
+    assert mock_write_bill_version.await_count == 2
+    assert backfilled == 1
+
+
 # ---------------------------------------------------------------------------
 # Batch result counters
 # ---------------------------------------------------------------------------
