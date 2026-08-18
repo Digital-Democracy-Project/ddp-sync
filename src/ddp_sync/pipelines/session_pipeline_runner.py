@@ -18,12 +18,14 @@ demand-based, memory-gated MLX-LM/MLX-VLM instance pool specifically to let
 CAMS scale up under genuine concurrent load -- but a caller that only ever
 has one request in flight can never trigger that pool's scale-up at all, no
 matter how much memory is free. `run_legbot_pipeline` runs up to
-`SESSION_PIPELINE_CONCURRENCY` (default 4, `SyncSettings.
-session_pipeline_concurrency`) bills' own `_process_bill` calls at once
-(`asyncio.Semaphore`-bounded, not unbounded `asyncio.gather` -- see that
-setting's own docstring for why an actual cap still matters even with the
-pool's own backpressure). Fills only absent rows -- no freshness/version-
-currency check.
+`SESSION_PIPELINE_CONCURRENCY` (default 1 as of AGENTS-37 -- see
+`SyncSettings.session_pipeline_concurrency`'s own docstring for why the
+default dropped from this feature's original 4 -- env-configurable higher
+once real concurrent MLX-LM throughput is validated) bills' own
+`_process_bill` calls at once (`asyncio.Semaphore`-bounded, not unbounded
+`asyncio.gather` -- see that setting's own docstring for why an actual cap
+still matters even with the pool's own backpressure). Fills only absent
+rows -- no freshness/version-currency check.
 
 Two real callers now (SYNC-9): the on-demand API route
 (``POST /trigger/bill-artifact-generation``, api/routes/triggers.py) and
@@ -364,10 +366,11 @@ async def run_legbot_pipeline(
     specifies, not a separate metrics store.
 
     Bounded concurrency: up to `SyncSettings.session_pipeline_concurrency`
-    (default 4, env `SESSION_PIPELINE_CONCURRENCY`) bills' own _process_bill
-    calls run at once, not strictly one at a time -- see that setting's own
-    docstring and this module's own docstring for why. `session_pipeline_
-    bill_complete` is still logged per-bill, as each one actually finishes
+    (default 1 as of AGENTS-37, env `SESSION_PIPELINE_CONCURRENCY`) bills'
+    own _process_bill calls run at once -- see that setting's own docstring
+    and this module's own docstring for why the default isn't higher out of
+    the box. `session_pipeline_bill_complete` is still logged per-bill, as
+    each one actually finishes
     (interleaved under concurrency, not batched at the end).
 
     Returns:

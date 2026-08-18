@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.session_pipeline_runner import (
     ALL_8_ARTIFACT_TYPES,
     run_scheduled_session_pipeline,
@@ -990,3 +991,18 @@ async def test_concurrency_of_one_is_effectively_sequential():
 
     assert max_seen["value"] == 1
     assert len(result["results"]) == 3
+
+
+def test_session_pipeline_concurrency_defaults_to_one_not_four():
+    """AGENTS-37 (2026-08-18): the first real dispatch under this setting's
+    original default of 4 found LEGBOT_MLX_MAX_INSTANCES configured at 3
+    (oversubscribing the pool from the first request) AND real concurrent
+    MLX-LM throughput on that hardware degrading 20-50x under 3-way
+    contention rather than parallelizing -- confirmed via dev ddp-broker-py
+    itself landing zero new BillArtifact rows from that run. The safe
+    out-of-the-box default is 1 (genuinely sequential, the pre-2026-08-18
+    behavior) until real concurrent MLX-LM throughput is actually
+    benchmarked and shown safe -- operators can still opt into a higher
+    value via SESSION_PIPELINE_CONCURRENCY once that validation happens.
+    """
+    assert SyncSettings().session_pipeline_concurrency == 1
