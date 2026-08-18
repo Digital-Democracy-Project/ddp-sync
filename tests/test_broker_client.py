@@ -11,6 +11,7 @@ import pytest
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     create_concept_statement_set,
+    ensure_bill_exists,
     get_bill_artifacts,
     get_bill_organization_positions_status,
     get_concept_statement_set,
@@ -226,6 +227,101 @@ async def test_unreachable_broker_raises_broker_write_error():
                 version_note="Introduced",
                 artifact_type="bill_summary",
                 content="A summary.",
+            )
+
+
+@pytest.mark.asyncio
+async def test_ensure_bill_exists_missing_base_url_raises_immediately():
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base=""),
+    ):
+        with pytest.raises(BrokerClientError, match="DDP_BROKER_API_BASE"):
+            await ensure_bill_exists(
+                jurisdiction="FL",
+                session_code="2026",
+                gov_id="SJR 2F",
+                title="A bill",
+                chamber_classification="lower",
+                jurisdiction_classification="state",
+            )
+
+
+@pytest.mark.asyncio
+async def test_ensure_bill_exists_posts_expected_payload_and_returns_result():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"bill_id": 42, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await ensure_bill_exists(
+            jurisdiction="FL",
+            session_code="2026",
+            gov_id="SJR 2F",
+            title="A bill",
+            chamber_classification="lower",
+            jurisdiction_classification="state",
+        )
+
+    assert result == {"bill_id": 42, "created": True}
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://localhost:8080/api/bills/ensure/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert call.kwargs["json"] == {
+        "jurisdiction": "FL",
+        "session_code": "2026",
+        "gov_id": "SJR 2F",
+        "title": "A bill",
+        "chamber_classification": "lower",
+        "jurisdiction_classification": "state",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ensure_bill_exists_error_status_raises_broker_client_error():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 400
+    response.text = '{"error": "chamber_classification/jurisdiction_classification did not resolve to a known Chamber"}'
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="400"):
+            await ensure_bill_exists(
+                jurisdiction="FL",
+                session_code="2026",
+                gov_id="SJR 2F",
+                title="A bill",
+                chamber_classification="bogus",
+                jurisdiction_classification="state",
+            )
+
+
+@pytest.mark.asyncio
+async def test_ensure_bill_exists_unreachable_broker_raises_broker_client_error():
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="unreachable"):
+            await ensure_bill_exists(
+                jurisdiction="FL",
+                session_code="2026",
+                gov_id="SJR 2F",
+                title="A bill",
+                chamber_classification="lower",
+                jurisdiction_classification="state",
             )
 
 
