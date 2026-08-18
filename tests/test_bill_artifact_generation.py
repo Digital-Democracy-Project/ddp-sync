@@ -611,6 +611,157 @@ async def test_changelog_broker_write_failure_propagates():
 
 
 # ---------------------------------------------------------------------------
+# SYNC-26 follow-up: run_legbot_pipeline's own compare_version backfill.
+# check_and_reingest_version (the daily sync job) already backfills missing
+# older BillVersion rows on a bill's first sighting -- run_legbot_pipeline
+# never went through that code path, so it could still hit the same
+# compare_version-FK-resolution 400 SYNC-26 fixed for the other caller.
+# ---------------------------------------------------------------------------
+
+_CHANGELOG_DISPATCH_RESULT = {
+    "answer": {
+        "insufficient_information": False,
+        "sections_added": [],
+        "sections_removed": [],
+        "sections_modified": [],
+        "policy_implications": "",
+    },
+    "backend": "mlx",
+}
+
+
+@pytest.mark.asyncio
+async def test_changelog_backfills_compare_version_on_first_sighting():
+    """No ledger row at all yet for this bill -- safe to backfill the older
+    (compare_version) row before writing, mirroring check_and_reingest_
+    version's own first-sighting safety scoping exactly."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_latest_bill_version",
+        new=AsyncMock(return_value=None),
+    ) as mock_get_latest, patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ) as mock_backfill, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 2, "created": True}
+    mock_get_latest.assert_awaited_once_with(
+        _CHANGELOG_KWARGS["bill_openstates_id"], broker_api_base=None,
+    )
+    mock_backfill.assert_awaited_once_with(
+        bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
+        jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
+        session_code=_CHANGELOG_KWARGS["session_code"],
+        versions=[
+            {"date": "2026-01-01", "note": "Introduced"},
+            {"date": "2026-02-01", "note": "Engrossed"},
+        ],
+        latest_version={"date": "2026-02-01", "note": "Engrossed"},
+        broker_api_base=None,
+        broker_api_token=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_changelog_skips_backfill_when_ledger_already_has_a_row():
+    """A bill that already has a `latest` ledger row is exactly the
+    "already broken" shape PR #54's own body warned about -- backfilling an
+    older version now would risk inverting created_at-based latest-version
+    resolution. Must not attempt it."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_latest_bill_version",
+        new=AsyncMock(return_value={"version_date": "2026-02-01", "version_note": "Engrossed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(),
+    ) as mock_backfill, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 2, "created": True}
+    mock_backfill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changelog_skips_backfill_when_ledger_read_fails():
+    """An ambiguous ledger read (broker error, not a clean 'not found')
+    must not be treated as a first sighting -- skip the backfill attempt
+    rather than guess, and still let the write below proceed (it will
+    surface its own error if the ledger really was the cause)."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_latest_bill_version",
+        new=AsyncMock(side_effect=BrokerClientError("ddp-broker-py unreachable")),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(),
+    ) as mock_backfill, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 2, "created": True}
+    mock_backfill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changelog_backfill_threads_broker_target_override():
+    """The X-DDP-Environment-resolved broker target must reach both the
+    first-sighting check and the backfill call itself -- not silently fall
+    back to this process's own global config."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_latest_bill_version",
+        new=AsyncMock(return_value=None),
+    ) as mock_get_latest, patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ) as mock_backfill, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ):
+        await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS,
+            broker_api_base="http://localhost:8080",
+            broker_api_token="dev-token",
+        )
+
+    mock_get_latest.assert_awaited_once_with(
+        _CHANGELOG_KWARGS["bill_openstates_id"], broker_api_base="http://localhost:8080",
+    )
+    assert mock_backfill.await_args.kwargs["broker_api_base"] == "http://localhost:8080"
+    assert mock_backfill.await_args.kwargs["broker_api_token"] == "dev-token"
+
+
+# ---------------------------------------------------------------------------
 # dispatch_and_record_bill_artifact -- on-demand single-bill endpoint (SYNC-10)
 # ---------------------------------------------------------------------------
 

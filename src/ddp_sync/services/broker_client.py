@@ -374,7 +374,11 @@ async def write_bill_organization_position(
     return result
 
 
-async def get_latest_bill_version(bill_openstates_id: str) -> dict | None:
+async def get_latest_bill_version(
+    bill_openstates_id: str,
+    *,
+    broker_api_base: str | None = None,
+) -> dict | None:
     """Read the latest version ddp-broker-py has recorded for a bill —
     Phase 4's replacement for a Redis lookup.
 
@@ -386,12 +390,22 @@ async def get_latest_bill_version(bill_openstates_id: str) -> dict | None:
         Redis-miss path did ("no prior version, so nothing to compare
         against yet").
 
+    broker_api_base overrides the process-wide settings.ddp_broker_api_base
+    for this one call, same convention as write_bill_artifact's own
+    broker_api_base/broker_api_token override (SYNC-10) — added so
+    generate_and_store_bill_changelog's compare_version backfill check
+    (SYNC-26 follow-up) can target the same dev/prod broker its caller
+    already resolved via X-DDP-Environment, rather than whatever this
+    process's global config happens to be. No token override here since
+    this read endpoint sends no Authorization header, unlike the writes.
+
     Raises:
         BrokerClientError: ddp-broker-py rejected the request or was
             unreachable — a real failure, distinct from "not found."
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot read BillVersion."
         )
@@ -399,7 +413,7 @@ async def get_latest_bill_version(bill_openstates_id: str) -> dict | None:
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
-                f"{settings.ddp_broker_api_base}/api/bill-versions/latest/",
+                f"{resolved_api_base}/api/bill-versions/latest/",
                 params={"bill_openstates_id": bill_openstates_id},
             )
         except httpx.RequestError as exc:
@@ -428,6 +442,8 @@ async def write_bill_version(
     media_type: str = "",
     chunk_count: int = 0,
     pinecone_ingested: bool = False,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Record a bill version in ddp-broker-py — the write half of Phase 4's
     redesign. Without this, get_latest_bill_version would always return None
@@ -435,6 +451,14 @@ async def write_bill_version(
 
     Identifies the target BillVersion by its natural key (bill + version_date
     + version_note), same as write_bill_artifact — idempotent, safe to retry.
+
+    broker_api_base/broker_api_token override the process-wide
+    settings.ddp_broker_api_base/ddp_broker_api_token for this one call,
+    same convention as write_bill_artifact's own override (SYNC-10) — added
+    so generate_and_store_bill_changelog's compare_version backfill (SYNC-26
+    follow-up) can target the same dev/prod broker its caller already
+    resolved via X-DDP-Environment. None (the default) preserves every
+    existing caller's behavior unchanged.
 
     Returns:
         {"id": ..., "created": bool}.
@@ -444,7 +468,9 @@ async def write_bill_version(
             Bill exists yet for this bill_openstates_id) or was unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write BillVersion."
         )
@@ -460,12 +486,12 @@ async def write_bill_version(
         "chunk_count": chunk_count,
         "pinecone_ingested": pinecone_ingested,
     }
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/bill-versions/",
+                f"{resolved_api_base}/api/bill-versions/",
                 headers=headers,
                 json=payload,
             )
