@@ -11,28 +11,37 @@ Organization Position Research was a single-bill, single-type manual call.
 Motivated directly by trying to do exactly that against FL's real 2026F
 session (2026-08-01) and finding the answer was no.
 
-Sequential, no concurrency control -- matches this pipeline's actual state
-everywhere else. Fills only absent rows -- no freshness/version-currency
-check.
+Bounded-concurrency, not sequential -- changed 2026-08-18 after a real live
+run confirmed the pipeline processed every bill strictly one at a time,
+regardless of real spare capacity. ddp-agents' AGENTS-33/34 shipped a
+demand-based, memory-gated MLX-LM/MLX-VLM instance pool specifically to let
+CAMS scale up under genuine concurrent load -- but a caller that only ever
+has one request in flight can never trigger that pool's scale-up at all, no
+matter how much memory is free. `run_legbot_pipeline` runs up to
+`SESSION_PIPELINE_CONCURRENCY` (default 4, `SyncSettings.
+session_pipeline_concurrency`) bills' own `_process_bill` calls at once
+(`asyncio.Semaphore`-bounded, not unbounded `asyncio.gather` -- see that
+setting's own docstring for why an actual cap still matters even with the
+pool's own backpressure). Fills only absent rows -- no freshness/version-
+currency check.
 
 Two real callers now (SYNC-9): the on-demand API route
 (``POST /trigger/bill-artifact-generation``, api/routes/triggers.py) and
 ``run_scheduled_session_pipeline`` below, registered as the
 ``session_pipeline_batch`` APScheduler job (scheduler.py) -- shipped
 ``enabled: false`` in sync_schedule.yaml pending ddp-infra's own Phase 8
-(concurrency cap, prioritization vs. interactive Agent Smith traffic):
-verified 2026-08-14 directly against ``PLAN-legbot.md`` and
-``PLAN-bill-document-provenance.md`` that this still doesn't exist anywhere
-in that pipeline (a plain sequential loop, no semaphore) -- see
-``session_pipeline_batch``'s own YAML comment for the full status. Phase 6
-(``BillArtifact`` dedup key) is separately confirmed live since 2026-07-26,
-so this pipeline's actual writes are safe; what's gated is unattended
-*broad* production batch volume specifically, not this module's existence
-as a real caller.
+(prioritization vs. interactive Agent Smith traffic specifically -- this
+change fixes "bills stack up one at a time no matter what capacity exists,"
+not "this batch job might still contend with interactive traffic under real
+load," which is a separate, still-open concern). Phase 6 (``BillArtifact``
+dedup key) is separately confirmed live since 2026-07-26, so this pipeline's
+actual writes are safe; what's gated is unattended *broad* production batch
+volume specifically, not this module's existence as a real caller.
 """
 
 from __future__ import annotations
 
+import asyncio
 import resource
 import sys
 import time
@@ -40,6 +49,7 @@ import uuid
 
 import structlog
 
+from ddp_sync.config import get_settings
 from ddp_sync.pipelines.bill_artifact_generation import (
     generate_and_store_bill_artifact,
     generate_and_store_bill_changelog,
@@ -353,15 +363,25 @@ async def run_legbot_pipeline(
     plain fields on the same result dict/log events this design already
     specifies, not a separate metrics store.
 
+    Bounded concurrency: up to `SyncSettings.session_pipeline_concurrency`
+    (default 4, env `SESSION_PIPELINE_CONCURRENCY`) bills' own _process_bill
+    calls run at once, not strictly one at a time -- see that setting's own
+    docstring and this module's own docstring for why. `session_pipeline_
+    bill_complete` is still logged per-bill, as each one actually finishes
+    (interleaved under concurrency, not batched at the end).
+
     Returns:
         {
             "bills_considered": int,   # how many candidates were actually looked at
             "bills_processed": int,    # always equal to bills_considered today
-                                        # (no concurrency, no early-abort reason exists)
+                                        # (no early-abort reason exists)
             "truncated": bool,         # True if more bills exist beyond bills_considered
             "duration_seconds": float, # whole-run wall-clock time
             "peak_memory_mb": float,   # this process' peak RSS so far, at run end
-            "results": [               # one entry per bill, in the order processed
+            "results": [               # one entry per bill, in candidate order
+                                        # (asyncio.gather preserves input order
+                                        # regardless of completion order under
+                                        # concurrency)
                 {
                     "gov_id": str,
                     "artifacts_generated": [str],
@@ -416,21 +436,40 @@ async def run_legbot_pipeline(
     candidates = candidates[:limit]
     bills_considered = len(candidates)
 
-    results = []
-    for candidate in candidates:
-        bill_result = await _process_bill(
-            candidate,
-            jurisdiction_iso2=jurisdiction_iso2,
-            session_code=session_code,
-            artifact_types=artifact_types,
-            include_org_research=include_org_research,
-            dry_run=dry_run,
-            run_id=run_id,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
-        results.append(bill_result)
+    # Bounded concurrency (2026-08-18): several bills' own _process_bill
+    # calls run at once instead of strictly one at a time, up to
+    # session_pipeline_concurrency -- see this module's own docstring and
+    # that setting's docstring for why a caller that only ever has one
+    # request in flight can never exercise ddp-agents' AGENTS-33/34 MLX
+    # instance pool at all. A semaphore, not a bare asyncio.gather over
+    # every candidate at once: _process_bill() fires several non-MLX HTTP
+    # calls per bill (broker coverage check, OpenStates lookups,
+    # ensure_bill_exists) that a genuinely unbounded fan-out would send all
+    # at once for however many bills a session has -- potentially thousands
+    # -- for no throughput benefit once only a handful of MLX-LM instances
+    # can usefully be busy at the same time.
+    semaphore = asyncio.Semaphore(get_settings().session_pipeline_concurrency)
+
+    async def _process_bill_bounded(candidate: dict) -> dict:
+        async with semaphore:
+            bill_result = await _process_bill(
+                candidate,
+                jurisdiction_iso2=jurisdiction_iso2,
+                session_code=session_code,
+                artifact_types=artifact_types,
+                include_org_research=include_org_research,
+                dry_run=dry_run,
+                run_id=run_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        # Outside the semaphore's `async with` -- release this bill's slot
+        # for the next queued one as soon as the real work finishes, rather
+        # than holding it through this log call too.
         logger.info("session_pipeline_bill_complete", run_id=run_id, **bill_result)
+        return bill_result
+
+    results = list(await asyncio.gather(*(_process_bill_bounded(c) for c in candidates)))
 
     summary = {
         "bills_considered": bills_considered,
