@@ -391,9 +391,43 @@ async def test_ensure_called_when_archived_text_exists_and_dispatch_proceeds():
     assert call_kwargs["title"] == "Save our Homes from Excessive Property Taxes"
     assert call_kwargs["chamber_classification"] == "lower"
     assert call_kwargs["jurisdiction_classification"] == "state"
+    assert call_kwargs["bill_openstates_id"] == "a3afb726-0000-0000-0000-000000000001"
     bill_result = result["results"][0]
     assert bill_result["artifacts_generated"] == ["bill_summary"]
     assert bill_result["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_called_with_each_bills_own_openstates_id_not_a_stale_one():
+    """SYNC-22 (PLAN-local-openstates-migration.md §3.6, BROKER-81's paired
+    fix): ensure_bill_exists must be called with EACH candidate's own
+    bill_openstates_id, never a hardcoded, stale, or leaked-from-a-previous-
+    iteration value -- without this, ddp-broker-py has no way to backfill
+    primary_openstates_id on the stub it creates/matches, so a later Voatz/
+    Webflow curation pass can't match its own OpenStates lookup back to the
+    stub and creates a duplicate Bill row instead of promoting this one.
+    Two candidates in the same run (rather than one) is what actually rules
+    out a loop-variable/closure bug that a single-candidate case can't
+    catch."""
+    candidate_a = {**_CANDIDATE, "gov_id": "SJR 2F", "bill_openstates_id": "aaaaaaaa-1111-1111-1111-111111111111"}
+    candidate_b = {**_CANDIDATE, "gov_id": "HB 100", "bill_openstates_id": "bbbbbbbb-2222-2222-2222-222222222222"}
+    with _patch_lister([candidate_a, candidate_b]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
+         patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10)
+
+    assert mock_ensure.await_count == 2
+    # Pair by gov_id (also passed on the same call) rather than just
+    # comparing the two id sets -- this is what actually catches a swap
+    # (each id correct in isolation, but attached to the wrong bill).
+    ids_by_gov_id = {call.kwargs["gov_id"]: call.kwargs["bill_openstates_id"] for call in mock_ensure.await_args_list}
+    assert ids_by_gov_id == {
+        "SJR 2F": "aaaaaaaa-1111-1111-1111-111111111111",
+        "HB 100": "bbbbbbbb-2222-2222-2222-222222222222",
+    }
 
 
 @pytest.mark.asyncio
