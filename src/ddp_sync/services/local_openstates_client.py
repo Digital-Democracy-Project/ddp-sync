@@ -506,6 +506,7 @@ async def list_current_session_bill_candidates(
     # was confirmed as a real, reproducible cause on its own.
     candidates: list[dict] = []
     seen_bill_openstates_ids: set[str] = set()
+    duplicates_dropped = 0
     page = 1
     per_page = str(min(_API_V3_MAX_PER_PAGE, limit))
     while len(candidates) < limit:
@@ -551,6 +552,7 @@ async def list_current_session_bill_candidates(
             if not gov_id or not bill_openstates_id:
                 continue
             if bill_openstates_id in seen_bill_openstates_ids:
+                duplicates_dropped += 1
                 continue
             seen_bill_openstates_ids.add(bill_openstates_id)
             sources = bill.get("sources") or []
@@ -567,5 +569,20 @@ async def list_current_session_bill_candidates(
         if page >= max_page or len(candidates) >= limit:
             break
         page += 1
+
+    if duplicates_dropped:
+        # Surfaces the residual api-v3 sort-tie case (no secondary
+        # tiebreaker key on its default sort) even after the per_page fix
+        # above -- dedup silently returning fewer than `limit` unique
+        # candidates, with no other signal that api-v3's own pagination is
+        # still occasionally unstable, would otherwise be invisible.
+        logger.warning(
+            "list_current_session_bill_candidates dropped duplicate "
+            "candidates across pages",
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=resolved_session_code,
+            duplicates_dropped=duplicates_dropped,
+            unique_candidates=len(candidates),
+        )
 
     return candidates[:limit]
