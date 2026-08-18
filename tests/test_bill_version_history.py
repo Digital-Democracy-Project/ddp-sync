@@ -766,6 +766,266 @@ async def test_broker_read_failure_skips_this_bill_without_crashing():
 
 
 # ---------------------------------------------------------------------------
+# SYNC-26: backfilling missing older versions on first sighting
+# ---------------------------------------------------------------------------
+
+async def test_backfills_missing_older_versions_on_first_sighting():
+    """A fast-moving bill's first-ever sighting can already be several
+    versions ahead (Filed -> e1 -> er between polls) -- every version other
+    than the latest (written separately, at the end of the normal flow)
+    must get its own ledger-only BillVersion row here, or
+    bill_changelog's compare_version FK can never resolve them later."""
+    svc = _make_service()
+
+    mock_ingest = _make_ingest_result(4)
+    mock_pipeline = AsyncMock()
+    mock_pipeline.ingest_document = AsyncMock(return_value=mock_ingest)
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+    mock_redis.publish = AsyncMock(return_value=0)
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
+
+    bill_data = {
+        "id": "ocd-bill/fast-mover-1234",
+        "versions": [
+            {"date": "2026-08-01", "note": "Filed", "links": []},
+            {"date": "2026-08-05", "note": "e1", "links": [{"url": "https://example.gov/e1.pdf", "media_type": "application/pdf"}]},
+            {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
+        ],
+    }
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.get_latest_bill_version", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "content"))),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._generate_and_ingest_changelog", new=AsyncMock(return_value=(0, True, "no_old_url"))),
+    ):
+        await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Fast Mover",
+            jurisdiction_code="FL",
+            bill_data=bill_data,
+            bill_slug="fast-mover",
+            fields={"session-code": "2026E"},
+        )
+
+    # 2 backfilled (Filed, e1) + 1 normal final write for the latest (er).
+    assert mock_write_bill_version.await_count == 3
+    written_notes = {call.kwargs["version_note"] for call in mock_write_bill_version.await_args_list}
+    assert written_notes == {"Filed", "e1", "er"}
+    backfill_calls = [
+        call for call in mock_write_bill_version.await_args_list
+        if call.kwargs["version_note"] in ("Filed", "e1")
+    ]
+    for call in backfill_calls:
+        assert call.kwargs["bill_openstates_id"] == "fast-mover-1234"
+        assert call.kwargs["jurisdiction"] == "FL"
+        assert call.kwargs["session_code"] == "2026E"
+        # Ledger-only -- no ingestion happened for the older versions.
+        assert call.kwargs.get("chunk_count", 0) == 0
+        assert call.kwargs.get("pinecone_ingested", False) is False
+
+
+async def test_no_backfill_when_bill_already_previously_cached():
+    """A bill ddp-sync has already seen before (cached is not None) must
+    not trigger the first-sighting backfill -- only a genuinely new
+    version's own normal write happens, exactly as before SYNC-26."""
+    svc = _make_service()
+
+    mock_ingest = _make_ingest_result(4)
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+    mock_redis.publish = AsyncMock(return_value=0)
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
+
+    bill_data = {
+        "id": "ocd-bill/already-seen-1234",
+        "versions": [
+            {"date": "2026-08-01", "note": "Filed", "links": []},
+            {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
+        ],
+    }
+    cached = {"version_date": "2026-08-01", "version_note": "Filed", "text_url": "", "chunk_count": 0}
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.get_latest_bill_version", new=AsyncMock(return_value=cached)),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "content"))),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._generate_and_ingest_changelog", new=AsyncMock(return_value=(0, True, "no_old_url"))),
+    ):
+        await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Already Seen",
+            jurisdiction_code="FL",
+            bill_data=bill_data,
+            bill_slug="already-seen",
+            fields={"session-code": "2026E"},
+        )
+
+    # Only the normal final write for the newly-detected "er" version --
+    # no backfill attempt, since this bill wasn't a first sighting.
+    mock_write_bill_version.assert_awaited_once()
+    assert mock_write_bill_version.await_args.kwargs["version_note"] == "er"
+
+
+async def test_no_backfill_when_first_sighting_has_only_one_version():
+    """A first sighting with only a single version has nothing to backfill
+    -- must not attempt a spurious write for a version that doesn't exist."""
+    svc = _make_service()
+
+    mock_ingest = _make_ingest_result(4)
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+    mock_redis.publish = AsyncMock(return_value=0)
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
+
+    bill_data = {
+        "id": "ocd-bill/single-version-1234",
+        "versions": [{"date": "2026-08-01", "note": "Filed", "links": [{"url": "https://example.gov/filed.pdf", "media_type": "application/pdf"}]}],
+    }
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.get_latest_bill_version", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "content"))),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._generate_and_ingest_changelog", new=AsyncMock(return_value=(0, True, "no_old_url"))),
+    ):
+        await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Single Version",
+            jurisdiction_code="FL",
+            bill_data=bill_data,
+            bill_slug="single-version",
+            fields={"session-code": "2026E"},
+        )
+
+    mock_write_bill_version.assert_awaited_once()
+    assert mock_write_bill_version.await_args.kwargs["version_note"] == "Filed"
+
+
+async def test_backfill_one_bad_version_does_not_block_the_others():
+    """A BrokerClientError backfilling one older version must not prevent
+    the other older versions (or the normal final write for latest) from
+    still being attempted -- best-effort, not all-or-nothing."""
+    from ddp_sync.services.broker_client import BrokerClientError
+
+    svc = _make_service()
+
+    mock_redis = AsyncMock()
+    mock_redis.set_bill_version = AsyncMock()
+    mock_redis.publish = AsyncMock(return_value=0)
+
+    async def _write_side_effect(**kwargs):
+        if kwargs["version_note"] == "e1":
+            raise BrokerClientError("ddp-broker-py rejected the write")
+        return {"id": 1, "created": True}
+
+    mock_write_bill_version = AsyncMock(side_effect=_write_side_effect)
+
+    bill_data = {
+        "id": "ocd-bill/partial-fail-1234",
+        "versions": [
+            {"date": "2026-08-01", "note": "Filed", "links": []},
+            {"date": "2026-08-05", "note": "e1", "links": []},
+            {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
+        ],
+    }
+
+    with (
+        patch("ddp_sync.services.redis_store.get_redis_store", return_value=mock_redis),
+        patch("ddp_sync.services.broker_client.get_latest_bill_version", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_text", new=AsyncMock(return_value=(4, "content"))),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._delete_surplus_chunks", new=AsyncMock(return_value=0)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._ingest_bill_history", new=AsyncMock(return_value=4)),
+        patch("ddp_sync.pipelines.bill_version.BillVersionSyncService._generate_and_ingest_changelog", new=AsyncMock(return_value=(0, True, "no_old_url"))),
+    ):
+        await svc.check_and_reingest_version(
+            webflow_id="webflow123",
+            bill_title="Partial Fail",
+            jurisdiction_code="FL",
+            bill_data=bill_data,
+            bill_slug="partial-fail",
+            fields={"session-code": "2026E"},
+        )
+
+    # Filed backfilled, e1 attempted-but-failed, er's own normal write still happened.
+    written_notes = {call.kwargs["version_note"] for call in mock_write_bill_version.await_args_list}
+    assert written_notes == {"Filed", "e1", "er"}
+
+
+async def test_backfill_excludes_latest_by_natural_key_not_object_identity():
+    """_backfill_missing_versions must skip `latest_version` by matching
+    (date, note), not by Python object identity -- a caller that resolves
+    latest_version independently (e.g. a freshly-constructed dict with the
+    same values, not the exact same object _get_latest_version happened to
+    return) must still get the same correct exclusion, not an accidental
+    duplicate backfill of the latest version itself."""
+    mock_write_bill_version = AsyncMock(return_value={"id": 1, "created": True})
+
+    versions = [
+        {"date": "2026-08-01", "note": "Filed", "links": []},
+        {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]},
+    ]
+    # A distinct dict object, not `versions[1]` itself, but equal by (date, note).
+    latest_version_copy = {"date": "2026-08-10", "note": "er", "links": [{"url": "https://example.gov/er.pdf", "media_type": "application/pdf"}]}
+    assert latest_version_copy is not versions[1]
+
+    with patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version):
+        backfilled = await BillVersionSyncService._backfill_missing_versions(
+            bill_openstates_id="natural-key-test",
+            jurisdiction_code="FL",
+            session_code="2026E",
+            versions=versions,
+            latest_version=latest_version_copy,
+        )
+
+    mock_write_bill_version.assert_awaited_once()
+    assert mock_write_bill_version.await_args.kwargs["version_note"] == "Filed"
+    assert backfilled == 1
+
+
+async def test_backfill_return_count_excludes_already_present_versions():
+    """The returned count reflects versions actually newly created
+    (create=True), not just attempted -- a version write_bill_version
+    reports as already-present (create=False) shouldn't inflate it."""
+    async def _write_side_effect(**kwargs):
+        if kwargs["version_note"] == "Filed":
+            return {"id": 1, "created": False}  # already recorded previously
+        return {"id": 2, "created": True}
+
+    mock_write_bill_version = AsyncMock(side_effect=_write_side_effect)
+
+    versions = [
+        {"date": "2026-08-01", "note": "Filed", "links": []},
+        {"date": "2026-08-05", "note": "e1", "links": []},
+        {"date": "2026-08-10", "note": "er", "links": []},
+    ]
+
+    with patch("ddp_sync.services.broker_client.write_bill_version", new=mock_write_bill_version):
+        backfilled = await BillVersionSyncService._backfill_missing_versions(
+            bill_openstates_id="count-test",
+            jurisdiction_code="FL",
+            session_code="2026E",
+            versions=versions,
+            latest_version=versions[2],  # "er"
+        )
+
+    # Both "Filed" and "e1" were attempted; only "e1" was actually new.
+    assert mock_write_bill_version.await_count == 2
+    assert backfilled == 1
+
+
+# ---------------------------------------------------------------------------
 # Batch result counters
 # ---------------------------------------------------------------------------
 
