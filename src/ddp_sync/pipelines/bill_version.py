@@ -778,6 +778,12 @@ class BillVersionSyncService:
                     version_note=version_note,
                     text_url=text_url,
                     media_type=media_type,
+                    # Explicit, not relied-on-as-defaults -- self-documents
+                    # the ledger-only contract this method's own docstring
+                    # describes, rather than depending on write_bill_version's
+                    # signature never changing its own defaults.
+                    chunk_count=0,
+                    pinecone_ingested=False,
                 )
                 if write_result.get("created"):
                     backfilled += 1
