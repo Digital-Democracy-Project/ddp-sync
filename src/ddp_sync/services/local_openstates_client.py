@@ -589,6 +589,8 @@ async def list_current_session_bill_candidates(
             session_code=resolved_session_code,
             duplicates_dropped=duplicates_dropped,
             unique_candidates=len(candidates),
+            requested_limit=limit,
+            pages_fetched=page,
         )
 
     return candidates[:limit]

@@ -383,7 +383,55 @@ async def test_dropped_duplicates_are_logged_for_observability():
         session_code="2026",
         duplicates_dropped=1,
         unique_candidates=21,
+        requested_limit=25,
+        pages_fetched=2,
     )
+
+
+@pytest.mark.asyncio
+async def test_underfills_limit_even_when_enough_unique_bills_exist_regression():
+    """Sharper than the displaced-bill test above: here total_items(25)
+    equals `limit`(25) exactly, so enough real, distinct bills exist to
+    fully satisfy the request -- yet a page-2 duplicate still causes the
+    returned list to fall short of `limit`. Page 1 returns a full 20 (ids
+    0-19); page 2, at max_page (ceil(25/20)=2), returns only 5 more items
+    (ids 20-23 plus a repeat of id 19) -- one real bill (id 24) is
+    displaced by the tie and never observed, so the result has 24 unique
+    candidates, not the 25 that actually exist and that `limit` asked for."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 25},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": "ocd-bill/19", "identifier": "HB 19", "sources": []},
+            {"id": "ocd-bill/20", "identifier": "HB 20", "sources": []},
+            {"id": "ocd-bill/21", "identifier": "HB 21", "sources": []},
+            {"id": "ocd-bill/22", "identifier": "HB 22", "sources": []},
+            {"id": "ocd-bill/23", "identifier": "HB 23", "sources": []},
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 25},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    bill_openstates_ids = [c["bill_openstates_id"] for c in result]
+    assert len(result) == 24  # 25 real bills exist and were asked for; only 24 observed
+    assert "24" not in bill_openstates_ids  # displaced -- never fetched at all
+    assert bill_openstates_ids.count("19") == 1
 
 
 @pytest.mark.asyncio
