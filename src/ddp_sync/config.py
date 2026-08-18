@@ -191,15 +191,34 @@ class SyncSettings:
     # ever has one request in flight can never trigger that pool's scale-up
     # at all, regardless of how much memory or how many bills are queued --
     # defeating the whole point of building it for bulk session backfills.
-    # Default of 4 mirrors CAMS's own WorkerPool worker count (AGENTS-26) --
-    # a reasonable standalone anchor since ddp-sync and ddp-agents are
-    # separate services with no shared config today. Does NOT by itself
-    # resolve the still-open Phase 8 concern (prioritizing this batch
-    # pipeline's own concurrency against Agent Smith's interactive traffic
-    # specifically) -- it fixes "bills stack up one at a time no matter what
-    # capacity exists," not "this batch job might still contend with
-    # interactive traffic under real load."
-    session_pipeline_concurrency: int = 4
+    #
+    # Default is 1 (AGENTS-37, 2026-08-18) -- NOT the 4 this setting first
+    # shipped with. The very first real dispatch run under concurrency=4
+    # (FL's 2026E session, 20 bills) found that value actively harmful on
+    # real hardware: LEGBOT_MLX_MAX_INSTANCES was configured at 3 (one below
+    # 4, so the pool was oversubscribed from the first request), and worse,
+    # the 3 real MLX-LM instances that did run concurrently thrashed rather
+    # than parallelized -- per-bill bill_summary generation went from a
+    # 30-50s single-instance sequential baseline to 20-47+ minutes under
+    # 3-way concurrent load, a 20-50x slowdown. Confirmed directly against
+    # dev ddp-broker-py's own database: zero new BillArtifact rows landed
+    # from that run. This matches a risk ddp-agents' own AGENTS-30/33 design
+    # docs already flagged as open ("not yet live-validated against real
+    # Metal/GPU hardware") -- this was that validation, and the result was
+    # bad. Until real concurrent MLX-LM throughput on the target hardware is
+    # actually benchmarked and shown safe, defaulting to genuinely sequential
+    # behavior (1) is the only value known not to make things worse than the
+    # pre-concurrency baseline. Operators may still opt into a higher value
+    # via SESSION_PIPELINE_CONCURRENCY once that validation happens -- this
+    # is a default change, not a removal of the configurability itself.
+    #
+    # Does NOT by itself resolve the still-open Phase 8 concern
+    # (prioritizing this batch pipeline's own concurrency against Agent
+    # Smith's interactive traffic specifically), nor the still-open question
+    # of whether legbot_dispatch_timeout_seconds should change given real
+    # per-instance latency can apparently exceed 20 minutes under
+    # contention -- both remain open, tracked on AGENTS-37.
+    session_pipeline_concurrency: int = 1
 
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
@@ -297,7 +316,7 @@ def _load_from_env() -> dict:
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
-        "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "4")),
+        "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
     }
 
 
