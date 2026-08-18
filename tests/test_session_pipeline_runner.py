@@ -420,8 +420,14 @@ async def test_ensure_called_with_each_bills_own_openstates_id_not_a_stale_one()
         await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10)
 
     assert mock_ensure.await_count == 2
-    called_ids = {call.kwargs["bill_openstates_id"] for call in mock_ensure.await_args_list}
-    assert called_ids == {"aaaaaaaa-1111-1111-1111-111111111111", "bbbbbbbb-2222-2222-2222-222222222222"}
+    # Pair by gov_id (also passed on the same call) rather than just
+    # comparing the two id sets -- this is what actually catches a swap
+    # (each id correct in isolation, but attached to the wrong bill).
+    ids_by_gov_id = {call.kwargs["gov_id"]: call.kwargs["bill_openstates_id"] for call in mock_ensure.await_args_list}
+    assert ids_by_gov_id == {
+        "SJR 2F": "aaaaaaaa-1111-1111-1111-111111111111",
+        "HB 100": "bbbbbbbb-2222-2222-2222-222222222222",
+    }
 
 
 @pytest.mark.asyncio
