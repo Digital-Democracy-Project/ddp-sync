@@ -582,6 +582,9 @@ async def test_current_version_identity_picks_latest_and_title():
             {"note": "Introduced", "date": "2026-01-01", "links": []},
             {"note": "Engrossed", "date": "2026-02-01", "links": []},
         ],
+        # SYNC-21: read for chamber_classification/jurisdiction_classification below.
+        "from_organization": {"classification": "lower", "id": "org-1", "name": "House"},
+        "jurisdiction": {"classification": "state", "name": "Florida"},
     }
     mock_client.get = AsyncMock(return_value=response)
 
@@ -595,7 +598,35 @@ async def test_current_version_identity_picks_latest_and_title():
         "version_date": "2026-02-01",
         "version_note": "Engrossed",
         "bill_title": "Save our Homes from Excessive Property Taxes",
+        "chamber_classification": "lower",
+        "jurisdiction_classification": "state",
     }
+
+
+@pytest.mark.asyncio
+async def test_current_version_identity_classification_keys_default_empty_when_absent():
+    """SYNC-21: chamber_classification/jurisdiction_classification are
+    additive keys -- a response that doesn't have from_organization/
+    jurisdiction at all (shouldn't happen in practice, but this function
+    never raises on a missing field) must still return the two keys as
+    empty strings, not omit them or raise a KeyError/AttributeError."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "title": "A bill",
+        "versions": [{"note": "Introduced", "date": "2026-01-01", "links": []}],
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_current_version_identity("some-uuid")
+
+    assert result["chamber_classification"] == ""
+    assert result["jurisdiction_classification"] == ""
 
 
 @pytest.mark.asyncio

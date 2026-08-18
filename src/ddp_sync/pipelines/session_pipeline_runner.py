@@ -49,10 +49,12 @@ from ddp_sync.pipelines.bill_organization_position_research import (
 )
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    ensure_bill_exists,
     get_bill_artifacts,
     get_bill_organization_positions_status,
 )
 from ddp_sync.services.local_openstates_client import (
+    get_archived_bill_text,
     get_current_version_identity,
     list_current_session_bill_candidates,
 )
@@ -155,6 +157,56 @@ async def _process_bill(
     version = None
     if needs_dispatch or include_org_research:
         version = await get_current_version_identity(bill_openstates_id)
+
+    # SYNC-21 (PLAN-local-openstates-migration.md §3.6): make sure a Bill row
+    # exists in ddp-broker-py before dispatching any real LegBot analysis for
+    # this bill -- write_bill_artifact/write_bill_organization_position only
+    # ever attach to an EXISTING Bill row, by design, so without this a real
+    # dispatch's output is silently discarded for any bill Voatz/Webflow
+    # hasn't already brought in. `version is not None` here already implies
+    # needs_dispatch or include_org_research was true above (version is only
+    # ever resolved in that case) -- this bill was never going to be
+    # skipped, so `ensure` is worth attempting.
+    #
+    # get_archived_bill_text below is a NEW, additional call, purely as a
+    # gate -- generate_and_store_bill_artifact's own internal per-artifact-
+    # type archived-text check (_resolve_bill_source) is completely
+    # unchanged and still runs exactly as it does today. A bill with version
+    # metadata but no archived text yet (most jurisdictions besides FL,
+    # today) must never trigger `ensure` or get a stub created for it --
+    # placing this check any earlier (e.g. right after
+    # get_current_version_identity, before confirming text is actually
+    # archived) would do exactly that for most non-FL bills in a session.
+    if not dry_run and version is not None:
+        archived_text = await get_archived_bill_text(bill_openstates_id)
+        if archived_text:
+            try:
+                await ensure_bill_exists(
+                    jurisdiction=jurisdiction_iso2,
+                    session_code=session_code,
+                    gov_id=gov_id,
+                    title=version["bill_title"],
+                    chamber_classification=version["chamber_classification"],
+                    jurisdiction_classification=version["jurisdiction_classification"],
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
+                )
+            except BrokerClientError as exc:
+                # Prevents this bill's LegBot dispatch entirely (both
+                # artifact generation and org research below) -- a stable,
+                # named result category distinct from artifacts_failed's
+                # per-artifact-type failures, so a systemic problem (the
+                # broker endpoint itself down/misconfigured -- every bill in
+                # the run would show this same reason) reads differently
+                # from a handful of bills each individually lacking archived
+                # text.
+                logger.warning(
+                    "session_pipeline_ensure_bill_failed",
+                    run_id=run_id, gov_id=gov_id, error=str(exc),
+                )
+                result["error"] = f"ensure_failed: {exc}"
+                result["duration_seconds"] = round(time.monotonic() - bill_started, 3)
+                return result
 
     for artifact_type in needs_dispatch:
         if dry_run:

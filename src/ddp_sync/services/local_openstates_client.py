@@ -176,11 +176,21 @@ async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
     already computes twice elsewhere, just exposing different fields off it.
 
     Returns:
-        {"version_date": str, "version_note": str, "bill_title": str} if the
-        bill has at least one version archived, else None -- same
+        {"version_date": str, "version_note": str, "bill_title": str,
+        "chamber_classification": str, "jurisdiction_classification": str} if
+        the bill has at least one version archived, else None -- same
         never-abort posture as get_archived_bill_text: a caller that can't
         resolve this for one bill should skip that bill for this run, not
         abort the whole batch.
+
+        chamber_classification/jurisdiction_classification (SYNC-21,
+        PLAN-local-openstates-migration.md §3.6): additive keys, read off the
+        same already-parsed `data` this function's other fields already come
+        from (`data["from_organization"]["classification"]` /
+        `data["jurisdiction"]["classification"]` -- the same two fields
+        ddp-broker-py's OpenStatesService._get_chamber_for_bill reads off its
+        own bill_data object) -- no new network call, no change to any
+        existing key, so every existing caller is unaffected.
     """
     settings = get_settings()
     if not settings.local_openstates_api_base:
@@ -233,6 +243,8 @@ async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
         "version_date": latest.get("date", ""),
         "version_note": latest.get("note", ""),
         "bill_title": data.get("title", ""),
+        "chamber_classification": (data.get("from_organization") or {}).get("classification", ""),
+        "jurisdiction_classification": (data.get("jurisdiction") or {}).get("classification", ""),
     }
 
 

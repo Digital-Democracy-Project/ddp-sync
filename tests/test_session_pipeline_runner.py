@@ -28,6 +28,8 @@ _VERSION_IDENTITY = {
     "version_date": "2026-06-01",
     "version_note": "c1",
     "bill_title": "Save our Homes from Excessive Property Taxes",
+    "chamber_classification": "lower",
+    "jurisdiction_classification": "state",
 }
 
 
@@ -56,6 +58,39 @@ def _patch_version(result=_VERSION_IDENTITY):
     return patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_current_version_identity",
         new=AsyncMock(return_value=result),
+    )
+
+
+def _patch_archived_text(result=None):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_archived_bill_text",
+        new=AsyncMock(return_value=result),
+    )
+
+
+def _patch_ensure(result=None, side_effect=None):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.ensure_bill_exists",
+        new=AsyncMock(
+            return_value=result if result is not None else {"bill_id": 1, "created": True},
+            side_effect=side_effect,
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_no_archived_text(monkeypatch):
+    """SYNC-21: every pre-existing test in this file predates the new
+    get_archived_bill_text-gated ensure_bill_exists call in _process_bill.
+    Default every test here to "no archived text" (the common case for
+    every jurisdiction but FL today) so `ensure` is never attempted unless a
+    test explicitly overrides this via _patch_archived_text(...) -- keeps
+    every pre-existing test's dispatch behavior unchanged, since a bill
+    without archived text never triggers `ensure` per this ticket's own
+    design (PLAN-local-openstates-migration.md §3.6)."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.session_pipeline_runner.get_archived_bill_text",
+        AsyncMock(return_value=None),
     )
 
 
@@ -332,6 +367,132 @@ async def test_missing_version_identity_fails_the_needed_artifacts_not_the_whole
     bill_result = result["results"][0]
     assert bill_result["artifacts_failed"] == ["bill_summary"]
     assert bill_result["error"] is None
+
+
+# --- SYNC-21: ensure_bill_exists gating (PLAN-local-openstates-migration.md §3.6) ---
+
+@pytest.mark.asyncio
+async def test_ensure_called_when_archived_text_exists_and_dispatch_proceeds():
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
+         patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10
+        )
+
+    mock_ensure.assert_awaited_once()
+    call_kwargs = mock_ensure.await_args.kwargs
+    assert call_kwargs["jurisdiction"] == "fl"
+    assert call_kwargs["session_code"] == "2026F"
+    assert call_kwargs["gov_id"] == "SJR 2F"
+    assert call_kwargs["title"] == "Save our Homes from Excessive Property Taxes"
+    assert call_kwargs["chamber_classification"] == "lower"
+    assert call_kwargs["jurisdiction_classification"] == "state"
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_not_called_when_no_archived_text_yet():
+    """The sharpest version of the "don't stub a skipped bill" AC: version
+    metadata resolves fine (the common case for every jurisdiction but FL
+    today has this), but there's no archived text yet -- `ensure` must never
+    be attempted, and dispatch must still proceed normally via the existing
+    live-fetch fallback (this new gate doesn't block artifact dispatch
+    itself, only the new `ensure` call)."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text(None), _patch_ensure() as mock_ensure, \
+         patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10
+        )
+
+    mock_ensure.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_not_called_when_bill_is_already_fully_covered():
+    """A bill this run skips for any other ordinary reason (already fully
+    covered, nothing needs dispatch, org research not requested) must never
+    trigger `ensure` either -- version is never even resolved in that case,
+    confirming this gate's placement doesn't create rows for bills the
+    pipeline was never going to process anyway."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
+    ), _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10
+        )
+
+    mock_ensure.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_not_called_when_version_identity_fails():
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(None), \
+         _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
+         _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10
+        )
+
+    mock_ensure.assert_not_awaited()
+    assert result["results"][0]["artifacts_failed"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_never_called_under_dry_run():
+    """dry_run's whole contract is zero side effects -- creating a real Bill
+    row is a side effect, so `ensure` must be skipped under dry_run exactly
+    like every other dispatch already is, even when archived text exists."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
+         _patch_org_status({"has_rows": False, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10, dry_run=True
+        )
+
+    mock_ensure.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_failure_prevents_dispatch_and_org_research_with_its_own_error_category():
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_archived_text("the actual bill text"), \
+         _patch_ensure(side_effect=BrokerClientError("broker down")), \
+         patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
+        new=AsyncMock(),
+    ) as mock_org, _patch_org_status({"has_rows": False, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10
+        )
+
+    mock_artifact.assert_not_awaited()
+    mock_org.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["error"] == "ensure_failed: broker down"
+    # Distinct from artifacts_failed -- a systemic ensure failure (the
+    # broker endpoint down) must read differently from a per-artifact-type
+    # dispatch failure.
+    assert bill_result["artifacts_failed"] == []
+    assert bill_result["artifacts_generated"] == []
 
 
 # --- org research ------------------------------------------------------

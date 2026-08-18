@@ -12,6 +12,10 @@ PLAN-bill-concept-polling.md Phase 0.
   pair for ConceptStatementSet (PLAN-bill-concept-polling.md §0.3, built in
   ddp-broker-py PR #247) — see ddp_sync.pipelines.concept_statement_dispatch
   for the caller.
+- ensure_bill_exists: SYNC-21/BROKER-80 (PLAN-local-openstates-migration.md
+  §3.6) — the one write allowed to CREATE a Bill row (as an untracked
+  stub), called by session_pipeline_runner._process_bill before dispatching
+  real LegBot analysis for a bill Voatz/Webflow hasn't already brought in.
 
 Goes through ddp-broker-py's HTTP API rather than a direct DB connection —
 ddp-broker-py owns BillVersion/BillArtifact/ConceptStatementSet; this is a
@@ -149,6 +153,92 @@ async def write_bill_artifact(
         bill_openstates_id=bill_openstates_id,
         artifact_type=artifact_type,
         artifact_id=result.get("id"),
+        created=result.get("created"),
+    )
+    return result
+
+
+async def ensure_bill_exists(
+    *,
+    jurisdiction: str,
+    session_code: str,
+    gov_id: str,
+    title: str,
+    chamber_classification: str,
+    jurisdiction_classification: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Make sure a Bill row exists in ddp-broker-py, creating a minimal
+    untracked stub if not -- SYNC-21/BROKER-80
+    (ddp-infra PLAN-local-openstates-migration.md §3.6).
+
+    write_bill_artifact/write_bill_organization_position only ever attach to
+    an EXISTING Bill row, by design -- this is the one call allowed to
+    create one, so a full-session LegBot run isn't silently discarding real
+    analysis output for every bill Voatz/Webflow hasn't already brought in.
+    The row this creates is `tracked=False`, staying exactly as invisible to
+    the curated GET /api/bills/ site and the scorecard pipeline as an
+    OpenStates-discovered companion bill already is today; Voatz's or
+    Webflow's own existing logic promotes it to tracked=True later if/when
+    either independently brings the same bill in, with no special handling
+    needed on either side (verified directly against both call sites during
+    this design's own review).
+
+    broker_api_base/broker_api_token: optional per-call override, same shape
+    as write_bill_artifact's identical parameters.
+
+    Returns:
+        {"bill_id": int, "created": bool} as ddp-broker-py reports it.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request (chamber_
+            classification/jurisdiction_classification or session_code
+            didn't resolve) or was unreachable -- callers treat this as an
+            ordinary, expected failure mode (see SYNC-21's own
+            "ensure_failed" result category), not a special case.
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot ensure Bill exists."
+        )
+
+    payload = {
+        "jurisdiction": jurisdiction,
+        "session_code": session_code,
+        "gov_id": gov_id,
+        "title": title,
+        "chamber_classification": chamber_classification,
+        "jurisdiction_classification": jurisdiction_classification,
+    }
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{resolved_api_base}/api/bills/ensure/",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the ensure-bill-exists request "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    logger.info(
+        "Bill ensured",
+        gov_id=gov_id,
+        jurisdiction=jurisdiction,
+        session_code=session_code,
+        bill_id=result.get("bill_id"),
         created=result.get("created"),
     )
     return result
