@@ -751,7 +751,7 @@ class BillVersionSyncService:
         Returns the number of versions actually newly created (matches
         write_bill_version's own create=True/False, not just attempted).
         """
-        from ddp_sync.services.broker_client import BrokerClientError, write_bill_version
+        from ddp_sync.services.broker_client import write_bill_version
 
         # Compared by natural key (date, note) -- the same key
         # write_bill_version itself upserts on -- rather than object
@@ -767,9 +767,9 @@ class BillVersionSyncService:
             version_note = version.get("note", "")
             if not version_note:
                 continue
-            url_info = BillVersionSyncService._get_best_text_url(version)
-            text_url, media_type = url_info if url_info else ("", "")
             try:
+                url_info = BillVersionSyncService._get_best_text_url(version)
+                text_url, media_type = url_info if url_info else ("", "")
                 write_result = await write_bill_version(
                     bill_openstates_id=bill_openstates_id,
                     jurisdiction=jurisdiction_code,
@@ -781,7 +781,12 @@ class BillVersionSyncService:
                 )
                 if write_result.get("created"):
                     backfilled += 1
-            except BrokerClientError as e:
+            except Exception as e:
+                # Broad on purpose, matching this method's own "never raises"
+                # contract -- an unexpected error here (not just a
+                # BrokerClientError) must not propagate up through
+                # check_and_reingest_version's own BrokerClientError-only
+                # except and block the latest version's own handling below.
                 logger.warning(
                     "SYNC-26: failed to backfill an older BillVersion -- "
                     "changelog generation may still fail for this version pair",
@@ -790,6 +795,13 @@ class BillVersionSyncService:
                     version_note=version_note,
                     error=str(e),
                 )
+
+        logger.info(
+            "SYNC-26: first-sighting version backfill complete",
+            bill_openstates_id=bill_openstates_id,
+            versions_seen=len(versions),
+            versions_backfilled=backfilled,
+        )
         return backfilled
 
     @staticmethod
