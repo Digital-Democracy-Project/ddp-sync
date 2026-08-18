@@ -177,6 +177,30 @@ class SyncSettings:
     # bill's real positions with only a log warning to show for it.
     org_research_max_organizations: int = 500
 
+    # How many bills run_legbot_pipeline (session_pipeline_runner.py)
+    # processes concurrently, instead of one at a time. Bounded, not
+    # unbounded -- _process_bill() also fires several non-MLX HTTP calls per
+    # bill (a broker coverage check, OpenStates version/archived-text
+    # lookups, ensure_bill_exists) that would otherwise all fire at once for
+    # however many bills a session has -- potentially thousands -- for no
+    # real throughput benefit once only a handful of MLX-LM pool instances
+    # (ddp-agents' own LEGBOT_MLX_MAX_INSTANCES) can usefully be busy at the
+    # same time. Added after a real live run confirmed the pipeline was
+    # strictly sequential: with AGENTS-33/34's demand-based, memory-gated
+    # MLX-LM/MLX-VLM instance pool now live in ddp-agents, a caller that only
+    # ever has one request in flight can never trigger that pool's scale-up
+    # at all, regardless of how much memory or how many bills are queued --
+    # defeating the whole point of building it for bulk session backfills.
+    # Default of 4 mirrors CAMS's own WorkerPool worker count (AGENTS-26) --
+    # a reasonable standalone anchor since ddp-sync and ddp-agents are
+    # separate services with no shared config today. Does NOT by itself
+    # resolve the still-open Phase 8 concern (prioritizing this batch
+    # pipeline's own concurrency against Agent Smith's interactive traffic
+    # specifically) -- it fixes "bills stack up one at a time no matter what
+    # capacity exists," not "this batch job might still contend with
+    # interactive traffic under real load."
+    session_pipeline_concurrency: int = 4
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -273,6 +297,7 @@ def _load_from_env() -> dict:
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
+        "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "4")),
     }
 
 

@@ -5,6 +5,8 @@ PLAN-bill-document-provenance.md, "Step 1, scoped version", approved
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -859,3 +861,132 @@ async def test_single_bill_broker_override_defaults_to_none_preserving_batch_beh
     sig = inspect.signature(run_legbot_pipeline)
     assert sig.parameters["broker_api_base"].default is None
     assert sig.parameters["broker_api_token"].default is None
+
+
+# --- bounded concurrency (2026-08-18) ---------------------------------------
+#
+# ddp-agents' AGENTS-33/34 shipped a demand-based, memory-gated MLX-LM/
+# MLX-VLM instance pool specifically so CAMS can scale up under real
+# concurrent load -- but a live run against FL's 2026F session confirmed
+# run_legbot_pipeline drove exactly one _process_bill call at a time no
+# matter how many bills or how much spare memory existed, so that pool could
+# never actually be exercised by this real caller. These tests use a
+# tracking coverage-check stub (the first await inside _process_bill) rather
+# than trying to patch _process_bill itself, since it's a closure-captured
+# call inside run_legbot_pipeline's own local _process_bill_bounded helper.
+
+def _make_candidates(n: int) -> list[dict]:
+    return [
+        dict(_CANDIDATE, gov_id=f"HB {i}", bill_openstates_id=f"id-{i}")
+        for i in range(n)
+    ]
+
+
+def _patch_settings(concurrency: int):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_settings",
+        return_value=SimpleNamespace(session_pipeline_concurrency=concurrency),
+    )
+
+
+@pytest.mark.asyncio
+async def test_bills_are_processed_with_real_concurrency_not_strictly_one_at_a_time():
+    candidates = _make_candidates(4)
+    in_flight = {"count": 0}
+    max_seen = {"value": 0}
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        in_flight["count"] += 1
+        max_seen["value"] = max(max_seen["value"], in_flight["count"])
+        await asyncio.sleep(0.05)
+        in_flight["count"] -= 1
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(4):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True
+        )
+
+    assert max_seen["value"] > 1
+
+
+@pytest.mark.asyncio
+async def test_concurrency_is_capped_at_session_pipeline_concurrency():
+    """6 candidates against a cap of 2 must never let more than 2
+    _process_bill calls have their own coverage check in flight at once --
+    proving the semaphore is a real cap, not just decoration."""
+    candidates = _make_candidates(6)
+    in_flight = {"count": 0}
+    max_seen = {"value": 0}
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        in_flight["count"] += 1
+        max_seen["value"] = max(max_seen["value"], in_flight["count"])
+        await asyncio.sleep(0.05)
+        in_flight["count"] -= 1
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(2):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True
+        )
+
+    assert max_seen["value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_results_preserve_candidate_order_even_when_completion_order_differs():
+    """asyncio.gather preserves input order regardless of completion order --
+    give the FIRST candidate the LONGEST delay and the LAST candidate no
+    delay at all, so a bug that returned results in completion order instead
+    of candidate order would show up as a reversed list here."""
+    candidates = _make_candidates(4)
+    delays = {"HB 0": 0.09, "HB 1": 0.06, "HB 2": 0.03, "HB 3": 0.0}
+
+    async def _staggered_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        await asyncio.sleep(delays[gov_id])
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_staggered_coverage),
+    ), _patch_version(), _patch_settings(4):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True
+        )
+
+    assert [r["gov_id"] for r in result["results"]] == ["HB 0", "HB 1", "HB 2", "HB 3"]
+
+
+@pytest.mark.asyncio
+async def test_concurrency_of_one_is_effectively_sequential():
+    """A cap of 1 is the pre-2026-08-18 behavior this change replaced --
+    confirm it still works (falls back to strictly sequential) rather than
+    the semaphore silently becoming a no-op at the boundary value."""
+    candidates = _make_candidates(3)
+    in_flight = {"count": 0}
+    max_seen = {"value": 0}
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        in_flight["count"] += 1
+        max_seen["value"] = max(max_seen["value"], in_flight["count"])
+        await asyncio.sleep(0.01)
+        in_flight["count"] -= 1
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(1):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True
+        )
+
+    assert max_seen["value"] == 1
+    assert len(result["results"]) == 3
