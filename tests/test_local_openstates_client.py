@@ -247,6 +247,196 @@ async def test_per_page_never_exceeds_api_max_even_when_limit_is_larger():
 
 
 @pytest.mark.asyncio
+async def test_per_page_stays_fixed_across_pages_regression():
+    """SYNC-23 real bug, found live 2026-08-18: per_page used to be
+    recomputed each iteration as `limit - len(candidates)`, shrinking on
+    later pages (e.g. 20 then 5 for limit=25). api-v3 computes each
+    request's offset as (page - 1) * per_page and max_page from that same
+    request's per_page (api-v3/api/pagination.py) -- varying per_page while
+    treating `page` as a stable cursor breaks that offset math and
+    re-fetches bills already collected on an earlier page as if they were
+    new. per_page must be decided once and held fixed for every page."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 22},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20, 22)
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 22},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    first_call_params = mock_client.get.await_args_list[0].kwargs["params"]
+    second_call_params = mock_client.get.await_args_list[1].kwargs["params"]
+    assert first_call_params["per_page"] == "20"
+    assert second_call_params["per_page"] == "20"
+    assert len(result) == 22
+
+
+def _duplicate_across_pages_fixture():
+    """22 real distinct bills (ids "0".."21") -- total_items=22, per_page=20
+    genuinely yields max_page=ceil(22/20)=2 per api-v3's own formula
+    (api-v3/api/pagination.py), so page 1 legitimately returns a full 20
+    items (ids 0-19).
+
+    Page 2's own LIMIT/OFFSET query re-runs api-v3's ORDER BY independently
+    of page 1's -- with no secondary tiebreaker key on a tied sort value,
+    that query has no guarantee of picking up exactly "whatever's left" from
+    page 1's perspective. This simulates the real, worse consequence of that
+    instability: page 2 returns id "19" again (a tie re-surfacing an
+    already-seen bill) and id "21", but never returns id "20" at all -- a
+    real, distinct bill that existed (it's counted in total_items=22) but
+    was silently displaced by the tie and never appears in either page's
+    results. Dedup can only drop the visible duplicate ("19" appearing
+    twice); it cannot recover "20", which this client never even saw."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 22},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": "ocd-bill/19", "identifier": "HB 19", "sources": []},
+            {"id": "ocd-bill/21", "identifier": "HB 21", "sources": []},
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 22},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+    return mock_client
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bill_across_pages_is_deduplicated_regression():
+    """SYNC-23, found live 2026-08-18: a real run against FL's 2026E session
+    (limit=25) came back with 25 entries for only 20 real unique bills -- 5
+    gov_ids each appearing twice. The repeated bill_openstates_id must only
+    appear once in the returned candidate list.
+
+    This also makes the residual risk explicit rather than hiding it: 22
+    real distinct bills exist (see _duplicate_across_pages_fixture), but the
+    same instability that produces the visible duplicate ("19") also
+    silently displaces a genuinely distinct bill ("20") that this client
+    never observes at all -- so the result has 21 candidates, not the 22
+    that actually exist. Dedup fixes the duplicate; it cannot fix a bill it
+    was never shown. That gap is exactly why the new warning log below
+    matters -- it's the only signal this happened at all."""
+    mock_client = _duplicate_across_pages_fixture()
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    bill_openstates_ids = [c["bill_openstates_id"] for c in result]
+    assert bill_openstates_ids.count("19") == 1
+    assert "20" not in bill_openstates_ids  # displaced -- never recoverable client-side
+    assert len(result) == 21  # 22 real bills exist; only 21 were ever observed
+    assert set(bill_openstates_ids) == {str(n) for n in range(20)} | {"21"}
+
+
+@pytest.mark.asyncio
+async def test_dropped_duplicates_are_logged_for_observability():
+    """A dedup that silently returns fewer than `limit` unique candidates,
+    with no other signal that api-v3's pagination produced an overlap,
+    would be invisible in production -- this must log so the team can tell
+    whether the residual sort-tie case (including a genuinely displaced
+    bill, per the test above) is actually occurring live."""
+    mock_client = _duplicate_across_pages_fixture()
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"), patch(
+        "ddp_sync.services.local_openstates_client.logger"
+    ) as mock_logger:
+        await list_current_session_bill_candidates("fl", limit=25)
+
+    mock_logger.warning.assert_any_call(
+        "list_current_session_bill_candidates dropped duplicate "
+        "candidates across pages",
+        jurisdiction_iso2="fl",
+        session_code="2026",
+        duplicates_dropped=1,
+        unique_candidates=21,
+        requested_limit=25,
+        pages_fetched=2,
+        api_reported_total_items=22,
+        api_reported_max_page=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_underfills_limit_even_when_enough_unique_bills_exist_regression():
+    """Sharper than the displaced-bill test above: here total_items(25)
+    equals `limit`(25) exactly, so enough real, distinct bills exist to
+    fully satisfy the request -- yet a page-2 duplicate still causes the
+    returned list to fall short of `limit`. Page 1 returns a full 20 (ids
+    0-19); page 2, at max_page (ceil(25/20)=2), returns only 5 more items
+    (ids 20-23 plus a repeat of id 19) -- one real bill (id 24) is
+    displaced by the tie and never observed, so the result has 24 unique
+    candidates, not the 25 that actually exist and that `limit` asked for."""
+    page_1 = MagicMock()
+    page_1.status_code = 200
+    page_1.json.return_value = {
+        "results": [
+            {"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []}
+            for n in range(20)
+        ],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 2, "total_items": 25},
+    }
+    page_2 = MagicMock()
+    page_2.status_code = 200
+    page_2.json.return_value = {
+        "results": [
+            {"id": "ocd-bill/19", "identifier": "HB 19", "sources": []},
+            {"id": "ocd-bill/20", "identifier": "HB 20", "sources": []},
+            {"id": "ocd-bill/21", "identifier": "HB 21", "sources": []},
+            {"id": "ocd-bill/22", "identifier": "HB 22", "sources": []},
+            {"id": "ocd-bill/23", "identifier": "HB 23", "sources": []},
+        ],
+        "pagination": {"per_page": 20, "page": 2, "max_page": 2, "total_items": 25},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[page_1, page_2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("fl", limit=25)
+
+    bill_openstates_ids = [c["bill_openstates_id"] for c in result]
+    assert len(result) == 24  # 25 real bills exist and were asked for; only 24 observed
+    assert "24" not in bill_openstates_ids  # displaced -- never fetched at all
+    assert bill_openstates_ids.count("19") == 1
+
+
+@pytest.mark.asyncio
 async def test_missing_sources_yields_empty_live_url_fallback_not_a_crash():
     mock_client = AsyncMock()
     response = MagicMock()

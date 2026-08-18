@@ -422,6 +422,20 @@ async def list_current_session_bill_candidates(
         actual bill_source (archived vs. live) stays get_archived_bill_text's
         job, not this one's.
 
+        Deduplicated by bill_openstates_id (SYNC-23): a live run found the
+        same bill appearing twice in one call's results, traced to this
+        function's own pagination sending a shrinking per_page across pages
+        (fixed below) -- this dedup is a second, independent safety net
+        against api-v3's default sort having no secondary tiebreaker key,
+        which could still land a tied-sort-value bill on two pages even with
+        per_page held fixed. Dedup only removes a visible duplicate -- if the
+        same tie displaces a different, genuinely distinct bill off of every
+        page entirely, this function has no way to know that bill exists at
+        all, and the returned list can be shorter than `limit` even when
+        that many unique bills really exist. `duplicates_dropped` is logged
+        as a warning specifically so that residual case is observable rather
+        than silent.
+
         Never raises: any failure (no current session resolvable, local
         api-v3 unreachable/rejecting/non-JSON) returns an empty list, same
         never-abort-the-run posture as get_archived_bill_text -- a listing
@@ -476,11 +490,34 @@ async def list_current_session_bill_candidates(
     # loop against api-v3's own pagination.max_page, capped at
     # _API_V3_MAX_PER_PAGE per request (confirmed live: api-v3 rejects
     # per_page > 20).
+    #
+    # Real, separate duplicate-candidate bug found live 2026-08-18 (SYNC-23):
+    # per_page here used to be recomputed every iteration as `limit -
+    # len(candidates)`, shrinking on later pages. api-v3's own pagination
+    # (api-v3/api/pagination.py Pagination.paginate) computes each request's
+    # offset as `(page - 1) * per_page` and `max_page` from THAT SAME
+    # request's per_page -- both derived fresh per call, not fixed
+    # server-side. Varying per_page across pages while treating `page` as a
+    # stable cursor breaks that offset math: e.g. limit=25 against a
+    # same-jurisdiction/session total of 22 bills fetches page=1
+    # per_page=20 (items 1-20, max_page=ceil(22/20)=2), then page=2
+    # per_page=5 (offset=(2-1)*5=5 -- items 6-10, NOT 21-22) -- re-fetching 5
+    # bills already collected on page 1 as if they were new. per_page is now
+    # decided ONCE, before the loop, and held fixed for every page this call
+    # makes, so offset math stays consistent across however many pages are
+    # needed. The dedup below is an additional, independent safety net (api-
+    # v3's default sort has no secondary tiebreaker key, so bills with a tied
+    # sort value could still land on two pages even with per_page held
+    # fixed) -- not a substitute for this fix, since the per_page bug above
+    # was confirmed as a real, reproducible cause on its own.
     candidates: list[dict] = []
+    seen_bill_openstates_ids: set[str] = set()
+    duplicates_dropped = 0
     page = 1
+    per_page = str(min(_API_V3_MAX_PER_PAGE, limit))
     while len(candidates) < limit:
         params = dict(base_params)
-        params["per_page"] = str(min(_API_V3_MAX_PER_PAGE, limit - len(candidates)))
+        params["per_page"] = per_page
         params["page"] = str(page)
 
         try:
@@ -520,6 +557,10 @@ async def list_current_session_bill_candidates(
             bill_openstates_id = raw_id.rsplit("/", 1)[-1] if raw_id else ""
             if not gov_id or not bill_openstates_id:
                 continue
+            if bill_openstates_id in seen_bill_openstates_ids:
+                duplicates_dropped += 1
+                continue
+            seen_bill_openstates_ids.add(bill_openstates_id)
             sources = bill.get("sources") or []
             live_url_fallback = sources[0].get("url", "") if sources else ""
             candidates.append({
@@ -534,5 +575,27 @@ async def list_current_session_bill_candidates(
         if page >= max_page or len(candidates) >= limit:
             break
         page += 1
+
+    if duplicates_dropped:
+        # Surfaces the residual api-v3 sort-tie case (no secondary
+        # tiebreaker key on its default sort) even after the per_page fix
+        # above -- dedup silently returning fewer than `limit` unique
+        # candidates, with no other signal that api-v3's own pagination is
+        # still occasionally unstable, would otherwise be invisible.
+        logger.warning(
+            "list_current_session_bill_candidates dropped duplicate "
+            "candidates across pages",
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=resolved_session_code,
+            duplicates_dropped=duplicates_dropped,
+            unique_candidates=len(candidates),
+            requested_limit=limit,
+            pages_fetched=page,
+            # From the last page fetched -- lets an operator tell "api-v3
+            # genuinely has fewer bills than requested" apart from "enough
+            # bills exist but the sort-tie displaced one" at a glance.
+            api_reported_total_items=pagination.get("total_items"),
+            api_reported_max_page=max_page,
+        )
 
     return candidates[:limit]
