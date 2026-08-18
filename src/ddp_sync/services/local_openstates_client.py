@@ -591,6 +591,11 @@ async def list_current_session_bill_candidates(
             unique_candidates=len(candidates),
             requested_limit=limit,
             pages_fetched=page,
+            # From the last page fetched -- lets an operator tell "api-v3
+            # genuinely has fewer bills than requested" apart from "enough
+            # bills exist but the sort-tie displaced one" at a glance.
+            api_reported_total_items=pagination.get("total_items"),
+            api_reported_max_page=max_page,
         )
 
     return candidates[:limit]

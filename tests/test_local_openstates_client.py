@@ -385,6 +385,8 @@ async def test_dropped_duplicates_are_logged_for_observability():
         unique_candidates=21,
         requested_limit=25,
         pages_fetched=2,
+        api_reported_total_items=22,
+        api_reported_max_page=2,
     )
 
 
