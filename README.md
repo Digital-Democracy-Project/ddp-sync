@@ -137,7 +137,25 @@ defaults for cost-relevant params" discipline. `limit` has no upper ceiling (rem
 hard cap of 25 assumed there was no concurrency protection for a shared CAMS/LegBot/MLX backend, but that
 protection already exists one layer down (CAMS's own `_mlx_semaphore`, `ddp-agents/src/legbot/reasoning.py`,
 shipped 2026-08-04, serializes every MLX call regardless of caller), and this pipeline dispatches sequentially
-anyway; MLX inference also has no per-call cost, unlike a metered cloud API. This route is still synchronous,
+anyway; MLX inference also has no per-call cost, unlike a metered cloud API.
+
+**Updated 2026-08-17 (SYNC-21, paired with `ddp-broker-py`'s BROKER-80):** `_process_bill()` now calls a new
+`ensure_bill_exists()` (`broker_client.py`) before dispatching any artifact/org-research work for a bill that
+isn't already fully covered — gated on `not dry_run` and on a fresh `get_archived_bill_text()` check (a bill
+with version metadata but no archived text yet, the common case for every jurisdiction but FL today, never
+triggers this and never gets a stub created). Previously, `write_bill_artifact`/`write_bill_organization_position`
+silently discarded real, costly LegBot output for any bill Voatz/Webflow hadn't already brought into
+`ddp-broker-py` — this closes that gap by letting the pipeline create its own minimal, untracked `Bill` stub via
+`ddp-broker-py`'s new `POST /api/bills/ensure/`, which Voatz's/Webflow's existing logic promotes later exactly
+as it already does for any other pre-existing row. A failed `ensure` call shows up as its own `"ensure_failed: ..."`
+result category, distinct from `artifacts_failed` (a systemic problem, e.g. the broker endpoint down, reads
+differently from a handful of bills individually lacking archived text). Since all three `/trigger/*` routes in
+this section reuse `_process_bill()` directly, this behavior applies to `/trigger/bill-artifact-generation`,
+`/trigger/legbot-analyze-bill-full`, and (via `bill_artifact_generation.py`'s shared dispatch path)
+`/trigger/legbot-analyze-bill` alike. **Requires BROKER-80 deployed to the target `ddp-broker-py` instance** —
+until then, `ensure` fails gracefully as `ensure_failed` for every affected bill rather than crashing the run.
+
+This route is still synchronous,
 though, so a very large `limit` means a very long-held HTTP request — a client/proxy timeout consideration, not
 a cost or concurrency one. Start with a small `artifact_types` subset, not all 8 at once.
 
