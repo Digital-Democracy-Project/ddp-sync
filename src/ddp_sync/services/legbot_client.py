@@ -256,17 +256,25 @@ async def _dispatch_and_await(
         # inference has begun), `deadline` resets to a fresh
         # timeout_seconds-sized window measured from *that* moment -- the
         # task gets its normal full inference budget starting from when
-        # generation genuinely began, not from dispatch. If the marker never
-        # appears (a non-MLX/Claude-or-OpenAI-routed task that completes
-        # quickly regardless, or an older CAMS deployed without this field),
-        # `deadline` simply never resets and queue_wait_timeout_seconds is
-        # what bounds the wait -- still finite and still cancels the
-        # orphaned task on timeout, just not the older, tighter number,
-        # since a still-queued task and a task that will never start look
-        # identical from here until one of them actually happens.
+        # generation genuinely began, not from dispatch.
+        #
+        # PM review: absence of the key entirely (an older CAMS deployed
+        # before this field existed) is deliberately NOT treated the same
+        # as the key being present-but-empty (a newer CAMS reporting a real
+        # task that simply hasn't started generating yet) -- those are two
+        # different situations a mismatched rollout order could otherwise
+        # conflate, and only the second one is what queue_wait_timeout_seconds
+        # exists to cover. If the key is missing from the response schema
+        # entirely, this collapses to *exactly* the old, single flat
+        # legbot_dispatch_timeout_seconds-from-dispatch behavior (no
+        # generous queue-wait window at all) -- full backward compatibility
+        # for a ddp-sync deployed ahead of its paired ddp-agents PR, with no
+        # deploy-order requirement between the two repos.
         status = "queued"
         generation_started_seen = False
-        deadline = time.monotonic() + queue_wait_timeout_seconds
+        legacy_no_marker_field = False
+        dispatch_time = time.monotonic()
+        deadline = dispatch_time + queue_wait_timeout_seconds
         while time.monotonic() < deadline:
             status_resp = await client.get(
                 f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
@@ -276,7 +284,17 @@ async def _dispatch_and_await(
             status = body["status"]
             if status in _TERMINAL_STATUSES:
                 break
-            if not generation_started_seen and body.get("mlx_generation_started_at"):
+            if "mlx_generation_started_at" not in body:
+                if not legacy_no_marker_field:
+                    legacy_no_marker_field = True
+                    deadline = dispatch_time + timeout_seconds
+                    logger.info(
+                        "LegBot task response has no mlx_generation_started_at "
+                        "field -- CAMS predates AGENTS-42, falling back to the "
+                        "legacy flat dispatch timeout",
+                        task_id=task_id, question_type=question_type,
+                    )
+            elif not generation_started_seen and body.get("mlx_generation_started_at"):
                 generation_started_seen = True
                 deadline = time.monotonic() + timeout_seconds
                 logger.info(
@@ -312,11 +330,15 @@ async def _dispatch_and_await(
                     task_id=task_id, question_type=question_type,
                     error=str(cancel_exc),
                 )
-            timeout_desc = (
-                f"inference timeout {timeout_seconds}s (generation had started)"
-                if generation_started_seen
-                else f"queue-wait timeout {queue_wait_timeout_seconds}s (generation never started)"
-            )
+            if legacy_no_marker_field:
+                timeout_desc = (
+                    f"legacy dispatch timeout {timeout_seconds}s "
+                    f"(CAMS response has no mlx_generation_started_at field)"
+                )
+            elif generation_started_seen:
+                timeout_desc = f"inference timeout {timeout_seconds}s (generation had started)"
+            else:
+                timeout_desc = f"queue-wait timeout {queue_wait_timeout_seconds}s (generation never started)"
             raise LegBotDispatchError(
                 f"LegBot task {task_id} did not finish within its timeout window "
                 f"({timeout_desc}) (last status: {status})"
