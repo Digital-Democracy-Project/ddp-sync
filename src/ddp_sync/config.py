@@ -165,6 +165,27 @@ class SyncSettings:
     # data (four artifacts silently failed) for no actual cost savings.
     legbot_dispatch_timeout_seconds: float = 1200.0
 
+    # AGENTS-42 (2026-08-19): a single 45-call incident (one crashed MLX
+    # request wedging LegBot's single-instance MLX pool, ddp-agents'
+    # legbot/reasoning.py _MLXInstancePool) burned ~14h of wall-clock time --
+    # every task queued behind the stuck request had no way to tell "waiting
+    # for a turn" apart from "actively generating" (both read as CAMS task
+    # status "running"), so each one burned its full
+    # legbot_dispatch_timeout_seconds just sitting in queue with zero chance
+    # of ever getting one. legbot_client.py's _dispatch_and_await now splits
+    # its poll loop into two phases: this generous ceiling governs from
+    # dispatch until ddp-agents' new mlx_generation_started_at marker
+    # (cams/api/routes.py TaskResponse) is first observed non-empty --  at
+    # that point legbot_dispatch_timeout_seconds takes back over, measured
+    # from when generation actually began. Sized to cover a full batch's
+    # worth of legitimate queueing (not a tight guardrail, matching this
+    # module's existing dispatch-timeout philosophy above) without being
+    # unboundable -- a task that never starts generating within this window
+    # (whether genuinely still stuck in queue, a non-MLX-routed task that's
+    # otherwise hung, or an older CAMS deployed without this field yet) is
+    # still given up on and cancelled, not waited on forever.
+    legbot_queue_wait_timeout_seconds: float = 3600.0
+
     # Cap on how many organizations bill_organization_position_research.py's
     # generate_and_store_bill_organization_positions will verify/write per
     # invocation -- a safety valve against a malformed or hallucinated
@@ -312,6 +333,9 @@ def _load_from_env() -> dict:
         "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
         "legbot_dispatch_timeout_seconds": float(
             os.getenv("LEGBOT_DISPATCH_TIMEOUT_SECONDS", "1200")
+        ),
+        "legbot_queue_wait_timeout_seconds": float(
+            os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
