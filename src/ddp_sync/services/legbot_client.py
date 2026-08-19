@@ -224,6 +224,7 @@ async def _dispatch_and_await(
         )
     if timeout_seconds is None:
         timeout_seconds = settings.legbot_dispatch_timeout_seconds
+    queue_wait_timeout_seconds = settings.legbot_queue_wait_timeout_seconds
 
     headers = {"Authorization": f"Bearer {settings.cams_api_token}"}
     create_payload = {
@@ -242,16 +243,48 @@ async def _dispatch_and_await(
             "LegBot task dispatched", task_id=task_id, question_type=question_type,
         )
 
+        # AGENTS-42: two-phase deadline, replacing one flat timeout measured
+        # from dispatch. `deadline` starts generous
+        # (queue_wait_timeout_seconds) so a task genuinely still queued
+        # behind LegBot's single-instance MLX pool (ddp-agents'
+        # _MLXInstancePool) isn't cut off before it ever gets a turn -- the
+        # exact incident that motivated this (one crashed MLX request wedged
+        # the pool; 45 consecutive tasks each burned their full
+        # legbot_dispatch_timeout_seconds waiting in queue for a turn that
+        # never came, ~14h wasted). The moment a poll response first shows
+        # ddp-agents' mlx_generation_started_at marker populated (real
+        # inference has begun), `deadline` resets to a fresh
+        # timeout_seconds-sized window measured from *that* moment -- the
+        # task gets its normal full inference budget starting from when
+        # generation genuinely began, not from dispatch. If the marker never
+        # appears (a non-MLX/Claude-or-OpenAI-routed task that completes
+        # quickly regardless, or an older CAMS deployed without this field),
+        # `deadline` simply never resets and queue_wait_timeout_seconds is
+        # what bounds the wait -- still finite and still cancels the
+        # orphaned task on timeout, just not the older, tighter number,
+        # since a still-queued task and a task that will never start look
+        # identical from here until one of them actually happens.
         status = "queued"
-        deadline = time.monotonic() + timeout_seconds
+        generation_started_seen = False
+        deadline = time.monotonic() + queue_wait_timeout_seconds
         while time.monotonic() < deadline:
             status_resp = await client.get(
                 f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
             )
             status_resp.raise_for_status()
-            status = status_resp.json()["status"]
+            body = status_resp.json()
+            status = body["status"]
             if status in _TERMINAL_STATUSES:
                 break
+            if not generation_started_seen and body.get("mlx_generation_started_at"):
+                generation_started_seen = True
+                deadline = time.monotonic() + timeout_seconds
+                logger.info(
+                    "LegBot task MLX generation started -- switching from "
+                    "queue-wait to inference timeout",
+                    task_id=task_id, question_type=question_type,
+                    inference_timeout_seconds=timeout_seconds,
+                )
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         else:
             # SYNC-20: giving up here must not just walk away from the CAMS
@@ -279,9 +312,14 @@ async def _dispatch_and_await(
                     task_id=task_id, question_type=question_type,
                     error=str(cancel_exc),
                 )
+            timeout_desc = (
+                f"inference timeout {timeout_seconds}s (generation had started)"
+                if generation_started_seen
+                else f"queue-wait timeout {queue_wait_timeout_seconds}s (generation never started)"
+            )
             raise LegBotDispatchError(
-                f"LegBot task {task_id} did not finish within {timeout_seconds}s "
-                f"(last status: {status})"
+                f"LegBot task {task_id} did not finish within its timeout window "
+                f"({timeout_desc}) (last status: {status})"
             )
 
     if status != "completed":
