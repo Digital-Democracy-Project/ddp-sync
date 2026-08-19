@@ -32,7 +32,7 @@ class _FakeSettings:
 
 def _mock_client(
     *, statuses, task_id="abc123", delete_should_fail=False,
-    mlx_generation_started_at_by_index=None,
+    mlx_generation_started_at_by_index=None, omit_generation_field=False,
 ):
     """Build a mock httpx.AsyncClient whose GET calls return `statuses` in
     order, then keep returning the last one. `delete_should_fail` controls
@@ -43,6 +43,13 @@ def _mock_client(
     mlx_generation_started_at value that poll's response should carry --
     lets a test simulate the marker appearing partway through polling, the
     same field cams/api/routes.py's TaskResponse now always includes.
+
+    `omit_generation_field` (AGENTS-42): when True, the mocked response
+    dict has no "mlx_generation_started_at" key at all -- simulates an
+    older CAMS deployed before this field existed, as opposed to a newer
+    CAMS reporting an empty value for a task that just hasn't started
+    generating yet. These two are deliberately handled differently by
+    legbot_client.py's own two-phase timeout logic.
     """
     client = AsyncMock()
     post_response = MagicMock()
@@ -59,10 +66,10 @@ def _mock_client(
         call_index["n"] += 1
         status = remaining.pop(0) if remaining else statuses[-1]
         resp = MagicMock()
-        resp.json.return_value = {
-            "status": status,
-            "mlx_generation_started_at": marker_map.get(idx, ""),
-        }
+        body = {"status": status}
+        if not omit_generation_field:
+            body["mlx_generation_started_at"] = marker_map.get(idx, "")
+        resp.json.return_value = body
         resp.raise_for_status.return_value = None
         return resp
 
@@ -364,6 +371,15 @@ class TestAgents42TwoPhaseTimeout:
     (c) marker never appears and the queue-wait ceiling itself is
         exceeded -> still bounded, still raises and cancels -- this is not
         an unboundable wait.
+    (d) the response has no mlx_generation_started_at key AT ALL (an older
+        CAMS deployed before this field existed, not merely a newer CAMS
+        reporting an empty value) -> collapses to exactly the old, single
+        flat legbot_dispatch_timeout_seconds-from-dispatch behavior, full
+        stop -- no deploy-order requirement between ddp-sync and
+        ddp-agents (PM-review-folded: (a)/(c) alone would have let a
+        genuinely-still-queued task and an old-CAMS response share one
+        (much larger) ceiling, silently changing timeout behavior for
+        every long-running task during a mismatched rollout).
     """
 
     @pytest.mark.asyncio
@@ -439,3 +455,40 @@ class TestAgents42TwoPhaseTimeout:
         # Never timed out/cancelled -- the reset gave it exactly the room
         # it needed past the original 10s queue-wait ceiling.
         mock_client.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_d_field_entirely_absent_uses_legacy_flat_timeout_not_queue_wait(self, tmp_path):
+        """An old CAMS's response has no mlx_generation_started_at key at
+        all -- this must NOT share the generous queue-wait ceiling scenario
+        (a)/(c) use for a newer CAMS's empty-value response. Queue-wait is
+        set deliberately huge (3600s, the real production default) while
+        the legacy dispatch timeout is small (5s) -- if this incorrectly
+        fell through to the queue-wait path, the mocked clock (which never
+        exceeds 8.0) would never trigger a timeout at all and the test
+        would hang/fail differently."""
+        mock_client = _mock_client(statuses=["running"], omit_generation_field=True)
+        with patch(
+            "ddp_sync.services.legbot_client.get_settings",
+            return_value=_FakeSettings(
+                cams_artifacts_dir=str(tmp_path),
+                legbot_dispatch_timeout_seconds=5.0,
+                legbot_queue_wait_timeout_seconds=3600.0,
+            ),
+        ), _patch_async_client(mock_client), patch(
+            "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+        ), patch(
+            "ddp_sync.services.legbot_client.time.monotonic",
+            # call1: dispatch_time=0.0; call2: iter1 while-check (0.0<3600
+            # True) -> poll has no marker field -> legacy mode, deadline
+            # collapses to dispatch_time+5.0=5.0; call3: iter2 while-check
+            # (8.0<5.0 False) -> times out at the SMALL legacy deadline,
+            # proving the huge queue-wait ceiling was never in play.
+            side_effect=[0.0, 0.0, 8.0],
+        ):
+            with pytest.raises(
+                LegBotDispatchError,
+                match=r"legacy dispatch timeout 5\.0s \(CAMS response has no mlx_generation_started_at field\)",
+            ):
+                await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+        mock_client.delete.assert_awaited_once()
