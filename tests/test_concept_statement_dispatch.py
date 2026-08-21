@@ -242,6 +242,47 @@ def test_bill_artifact_generation_dispatch_map_is_unchanged():
     }
 
 
+# ---------------------------------------------------------------------------
+# SYNC-32: the retired standalone scheduled job must never come back, even
+# if a stale `concept_statement_dispatch` block lingers in sync_schedule.yaml
+# (e.g. a config file not yet updated to match this removal) -- there is no
+# registration code left to read it.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_retired_job_ids_never_registered_even_with_stale_yaml_block():
+    import tempfile
+    import textwrap
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from ddp_sync.scheduler import UpdateScheduler
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(textwrap.dedent(
+            """
+            concept_statement_dispatch:
+              enabled: true
+              frequency: weekly
+              sync_day: sunday
+              sync_time_utc: "11:00"
+              max_bills_per_run: 25
+            """
+        ))
+        path = Path(f.name)
+
+    settings = MagicMock()
+    settings.sync_interval_minutes = 30
+    sched = UpdateScheduler(settings=settings, config_path=path)
+    sched.start()
+    try:
+        ids = {j.id for j in sched.scheduler.get_jobs()}
+        assert "daily_concept_statement_dispatch" not in ids
+        assert "weekly_concept_statement_dispatch" not in ids
+    finally:
+        sched.stop()
+
+
 @pytest.mark.asyncio
 async def test_bill_artifact_generation_bill_summary_dispatch_still_works_unchanged():
     """A real end-to-end smoke test of one of the 8 existing BillArtifact
