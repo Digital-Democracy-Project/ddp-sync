@@ -620,6 +620,7 @@ async def test_changelog_inputs_happy_path():
     ), _patch_async_client(mock_client):
         result = await get_archived_changelog_inputs("a3afb726-fac4-41e7-b428-0cae1f4ddada")
 
+    versions = result.pop("versions")
     assert result == {
         "old_bill_source": "Archived introduced text.",
         "diff_source": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
@@ -628,10 +629,56 @@ async def test_changelog_inputs_happy_path():
         "latest_version_date": "2026-02-01",
         "latest_version_note": "Engrossed",
     }
+    # SYNC-30: the raw versions list is passed straight through, unfiltered
+    # and untransformed -- exactly what _versions_response built.
+    assert [v["note"] for v in versions] == ["Introduced", "Engrossed"]
     call = mock_client.get.await_args
     assert call.args[0] == (
         "http://localhost:8002/bills/ocd-bill/a3afb726-fac4-41e7-b428-0cae1f4ddada"
     )
+
+
+@pytest.mark.asyncio
+async def test_changelog_inputs_returns_full_history_for_a_three_version_bill():
+    """SYNC-30: a bill with 3+ real versions (matching FL SB 2506E's real
+    Filed -> e1 -> er shape) must still resolve the diff pair as
+    versions[-2]/versions[-1] only -- that resolution is unchanged -- while
+    the returned `versions` list carries the bill's FULL history, including
+    the oldest version neither old_bill_source nor diff_source ever touch."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [
+            {"note": "Filed", "date": "2025-12-01", "links": []},
+            {
+                "note": "Introduced",
+                "date": "2026-01-01",
+                "links": [{"url": "https://x/introduced.pdf", "raw_text": "Archived introduced text."}],
+            },
+            {
+                "note": "Engrossed",
+                "date": "2026-02-01",
+                "links": [{"url": "https://x/engrossed.pdf", "raw_text": "Archived engrossed text."}],
+                "diff_from_previous_version": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_changelog_inputs("a3afb726-fac4-41e7-b428-0cae1f4ddada")
+
+    # Diff pair is still just the immediately-previous version, not "Filed".
+    assert result["old_version_note"] == "Introduced"
+    assert result["latest_version_note"] == "Engrossed"
+    assert result["old_bill_source"] == "Archived introduced text."
+    # But the full history -- including "Filed" -- is there for a caller's
+    # own backfill to use.
+    assert [v["note"] for v in result["versions"]] == ["Filed", "Introduced", "Engrossed"]
 
 
 @pytest.mark.asyncio

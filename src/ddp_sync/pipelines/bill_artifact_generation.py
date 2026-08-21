@@ -592,16 +592,27 @@ async def generate_and_store_bill_changelog(
     # loss or a broken artifact -- and it is strictly better than this
     # function's own prior behavior, which failed outright, every time,
     # for every bill in this shape.
+    #
+    # SYNC-30: pass archived["versions"] -- the bill's COMPLETE archived
+    # version list -- rather than a synthetic 2-element [old, new] list.
+    # SYNC-28's own fix above only ever covered the ONE compare_version
+    # this function itself needs; a bill with 3+ real versions (confirmed
+    # live, FL SB 2506E: Filed -> e1 -> er) still never got its oldest
+    # version(s) backfilled at all, because nothing in that narrower fix
+    # ever looked past "old" and "new". _backfill_missing_versions already
+    # loops over every entry in `versions` other than `latest_version`
+    # (SYNC-26) -- passing the real full list here, which
+    # get_archived_changelog_inputs now also returns, costs no extra I/O
+    # (it already fetched this list to resolve old/diff) and closes that
+    # gap for exactly the same reason SYNC-26's own first-sighting backfill
+    # already covers full depth when it fires.
     from ddp_sync.pipelines.bill_version import BillVersionSyncService
 
     await BillVersionSyncService._backfill_missing_versions(
         bill_openstates_id=bill_openstates_id,
         jurisdiction_code=jurisdiction,
         session_code=session_code,
-        versions=[
-            {"date": archived["old_version_date"], "note": archived["old_version_note"]},
-            {"date": version_date, "note": version_note},
-        ],
+        versions=archived["versions"],
         latest_version={"date": version_date, "note": version_note},
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,

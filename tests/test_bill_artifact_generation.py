@@ -456,6 +456,16 @@ _ARCHIVED = {
     "old_version_note": "Introduced",
     "latest_version_date": "2026-02-01",
     "latest_version_note": "Engrossed",
+    # SYNC-30: a real bill can have more than the two versions
+    # (old/latest) this function's own diff resolution needs -- "Filed" here
+    # is older than either, matching FL SB 2506E's real 3-version shape
+    # (Filed -> e1 -> er) that motivated widening the backfill below to the
+    # bill's full archived history.
+    "versions": [
+        {"date": "2025-12-01", "note": "Filed"},
+        {"date": "2026-01-01", "note": "Introduced"},
+        {"date": "2026-02-01", "note": "Engrossed"},
+    ],
 }
 
 
@@ -674,14 +684,39 @@ async def test_changelog_always_backfills_compare_version_regardless_of_ledger_s
         bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
         jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
         session_code=_CHANGELOG_KWARGS["session_code"],
-        versions=[
-            {"date": "2026-01-01", "note": "Introduced"},
-            {"date": "2026-02-01", "note": "Engrossed"},
-        ],
+        versions=_ARCHIVED["versions"],
         latest_version={"date": "2026-02-01", "note": "Engrossed"},
         broker_api_base=None,
         broker_api_token=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_changelog_backfill_covers_full_version_history_not_just_old_and_new():
+    """SYNC-30: a bill with 3+ real versions must have EVERY older version
+    passed to _backfill_missing_versions, not just the one immediately-
+    previous compare_version this function's own diff needs -- SYNC-28's
+    fix only ever covered that one version, silently never backfilling
+    anything older (confirmed live: FL SB 2506E's "Filed" version never
+    got a BillVersion row, while "e1"/"er" did)."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ) as mock_backfill, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ):
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    passed_versions = mock_backfill.await_args.kwargs["versions"]
+    passed_notes = {v["note"] for v in passed_versions}
+    assert passed_notes == {"Filed", "Introduced", "Engrossed"}
 
 
 @pytest.mark.asyncio
@@ -711,10 +746,7 @@ async def test_changelog_backfill_threads_broker_target_override():
         bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
         jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
         session_code=_CHANGELOG_KWARGS["session_code"],
-        versions=[
-            {"date": "2026-01-01", "note": "Introduced"},
-            {"date": "2026-02-01", "note": "Engrossed"},
-        ],
+        versions=_ARCHIVED["versions"],
         latest_version={"date": "2026-02-01", "note": "Engrossed"},
         broker_api_base="http://localhost:8080",
         broker_api_token="dev-token",
