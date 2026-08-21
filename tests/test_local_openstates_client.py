@@ -620,6 +620,7 @@ async def test_changelog_inputs_happy_path():
     ), _patch_async_client(mock_client):
         result = await get_archived_changelog_inputs("a3afb726-fac4-41e7-b428-0cae1f4ddada")
 
+    versions = result.pop("versions")
     assert result == {
         "old_bill_source": "Archived introduced text.",
         "diff_source": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
@@ -628,6 +629,9 @@ async def test_changelog_inputs_happy_path():
         "latest_version_date": "2026-02-01",
         "latest_version_note": "Engrossed",
     }
+    # SYNC-30: the raw versions list is passed straight through, unfiltered
+    # and untransformed -- exactly what _versions_response built.
+    assert [v["note"] for v in versions] == ["Introduced", "Engrossed"]
     call = mock_client.get.await_args
     assert call.args[0] == (
         "http://localhost:8002/bills/ocd-bill/a3afb726-fac4-41e7-b428-0cae1f4ddada"

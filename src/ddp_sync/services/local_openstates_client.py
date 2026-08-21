@@ -266,8 +266,9 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
 
     Returns:
         {"old_bill_source": str, "diff_source": str, "old_version_date": str,
-        "old_version_note": str, "latest_version_date": str, "latest_version_note": str} if
-        old_bill_source and diff_source are both archived and non-empty, else None -- covering
+        "old_version_note": str, "latest_version_date": str, "latest_version_note": str,
+        "versions": list[dict]} if old_bill_source and diff_source are both archived and
+        non-empty, else None -- covering
         every "not available" case identically (fewer than two versions, latest not archived,
         previous not archived, no diff computed yet e.g. previous was the first version ever
         archived, local api-v3 unreachable/rejecting/non-JSON, or the bill not found at all).
@@ -280,6 +281,14 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
         this is a pre-check for an optimization, not a required read -- any failure here must
         fall back to bill_version.py's existing live-refetch-and-diff path exactly as if this
         function didn't exist, never abort changelog generation.
+
+        versions (SYNC-30): the bill's complete raw version list as api-v3 returned it (every
+        entry, not just latest/previous) -- added so a caller's own BillVersion-ledger backfill
+        can cover the bill's full historical depth, not just the one immediately-previous
+        version this function's own diff/old_bill_source resolution needs. This function itself
+        still only ever resolves ONE version transition (versions[-1]/versions[-2]) for the diff
+        -- that part is unchanged and still latest-version-only by construction; only the
+        raw list available to backfill from is new.
     """
     settings = get_settings()
     if not settings.local_openstates_api_base:
@@ -347,6 +356,7 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
         "old_version_note": previous.get("note", ""),
         "latest_version_date": latest.get("date", ""),
         "latest_version_note": latest.get("note", ""),
+        "versions": versions,
     }
 
 
