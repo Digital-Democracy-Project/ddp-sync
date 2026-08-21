@@ -268,3 +268,17 @@ def test_include_org_research_true_is_passed_through():
 
     assert response.status_code == 200
     assert mock_run.await_args.kwargs["include_org_research"] is True
+
+
+def test_include_concept_statements_true_is_passed_through():
+    client = _make_authed_client()
+    payload = dict(_VALID_PAYLOAD, include_concept_statements=True)
+
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_configured_settings()), \
+            _patch_run() as mock_run:
+        response = client.post(
+            "/trigger/legbot-analyze-bill-full", json=payload, headers={"X-DDP-Environment": "dev"},
+        )
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["include_concept_statements"] is True

@@ -137,6 +137,20 @@ def test_dry_run_flag_is_passed_through():
     assert mock_run.await_args.kwargs["dry_run"] is True
 
 
+def test_include_concept_statements_true_is_passed_through():
+    client = _make_authed_client()
+    payload = dict(_VALID_PAYLOAD, include_concept_statements=True)
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["include_concept_statements"] is True
+
+
 def test_value_error_from_pipeline_returns_400():
     client = _make_authed_client()
 
