@@ -91,7 +91,36 @@ async def test_happy_path_creates_row_via_new_endpoint():
         statements=dispatch_result["answer"]["statements"],
         source_document_url=_COMMON_KWARGS["bill_source"],
         model_name="mlx",
+        broker_api_base=None,
+        broker_api_token=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_broker_override_threads_through_to_create_call():
+    """SYNC-31: session_pipeline_runner.py's consolidated path needs this
+    write to land on the same dev/prod broker instance its other artifact
+    types do -- None (the default, exercised above) preserves the original
+    caller's behavior unchanged."""
+    dispatch_result = {
+        "answer": {"statements": ["The state should require X."], "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.concept_statement_dispatch.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.concept_statement_dispatch.create_concept_statement_set",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_create:
+        await dispatch_and_store_concept_statements(
+            **_COMMON_KWARGS,
+            broker_api_base="http://dev-broker:8080",
+            broker_api_token="dev-token",
+        )
+
+    assert mock_create.await_args.kwargs["broker_api_base"] == "http://dev-broker:8080"
+    assert mock_create.await_args.kwargs["broker_api_token"] == "dev-token"
 
 
 @pytest.mark.asyncio

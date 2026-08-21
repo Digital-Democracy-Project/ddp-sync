@@ -114,6 +114,14 @@ class BillArtifactGenerationRequest(BaseModel):
             "bills not yet researched."
         ),
     )
+    include_concept_statements: bool = Field(
+        ...,
+        description=(
+            "Whether to also generate ConceptStatementSet rows (LegBot's "
+            "concept_statements question type) for bills without an "
+            "existing published set (SYNC-31)."
+        ),
+    )
     limit: int = Field(
         ...,
         description=(
@@ -220,6 +228,7 @@ async def trigger_bill_artifact_generation(
             body.artifact_types,
             body.include_org_research,
             body.limit,
+            include_concept_statements=body.include_concept_statements,
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
@@ -382,11 +391,11 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
     org position research, instead of 8+ separate calls. gov_id has no
     default (required, unlike artifact_types) -- see
     run_single_bill_full's own docstring for why it can't be derived or
-    skipped. include_org_research still has no default, matching this
-    codebase's "every cost-relevant parameter is a conscious choice"
-    discipline used everywhere else in this file -- only artifact_types
-    gets a real default (all of them), since that's this endpoint's whole
-    reason to exist.
+    skipped. include_org_research and include_concept_statements (SYNC-31)
+    still have no default, matching this codebase's "every cost-relevant
+    parameter is a conscious choice" discipline used everywhere else in
+    this file -- only artifact_types gets a real default (all of them),
+    since that's this endpoint's whole reason to exist.
     """
 
     bill_openstates_id: str = Field(..., description="OpenStates bill ID.")
@@ -404,6 +413,13 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
     )
     include_org_research: bool = Field(
         ..., description="Whether to also dispatch Organization Position Research for this bill."
+    )
+    include_concept_statements: bool = Field(
+        ...,
+        description=(
+            "Whether to also generate a ConceptStatementSet for this bill, "
+            "if none is already published (SYNC-31)."
+        ),
     )
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
 
@@ -455,6 +471,7 @@ async def trigger_legbot_analyze_bill_full(
             bill_source=body.bill_source,
             artifact_types=body.artifact_types,
             include_org_research=body.include_org_research,
+            include_concept_statements=body.include_concept_statements,
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,

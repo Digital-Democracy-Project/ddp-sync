@@ -101,9 +101,19 @@ async def dispatch_and_store_concept_statements(
     jurisdiction_iso2: str,
     session_code: str,
     bill_source: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict | None:
     """Dispatch LegBot's `concept_statements` question for one bill, then
     persist the result as a new `ConceptStatementSet` row.
+
+    broker_api_base/broker_api_token: optional per-call override forwarded
+    unchanged to create_concept_statement_set, same shape as every other
+    broker write in this codebase (SYNC-10) -- None (the default) preserves
+    this function's original behavior for its original caller (the now-
+    retired standalone batch job, SYNC-32); session_pipeline_runner.py's
+    consolidated path (SYNC-31) passes these through so this write lands on
+    the same dev/prod broker instance its other artifact types do.
 
     Args:
         gov_id: the bill's short public identifier (e.g. "SJR 2F",
@@ -173,6 +183,8 @@ async def dispatch_and_store_concept_statements(
         statements=answer["statements"],
         source_document_url=bill_source,
         model_name=dispatch_result.get("backend"),
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
     )
 
 

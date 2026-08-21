@@ -39,6 +39,18 @@ load," which is a separate, still-open concern). Phase 6 (``BillArtifact``
 dedup key) is separately confirmed live since 2026-07-26, so this pipeline's
 actual writes are safe; what's gated is unattended *broad* production batch
 volume specifically, not this module's existence as a real caller.
+
+SYNC-31: ``include_concept_statements`` folds ``ConceptStatementSet``
+generation (previously the standalone, since-retired ``concept_statement_
+dispatch.py`` weekly job -- see SYNC-32) into this same per-bill batch,
+reusing its candidate enumeration and ``ensure_bill_exists()`` call. Kept as
+its own boolean option, the same shape as ``include_org_research``, rather
+than folded into ``artifact_types``/``ALL_8_ARTIFACT_TYPES`` -- a
+``ConceptStatementSet`` row has no ``BillVersion`` at all and a coarser,
+published-only dedup rule (no "failed" status exists for it), neither of
+which the generic per-artifact-type coverage loop below (keyed on
+``get_bill_artifacts``, which never returns this type) could express
+correctly.
 """
 
 from __future__ import annotations
@@ -59,11 +71,15 @@ from ddp_sync.pipelines.bill_artifact_generation import (
 from ddp_sync.pipelines.bill_organization_position_research import (
     generate_and_store_bill_organization_positions,
 )
+from ddp_sync.pipelines.concept_statement_dispatch import (
+    dispatch_and_store_concept_statements,
+)
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     ensure_bill_exists,
     get_bill_artifacts,
     get_bill_organization_positions_status,
+    get_concept_statement_set,
 )
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
@@ -113,6 +129,7 @@ async def _process_bill(
     session_code: str,
     artifact_types: list[str],
     include_org_research: bool,
+    include_concept_statements: bool,
     dry_run: bool,
     run_id: str,
     broker_api_base: str | None = None,
@@ -131,6 +148,9 @@ async def _process_bill(
         "org_research_dispatched": False,
         "org_research_skipped_reason": None,
         "org_research_duration_seconds": None,
+        "concept_statements_dispatched": False,
+        "concept_statements_skipped_reason": None,
+        "concept_statements_duration_seconds": None,
         "duration_seconds": None,
         "error": None,
     }
@@ -316,6 +336,65 @@ async def _process_bill(
                         time.monotonic() - org_started, 3
                     )
 
+    # SYNC-31: ConceptStatementSet generation, folded in from the now-retired
+    # standalone concept_statement_dispatch.py weekly job (SYNC-32). No
+    # `version` dependency at all -- unlike every other artifact_type/org
+    # research above, a ConceptStatementSet row has no BillVersion FK, so
+    # this never needs get_current_version_identity to have resolved
+    # anything. Its own dedup check (get_concept_statement_set) is
+    # deliberately coarser than get_bill_artifacts' -- "does a *published*
+    # set exist at all," with no version-currency concept -- and preserved
+    # exactly as concept_statement_dispatch.py's own standalone job already
+    # implemented it, per this ticket's own "relocation, not a rewrite"
+    # scope. There is also no "failed" ConceptStatementSet status to skip on
+    # a later run -- insufficient_information (or no archived text at all)
+    # means dispatch_and_store_concept_statements wrote nothing, recorded
+    # here as concept_statements_skipped_reason="nothing_to_publish", not as
+    # a member of artifacts_failed (which is BillArtifact-status-shaped).
+    if include_concept_statements:
+        try:
+            existing_concept_set = await get_concept_statement_set(
+                gov_id=gov_id,
+                jurisdiction_iso2=jurisdiction_iso2,
+                session_code=session_code,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        except BrokerClientError as exc:
+            result["concept_statements_skipped_reason"] = f"status_check_failed: {exc}"
+        else:
+            if existing_concept_set is not None:
+                result["concept_statements_skipped_reason"] = "already_published"
+            elif dry_run:
+                result["concept_statements_dispatched"] = True
+            else:
+                concept_started = time.monotonic()
+                try:
+                    concept_result = await dispatch_and_store_concept_statements(
+                        gov_id=gov_id,
+                        bill_openstates_id=bill_openstates_id,
+                        jurisdiction_iso2=jurisdiction_iso2,
+                        session_code=session_code,
+                        bill_source=candidate.get("live_url_fallback", ""),
+                        broker_api_base=broker_api_base,
+                        broker_api_token=broker_api_token,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "session_pipeline_concept_statements_dispatch_failed",
+                        run_id=run_id, gov_id=gov_id, error=str(exc),
+                    )
+                    result["concept_statements_skipped_reason"] = f"dispatch_failed: {exc}"
+                else:
+                    if concept_result is None:
+                        result["concept_statements_skipped_reason"] = "nothing_to_publish"
+                    else:
+                        result["concept_statements_dispatched"] = True
+                finally:
+                    result["concept_statements_duration_seconds"] = round(
+                        time.monotonic() - concept_started, 3
+                    )
+
     result["duration_seconds"] = round(time.monotonic() - bill_started, 3)
 
     return result
@@ -328,16 +407,22 @@ async def run_legbot_pipeline(
     include_org_research: bool,
     limit: int,
     *,
+    include_concept_statements: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
 
-    artifact_types, include_org_research, and limit all have NO default --
-    the caller must decide explicitly, for every parameter with real cost
-    implications. One call can trigger up to 10 real dispatches (9 artifacts
-    + org research) per bill.
+    artifact_types, include_org_research, include_concept_statements, and
+    limit all have NO default -- the caller must decide explicitly, for
+    every parameter with real cost implications. One call can trigger up to
+    11 real dispatches (9 artifacts + org research + concept statements) per
+    bill. include_concept_statements is keyword-only (unlike the other
+    three, which are positional-or-keyword) -- added after those three
+    already had real positional callers (SYNC-9/SYNC-15); every caller must
+    still pass it explicitly, just as an explicit keyword rather than a new
+    required positional slot spliced into an existing argument order.
 
     broker_api_base/broker_api_token: optional per-call override threaded to
     every bill's _process_bill call. None (the default) preserves this
@@ -395,6 +480,9 @@ async def run_legbot_pipeline(
                     "org_research_dispatched": bool,
                     "org_research_skipped_reason": str | None,
                     "org_research_duration_seconds": float | None,
+                    "concept_statements_dispatched": bool,
+                    "concept_statements_skipped_reason": str | None,
+                    "concept_statements_duration_seconds": float | None,
                     "duration_seconds": float,  # this bill's total processing time
                     "error": str | None,
                 },
@@ -423,6 +511,7 @@ async def run_legbot_pipeline(
         session_code=session_code,
         artifact_types=list(artifact_types),
         include_org_research=include_org_research,
+        include_concept_statements=include_concept_statements,
         limit=limit,
         dry_run=dry_run,
         peak_memory_mb=round(_peak_memory_mb(), 1),
@@ -461,6 +550,7 @@ async def run_legbot_pipeline(
                 session_code=session_code,
                 artifact_types=artifact_types,
                 include_org_research=include_org_research,
+                include_concept_statements=include_concept_statements,
                 dry_run=dry_run,
                 run_id=run_id,
                 broker_api_base=broker_api_base,
@@ -503,13 +593,15 @@ async def run_single_bill_full(
     bill_source: str,
     artifact_types: list[str] | None,
     include_org_research: bool,
+    include_concept_statements: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
     """Run every requested artifact type (default: all of
-    ALL_8_ARTIFACT_TYPES) plus optional org research for ONE caller-specified
-    bill, in a single call -- SYNC-15.
+    ALL_8_ARTIFACT_TYPES) plus optional org research and concept-statement
+    generation for ONE caller-specified bill, in a single call -- SYNC-15
+    (include_concept_statements added SYNC-31).
 
     The single-bill counterpart to run_legbot_pipeline: that function lists
     candidates across a whole jurisdiction/session and loops _process_bill
@@ -570,6 +662,7 @@ async def run_single_bill_full(
         gov_id=gov_id,
         artifact_types=resolved_artifact_types,
         include_org_research=include_org_research,
+        include_concept_statements=include_concept_statements,
         dry_run=dry_run,
     )
 
@@ -584,6 +677,7 @@ async def run_single_bill_full(
         session_code=session_code,
         artifact_types=resolved_artifact_types,
         include_org_research=include_org_research,
+        include_concept_statements=include_concept_statements,
         dry_run=dry_run,
         run_id=run_id,
         broker_api_base=broker_api_base,
@@ -611,7 +705,8 @@ async def run_scheduled_session_pipeline(config: dict) -> dict:
         config: this job's own ``session_pipeline_batch`` block
             (sync_schedule.yaml). Required keys: jurisdiction_iso2,
             session_code, artifact_types, limit. Optional:
-            include_org_research (default False), dry_run (default False).
+            include_org_research (default False), include_concept_statements
+            (default False, SYNC-31), dry_run (default False).
 
     Returns:
         run_legbot_pipeline's own result dict on success. On a missing
@@ -633,6 +728,7 @@ async def run_scheduled_session_pipeline(config: dict) -> dict:
             config["artifact_types"],
             config.get("include_org_research", False),
             config["limit"],
+            include_concept_statements=config.get("include_concept_statements", False),
             dry_run=config.get("dry_run", False),
         )
     except ValueError as exc:
