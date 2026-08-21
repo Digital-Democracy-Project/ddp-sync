@@ -117,6 +117,163 @@ async def test_compare_version_fields_pass_through_the_payload():
     assert call.kwargs["json"]["compare_version_note"] == "Introduced"
 
 
+# ---------------------------------------------------------------------------
+# SYNC-29: failure_reason truncation -- a verbose failure_reason (e.g. a
+# backend-error repr) must never cause ddp-broker-py to reject the whole
+# write and lose the BillArtifact row entirely.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_overlong_failure_reason_is_truncated_before_posting():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 11, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    overlong = "backend error: " + "x" * 200
+    assert len(overlong) > 100
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_changelog",
+            content="",
+            status="failed",
+            failure_stage="generation",
+            failure_reason=overlong,
+        )
+
+    sent_reason = mock_client.post.await_args.kwargs["json"]["failure_reason"]
+    assert len(sent_reason) == 100
+    assert sent_reason == overlong[:100]
+
+
+@pytest.mark.asyncio
+async def test_overlong_failure_reason_logs_a_warning():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 14, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.broker_client.logger",
+    ) as mock_logger:
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_changelog",
+            content="",
+            status="failed",
+            failure_reason="x" * 150,
+        )
+
+    mock_logger.warning.assert_called_once()
+    assert mock_logger.warning.call_args.kwargs["original_length"] == 150
+
+
+@pytest.mark.asyncio
+async def test_exactly_100_char_failure_reason_is_not_truncated_or_warned():
+    """The boundary case: exactly at the limit must pass through unchanged
+    and must not log a truncation warning that never actually happened."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 15, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    exactly_100 = "x" * 100
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.broker_client.logger",
+    ) as mock_logger:
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="",
+            status="failed",
+            failure_reason=exactly_100,
+        )
+
+    sent_reason = mock_client.post.await_args.kwargs["json"]["failure_reason"]
+    assert sent_reason == exactly_100
+    mock_logger.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failure_reason_within_limit_is_unchanged():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 12, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="",
+            status="failed",
+            failure_reason="insufficient_information",
+        )
+
+    sent_reason = mock_client.post.await_args.kwargs["json"]["failure_reason"]
+    assert sent_reason == "insufficient_information"
+
+
+@pytest.mark.asyncio
+async def test_none_failure_reason_stays_none():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 13, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="A summary.",
+        )
+
+    assert mock_client.post.await_args.kwargs["json"]["failure_reason"] is None
+
+
 @pytest.mark.asyncio
 async def test_write_bill_organization_position_posts_expected_payload():
     """PLAN-bill-document-provenance.md's Organization Position Research

@@ -785,7 +785,7 @@ async def dispatch_and_record_bill_artifact(
                 content="",
                 status="failed",
                 failure_stage="dispatch_error",
-                failure_reason=str(exc)[:100],
+                failure_reason=str(exc),
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )

@@ -35,6 +35,12 @@ logger = structlog.get_logger()
 
 _REQUEST_TIMEOUT_SECONDS = 30.0
 
+# BillArtifact.failure_reason's real max_length on the ddp-broker-py side
+# (confirmed live, SYNC-29: a 191-character backend-error repr was rejected
+# outright with "Ensure this field has no more than 100 characters", losing
+# the entire BillArtifact write, not just the excess text in this field).
+_FAILURE_REASON_MAX_LENGTH = 100
+
 
 class BrokerClientError(Exception):
     """Raised when a ddp-broker-py request fails outright (bad request, auth
@@ -92,6 +98,17 @@ async def write_bill_artifact(
     configured for. None (the default) preserves every existing caller's
     behavior unchanged.
 
+    failure_reason is truncated to _FAILURE_REASON_MAX_LENGTH here,
+    unconditionally, regardless of what any caller passed in -- SYNC-29.
+    ddp-broker-py's BillArtifact.failure_reason has a real 100-character
+    max_length; a longer value doesn't just lose its own excess text, it
+    makes ddp-broker-py reject the entire write (400), silently losing the
+    whole BillArtifact row with no trace it was ever attempted. Fixed here,
+    the one place every caller's write actually passes through, rather than
+    requiring each caller (generate_and_store_bill_artifact,
+    generate_and_store_bill_changelog, and any future one) to remember to
+    bound it themselves.
+
     Returns:
         The written row as ddp-broker-py's API reports it, e.g.
         {"id": 42, "created": True}.
@@ -106,6 +123,16 @@ async def write_bill_artifact(
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write BillArtifact."
         )
+
+    if failure_reason is not None and len(failure_reason) > _FAILURE_REASON_MAX_LENGTH:
+        logger.warning(
+            "failure_reason exceeded ddp-broker-py's max_length — truncating",
+            bill_openstates_id=bill_openstates_id,
+            artifact_type=artifact_type,
+            original_length=len(failure_reason),
+            max_length=_FAILURE_REASON_MAX_LENGTH,
+        )
+        failure_reason = failure_reason[:_FAILURE_REASON_MAX_LENGTH]
 
     payload = {
         "bill_openstates_id": bill_openstates_id,
