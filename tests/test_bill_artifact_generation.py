@@ -640,49 +640,20 @@ _CHANGELOG_DISPATCH_RESULT = {
 
 
 @pytest.mark.asyncio
-async def test_changelog_backfills_compare_version_on_first_sighting():
-    """No ledger row at all yet for this bill -- backfill the older
-    (compare_version) row before writing, mirroring check_and_reingest_
-    version's own first-sighting safety scoping exactly."""
-    with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
-    ), patch(
-        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
-        new=AsyncMock(return_value=1),
-    ) as mock_backfill, patch(
-        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
-        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
-    ), patch(
-        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
-        new=AsyncMock(return_value={"id": 2, "created": True}),
-    ):
-        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
-
-    assert result == {"id": 2, "created": True}
-    mock_backfill.assert_awaited_once_with(
-        bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
-        jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
-        session_code=_CHANGELOG_KWARGS["session_code"],
-        versions=[
-            {"date": "2026-01-01", "note": "Introduced"},
-            {"date": "2026-02-01", "note": "Engrossed"},
-        ],
-        latest_version={"date": "2026-02-01", "note": "Engrossed"},
-        broker_api_base=None,
-        broker_api_token=None,
-    )
-
-
-@pytest.mark.asyncio
-async def test_changelog_backfills_compare_version_even_when_sibling_already_created_the_latest_row():
-    """SYNC-28's own reproduction: a sibling artifact type already wrote for
-    this bill's current version earlier in the same run_legbot_pipeline
-    batch, so ddp-broker-py's ledger is NOT empty by the time bill_changelog
-    runs -- but the OLDER compare_version row this call needs was never
-    created by that sibling write. The backfill must still be attempted
-    (and, since _backfill_missing_versions is a natural-key upsert, is safe
-    to attempt regardless of what the ledger already has)."""
+async def test_changelog_always_backfills_compare_version_regardless_of_ledger_state():
+    """SYNC-28: the backfill call is now unconditional -- this function no
+    longer has any awareness of ledger state (no more gate to distinguish
+    "first sighting" from "a sibling artifact type already wrote a `latest`
+    row for this bill earlier in the same batch," SYNC-28's own real bug
+    scenario), so both cases exercise this exact same code path and this one
+    test covers both. The actual safety property this depends on --
+    _backfill_missing_versions never re-writing `latest_version`'s own
+    natural key, and write_bill_version being a true idempotent no-op for a
+    version that already exists -- is verified separately, at that
+    function's own level, by test_bill_version_history.py's
+    test_backfill_excludes_latest_by_natural_key_not_object_identity and
+    test_backfill_return_count_excludes_already_present_versions; this test
+    only needs to prove THIS caller invokes it unconditionally."""
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
         new=AsyncMock(return_value=_ARCHIVED),

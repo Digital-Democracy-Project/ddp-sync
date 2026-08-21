@@ -569,6 +569,13 @@ async def generate_and_store_bill_changelog(
     # version), and (b) calls write_bill_version, itself an idempotent
     # natural-key upsert, for the compare_version row -- a no-op if that
     # row already exists, a real (if overdue) creation if it doesn't.
+    # _backfill_missing_versions also never raises (best-effort, logs and
+    # continues per its own docstring), so a broker hiccup here cannot
+    # block the write below -- both properties already have their own
+    # dedicated coverage in test_bill_version_history.py (respectively
+    # test_backfill_excludes_latest_by_natural_key_not_object_identity and
+    # test_backfill_one_bad_version_does_not_block_the_others), not
+    # re-verified again here.
     #
     # Known, bounded, accepted trade-off (not a new risk this fix
     # introduces, but stated honestly rather than left implicit): if the
