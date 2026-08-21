@@ -521,11 +521,21 @@ async def get_concept_statement_set(
     gov_id: str,
     jurisdiction_iso2: str,
     session_code: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict | None:
     """Read the current *published* ConceptStatementSet for a bill, if any
     (ddp-infra PLAN-bill-concept-polling.md §1.1's public read endpoint,
     GET /api/concept-statements/ — unauthenticated, resolves
     ConceptStatementSet.objects.current(...)).
+
+    broker_api_base/broker_api_token: optional per-call override, same shape
+    as get_bill_artifacts' own (SYNC-10) -- None (the default) preserves
+    this function's original behavior for its original caller
+    (concept_statement_dispatch.py's now-retired standalone batch job,
+    SYNC-32); session_pipeline_runner.py's consolidated path (SYNC-31)
+    passes these through so this dedup check lands on the same dev/prod
+    broker instance its own writes do.
 
     Returns:
         None when no *published* set exists yet for this bill identity.
@@ -543,7 +553,8 @@ async def get_concept_statement_set(
             unreachable — a real failure, distinct from "not found."
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot read ConceptStatementSet."
         )
@@ -551,7 +562,7 @@ async def get_concept_statement_set(
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
-                f"{settings.ddp_broker_api_base}/api/concept-statements/",
+                f"{resolved_api_base}/api/concept-statements/",
                 params={
                     "gov_id": gov_id,
                     "jurisdiction": jurisdiction_iso2,
@@ -581,6 +592,8 @@ async def create_concept_statement_set(
     statements: list[str],
     source_document_url: str = "",
     model_name: str | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
 ) -> dict:
     """Create a new ConceptStatementSet row (ddp-infra
     PLAN-bill-concept-polling.md §0.3/§0.4) — POST
@@ -597,6 +610,10 @@ async def create_concept_statement_set(
     ddp_sync.pipelines.concept_statement_dispatch's dedup note) — this
     function has no opinion and performs no existence check of its own.
 
+    broker_api_base/broker_api_token: optional per-call override, same shape
+    as write_bill_artifact's own (SYNC-10) -- see get_concept_statement_set's
+    own docstring for why this was added (SYNC-31).
+
     Returns:
         The created row as ddp-broker-py's API reports it, e.g.
         {"id": 12, "gov_id": ..., "status": "pending", "generated_at": ...}.
@@ -606,7 +623,9 @@ async def create_concept_statement_set(
             unreachable.
     """
     settings = get_settings()
-    if not settings.ddp_broker_api_base:
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot write ConceptStatementSet."
         )
@@ -619,12 +638,12 @@ async def create_concept_statement_set(
         "source_document_url": source_document_url,
         "model_name": model_name,
     }
-    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/concept-statement-sets/",
+                f"{resolved_api_base}/api/concept-statement-sets/",
                 headers=headers,
                 json=payload,
             )

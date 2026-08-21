@@ -22,6 +22,7 @@ _VALID_PAYLOAD = {
     "session_code": "2026F",
     "artifact_types": ["bill_summary", "bill_pros_cons"],
     "include_org_research": False,
+    "include_concept_statements": False,
     "limit": 10,
 }
 
@@ -84,7 +85,8 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
 
     assert response.status_code == 200
     mock_run.assert_awaited_once_with(
-        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500, dry_run=False,
+        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500,
+        include_concept_statements=False, dry_run=False,
         broker_api_base=None, broker_api_token=None,
     )
 
@@ -115,7 +117,8 @@ def test_valid_payload_returns_200_and_calls_pipeline_with_exact_args():
     assert response.status_code == 200
     assert response.json() == {"bills_considered": 3, "results": []}
     mock_run.assert_awaited_once_with(
-        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10, dry_run=False,
+        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
+        include_concept_statements=False, dry_run=False,
         broker_api_base=None, broker_api_token=None,
     )
 
