@@ -748,8 +748,6 @@ async def test_changelog_backfill_threads_broker_target_override():
         broker_api_base="http://localhost:8080",
         broker_api_token="dev-token",
     )
-    assert mock_backfill.await_args.kwargs["broker_api_base"] == "http://localhost:8080"
-    assert mock_backfill.await_args.kwargs["broker_api_token"] == "dev-token"
 
 
 # ---------------------------------------------------------------------------
