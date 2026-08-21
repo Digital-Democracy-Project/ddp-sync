@@ -63,7 +63,6 @@ import structlog
 
 from ddp_sync.services.broker_client import (
     BrokerClientError,
-    get_latest_bill_version,
     write_bill_artifact,
 )
 from ddp_sync.services.legbot_client import (
@@ -543,45 +542,63 @@ async def generate_and_store_bill_changelog(
     # generating artifacts for can hit the exact compare_version-FK-
     # resolution 400 SYNC-26 fixed for the daily bill_version_check job --
     # confirmed live against FL 2026E, where run_legbot_pipeline was the
-    # actual caller that surfaced the bug report. Mirrors that fix's own
-    # safety scoping precisely (reuses the same primitive rather than a new
-    # one, per this codebase's own "don't reinvent" convention for this
-    # module): only backfill when ddp-broker-py's ledger has no row at all
-    # yet for this bill (a genuine first sighting from this process's own
-    # point of view), never when a `latest` row already exists. BillVersion.
-    # created_at is auto_now_add and ddp-broker-py's own latest_bill_version
-    # resolves by -created_at, not version_date -- backfilling an older
-    # version after a newer one's row already exists would invert that
-    # ordering (the exact, still-open risk PR #54's own body documents for
-    # its now-removed one-off repair script). A bill that already has a
-    # ledger row is exactly the "already broken" case that still needs the
-    # separate, not-yet-built ddp-broker-py-side management command, not
-    # something safe to patch from here.
-    try:
-        already_has_ledger_row = await get_latest_bill_version(
-            bill_openstates_id, broker_api_base=broker_api_base,
-        ) is not None
-    except BrokerClientError:
-        # Ambiguous -- can't tell if this is a genuine first sighting.
-        # Skip the backfill attempt rather than guess; the write below
-        # will surface its own error if the ledger really is the cause.
-        already_has_ledger_row = True
+    # actual caller that surfaced the bug report.
+    #
+    # SYNC-28: the original version of this fix gated the backfill on "does
+    # ddp-broker-py's ledger have ANY row at all for this bill" (skipping
+    # entirely once one existed), reasoning that a bill with a `latest` row
+    # was either genuinely fully synced already, or "already broken" in a
+    # way only a separate ddp-broker-py-side management command should
+    # touch. That reasoning missed a real, deterministic case: within a
+    # single run_legbot_pipeline batch call, bill_changelog runs LAST among
+    # a bill's artifact types, and ddp-broker-py's own BillArtifact write
+    # endpoint auto-creates a bare BillVersion row for whichever version an
+    # EARLIER sibling artifact type (bill_summary, bill_pros_cons, etc.)
+    # just wrote -- always the bill's actual current version, never the
+    # OLDER compare_version this function itself needs. The per-bill gate
+    # saw that sibling-created row, concluded "already has a ledger row,"
+    # and skipped backfilling the older version entirely -- so the write
+    # below failed 100% of the time for every bill in this shape.
+    #
+    # Fix: call _backfill_missing_versions unconditionally instead of
+    # gating on ledger state at all. Safe to do because
+    # _backfill_missing_versions already (a) never re-writes
+    # `latest_version`'s own natural key (so it can't touch/duplicate
+    # whatever row a sibling artifact type -- or a real prior
+    # check_and_reingest_version sync -- already created for the current
+    # version), and (b) calls write_bill_version, itself an idempotent
+    # natural-key upsert, for the compare_version row -- a no-op if that
+    # row already exists, a real (if overdue) creation if it doesn't.
+    #
+    # Known, bounded, accepted trade-off (not a new risk this fix
+    # introduces, but stated honestly rather than left implicit): if the
+    # compare_version row genuinely has never existed before and is
+    # created only now -- after a sibling artifact type's write already
+    # created the current version's row moments earlier in this same
+    # batch -- its created_at will be later than the current version's.
+    # BillVersion.created_at is auto_now_add and ddp-broker-py's own
+    # latest_bill_version resolves by -created_at, not version_date, so
+    # this can cause get_latest_bill_version's next caller
+    # (check_and_reingest_version, the daily live-poll job) to see the
+    # older version as "latest" and redundantly re-check/re-ingest a
+    # version it already has real data for. That's wasted work, not data
+    # loss or a broken artifact -- and it is strictly better than this
+    # function's own prior behavior, which failed outright, every time,
+    # for every bill in this shape.
+    from ddp_sync.pipelines.bill_version import BillVersionSyncService
 
-    if not already_has_ledger_row:
-        from ddp_sync.pipelines.bill_version import BillVersionSyncService
-
-        await BillVersionSyncService._backfill_missing_versions(
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction_code=jurisdiction,
-            session_code=session_code,
-            versions=[
-                {"date": archived["old_version_date"], "note": archived["old_version_note"]},
-                {"date": version_date, "note": version_note},
-            ],
-            latest_version={"date": version_date, "note": version_note},
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
+    await BillVersionSyncService._backfill_missing_versions(
+        bill_openstates_id=bill_openstates_id,
+        jurisdiction_code=jurisdiction,
+        session_code=session_code,
+        versions=[
+            {"date": archived["old_version_date"], "note": archived["old_version_note"]},
+            {"date": version_date, "note": version_note},
+        ],
+        latest_version={"date": version_date, "note": version_note},
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
 
     dispatch_result = await dispatch_bill_changelog(
         old_bill_source=archived["old_bill_source"],
