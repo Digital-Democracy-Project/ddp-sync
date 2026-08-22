@@ -2,6 +2,19 @@
 
 Instructions for Claude Code sessions working in this repository.
 
+## ⚠️ WEBFLOW IS BEING DEPRECATED SOON ⚠️
+
+**DO NOT design, build, or extend any new mechanism around Webflow** (the CMS sync
+jobs, `webflow_id`-keyed flows, `bill_version.py`'s `check_and_reingest_version`/
+Flow-2 write path, etc.). It is on its way out. Any new trigger, pipeline, or
+feature — including bill-version-change detection, changelog generation, or
+anything else that might naturally reach for the existing Webflow-driven poll job
+as a hook point — must be built on the newer, Webflow-independent reach instead
+(`/explore`'s own OpenStates-direct path, `session_pipeline_runner.py`,
+`ensure_bill_exists`, etc.). Confirmed directly by Ramon, 2026-08-21 (see SYNC
+session history around that date for the context this came up in — a discussion
+of how to auto-trigger `bill_changelog` generation on a new scraped bill version).
+
 ## Dev/prod checkout discipline
 
 `~/Developer/repos/ddp-sync` is **production** — the `com.ddp.ddp-sync` LaunchDaemon
