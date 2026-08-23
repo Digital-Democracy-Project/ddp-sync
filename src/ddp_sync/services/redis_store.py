@@ -347,7 +347,19 @@ class RedisStore:
 
         The boolean matters: a caller that has just decided to escalate needs to know the
         decision did not persist, or it will re-decide and re-log it every review.
+
+        Rejects a value the reader would not recognise. resolve_cadence() would floor junk at the
+        configured cadence anyway, so this is not a safety fix -- it is so that a successful write
+        means something, and so a typo surfaces at the write rather than as a jurisdiction quietly
+        sitting at its floor with an override that looks present.
         """
+        if cadence not in ("nightly", "weekly"):
+            logger.error(
+                "Redis: refusing to store an unrecognised scrape cadence",
+                jurisdiction=jurisdiction,
+                cadence=cadence,
+            )
+            return False
         if not self._client:
             return False
         try:

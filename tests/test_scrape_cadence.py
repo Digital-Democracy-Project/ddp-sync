@@ -221,3 +221,55 @@ async def test_no_redis_client_at_all_is_not_an_error():
     s._client = None
     assert await s.get_scrape_cadence("fl") is None
     assert await s.set_scrape_cadence("fl", NIGHTLY) is False
+
+
+# -- pm-review round 1: the exclusion was declarative, and writes were unvalidated -------------
+
+
+def test_an_excluded_jurisdiction_is_never_escalated():
+    """MI must never be escalated: OPEN-53 established that more traffic against a WAF worsens a
+    block. The config key existed but nothing read it, which pm-review correctly called a
+    declaration rather than a rule. Enforced at the decision point so no caller can forget."""
+    hist = h(0, 25)  # qualifying activity — would escalate any other jurisdiction
+    v = cadence_review("mi", floor=WEEKLY, current_override=None, history=hist, excluded=["mi"])
+    assert v["excluded"] is True
+    assert v["action"] == "none"
+    assert v["effective"] == WEEKLY, "an excluded jurisdiction must stay at its floor"
+
+    # ...and the same history DOES escalate a jurisdiction that is not excluded, so the test is
+    # proving the exclusion rather than a quiet history.
+    other = cadence_review("va", floor=WEEKLY, current_override=None, history=hist, excluded=["mi"])
+    assert other["action"] == "escalate"
+
+
+def test_exclusion_does_not_strip_an_override_already_in_force():
+    """Excluding a jurisdiction stops it being escalated; it does not demote one that already is.
+    Demotion is never automatic, and that includes via the exclusion list."""
+    v = cadence_review(
+        "mi", floor=WEEKLY, current_override=NIGHTLY, history=h(0, 30), excluded=["mi"]
+    )
+    assert v["effective"] == NIGHTLY
+    assert v["action"] == "none"
+
+
+def test_exclusion_accepts_a_set_or_a_list():
+    hist = h(0, 25)
+    for ex in (["mi"], {"mi"}, ("mi",)):
+        assert cadence_review("mi", WEEKLY, None, hist, excluded=ex)["excluded"] is True
+
+
+def test_no_exclusions_configured_is_not_an_error():
+    assert cadence_review("va", WEEKLY, None, h(0, 25), excluded=None)["action"] == "escalate"
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognised_cadence_is_refused_at_the_write():
+    """resolve_cadence would floor junk anyway, so this is not a safety fix -- it is so that a
+    successful write means something and a typo surfaces where it happened."""
+    from ddp_sync.services.redis_store import RedisStore
+
+    s = RedisStore.__new__(RedisStore)
+    s._client = AsyncMock()
+    for bad in ("hourly", "WEEKLY", "", "daily"):
+        assert await s.set_scrape_cadence("fl", bad) is False
+    s._client.set.assert_not_awaited()

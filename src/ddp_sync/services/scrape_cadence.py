@@ -133,28 +133,68 @@ def cadence_review(
     history: list[dict],
     escalate_window: int = 2,
     quiet_window: int = 4,
+    excluded: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Decide what should happen to one jurisdiction's cadence. Pure; performs no I/O.
+
+    Both windows count **measured reviews, not calendar days.** `escalate_window=2` means "in the
+    last two reviews that produced a figure", which for a weekly jurisdiction is about two weeks
+    and for a nightly one about two nights. Runs we could not measure do not consume a slot, so a
+    stretch of unparseable import reports stretches the window in wall-clock terms rather than
+    silently ageing a productive run out of it. Deliberate, and worth knowing before tuning these.
+
+    `excluded` is enforced here rather than left to the caller. Michigan must never be escalated:
+    OPEN-53 established that more traffic against a WAF worsens a block, which is why MI is
+    already excluded from scrape retries. Enforcing it at the decision point means no future
+    caller can forget to check, and pm-review's objection was exactly that a config key nothing
+    reads is only a declaration.
 
     Returns a verdict the caller acts on:
         effective          the cadence that should be in force now
         action             "escalate" | "none"
+        excluded           True when this jurisdiction is barred from escalation
         demotion_advice    True when demotion would be defensible (advisory only)
     """
-    effective = resolve_cadence(floor, current_override)
+    is_excluded = jurisdiction in set(excluded or ())
+    previous = resolve_cadence(floor, current_override)
+    effective = previous
     action = "none"
 
-    if effective == WEEKLY and should_escalate(history, escalate_window):
+    if is_excluded:
+        logger.info(
+            "scrape_cadence: jurisdiction excluded from escalation, leaving cadence alone",
+            jurisdiction=jurisdiction,
+            effective=effective,
+        )
+    elif effective == WEEKLY and should_escalate(history, escalate_window):
         effective = NIGHTLY
         action = "escalate"
+        logger.info(
+            "scrape_cadence: escalating to nightly on observed filing activity",
+            jurisdiction=jurisdiction,
+            floor=floor,
+            window=escalate_window,
+        )
+
+    advice = effective == NIGHTLY and demotion_looks_reasonable(history, quiet_window)
+    if advice:
+        # Logged rather than acted on, and this log line is the whole delivery mechanism for the
+        # advice today -- see the module docstring for why demotion is never automatic.
+        logger.info(
+            "scrape_cadence: quiet for a sustained window and healthy — demotion to its "
+            "configured floor would be defensible. NOT acting; edit sync_day to do it.",
+            jurisdiction=jurisdiction,
+            quiet_window=quiet_window,
+            effective=effective,
+            floor=floor,
+        )
 
     return {
         "jurisdiction": jurisdiction,
         "floor": floor,
-        "previous": resolve_cadence(floor, current_override),
+        "previous": previous,
         "effective": effective,
         "action": action,
-        "demotion_advice": (
-            effective == NIGHTLY and demotion_looks_reasonable(history, quiet_window)
-        ),
+        "excluded": is_excluded,
+        "demotion_advice": advice,
     }
