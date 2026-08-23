@@ -927,17 +927,34 @@ class StateLegislativeCalendar:
         if not sessions:
             return None  # No live data, fall through to hardcoded
 
-        year_is_represented = False
+        # Which years this state's live data actually says anything about, from PARSED DATES
+        # ONLY -- never from the identifier.
+        #
+        # Identifiers are effectively free text from upstream, and pulling years out of them
+        # is not safe enough to decide whether to trust or discard the hardcoded calendar.
+        # pm-review flagged substring matching; extracting \d{4} has the same weakness in a
+        # less obvious form -- it finds "2026" inside a token like "HB2026", which says
+        # nothing about the year 2026. Dates are structured and mean what they say.
+        #
+        # Nothing is lost by this. The identifier's years are still used, a few lines below,
+        # for the stale-end-date case where a "2025-2026" session with a 2025 end date is
+        # treated as still active in 2026 -- that path returns True and never reaches this
+        # decision at all. Identifiers get to say "still sitting"; only dates get to say
+        # "we have real data about this year".
+        covered_years: set[int] = {
+            d.year
+            for session in sessions
+            for d in (
+                self._parse_date_str(session.get("start_date")),
+                self._parse_date_str(session.get("end_date")),
+            )
+            if d
+        }
+
         for session in sessions:
             start = self._parse_date_str(session.get("start_date"))
             end = self._parse_date_str(session.get("end_date"))
             identifier = session.get("identifier", "")
-
-            for d in (start, end):
-                if d and d.year == check_date.year:
-                    year_is_represented = True
-            if str(check_date.year) in identifier:
-                year_is_represented = True
 
             effective_start = (
                 start - timedelta(days=prefiling_days) if start and prefiling_days else start
@@ -954,13 +971,31 @@ class StateLegislativeCalendar:
                     int_years = [int(y) for y in years]
                     if len(int_years) > 1 and int_years[0] <= check_date.year <= int_years[-1]:
                         return True
-                    year_is_represented = year_is_represented or (
-                        int_years[0] <= check_date.year <= int_years[-1]
-                    )
 
-        # Had live data covering this year and none of it was active -> a real False.
-        # Had live data about entirely other years -> we do not actually know.
-        return False if year_is_represented else None
+        # Nothing live is active. Whether that is a real "not sitting" or just a gap in our
+        # copy of the data depends on which years the data speaks to.
+        #
+        # A pre-filing question spans a year boundary, so it needs BOTH years. pm-review
+        # caught the case: in December 2026 with only 2026's finished session cached, the
+        # data covers 2026 and so looked authoritative -- returning False and preventing the
+        # fallback from ever noticing that the 2027 session's window had already opened.
+        # That is the same stale-data suppression this fix exists to remove, in the one month
+        # it matters most, so a pre-filing check also requires the next year to be present.
+        needed = {check_date.year}
+        if prefiling_days:
+            needed.add(check_date.year + 1)
+        if needed <= covered_years:
+            return False
+
+        logger.debug(
+            "legislative calendar: live session data does not cover the period asked about, "
+            "falling back to the hardcoded calendar",
+            state=state_code.upper(),
+            check_date=str(check_date),
+            years_needed=sorted(needed),
+            years_covered=sorted(covered_years),
+        )
+        return None
 
     def _parse_date_str(self, date_str: str | None) -> date | None:
         """Parse a YYYY-MM-DD date string into a date object."""

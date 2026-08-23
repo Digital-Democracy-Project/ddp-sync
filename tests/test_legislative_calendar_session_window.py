@@ -170,3 +170,66 @@ def test_unknown_jurisdictions_are_unchanged(cal):
     for code in ["DC", "PR", "US", "XX"]:
         assert cal.is_in_session(code) is False
         assert cal.is_in_session(code, include_prefiling=True) is False
+
+
+# -- pm-review round 1: the late-year case the first version got wrong -----------------------
+
+
+def test_current_year_live_data_does_not_hide_next_years_prefiling_window():
+    """December 2026, live data holds only 2026's finished session, 2027's isn't cached yet.
+
+    The first version marked 2026 "covered" and answered a definite False, so the fallback
+    never noticed that the 2027 session's pre-filing window had already opened. Same stale-data
+    suppression this ticket exists to remove, in the one month it matters most -- 37 states'
+    windows open in November.
+    """
+    fallback_only = StateLegislativeCalendar()
+    december = date(2026, 12, 20)
+    assert fallback_only.is_in_session("AR", december, include_prefiling=True) is True
+
+    partial = StateLegislativeCalendar()
+    partial.warm_cache({"AR": _Juris([_Session("2026", "2026-04-13", "2026-05-15")])})
+    assert partial._check_live_sessions("AR", december, prefiling_days=42) is None
+    assert partial.is_in_session("AR", december, include_prefiling=True) is True
+
+
+def test_live_data_covering_both_years_is_authoritative_for_prefiling():
+    """The other side: when the data DOES cover both years and neither session is open, that
+    is a real answer and must not fall through to a guess."""
+    c = StateLegislativeCalendar()
+    c.warm_cache({"AR": _Juris([
+        _Session("2026", "2026-04-13", "2026-05-15"),
+        _Session("2027", "2027-01-11", "2027-03-01"),
+    ])})
+    # August 2026: 2026 is over, 2027's window has not opened. Both years known.
+    assert c._check_live_sessions("AR", date(2026, 8, 1), prefiling_days=42) is False
+    # ...and December 2026 IS inside 2027's window, from live data alone.
+    assert c.is_in_session("AR", date(2026, 12, 20), include_prefiling=True) is True
+
+
+def test_a_non_prefiling_question_only_needs_its_own_year():
+    """Requiring year+1 is specific to pre-filing. A plain "is it sitting today?" must stay
+    answerable from one year of data, or every ordinary check would fall through."""
+    c = StateLegislativeCalendar()
+    c.warm_cache({"AR": _Juris([_Session("2026", "2026-04-13", "2026-05-15")])})
+    assert c._check_live_sessions("AR", date(2026, 8, 1)) is False
+
+
+def test_year_detection_does_not_substring_match():
+    """`str(year) in identifier` would match a year inside an unrelated token. Identifiers are
+    effectively free text from upstream, so years are parsed, not searched for."""
+    c = StateLegislativeCalendar()
+    # "HB2026" is a bill-ish token, not a statement about the year 2026.
+    c.warm_cache({"AR": _Juris([_Session("special-HB2026-x", "2019-01-01", "2019-02-01")])})
+    # 2019 is covered; 2026 is not -> falls through rather than answering False.
+    assert c._check_live_sessions("AR", date(2026, 4, 20)) is None
+
+
+def test_an_identifier_year_span_keeps_a_session_active_but_does_not_grant_coverage():
+    """The identifier's years still do their original job -- a "2025-2028" session whose end
+    date is in 2025 is treated as still sitting in 2027 (the stale-end-date case). What they no
+    longer do is decide whether we have trustworthy data about a year; only parsed dates do
+    that. Identifiers get to say "still sitting"; dates get to say "we know about this year"."""
+    c = StateLegislativeCalendar()
+    c.warm_cache({"MI": _Juris([_Session("2025-2028", "2025-01-08", "2025-03-01")])})
+    assert c._check_live_sessions("MI", date(2027, 7, 1)) is True
