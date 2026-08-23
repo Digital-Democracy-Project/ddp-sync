@@ -318,6 +318,50 @@ class RedisStore:
     RUN_HISTORY_TTL = 86400 * 30  # 30 days -- comfortable margin over the weekly cadence this
     # exists for (a window of the last 3-4 runs), so a slow/delayed run doesn't age out early.
 
+    # OPEN-140: the runtime scrape cadence per jurisdiction. Redis is the source of truth and the
+    # YAML value is a floor, so an absent or unreadable key is not a failure -- it means "use the
+    # configured cadence", which is what resolve_cadence() does with None. Deliberately NO TTL:
+    # an expiry would silently demote a jurisdiction back to its floor, which is precisely the
+    # unattended demotion OPEN-140 refuses to do on purpose.
+    CADENCE_PREFIX = "ddp:scrape_cadence:"
+
+    async def get_scrape_cadence(self, jurisdiction: str) -> str | None:
+        """Runtime cadence override for a jurisdiction, or None if there isn't one.
+
+        None on any failure, deliberately: the caller floors it at the configured cadence, so a
+        Redis outage degrades to sync_schedule.yaml rather than to an unscheduled jurisdiction.
+        """
+        if not self._client:
+            return None
+        try:
+            v = await self._client.get(f"{self.CADENCE_PREFIX}{jurisdiction}")
+            return v.decode() if isinstance(v, bytes) else v
+        except Exception as e:
+            logger.error(
+                "Redis: failed to read scrape cadence", jurisdiction=jurisdiction, error=str(e)
+            )
+            return None
+
+    async def set_scrape_cadence(self, jurisdiction: str, cadence: str) -> bool:
+        """Record a runtime cadence override. Returns whether it was actually stored.
+
+        The boolean matters: a caller that has just decided to escalate needs to know the
+        decision did not persist, or it will re-decide and re-log it every review.
+        """
+        if not self._client:
+            return False
+        try:
+            await self._client.set(f"{self.CADENCE_PREFIX}{jurisdiction}", cadence)
+            return True
+        except Exception as e:
+            logger.error(
+                "Redis: failed to write scrape cadence",
+                jurisdiction=jurisdiction,
+                cadence=cadence,
+                error=str(e),
+            )
+            return False
+
     async def append_run_history(
         self, flow_name: str, jurisdiction: str, record: dict, max_len: int = 20
     ) -> None:
