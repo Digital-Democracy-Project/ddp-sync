@@ -15,17 +15,17 @@ import pytest
 
 from ddp_sync.pipelines.openstates_scrape import _run_scrape, _sweep_import_eligible
 
-CANARY_CFG = {"sweep_import": {"enabled": True, "jurisdictions": ["va", "ut"]}}
+CANARY_CFG = {"sweep_import": {"enabled": True, "jurisdictions": ["va"]}}
 
 
 # --- the gate itself -------------------------------------------------------------------
 
-@pytest.mark.parametrize("jurisdiction", ["va", "ut"])
+@pytest.mark.parametrize("jurisdiction", ["va"])
 def test_listed_jurisdictions_are_eligible(jurisdiction):
     assert _sweep_import_eligible(jurisdiction, CANARY_CFG) is True
 
 
-@pytest.mark.parametrize("jurisdiction", ["fl", "wa", "usa", "mi", "ma", "az", "al"])
+@pytest.mark.parametrize("jurisdiction", ["ut", "fl", "wa", "usa", "mi", "ma", "az", "al"])
 def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
     """The canary must not leak to anything else — including the three primaries."""
     assert _sweep_import_eligible(jurisdiction, CANARY_CFG) is False
@@ -33,7 +33,7 @@ def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
 
 def test_disabled_flag_overrides_the_list():
     """The documented rollback: flip enabled: false and the list stops mattering."""
-    cfg = {"sweep_import": {"enabled": False, "jurisdictions": ["va", "ut"]}}
+    cfg = {"sweep_import": {"enabled": False, "jurisdictions": ["va"]}}
     assert _sweep_import_eligible("va", cfg) is False
 
 
@@ -95,7 +95,7 @@ async def test_env_var_is_absent_when_no_config_is_passed():
 
 # --- the shipped config ---------------------------------------------------------------
 
-def test_shipped_yaml_enables_exactly_the_two_canary_jurisdictions():
+def test_shipped_yaml_enables_exactly_the_one_canary_jurisdiction():
     """Guards the actual rollout state, so widening it is a deliberate, reviewed edit."""
     from pathlib import Path
 
@@ -106,4 +106,4 @@ def test_shipped_yaml_enables_exactly_the_two_canary_jurisdictions():
     sweep = cfg["openstates_scrape"]["sweep_import"]
 
     assert sweep["enabled"] is True
-    assert sweep["jurisdictions"] == ["va", "ut"]
+    assert sweep["jurisdictions"] == ["va"]

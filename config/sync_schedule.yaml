@@ -228,9 +228,23 @@ openstates_scrape:
   # The mechanism has been merged but dark since 2026-07-30 -- run-scrape.sh reads
   # SWEEP_IMPORT_ENABLED and nothing set it. This is the gate.
   #
-  # Rolled out per jurisdiction on purpose: VA and UT first (smallest, weekly, lowest risk) per
-  # PLAN-incremental-scraping.md's own rollout condition, before FL/MA/USA. Add a jurisdiction
-  # here only after watching a clean canary cycle for the ones already listed.
+  # Rolled out per jurisdiction on purpose. VA ONLY for the first cycle, per
+  # PLAN-incremental-scraping.md's own rollout condition ("run the VA *or* UT canary first" —
+  # singular), before UT and then FL/MA/USA.
+  #
+  # Why one and not both: the secondary-states job fans its five jurisdictions out with
+  # asyncio.gather, so VA and UT start simultaneously (confirmed live 2026-08-22 — both at
+  # 22:00:00), and run-scrape.sh's import lock is keyed per SCRAPE_KEY so they would NOT
+  # serialise. Enabling both would make the very first canary a test of two concurrent
+  # sweep-imports against the same Postgres, which conflates "does the sweep work" with "does
+  # sweep contention work". VA alone answers the first question; add UT for the second.
+  #
+  # VA rather than UT because VA is currently healthy (124s run 2026-08-22) while UT is only
+  # just recovering from OPEN-106's get_session_list() failure — don't canary on the one that
+  # was broken last week.
+  #
+  # Add a jurisdiction here only after watching a clean cycle for the ones already listed.
+  # Both run weekly, so each cycle costs a week of calendar time.
   #
   # Product sign-off obtained 2026-08-22 (Ramon) on the one question this actually turned on:
   # consumers (api-v3, dashboards) MAY see a jurisdiction mid-update rather than a consistent
@@ -239,10 +253,15 @@ openstates_scrape:
   #
   # Read by _sweep_import_eligible() in pipelines/openstates_scrape.py, which sets
   # SWEEP_IMPORT_ENABLED=1 in run-scrape.sh's environment. Shape mirrors
-  # secondary.scrapebot_fallback below. To roll back: set enabled: false, or empty the list.
+  # secondary.scrapebot_fallback below.
+  #
+  # Rollback: set enabled: false, or empty the list. Note precisely what that does and does
+  # not do -- it stops SWEEP_IMPORT_ENABLED being injected into FUTURE runs. It does not revert
+  # bills a sweep already imported, and it does not stop an in-flight run. To stop a run in
+  # progress you have to kill the run itself.
   sweep_import:
     enabled: true
-    jurisdictions: ["va", "ut"]
+    jurisdictions: ["va"]   # UT next, after one clean VA cycle
 
   patch_refresh:
     enabled: true
