@@ -218,6 +218,49 @@ openstates_scrape:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
 
+  # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
+  # transient fault currently waits a week for its next attempt -- that is what happened to MA
+  # on 2026-08-01, a network timeout on a run that would have succeeded on a re-run. When a
+  # jurisdiction is opted in here, ddp-sync invokes run-scrape-retrying.sh instead of
+  # run-scrape.sh; that wrapper re-runs the scrape a fixed number of times and lets
+  # run-scrape.sh alert exactly once, at the end, instead of once per attempt.
+  #
+  # MA and USA first, per the plan's staged-rollout recommendation -- MA because it is the
+  # jurisdiction the incident happened to, USA because it is the other high-value one. A
+  # jurisdiction not listed here is invoked exactly as it is today: same script, same
+  # arguments, no wrapper process at all.
+  #
+  # jurisdictions_excluded is not redundant with the allowlist, it outlives it. When the
+  # rollout finishes and someone widens `jurisdictions` (plausibly to every jurisdiction),
+  # this is the line that still keeps MI out. MI must never be retried: OPEN-53 established
+  # that a blind retry against a WAF worsens a block rather than recovering from it, because
+  # each attempt is more traffic from an already-suspect client. MI is the jurisdiction that
+  # gets WAF-blocked (it is why secondary.scrapebot_fallback below lists exactly ["mi"]).
+  #
+  # backoff_secs is the wait before each *re*try; the last value repeats if there are more
+  # retries than values. So [900, 900] is fixed 15m and [900, 1800, 3600] is growing 15/30/60 --
+  # the shape is a config edit, not a code change.
+  #
+  # THE VALUES BELOW ARE A PLACEHOLDER, NOT A DECISION. 3 attempts at 900,1800 covers a
+  # 45-minute window, and the MA failure this exists to catch only manifested after roughly
+  # five hours -- so this configuration would not have caught the very incident that motivated
+  # it. Whether the right answer is more attempts, much wider spacing, or something other than
+  # a retry loop is an open question on OPEN-87 for the operator, deliberately left open here
+  # rather than settled by whoever implemented the mechanism.
+  #
+  # Read by _retry_eligible() in pipelines/openstates_scrape.py. Shape mirrors
+  # secondary.scrapebot_fallback below.
+  #
+  # Rollback: set enabled: false, or empty the list. That makes future runs invoke
+  # run-scrape.sh directly again. It does not stop an in-flight wrapper -- to stop one that is
+  # mid-backoff you have to kill the run itself.
+  retry:
+    enabled: true
+    jurisdictions: ["ma", "usa"]      # staged rollout; widen only after a clean cycle
+    jurisdictions_excluded: ["mi"]    # never retry a WAF-blocked jurisdiction (OPEN-53)
+    max_attempts: 3
+    backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision
+
   patch_refresh:
     enabled: true
     sync_time_utc: "01:00"

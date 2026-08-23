@@ -194,6 +194,45 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in fallback_cfg.get("jurisdictions", [])
 
 
+def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """Is this jurisdiction opted into bounded whole-run retry (OPEN-87)?
+
+    These scrapes run weekly, so a run killed by a transient fault does not get
+    another attempt for a week. That is not hypothetical: MA lost a run to a
+    network timeout on 2026-08-01 that would have succeeded on a re-run. When a
+    jurisdiction is eligible, _run_scrape() invokes run-scrape-retrying.sh
+    instead of run-scrape.sh, which re-runs the scrape a bounded number of times
+    and lets run-scrape.sh fire exactly one alert at the end rather than one per
+    attempt.
+
+    Two conditions, not one: opted in via retry.jurisdictions AND not named in
+    retry.jurisdictions_excluded. The exclusion is not redundant with the
+    allowlist -- it is what still holds when the staged rollout finishes and
+    someone widens the allowlist to everything. MI must never be retried, because
+    OPEN-53 established that a blind retry against a WAF worsens a block rather
+    than recovering from it: every attempt is more traffic from a client the WAF
+    already distrusts. MI is the jurisdiction that actually gets WAF-blocked --
+    it is why secondary.scrapebot_fallback lists exactly ["mi"].
+
+    Config lives under openstates_scrape.retry in sync_schedule.yaml, mirroring
+    secondary.scrapebot_fallback's shape above. Absent/disabled by default, so a
+    jurisdiction that hasn't opted in is invoked exactly as it is today -- same
+    script, same arguments, no wrapper process at all.
+
+    Deliberately NOT a $STATE test in shell (OPEN-124): ddp-sync already resolves
+    per-jurisdiction opt-ins from this YAML, and it is what invokes the scrape,
+    so it is the right place to decide. This function is the single source of
+    that decision -- the wrapper's own SCRAPE_RETRY_EXCLUDED_JURISDICTIONS is for
+    a human invoking it by hand, and is deliberately not passed from here.
+    """
+    retry_cfg = (config or {}).get("retry", {})
+    if not retry_cfg.get("enabled", False):
+        return False
+    if jurisdiction in retry_cfg.get("jurisdictions_excluded", []):
+        return False
+    return jurisdiction in retry_cfg.get("jurisdictions", [])
+
+
 async def _maybe_preseed_scrapebot_cookies(
     jurisdiction: str,
     config: dict | None,
@@ -293,12 +332,44 @@ async def _run_scrape(
     """
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
 
-    script = os.path.join(openstates_root, "run-scrape.sh")
+    # OPEN-87: an opted-in jurisdiction goes through the bounded-retry wrapper instead. The
+    # wrapper takes the same arguments and calls run-scrape.sh itself, so nothing else about
+    # this invocation changes. Choosing the script (rather than passing run-scrape.sh a "please
+    # retry" flag) is what makes the opt-out absolute: a jurisdiction that is not eligible does
+    # not get a wrapper process at all, so its invocation is byte-identical to today's.
+    retry_enabled = _retry_eligible(jurisdiction, config)
+    script_name = "run-scrape-retrying.sh" if retry_enabled else "run-scrape.sh"
+    script = os.path.join(openstates_root, script_name)
     cmd = ["/bin/bash", script, jurisdiction]
     if session_arg:
         cmd.append(session_arg)
 
     env = {**os.environ, "SKIP_PATCHES": "1"}
+    if retry_enabled:
+        # run-scrape-retrying.sh reads these; see _retry_eligible() for why the opt-in lives in
+        # YAML rather than as a $STATE test in the script. backoff_secs is a YAML list and the
+        # wrapper wants a comma string, since it is bash 3.2 and has no arrays to receive.
+        retry_cfg = (config or {}).get("retry", {})
+        env["SCRAPE_RETRY_MAX_ATTEMPTS"] = str(retry_cfg.get("max_attempts", 3))
+        env["SCRAPE_RETRY_BACKOFF_SECS"] = ",".join(
+            str(s) for s in retry_cfg.get("backoff_secs", [900, 1800])
+        )
+        logger.info(
+            "openstates_scrape: bounded retry enabled for this run",
+            jurisdiction=jurisdiction,
+            max_attempts=env["SCRAPE_RETRY_MAX_ATTEMPTS"],
+            backoff_secs=env["SCRAPE_RETRY_BACKOFF_SECS"],
+        )
+    # OPEN-87, unresolved and deliberately not worked around here: this timeout applies to the
+    # whole invocation, which for a retry-enabled jurisdiction means the wrapper AND all of its
+    # attempts AND the backoff between them. A 3-attempt wrapper can therefore be killed partway
+    # through attempt 2 no matter what budget it keeps for itself, and these values were sized
+    # for a single attempt. The plan's original RETRY_TOTAL_BUDGET_SECS was the mechanism for
+    # keeping the wrapper inside this ceiling, and the simplified scope dropped it -- so the
+    # interaction is now unguarded by design rather than by oversight. Raising these values,
+    # having the wrapper read the ceiling, or scheduling per-attempt instead of per-invocation
+    # are all real options; picking one is an operator decision on OPEN-87, not something to
+    # settle by quietly inventing a budget here.
     timeout = timeout_s or SCRAPE_TIMEOUT_S.get(jurisdiction, SCRAPE_TIMEOUT_S["default"])
     label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
 
