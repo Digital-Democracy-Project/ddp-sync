@@ -263,6 +263,65 @@ openstates_scrape:
     enabled: true
     jurisdictions: ["va"]   # UT next, after one clean VA cycle
 
+  # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
+  # transient fault currently waits a week for its next attempt -- that is what happened to MA
+  # on 2026-08-01, a network timeout on a run that would have succeeded on a re-run. When a
+  # jurisdiction is opted in here, ddp-sync invokes run-scrape-retrying.sh instead of
+  # run-scrape.sh; that wrapper re-runs the scrape a fixed number of times and lets
+  # run-scrape.sh alert exactly once, at the end, instead of once per attempt.
+  #
+  # MA ONLY for the first cycle. The ticket says "MA/USA-first", and MA is not in question --
+  # it is the jurisdiction the 2026-08-01 incident happened to. USA is deliberately held back
+  # for one cycle on arithmetic, not taste: SCRAPE_TIMEOUT_S["usa"] is 4h, the tightest ceiling
+  # of any named jurisdiction (fl 16h, wa 8h, ma falls to the 6h default). Three attempts plus
+  # 45 minutes of backoff has to fit inside that whole ceiling, so a USA session averaging much
+  # over an hour cannot complete its third attempt before ddp-sync kills the invocation. That
+  # makes USA the worst possible first canary: a kill mid-attempt would look like the retry
+  # design failing when it was really the timeout interaction (open question 2 on OPEN-87).
+  # Add USA once that question is settled, or once its timeout is raised.
+  #
+  # A jurisdiction not listed here is invoked exactly as it is today: same script, same
+  # arguments, no wrapper process at all.
+  #
+  # "One clean cycle" before widening means, concretely: the run completed without being killed
+  # by SCRAPE_TIMEOUT_S; exactly one failure alert per genuinely-failed run and none for a run
+  # that recovered on a later attempt; and total runtime still inside the ceiling with the
+  # backoff included.
+  #
+  # jurisdictions_excluded is not redundant with the allowlist, it outlives it. When the
+  # rollout finishes and someone widens `jurisdictions` (plausibly to every jurisdiction),
+  # this is the line that still keeps MI out. MI must never be retried: OPEN-53 established
+  # that a blind retry against a WAF worsens a block rather than recovering from it, because
+  # each attempt is more traffic from an already-suspect client. MI is the jurisdiction that
+  # gets WAF-blocked (it is why secondary.scrapebot_fallback below lists exactly ["mi"]).
+  #
+  # backoff_secs is the wait before each *re*try; the last value repeats if there are more
+  # retries than values. So [900, 900] is fixed 15m and [900, 1800, 3600] is growing 15/30/60 --
+  # the shape is a config edit, not a code change.
+  #
+  # THE VALUES BELOW ARE A PLACEHOLDER, NOT A DECISION. 3 attempts at 900,1800 covers a
+  # 45-minute window, and the MA failure this exists to catch only manifested after roughly
+  # five hours -- so this configuration would not have caught the very incident that motivated
+  # it. Whether the right answer is more attempts, much wider spacing, or something other than
+  # a retry loop is an open question on OPEN-87 for the operator, deliberately left open here
+  # rather than settled by whoever implemented the mechanism.
+  #
+  # Read by _retry_eligible() in pipelines/openstates_scrape.py. Shape mirrors
+  # secondary.scrapebot_fallback below.
+  #
+  # Rollback: set enabled: false, or empty the list. That makes future runs invoke
+  # run-scrape.sh directly again. It does not stop an in-flight wrapper -- to stop one that is
+  # mid-backoff you have to kill the run itself.
+  # Named scrape_retry, not retry: this file already has an unrelated TOP-LEVEL `retry:` block
+  # (OpenStates API call retries, max_attempts/backoff_seconds). Same word, different thing, and
+  # a reader skimming for "retry" should not have to work out which one they landed on.
+  scrape_retry:
+    enabled: true
+    jurisdictions: ["ma"]             # USA next, after one clean MA cycle (see above)
+    jurisdictions_excluded: ["mi"]    # never retry a WAF-blocked jurisdiction (OPEN-53)
+    max_attempts: 3
+    backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision
+
   patch_refresh:
     enabled: true
     sync_time_utc: "01:00"

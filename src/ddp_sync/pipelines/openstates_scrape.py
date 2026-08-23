@@ -223,6 +223,47 @@ def _sweep_import_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in sweep_cfg.get("jurisdictions", [])
 
 
+def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """Is this jurisdiction opted into bounded whole-run retry (OPEN-87)?
+
+    These scrapes run weekly, so a run killed by a transient fault does not get
+    another attempt for a week. That is not hypothetical: MA lost a run to a
+    network timeout on 2026-08-01 that would have succeeded on a re-run. When a
+    jurisdiction is eligible, _run_scrape() invokes run-scrape-retrying.sh
+    instead of run-scrape.sh, which re-runs the scrape a bounded number of times
+    and lets run-scrape.sh fire exactly one alert at the end rather than one per
+    attempt.
+
+    Two conditions, not one: opted in via scrape_retry.jurisdictions AND not
+    named in scrape_retry.jurisdictions_excluded. The exclusion is not redundant with the
+    allowlist -- it is what still holds when the staged rollout finishes and
+    someone widens the allowlist to everything. MI must never be retried, because
+    OPEN-53 established that a blind retry against a WAF worsens a block rather
+    than recovering from it: every attempt is more traffic from a client the WAF
+    already distrusts. MI is the jurisdiction that actually gets WAF-blocked --
+    it is why secondary.scrapebot_fallback lists exactly ["mi"].
+
+    Config lives under openstates_scrape.scrape_retry in sync_schedule.yaml
+    -- named scrape_retry because that file already has an unrelated top-level
+    `retry:` block for OpenStates API call retries. Mirroring
+    secondary.scrapebot_fallback's shape above. Absent/disabled by default, so a
+    jurisdiction that hasn't opted in is invoked exactly as it is today -- same
+    script, same arguments, no wrapper process at all.
+
+    Deliberately NOT a $STATE test in shell (OPEN-124): ddp-sync already resolves
+    per-jurisdiction opt-ins from this YAML, and it is what invokes the scrape,
+    so it is the right place to decide. This function is the single source of
+    that decision -- the wrapper's own SCRAPE_RETRY_EXCLUDED_JURISDICTIONS is for
+    a human invoking it by hand, and is deliberately not passed from here.
+    """
+    retry_cfg = (config or {}).get("scrape_retry", {})
+    if not retry_cfg.get("enabled", False):
+        return False
+    if jurisdiction in retry_cfg.get("jurisdictions_excluded", []):
+        return False
+    return jurisdiction in retry_cfg.get("jurisdictions", [])
+
+
 async def _maybe_preseed_scrapebot_cookies(
     jurisdiction: str,
     config: dict | None,
@@ -271,7 +312,7 @@ async def _maybe_preseed_scrapebot_cookies(
 
 
 def _run_with_group_kill(
-    cmd: list[str], env: dict, timeout: int
+    cmd: list[str], env: dict, timeout: int, cwd: str | None = None
 ) -> tuple[int, bytes, bytes, bool]:
     """Run cmd to completion or timeout, killing its whole process group on timeout.
 
@@ -286,7 +327,12 @@ def _run_with_group_kill(
     timeout can os.killpg() the whole group instead of just the one process we started.
     """
     process = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -322,7 +368,30 @@ async def _run_scrape(
     """
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
 
-    script = os.path.join(openstates_root, "run-scrape.sh")
+    # OPEN-87: an opted-in jurisdiction goes through the bounded-retry wrapper instead. The
+    # wrapper takes the same arguments and calls run-scrape.sh itself, so nothing else about
+    # this invocation changes. Choosing the script (rather than passing run-scrape.sh a "please
+    # retry" flag) is what makes the opt-out absolute: a jurisdiction that is not eligible does
+    # not get a wrapper process at all, so its invocation is byte-identical to today's.
+    retry_enabled = _retry_eligible(jurisdiction, config)
+    script = os.path.join(openstates_root, "run-scrape-retrying.sh") if retry_enabled else ""
+    if retry_enabled and not os.path.exists(script):
+        # These are two separate repos with two separate deploys, so this config can legitimately
+        # be live before the wrapper script is. Falling back matters more than it looks: without
+        # it, /bin/bash on a missing script exits 127, which is a *positive* return code -- and
+        # the returncode != 0 branch below deliberately does not alert on those, on the grounds
+        # that run-scrape.sh already alerted from inside the process. Here run-scrape.sh never
+        # ran, so nobody would alert and an opted-in jurisdiction would fail silently every
+        # cycle until someone noticed the missing data.
+        logger.warning(
+            "openstates_scrape: retry enabled but run-scrape-retrying.sh is missing — "
+            "falling back to run-scrape.sh (deploy ddp-open-states first)",
+            jurisdiction=jurisdiction,
+            expected_path=script,
+        )
+        retry_enabled = False
+    if not retry_enabled:
+        script = os.path.join(openstates_root, "run-scrape.sh")
     cmd = ["/bin/bash", script, jurisdiction]
     if session_arg:
         cmd.append(session_arg)
@@ -336,6 +405,31 @@ async def _run_scrape(
             "openstates_scrape: import-as-you-go sweep enabled for this run",
             jurisdiction=jurisdiction,
         )
+    if retry_enabled:
+        # run-scrape-retrying.sh reads these; see _retry_eligible() for why the opt-in lives in
+        # YAML rather than as a $STATE test in the script. backoff_secs is a YAML list and the
+        # wrapper wants a comma string, since it is bash 3.2 and has no arrays to receive.
+        retry_cfg = (config or {}).get("scrape_retry", {})
+        env["SCRAPE_RETRY_MAX_ATTEMPTS"] = str(retry_cfg.get("max_attempts", 3))
+        env["SCRAPE_RETRY_BACKOFF_SECS"] = ",".join(
+            str(s) for s in retry_cfg.get("backoff_secs", [900, 1800])
+        )
+        logger.info(
+            "openstates_scrape: bounded retry enabled for this run",
+            jurisdiction=jurisdiction,
+            max_attempts=env["SCRAPE_RETRY_MAX_ATTEMPTS"],
+            backoff_secs=env["SCRAPE_RETRY_BACKOFF_SECS"],
+        )
+    # OPEN-87, unresolved and deliberately not worked around here: this timeout applies to the
+    # whole invocation, which for a retry-enabled jurisdiction means the wrapper AND all of its
+    # attempts AND the backoff between them. A 3-attempt wrapper can therefore be killed partway
+    # through attempt 2 no matter what budget it keeps for itself, and these values were sized
+    # for a single attempt. The plan's original RETRY_TOTAL_BUDGET_SECS was the mechanism for
+    # keeping the wrapper inside this ceiling, and the simplified scope dropped it -- so the
+    # interaction is now unguarded by design rather than by oversight. Raising these values,
+    # having the wrapper read the ceiling, or scheduling per-attempt instead of per-invocation
+    # are all real options; picking one is an operator decision on OPEN-87, not something to
+    # settle by quietly inventing a budget here.
     timeout = timeout_s or SCRAPE_TIMEOUT_S.get(jurisdiction, SCRAPE_TIMEOUT_S["default"])
     label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
 
@@ -525,20 +619,40 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
     t = time.monotonic()
 
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        # _run_with_group_kill rather than subprocess.run: apply-local-patches.sh shells out to
+        # git, and subprocess.run(timeout=...) kills only the direct child — leaving those git
+        # operations running against a half-rebuilt scraper worktree that a concurrent scrape
+        # may already be reading through run-scrape.sh's READER_MARKER lock. Same reasoning as
+        # _run_scrape's own use of this helper.
+        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+            _run_with_group_kill,
             ["/bin/bash", script],
-            cwd=openstates_root,
-            capture_output=True,
-            timeout=300,
+            dict(os.environ),
+            300,
+            openstates_root,
         )
         duration = round(time.monotonic() - t, 1)
 
-        if result.returncode != 0:
-            stderr = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error("openstates_patch_refresh: timeout", duration_seconds=duration)
+            await _write_flow_status("openstates_patch_refresh", {
+                "flow": "openstates_patch_refresh",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "error": "timeout",
+                "duration_seconds": duration,
+            })
+            # We killed the script's whole process group, so its own ERR trap never ran and it
+            # never alerted. We're the only ones who know this happened.
+            _alert_scrape_failure("patch refresh", "timed out after 300s", duration)
+            return {"success": False, "error": "timeout", "duration_seconds": duration}
+
+        if returncode != 0:
+            stderr = (stderr_bytes or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_patch_refresh: failed",
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr,
                 duration_seconds=duration,
             )
@@ -547,10 +661,11 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "started_at": start_time.isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "failed",
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            return {"success": False, "error": f"exit_code_{result.returncode}", "duration_seconds": duration}
+            _alert_scrape_failure("patch refresh", f"exited {returncode}: {stderr[-200:]}", duration)
+            return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_patch_refresh: done", duration_seconds=duration)
         await _write_flow_status("openstates_patch_refresh", {
@@ -562,13 +677,16 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
         })
         return {"success": True, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - t, 1)
-        logger.error("openstates_patch_refresh: timeout", duration_seconds=duration)
-        return {"success": False, "error": "timeout", "duration_seconds": duration}
+    # No `except subprocess.TimeoutExpired` here any more: _run_with_group_kill swallows it and
+    # returns timed_out=True, handled inside the try above.
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_patch_refresh: error", error=str(e), duration_seconds=duration)
+        # Deliberately NOT alerting here. OPEN-127 is scoped to subprocess failures (timeout,
+        # nonzero exit), and _run_scrape has no generic-exception branch at all, so there's no
+        # established behaviour to match. An exception here is a scheduler/config/coding fault
+        # rather than a scrape failure, and routing those into #automation-errors is its own
+        # decision. Left as-is per /pm-review round 1.
         return {"success": False, "error": str(e), "duration_seconds": duration}
 
 
@@ -783,20 +901,37 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     t = time.monotonic()
 
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        # This call site already passed start_new_session=True, which _run_with_group_kill's own
+        # docstring explains is not sufficient on its own — it makes the child a process-group
+        # leader but nothing then targets that group, so a timeout still orphaned the real work
+        # (git pull, os-people to-database across every state). Routed through the helper so the
+        # group actually gets killed.
+        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+            _run_with_group_kill,
             ["/bin/bash", script],
-            capture_output=True,
-            timeout=3600,
-            start_new_session=True,
+            dict(os.environ),
+            3600,
         )
         duration = round(time.monotonic() - t, 1)
 
-        if result.returncode != 0:
-            stderr_tail = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error("openstates_people_refresh: timeout", duration_seconds=duration)
+            await _write_flow_status("openstates_people_refresh", {
+                "flow": "openstates_people_refresh",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "error": "timeout",
+                "duration_seconds": duration,
+            })
+            _alert_scrape_failure("people refresh", "timed out after 3600s", duration)
+            return {"success": False, "error": "timeout", "duration_seconds": duration}
+
+        if returncode != 0:
+            stderr_tail = (stderr_bytes or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_people_refresh: failed",
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr_tail,
                 duration_seconds=duration,
             )
@@ -805,10 +940,11 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "started_at": start_time.isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "failed",
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            return {"success": False, "error": f"exit_code_{result.returncode}", "duration_seconds": duration}
+            _alert_scrape_failure("people refresh", f"exited {returncode}: {stderr_tail[-200:]}", duration)
+            return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_people_refresh: done", duration_seconds=duration)
         await _write_flow_status("openstates_people_refresh", {
@@ -820,11 +956,10 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         })
         return {"success": True, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - t, 1)
-        logger.error("openstates_people_refresh: timeout", duration_seconds=duration)
-        return {"success": False, "error": "timeout", "duration_seconds": duration}
+    # No `except subprocess.TimeoutExpired` here any more: _run_with_group_kill swallows it and
+    # returns timed_out=True, handled inside the try above.
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_people_refresh: error", error=str(e), duration_seconds=duration)
+        # Deliberately NOT alerting here — see the matching note in run_patch_refresh_job.
         return {"success": False, "error": str(e), "duration_seconds": duration}
