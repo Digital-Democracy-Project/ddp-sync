@@ -13,6 +13,26 @@ import structlog
 
 logger = structlog.get_logger()
 
+# OPEN-138: how long before a session formally convenes bills actually start appearing.
+#
+# Bills are drafted and published on legislature websites up to about six weeks before a
+# session convenes, so "out of session" never means "no bills to collect". Nothing in this
+# module knew that: both the live-data and hardcoded paths tested `start_date <= date`,
+# strictly on or after the official convene date. Sampled nine states' 2026 convene dates
+# against six weeks earlier and got False for every one.
+#
+# The proportions are what make it matter. Arkansas is counted in session for 33 days of
+# 2026; six weeks of pre-filing is 42 days -- a window LARGER than the whole session this
+# module knows about. Same for New Mexico and Wyoming.
+#
+# Per-jurisdiction dict rather than one constant, following the convention OPEN-121 settled
+# on for this codebase (a Python dict of per-state values, the RESILIENCE_PROFILES shape,
+# rather than inline conditionals). Every state uses the default until someone establishes a
+# real figure for it -- deliberately not guessing 50 different numbers. Add an entry only
+# with evidence for that state.
+DEFAULT_PREFILING_DAYS = 42
+PREFILING_DAYS_BY_STATE: dict[str, int] = {}
+
 
 class StateLegislativeCalendar:
     """
@@ -880,18 +900,66 @@ class StateLegislativeCalendar:
         logger.info("Legislative calendar cache warmed", states_loaded=loaded)
         return loaded
 
-    def _check_live_sessions(self, state_code: str, check_date: date) -> bool | None:
-        """Check live session data. Returns True/False if data available, None to fall through."""
+    def _check_live_sessions(
+        self, state_code: str, check_date: date, prefiling_days: int = 0
+    ) -> bool | None:
+        """Check live session data. Returns True/False if data available, None to fall through.
+
+        OPEN-138: "data available" used to mean *any* session record for this state, so a
+        state whose live data held only a 2023 session answered a definite False about a
+        2026 date and the hardcoded fallback never ran. Reproduced: with live data
+        `[2023 session]`, `is_in_session('AR', 2026-04-20)` returned False while the
+        fallback alone correctly returned True. That fails toward silence exactly when our
+        upstream session data is incomplete, which is the worst direction for a caller
+        deciding whether to expect any bills.
+
+        Now the question is whether the live data is relevant to the date being asked
+        about, not merely present:
+
+            a session covers the date                  -> True
+            no session covers it, but some session
+              mentions that YEAR                       -> False   (real answer, real data)
+            no session even mentions that year         -> None    (stale/partial, fall through)
+
+        `prefiling_days` widens each session's start backwards -- see is_in_session().
+        """
         sessions = self._live_sessions.get(state_code.upper())
         if not sessions:
             return None  # No live data, fall through to hardcoded
+
+        # Which years this state's live data actually says anything about, from PARSED DATES
+        # ONLY -- never from the identifier.
+        #
+        # Identifiers are effectively free text from upstream, and pulling years out of them
+        # is not safe enough to decide whether to trust or discard the hardcoded calendar.
+        # pm-review flagged substring matching; extracting \d{4} has the same weakness in a
+        # less obvious form -- it finds "2026" inside a token like "HB2026", which says
+        # nothing about the year 2026. Dates are structured and mean what they say.
+        #
+        # Nothing is lost by this. The identifier's years are still used, a few lines below,
+        # for the stale-end-date case where a "2025-2026" session with a 2025 end date is
+        # treated as still active in 2026 -- that path returns True and never reaches this
+        # decision at all. Identifiers get to say "still sitting"; only dates get to say
+        # "we have real data about this year".
+        covered_years: set[int] = {
+            d.year
+            for session in sessions
+            for d in (
+                self._parse_date_str(session.get("start_date")),
+                self._parse_date_str(session.get("end_date")),
+            )
+            if d
+        }
 
         for session in sessions:
             start = self._parse_date_str(session.get("start_date"))
             end = self._parse_date_str(session.get("end_date"))
             identifier = session.get("identifier", "")
 
-            if start and start <= check_date:
+            effective_start = (
+                start - timedelta(days=prefiling_days) if start and prefiling_days else start
+            )
+            if effective_start and effective_start <= check_date:
                 # If end_date is missing or in the future, session is active
                 if end is None or check_date <= end:
                     return True
@@ -903,7 +971,31 @@ class StateLegislativeCalendar:
                     int_years = [int(y) for y in years]
                     if len(int_years) > 1 and int_years[0] <= check_date.year <= int_years[-1]:
                         return True
-        return False  # Had live data, no active session
+
+        # Nothing live is active. Whether that is a real "not sitting" or just a gap in our
+        # copy of the data depends on which years the data speaks to.
+        #
+        # A pre-filing question spans a year boundary, so it needs BOTH years. pm-review
+        # caught the case: in December 2026 with only 2026's finished session cached, the
+        # data covers 2026 and so looked authoritative -- returning False and preventing the
+        # fallback from ever noticing that the 2027 session's window had already opened.
+        # That is the same stale-data suppression this fix exists to remove, in the one month
+        # it matters most, so a pre-filing check also requires the next year to be present.
+        needed = {check_date.year}
+        if prefiling_days:
+            needed.add(check_date.year + 1)
+        if needed <= covered_years:
+            return False
+
+        logger.debug(
+            "legislative calendar: live session data does not cover the period asked about, "
+            "falling back to the hardcoded calendar",
+            state=state_code.upper(),
+            check_date=str(check_date),
+            years_needed=sorted(needed),
+            years_covered=sorted(covered_years),
+        )
+        return None
 
     def _parse_date_str(self, date_str: str | None) -> date | None:
         """Parse a YYYY-MM-DD date string into a date object."""
@@ -1020,7 +1112,16 @@ class StateLegislativeCalendar:
             raise ValueError(f"Invalid state code: {state_code}")
         return self.legislative_data[state_code]["biennial_odd_only"]
 
-    def is_in_session(self, state_code: str, check_date: date | None = None) -> bool:
+    def prefiling_days(self, state_code: str) -> int:
+        """How many days before a session convenes this state starts publishing bills."""
+        return PREFILING_DAYS_BY_STATE.get(state_code.upper().strip(), DEFAULT_PREFILING_DAYS)
+
+    def is_in_session(
+        self,
+        state_code: str,
+        check_date: date | None = None,
+        include_prefiling: bool = False,
+    ) -> bool:
         """
         Check if a state is currently in session.
 
@@ -1029,14 +1130,21 @@ class StateLegislativeCalendar:
         Args:
             state_code: Two-letter state code
             check_date: Date to check (defaults to today)
+            include_prefiling: Count the weeks before a session convenes as "in session"
+                (OPEN-138). Off by default so existing callers are unaffected. Pass True
+                when the question is "should we expect any bills?" rather than "is the
+                legislature formally sitting?" -- bills appear on legislature websites up
+                to six weeks before a session opens, so for a collection or monitoring
+                decision this is almost always the question you actually mean.
 
         Returns:
             True if the state is in session on the given date
         """
         check_date = check_date or date.today()
+        window = self.prefiling_days(state_code) if include_prefiling else 0
 
         # Prefer live OpenStates data when available
-        live_result = self._check_live_sessions(state_code, check_date)
+        live_result = self._check_live_sessions(state_code, check_date, prefiling_days=window)
         if live_result is not None:
             return live_result
 
@@ -1048,9 +1156,33 @@ class StateLegislativeCalendar:
             return False
 
         if session["start_date"] is None or session["end_date"] is None:
+            # A biennial state's off year lands here, and so does the pre-filing window for
+            # a session that opens in January of the FOLLOWING year -- checking December
+            # asks about a year with no session of its own. Look forward one year before
+            # concluding there is nothing to expect.
+            if window:
+                try:
+                    nxt = self.get_session_dates(state_code, year + 1)
+                except ValueError:
+                    return False
+                if nxt["start_date"] is not None:
+                    return nxt["start_date"] - timedelta(days=window) <= check_date
             return False
 
-        return session["start_date"] <= check_date <= session["end_date"]
+        start = session["start_date"] - timedelta(days=window)
+        if start <= check_date <= session["end_date"]:
+            return True
+
+        # Late in the year, the next session's pre-filing window may already be open even
+        # though this year's session has ended.
+        if window and check_date > session["end_date"]:
+            try:
+                nxt = self.get_session_dates(state_code, year + 1)
+            except ValueError:
+                return False
+            if nxt["start_date"] is not None:
+                return nxt["start_date"] - timedelta(days=window) <= check_date
+        return False
 
     def get_active_states(self, check_date: date | None = None) -> list[str]:
         """
