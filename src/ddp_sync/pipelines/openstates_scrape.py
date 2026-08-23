@@ -295,6 +295,25 @@ def should_alert_quiet(history: list[dict], window: int) -> bool:
     paths (OPEN-138), including four states reported out-of-session for all 365 days of 2026, so
     gating on it would silently exempt whole jurisdictions from this check. "It used to file and
     has stopped" needs no calendar.
+
+    WHAT THIS DOES AND DOES NOT DETECT -- state it plainly, because condition 2 is a real limit
+    and not just an anti-noise nicety:
+
+      detects      a jurisdiction observed filing within its retained history, now at zero for
+                   `window` consecutive measured runs. This is the Arizona case.
+      misses       a jurisdiction whose entire retained history is zeroes -- e.g. out of session
+                   for longer than the history goes back -- that then breaks at the moment
+                   filing should have resumed. It stays silent until one positive run is
+                   observed. Accepted trade: the alternative alerts every recess, every week,
+                   for every quiet jurisdiction, which trains people to ignore it.
+      misses       under-collection. A jurisdiction filing 5 bills a week when it should be
+                   filing 85 looks healthy here (that is OPEN-134, Michigan).
+
+    Repeat behaviour: while the condition holds this returns True on every run, so a sustained
+    quiet period alerts once per run rather than once per episode. That matches should_escalate
+    above, which also re-fires while its window stays bad, and for a weekly job it is roughly one
+    message a week. Left deliberately consistent with the existing check rather than inventing a
+    second, different dedupe policy here.
     """
     measured = [r for r in history if r.get("bills_new") is not None]
     if len(measured) < window:
@@ -721,13 +740,29 @@ async def _check_sustained_blocking(
         # and either way it is not a measurement of this one. Absent keys mean "not measured",
         # which should_alert_quiet skips rather than counting as a zero.
         if result["success"]:
-            counts = read_filing_counts(
-                openstates_root, scrape_key_for(result.get("jurisdiction", jurisdiction))
-            )
+            key = scrape_key_for(result.get("jurisdiction", jurisdiction))
+            counts = read_filing_counts(openstates_root, key)
             if counts is not None:
                 record["bills_new"] = counts["bills_new"]
                 record["bills_updated"] = counts["bills_updated"]
                 record["scrape_mode"] = counts["mode"]
+            else:
+                # A run that SUCCEEDED and still has no usable marker is the one case worth
+                # saying out loud. Before the producing half of OPEN-139 ships this is expected
+                # and harmless; after it, it means the two sides disagree -- most likely because
+                # scrape_key_for() and run-scrape.sh's SCRAPE_KEY have drifted apart, which
+                # otherwise degrades silently into "this jurisdiction reports no filing figures,
+                # forever". The path is logged so an operator can settle it with one `ls`.
+                # Warning, not an error, and never raises: instrumentation must not fail a scrape.
+                logger.warning(
+                    "openstates_scrape: no usable filing figures for a successful run — "
+                    "expected marker missing, unreadable, or unparsed",
+                    jurisdiction=jurisdiction,
+                    scrape_key=key,
+                    expected_path=os.path.join(
+                        openstates_root, "logs", "last-run", f"{key}.imported"
+                    ),
+                )
         try:
             await redis_store.append_run_history(
                 flow_key, jurisdiction, record, max_len=max(window, 20)

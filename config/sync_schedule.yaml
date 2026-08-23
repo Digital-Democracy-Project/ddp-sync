@@ -351,6 +351,26 @@ openstates_scrape:
   # on it would silently exempt whole jurisdictions. "It used to file and has stopped" needs no
   # calendar.
   #
+  # WHEN TO TURN THIS ON. Data collection is already live with enabled: false -- every successful
+  # run records its bills_new into the history regardless, so the history builds itself. Before
+  # flipping this, confirm the two sides are actually talking to each other: the scrape logs must
+  # be free of "no usable filing figures for a successful run" warnings (that warning names the
+  # scrape_key and the exact path it looked for, so a mismatch is one `ls` away from settled), and
+  # each of the five secondary jurisdictions needs at least quiet_window recorded runs -- i.e.
+  # three weeks. Check with:
+  #     redis-cli LRANGE ddp:flow_history:openstates_secondary_scrapes:va 0 -1
+  # Rollback is this line back to false; it stops alerting and leaves the recorded history intact.
+  #
+  # WHAT IT WILL AND WILL NOT CATCH, so nobody mistakes it for full coverage:
+  #   catches   a jurisdiction that was filing and has gone silent (the Arizona case)
+  #   misses    a jurisdiction with no filing anywhere in its retained history that breaks just
+  #             as its session opens -- silent until one positive run is seen. The alternative
+  #             alerts every recess every week, which trains people to ignore it.
+  #   misses    under-collection: 5 bills a week when it should be 85 looks healthy (OPEN-134).
+  #
+  # While a jurisdiction stays quiet this alerts once per run, not once per episode -- same
+  # behaviour as the escalation block above, deliberately not a second different dedupe policy.
+  #
   # Read by _check_sustained_blocking() in pipelines/openstates_scrape.py.
   filing_activity:
     enabled: false

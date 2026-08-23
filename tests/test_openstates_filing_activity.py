@@ -209,6 +209,49 @@ async def test_alerts_when_enabled_and_the_history_says_quiet(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_successful_run_with_no_marker_warns_with_the_path_it_looked_for(tmp_path):
+    """The blind-spot guard. If scrape_key_for() and run-scrape.sh's SCRAPE_KEY ever drift, this
+    feature reports nothing forever and nothing else would say so. The warning names the key and
+    the exact path, so a mismatch is one `ls` away from being settled."""
+    root = str(tmp_path)  # no marker written at all
+    store = AsyncMock()
+    store.get_run_history.return_value = []
+    with patch("ddp_sync.services.redis_store.get_redis_store", return_value=store), \
+         patch("ddp_sync.pipelines.openstates_scrape.logger") as log:
+        await _check_sustained_blocking(
+            "openstates_secondary_scrapes",
+            ["va"],
+            [{"success": True, "jurisdiction": "va session=2026"}],
+            {"openstates_root": root, "filing_activity": {"enabled": True}},
+        )
+    warned = [c for c in log.warning.call_args_list if "no usable filing figures" in c.args[0]]
+    assert len(warned) == 1
+    assert warned[0].kwargs["scrape_key"] == "va_session_2026"
+    assert warned[0].kwargs["expected_path"].endswith(
+        "logs/last-run/va_session_2026.imported"
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_is_read_after_this_run_is_appended(tmp_path):
+    """pm-review asked whether should_alert_quiet sees the current run. It must: the window is
+    'the last N runs including this one'. Pins the call order rather than trusting it."""
+    root = _write_marker(tmp_path, "az", "ok:0:0:895:incremental\n")
+    calls = []
+    store = AsyncMock()
+    store.append_run_history.side_effect = lambda *a, **k: calls.append("append")
+    store.get_run_history.side_effect = lambda *a, **k: calls.append("read") or []
+    with patch("ddp_sync.services.redis_store.get_redis_store", return_value=store):
+        await _check_sustained_blocking(
+            "openstates_secondary_scrapes",
+            ["az"],
+            [{"success": True, "jurisdiction": "az"}],
+            {"openstates_root": root, "filing_activity": {"enabled": True}},
+        )
+    assert calls == ["append", "read"]
+
+
+@pytest.mark.asyncio
 async def test_disabled_by_default_does_not_alert(tmp_path):
     """The config ships disabled for the first cycle; absent config must behave the same."""
     root = _write_marker(tmp_path, "az", "ok:0:0:895:incremental\n")
