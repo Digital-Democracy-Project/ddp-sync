@@ -218,6 +218,32 @@ openstates_scrape:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
 
+  # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
+  # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
+  # loses everything it had collected. That is not theoretical: FL 213 + MA 473 bills went that
+  # way on 2026-07-30, and again in SYNC-35, where a ddp-sync restart orphaned AZ's run after it
+  # had successfully scraped all 895 bills. With the sweep on, a periodic in-run import lands
+  # bills as they are scraped, so a death mid-scrape keeps whatever already went in.
+  #
+  # The mechanism has been merged but dark since 2026-07-30 -- run-scrape.sh reads
+  # SWEEP_IMPORT_ENABLED and nothing set it. This is the gate.
+  #
+  # Rolled out per jurisdiction on purpose: VA and UT first (smallest, weekly, lowest risk) per
+  # PLAN-incremental-scraping.md's own rollout condition, before FL/MA/USA. Add a jurisdiction
+  # here only after watching a clean canary cycle for the ones already listed.
+  #
+  # Product sign-off obtained 2026-08-22 (Ramon) on the one question this actually turned on:
+  # consumers (api-v3, dashboards) MAY see a jurisdiction mid-update rather than a consistent
+  # end-of-run snapshot. The trade was judged worth it -- a reader seeing a half-updated
+  # jurisdiction for a few minutes costs less than losing an entire run's work.
+  #
+  # Read by _sweep_import_eligible() in pipelines/openstates_scrape.py, which sets
+  # SWEEP_IMPORT_ENABLED=1 in run-scrape.sh's environment. Shape mirrors
+  # secondary.scrapebot_fallback below. To roll back: set enabled: false, or empty the list.
+  sweep_import:
+    enabled: true
+    jurisdictions: ["va", "ut"]
+
   patch_refresh:
     enabled: true
     sync_time_utc: "01:00"
