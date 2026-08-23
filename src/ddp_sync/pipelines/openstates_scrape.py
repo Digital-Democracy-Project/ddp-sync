@@ -139,6 +139,45 @@ def _alert_sustained_block(jurisdiction: str, blocked_count: int, window: int) -
         logger.error("openstates_scrape: sustained-block Slack alert error", error=str(e))
 
 
+def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
+    """Slack alert for a jurisdiction that used to file bills and has stopped (OPEN-139).
+
+    Worded to say what was measured rather than what it means, because the same signal has more
+    than one cause: a stuck incremental cutoff (Arizona, 14 days), a broken change signal, a
+    genuine recess, or an end of session. The alert's job is to get a human to look, not to
+    diagnose. Same channel/token convention as the other two alert paths in this module, and
+    never raises.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        logger.warning(
+            "openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on quiet jurisdiction",
+            jurisdiction=jurisdiction,
+        )
+        return
+    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
+    text = (
+        f":mag: *{jurisdiction} has imported no new bills in its last {quiet_window} runs* — "
+        f"it was filing before that, so collection has stopped rather than the legislature "
+        f"being quiet all along. Could be a stuck incremental cutoff (see AZ/OPEN-139), a "
+        f"broken change signal, or a real recess. Worth a look either way."
+    )
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": channel, "text": text},
+            timeout=15,
+        )
+        if not (resp.ok and resp.json().get("ok")):
+            logger.error(
+                "openstates_scrape: quiet-jurisdiction Slack alert failed",
+                response=resp.text[:200],
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.error("openstates_scrape: quiet-jurisdiction Slack alert error", error=str(e))
+
+
 # Substring markers matched against a failed run's stderr tail to classify *why* it failed
 # (OPEN-22 AC0b), so a sustained WAF-block pattern can be told apart from an unrelated network
 # blip or code bug. Matched against this same GitHub org's own first-party ScrapeError message
@@ -179,6 +218,91 @@ def should_escalate(history: list[dict], window: int, threshold: int) -> bool:
     recent = history[-window:]
     blocked = sum(1 for r in recent if r.get("failure_reason") == "waf_block")
     return blocked >= threshold
+
+
+def scrape_key_for(label: str) -> str:
+    """Reproduce run-scrape.sh's own SCRAPE_KEY, which names its marker files.
+
+        SCRAPE_KEY=$(echo "${STATE}${SESSION_ARG:+ $SESSION_ARG}" | tr ' =' '__')
+
+    `label` is this module's existing per-run label -- `f"{jurisdiction} {session_arg}"` when
+    there is a session, else the bare jurisdiction -- which is character-for-character the string
+    run-scrape.sh builds its key from, because it is assembled from the same two arguments this
+    module passes to that script. So `fl session=2026` becomes `fl_session_2026`, and
+    `usa session=119 chamber=lower` becomes `usa_session_119_chamber_lower`.
+
+    This is a derivation duplicated across two languages, which is a real coupling and worth
+    naming as one: if run-scrape.sh ever changes how it builds that key, this goes quietly
+    wrong -- it would read a file that does not exist and report no filing figures rather than
+    failing loudly. Pinned by tests against the actual filenames in
+    ddp-open-states/logs/last-run so a change on either side breaks a test instead of a metric.
+    The alternative -- having run-scrape.sh write to Redis itself -- would put a Redis client in
+    a bash script, which is worse.
+    """
+    return label.replace(" ", "_").replace("=", "_")
+
+
+def read_filing_counts(openstates_root: str, scrape_key: str) -> dict[str, Any] | None:
+    """Read one run's filing figures from run-scrape.sh's `.imported` marker (OPEN-139).
+
+    File format, one line -- see import-summary.sh in ddp-open-states for the full contract:
+
+        ok:37:83:168:incremental      real figures for the last completed run
+        unparsed::::incremental       the import ran, its report could not be read
+
+    Returns None when there is nothing trustworthy to report: no file (the jurisdiction has not
+    completed a run since that change shipped), an unreadable file, or a status of `unparsed`.
+    None means "no measurement", which callers must treat differently from a measured zero --
+    conflating them is exactly how a broken scraper comes to look like a quiet week.
+    """
+    path = os.path.join(openstates_root, "logs", "last-run", f"{scrape_key}.imported")
+    try:
+        with open(path) as f:
+            line = f.read().strip()
+    except OSError:
+        return None
+    parts = line.split(":")
+    if len(parts) != 5 or parts[0] != "ok":
+        return None
+    try:
+        return {
+            "bills_new": int(parts[1]),
+            "bills_updated": int(parts[2]),
+            "bills_noop": int(parts[3]),
+            "mode": parts[4],
+        }
+    except ValueError:
+        return None
+
+
+def should_alert_quiet(history: list[dict], window: int) -> bool:
+    """Pure function (OPEN-139): has a jurisdiction that used to file bills stopped filing?
+
+    Same stateless shape as should_escalate above -- recomputed from the rolling history every
+    time, no separate streak counter to drift out of sync.
+
+    Fires only when both halves are true:
+
+      1. The last `window` MEASURED runs all imported zero new bills, and there are at least
+         `window` of them. Runs with no measurement (`bills_new` absent, because the marker was
+         missing or the import report was unparseable) are skipped rather than counted as zero.
+      2. Somewhere further back in the retained history, this jurisdiction did import new bills.
+         Without this, every out-of-session jurisdiction would alert every week all recess --
+         and a jurisdiction we have never successfully collected from would alert forever
+         instead of being investigated once.
+
+    Deliberately NOT keyed on session state. is_in_session() has five confirmed false-negative
+    paths (OPEN-138), including four states reported out-of-session for all 365 days of 2026, so
+    gating on it would silently exempt whole jurisdictions from this check. "It used to file and
+    has stopped" needs no calendar.
+    """
+    measured = [r for r in history if r.get("bills_new") is not None]
+    if len(measured) < window:
+        return False
+    recent = measured[-window:]
+    if any(r["bills_new"] > 0 for r in recent):
+        return False
+    return any(r["bills_new"] > 0 for r in measured[:-window])
 
 
 def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
@@ -544,6 +668,14 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
 DEFAULT_ESCALATION_WINDOW = 4
 DEFAULT_ESCALATION_THRESHOLD = 3
 
+# OPEN-139: how many consecutive measured runs with zero new bills before saying a jurisdiction
+# has gone quiet. 3 rather than 2 because these are weekly jobs and a real legislature can
+# genuinely file nothing for a fortnight; 3 weeks of silence from a jurisdiction that was filing
+# is worth a look. Unlike the escalation pair above there is no separate threshold -- this fires
+# only on an unbroken run of zeroes, because a single non-zero week proves collection still works
+# and there is nothing to report.
+DEFAULT_QUIET_WINDOW = 3
+
 
 async def _check_sustained_blocking(
     flow_key: str,
@@ -551,13 +683,24 @@ async def _check_sustained_blocking(
     results: list[dict[str, Any]],
     config: dict | None,
 ) -> None:
-    """Record this run's outcome into each jurisdiction's rolling history and escalate if a
-    sustained WAF-blocking pattern shows up (OPEN-22 AC0-AC5). Best-effort: a Redis hiccup
-    here must never fail the scrape job itself, same convention as _write_flow_status.
+    """Record this run's outcome into each jurisdiction's rolling history, then run two
+    independent checks over that history.
+
+    The first is OPEN-22's: escalate if a sustained WAF-blocking pattern shows up (AC0-AC5).
+    The second is OPEN-139's: alert if a jurisdiction that used to file bills has stopped.
+
+    They share the append because there is one record per run, and splitting it would mean two
+    writers racing to extend the same Redis list. Best-effort throughout: a Redis hiccup here
+    must never fail the scrape job itself, same convention as _write_flow_status.
     """
     escalation_cfg = (config or {}).get("secondary", {}).get("escalation", {})
     window = escalation_cfg.get("window_size", DEFAULT_ESCALATION_WINDOW)
     threshold = escalation_cfg.get("threshold", DEFAULT_ESCALATION_THRESHOLD)
+
+    filing_cfg = (config or {}).get("filing_activity", {})
+    filing_enabled = filing_cfg.get("enabled", False)
+    quiet_window = filing_cfg.get("quiet_window", DEFAULT_QUIET_WINDOW)
+    openstates_root = _get_root(config)
 
     try:
         from ddp_sync.services.redis_store import get_redis_store
@@ -573,6 +716,18 @@ async def _check_sustained_blocking(
             "success": result["success"],
             "failure_reason": result.get("failure_reason"),
         }
+        # OPEN-139: fold this run's filing figures into the same record. Only for a run that
+        # succeeded -- a failed run's marker is either absent or left over from an earlier run,
+        # and either way it is not a measurement of this one. Absent keys mean "not measured",
+        # which should_alert_quiet skips rather than counting as a zero.
+        if result["success"]:
+            counts = read_filing_counts(
+                openstates_root, scrape_key_for(result.get("jurisdiction", jurisdiction))
+            )
+            if counts is not None:
+                record["bills_new"] = counts["bills_new"]
+                record["bills_updated"] = counts["bills_updated"]
+                record["scrape_mode"] = counts["mode"]
         try:
             await redis_store.append_run_history(
                 flow_key, jurisdiction, record, max_len=max(window, 20)
@@ -597,6 +752,16 @@ async def _check_sustained_blocking(
                 threshold=threshold,
             )
             _alert_sustained_block(jurisdiction, blocked, window)
+
+        # OPEN-139. Gated off by default: this needs a few runs of history before it can say
+        # anything, and until then it would only ever be wrong in one direction or the other.
+        if filing_enabled and should_alert_quiet(history, quiet_window):
+            logger.error(
+                "openstates_scrape: jurisdiction has stopped filing new bills",
+                jurisdiction=jurisdiction,
+                quiet_window=quiet_window,
+            )
+            _alert_quiet_jurisdiction(jurisdiction, quiet_window)
 
 
 # ---------------------------------------------------------------------------

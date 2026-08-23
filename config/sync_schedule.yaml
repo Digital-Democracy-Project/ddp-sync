@@ -322,6 +322,40 @@ openstates_scrape:
     max_attempts: 3
     backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision
 
+  # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
+  #
+  # Reads run-scrape.sh's per-run `.imported` marker (ddp-open-states, same ticket) and folds the
+  # new-bill count into the rolling per-jurisdiction history OPEN-22 already keeps in Redis. Two
+  # independent checks then run over that one history: OPEN-22's WAF-block escalation, and this.
+  #
+  # Why a filing count and not the scrape's own file count: a scrape re-writes bills that have
+  # not changed, so a frozen incremental cutoff looks perfectly healthy by file count. Arizona
+  # wrote 895 files a night for 14 nights while importing nothing -- and the old <20%-drop
+  # warning compared 895 against 895 every time and stayed silent. The import's new-bill count is
+  # the number that actually goes to zero.
+  #
+  # DISABLED for the first cycle, deliberately. The check needs `quiet_window` runs of recorded
+  # history before it can say anything at all, and these are weekly jobs, so there is nothing to
+  # gain by having it live before the history exists -- and a real risk of it firing on the empty
+  # state. Turn it on once the secondary jurisdictions have a few weeks of `bills_new` in their
+  # history (visible in Redis under ddp:flow_history:openstates_secondary_scrapes:<juris>).
+  #
+  # quiet_window is consecutive MEASURED runs with zero new bills. Runs where the marker was
+  # missing or the import report was unparseable are skipped, not counted as zeroes -- "we could
+  # not measure" is not "nothing was filed". The check also requires evidence the jurisdiction
+  # filed something earlier in its retained history, so an out-of-session state does not alert
+  # every week all recess, and a jurisdiction we have never collected from does not alert forever.
+  #
+  # Deliberately not gated on is_in_session(): that has five confirmed false-negative paths
+  # (OPEN-138), including four states reported out-of-session for all 365 days of 2026, so gating
+  # on it would silently exempt whole jurisdictions. "It used to file and has stopped" needs no
+  # calendar.
+  #
+  # Read by _check_sustained_blocking() in pipelines/openstates_scrape.py.
+  filing_activity:
+    enabled: false
+    quiet_window: 3
+
   patch_refresh:
     enabled: true
     sync_time_utc: "01:00"
