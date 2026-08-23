@@ -556,7 +556,11 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_patch_refresh: error", error=str(e), duration_seconds=duration)
-        _alert_scrape_failure("patch refresh", f"errored: {e}", duration)
+        # Deliberately NOT alerting here. OPEN-127 is scoped to subprocess failures (timeout,
+        # nonzero exit), and _run_scrape has no generic-exception branch at all, so there's no
+        # established behaviour to match. An exception here is a scheduler/config/coding fault
+        # rather than a scrape failure, and routing those into #automation-errors is its own
+        # decision. Left as-is per /pm-review round 1.
         return {"success": False, "error": str(e), "duration_seconds": duration}
 
 
@@ -831,5 +835,5 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_people_refresh: error", error=str(e), duration_seconds=duration)
-        _alert_scrape_failure("people refresh", f"errored: {e}", duration)
+        # Deliberately NOT alerting here — see the matching note in run_patch_refresh_job.
         return {"success": False, "error": str(e), "duration_seconds": duration}
