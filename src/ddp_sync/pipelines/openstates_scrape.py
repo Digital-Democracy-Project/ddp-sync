@@ -242,7 +242,7 @@ async def _maybe_preseed_scrapebot_cookies(
 
 
 def _run_with_group_kill(
-    cmd: list[str], env: dict, timeout: int
+    cmd: list[str], env: dict, timeout: int, cwd: str | None = None
 ) -> tuple[int, bytes, bytes, bool]:
     """Run cmd to completion or timeout, killing its whole process group on timeout.
 
@@ -257,7 +257,12 @@ def _run_with_group_kill(
     timeout can os.killpg() the whole group instead of just the one process we started.
     """
     process = subprocess.Popen(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -488,20 +493,40 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
     t = time.monotonic()
 
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        # _run_with_group_kill rather than subprocess.run: apply-local-patches.sh shells out to
+        # git, and subprocess.run(timeout=...) kills only the direct child — leaving those git
+        # operations running against a half-rebuilt scraper worktree that a concurrent scrape
+        # may already be reading through run-scrape.sh's READER_MARKER lock. Same reasoning as
+        # _run_scrape's own use of this helper.
+        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+            _run_with_group_kill,
             ["/bin/bash", script],
-            cwd=openstates_root,
-            capture_output=True,
-            timeout=300,
+            dict(os.environ),
+            300,
+            openstates_root,
         )
         duration = round(time.monotonic() - t, 1)
 
-        if result.returncode != 0:
-            stderr = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error("openstates_patch_refresh: timeout", duration_seconds=duration)
+            await _write_flow_status("openstates_patch_refresh", {
+                "flow": "openstates_patch_refresh",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "error": "timeout",
+                "duration_seconds": duration,
+            })
+            # We killed the script's whole process group, so its own ERR trap never ran and it
+            # never alerted. We're the only ones who know this happened.
+            _alert_scrape_failure("patch refresh", "timed out after 300s", duration)
+            return {"success": False, "error": "timeout", "duration_seconds": duration}
+
+        if returncode != 0:
+            stderr = (stderr_bytes or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_patch_refresh: failed",
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr,
                 duration_seconds=duration,
             )
@@ -510,10 +535,11 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "started_at": start_time.isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "failed",
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            return {"success": False, "error": f"exit_code_{result.returncode}", "duration_seconds": duration}
+            _alert_scrape_failure("patch refresh", f"exited {returncode}: {stderr[-200:]}", duration)
+            return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_patch_refresh: done", duration_seconds=duration)
         await _write_flow_status("openstates_patch_refresh", {
@@ -525,13 +551,16 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
         })
         return {"success": True, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - t, 1)
-        logger.error("openstates_patch_refresh: timeout", duration_seconds=duration)
-        return {"success": False, "error": "timeout", "duration_seconds": duration}
+    # No `except subprocess.TimeoutExpired` here any more: _run_with_group_kill swallows it and
+    # returns timed_out=True, handled inside the try above.
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_patch_refresh: error", error=str(e), duration_seconds=duration)
+        # Deliberately NOT alerting here. OPEN-127 is scoped to subprocess failures (timeout,
+        # nonzero exit), and _run_scrape has no generic-exception branch at all, so there's no
+        # established behaviour to match. An exception here is a scheduler/config/coding fault
+        # rather than a scrape failure, and routing those into #automation-errors is its own
+        # decision. Left as-is per /pm-review round 1.
         return {"success": False, "error": str(e), "duration_seconds": duration}
 
 
@@ -746,20 +775,37 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     t = time.monotonic()
 
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        # This call site already passed start_new_session=True, which _run_with_group_kill's own
+        # docstring explains is not sufficient on its own — it makes the child a process-group
+        # leader but nothing then targets that group, so a timeout still orphaned the real work
+        # (git pull, os-people to-database across every state). Routed through the helper so the
+        # group actually gets killed.
+        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+            _run_with_group_kill,
             ["/bin/bash", script],
-            capture_output=True,
-            timeout=3600,
-            start_new_session=True,
+            dict(os.environ),
+            3600,
         )
         duration = round(time.monotonic() - t, 1)
 
-        if result.returncode != 0:
-            stderr_tail = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error("openstates_people_refresh: timeout", duration_seconds=duration)
+            await _write_flow_status("openstates_people_refresh", {
+                "flow": "openstates_people_refresh",
+                "started_at": start_time.isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "error": "timeout",
+                "duration_seconds": duration,
+            })
+            _alert_scrape_failure("people refresh", "timed out after 3600s", duration)
+            return {"success": False, "error": "timeout", "duration_seconds": duration}
+
+        if returncode != 0:
+            stderr_tail = (stderr_bytes or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_people_refresh: failed",
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr_tail,
                 duration_seconds=duration,
             )
@@ -768,10 +814,11 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "started_at": start_time.isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "failed",
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            return {"success": False, "error": f"exit_code_{result.returncode}", "duration_seconds": duration}
+            _alert_scrape_failure("people refresh", f"exited {returncode}: {stderr_tail[-200:]}", duration)
+            return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_people_refresh: done", duration_seconds=duration)
         await _write_flow_status("openstates_people_refresh", {
@@ -783,11 +830,10 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         })
         return {"success": True, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - t, 1)
-        logger.error("openstates_people_refresh: timeout", duration_seconds=duration)
-        return {"success": False, "error": "timeout", "duration_seconds": duration}
+    # No `except subprocess.TimeoutExpired` here any more: _run_with_group_kill swallows it and
+    # returns timed_out=True, handled inside the try above.
     except Exception as e:
         duration = round(time.monotonic() - t, 1)
         logger.error("openstates_people_refresh: error", error=str(e), duration_seconds=duration)
+        # Deliberately NOT alerting here — see the matching note in run_patch_refresh_job.
         return {"success": False, "error": str(e), "duration_seconds": duration}
