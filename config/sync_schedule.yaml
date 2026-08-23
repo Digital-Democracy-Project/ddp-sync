@@ -218,6 +218,51 @@ openstates_scrape:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
 
+  # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
+  # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
+  # loses everything it had collected. That is not theoretical: FL 213 + MA 473 bills went that
+  # way on 2026-07-30, and again in SYNC-35, where a ddp-sync restart orphaned AZ's run after it
+  # had successfully scraped all 895 bills. With the sweep on, a periodic in-run import lands
+  # bills as they are scraped, so a death mid-scrape keeps whatever already went in.
+  #
+  # The mechanism has been merged but dark since 2026-07-30 -- run-scrape.sh reads
+  # SWEEP_IMPORT_ENABLED and nothing set it. This is the gate.
+  #
+  # Rolled out per jurisdiction on purpose. VA ONLY for the first cycle, per
+  # PLAN-incremental-scraping.md's own rollout condition ("run the VA *or* UT canary first" —
+  # singular), before UT and then FL/MA/USA.
+  #
+  # Why one and not both: the secondary-states job fans its five jurisdictions out with
+  # asyncio.gather, so VA and UT start simultaneously (confirmed live 2026-08-22 — both at
+  # 22:00:00), and run-scrape.sh's import lock is keyed per SCRAPE_KEY so they would NOT
+  # serialise. Enabling both would make the very first canary a test of two concurrent
+  # sweep-imports against the same Postgres, which conflates "does the sweep work" with "does
+  # sweep contention work". VA alone answers the first question; add UT for the second.
+  #
+  # VA rather than UT because VA is currently healthy (124s run 2026-08-22) while UT is only
+  # just recovering from OPEN-106's get_session_list() failure — don't canary on the one that
+  # was broken last week.
+  #
+  # Add a jurisdiction here only after watching a clean cycle for the ones already listed.
+  # Both run weekly, so each cycle costs a week of calendar time.
+  #
+  # Product sign-off obtained 2026-08-22 (Ramon) on the one question this actually turned on:
+  # consumers (api-v3, dashboards) MAY see a jurisdiction mid-update rather than a consistent
+  # end-of-run snapshot. The trade was judged worth it -- a reader seeing a half-updated
+  # jurisdiction for a few minutes costs less than losing an entire run's work.
+  #
+  # Read by _sweep_import_eligible() in pipelines/openstates_scrape.py, which sets
+  # SWEEP_IMPORT_ENABLED=1 in run-scrape.sh's environment. Shape mirrors
+  # secondary.scrapebot_fallback below.
+  #
+  # Rollback: set enabled: false, or empty the list. Note precisely what that does and does
+  # not do -- it stops SWEEP_IMPORT_ENABLED being injected into FUTURE runs. It does not revert
+  # bills a sweep already imported, and it does not stop an in-flight run. To stop a run in
+  # progress you have to kill the run itself.
+  sweep_import:
+    enabled: true
+    jurisdictions: ["va"]   # UT next, after one clean VA cycle
+
   # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
   # transient fault currently waits a week for its next attempt -- that is what happened to MA
   # on 2026-08-01, a network timeout on a run that would have succeeded on a re-run. When a

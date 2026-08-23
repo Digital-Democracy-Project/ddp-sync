@@ -194,6 +194,35 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in fallback_cfg.get("jurisdictions", [])
 
 
+def _sweep_import_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """Is this jurisdiction opted into run-scrape.sh's import-as-you-go sweep (OPEN-86)?
+
+    Without this, a scrape killed partway through loses everything it had already
+    collected: run-scrape.sh imports into Postgres once, at the very end, and the
+    next `--scrape` wipes $STATE_DATADIR before starting. That has cost real data
+    (FL 213 + MA 473 bills, 2026-07-30) and cost it again in SYNC-35, where a
+    ddp-sync restart orphaned AZ's run after it had successfully scraped all 895
+    bills -- all of which were then wiped. The sweep imports throughout the run
+    instead, so a death mid-scrape keeps whatever earlier sweeps already landed.
+
+    The mechanism has been merged but dark since 2026-07-30: run-scrape.sh reads
+    SWEEP_IMPORT_ENABLED and nothing anywhere set it. This is the gate that turns
+    it on, deliberately per-jurisdiction so the VA/UT canary can run before FL/MA/
+    USA -- PLAN-incremental-scraping.md's own rollout condition.
+
+    Config lives under openstates_scrape.sweep_import in sync_schedule.yaml,
+    mirroring secondary.scrapebot_fallback's shape above. Absent/disabled by
+    default, so a jurisdiction that hasn't opted in is completely unaffected.
+    Deliberately NOT a $STATE test in shell (OPEN-124): ddp-sync already resolves
+    per-jurisdiction opt-ins from this YAML, and it is what invokes run-scrape.sh,
+    so it is the right place to decide.
+    """
+    sweep_cfg = (config or {}).get("sweep_import", {})
+    if not sweep_cfg.get("enabled", False):
+        return False
+    return jurisdiction in sweep_cfg.get("jurisdictions", [])
+
+
 def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     """Is this jurisdiction opted into bounded whole-run retry (OPEN-87)?
 
@@ -368,6 +397,14 @@ async def _run_scrape(
         cmd.append(session_arg)
 
     env = {**os.environ, "SKIP_PATCHES": "1"}
+    if _sweep_import_eligible(jurisdiction, config):
+        # run-scrape.sh reads this; see _sweep_import_eligible() for why it exists and why the
+        # opt-in lives in YAML rather than as a $STATE test in the script.
+        env["SWEEP_IMPORT_ENABLED"] = "1"
+        logger.info(
+            "openstates_scrape: import-as-you-go sweep enabled for this run",
+            jurisdiction=jurisdiction,
+        )
     if retry_enabled:
         # run-scrape-retrying.sh reads these; see _retry_eligible() for why the opt-in lives in
         # YAML rather than as a $STATE test in the script. backoff_secs is a YAML list and the
