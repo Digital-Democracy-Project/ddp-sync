@@ -25,7 +25,7 @@ import pytest
 from ddp_sync.pipelines.openstates_scrape import _retry_eligible, _run_scrape
 
 ROLLOUT_CFG = {
-    "retry": {
+    "scrape_retry": {
         "enabled": True,
         "jurisdictions": ["ma", "usa"],
         "jurisdictions_excluded": ["mi"],
@@ -53,7 +53,7 @@ def test_exclusion_beats_the_allowlist():
     everything, and MI must still be excluded. A retry against a WAF makes the block worse
     (OPEN-53), so this is the one entry that must survive a careless widening."""
     cfg = {
-        "retry": {
+        "scrape_retry": {
             "enabled": True,
             "jurisdictions": ["ma", "usa", "mi", "va", "ut", "fl", "wa", "az"],
             "jurisdictions_excluded": ["mi"],
@@ -65,7 +65,7 @@ def test_exclusion_beats_the_allowlist():
 
 def test_disabled_flag_overrides_the_list():
     """The documented rollback: flip enabled: false and the list stops mattering."""
-    cfg = {"retry": {"enabled": False, "jurisdictions": ["ma", "usa"]}}
+    cfg = {"scrape_retry": {"enabled": False, "jurisdictions": ["ma", "usa"]}}
     assert _retry_eligible("ma", cfg) is False
 
 
@@ -74,8 +74,8 @@ def test_disabled_flag_overrides_the_list():
     [
         None,
         {},
-        {"retry": {}},
-        {"retry": {"enabled": True}},  # enabled but no list
+        {"scrape_retry": {}},
+        {"scrape_retry": {"enabled": True}},  # enabled but no list
     ],
 )
 def test_absent_or_incomplete_config_is_off(cfg):
@@ -86,7 +86,10 @@ def test_absent_or_incomplete_config_is_off(cfg):
 
 # --- does it actually change what gets invoked? --------------------------------------
 
-async def _captured_call_for(jurisdiction, config, session_arg=None):
+async def _captured_call_for(jurisdiction, config, session_arg=None, wrapper_present=True):
+    """wrapper_present models whether ddp-open-states has deployed run-scrape-retrying.sh yet.
+    _run_scrape() falls back to run-scrape.sh when it hasn't, so the default here is True and
+    the False case is exercised by its own test below."""
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
@@ -95,6 +98,10 @@ async def _captured_call_for(jurisdiction, config, session_arg=None):
         patch(
             "ddp_sync.pipelines.openstates_scrape._maybe_preseed_scrapebot_cookies",
             new=AsyncMock(),
+        ),
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.os.path.exists",
+            return_value=wrapper_present,
         ),
     ):
         await _run_scrape(jurisdiction, session_arg, "/fake/root", timeout_s=10, config=config)
@@ -165,7 +172,7 @@ async def test_backoff_and_attempts_come_from_config_not_hardcoded():
     YAML alone. One mechanism covers both candidate shapes: a repeated value is a fixed backoff,
     ascending values are a growing one."""
     cfg = {
-        "retry": {
+        "scrape_retry": {
             "enabled": True,
             "jurisdictions": ["ma"],
             "max_attempts": 5,
@@ -177,6 +184,34 @@ async def test_backoff_and_attempts_come_from_config_not_hardcoded():
     assert env["SCRAPE_RETRY_BACKOFF_SECS"] == "1800,3600,7200,7200"
 
 
+@pytest.mark.asyncio
+async def test_falls_back_to_run_scrape_when_the_wrapper_is_not_deployed_yet():
+    """Two repos, two deploys, so this config can go live before the wrapper script does.
+
+    The fallback matters more than it looks. Without it, /bin/bash on a missing script exits
+    127 -- a *positive* return code -- and _run_scrape()'s `returncode != 0` branch deliberately
+    does not alert on positive codes, because it assumes run-scrape.sh already alerted from
+    inside its own process. Here run-scrape.sh never ran, so nobody would alert at all and an
+    opted-in jurisdiction would fail silently every cycle until someone noticed missing data.
+    """
+    cmd, env = await _captured_call_for("ma", ROLLOUT_CFG, wrapper_present=False)
+    assert cmd == ["/bin/bash", "/fake/root/run-scrape.sh", "ma"]
+    # And it must not claim retry is active by leaving the env vars behind.
+    assert "SCRAPE_RETRY_MAX_ATTEMPTS" not in env
+    assert "SCRAPE_RETRY_BACKOFF_SECS" not in env
+    assert env["SKIP_PATCHES"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_fallback_does_not_disturb_an_ineligible_jurisdiction():
+    """The existence check must only ever run for an eligible jurisdiction; an ineligible one
+    reaches run-scrape.sh either way and must not depend on the wrapper being present."""
+    for present in (True, False):
+        cmd, env = await _captured_call_for("fl", ROLLOUT_CFG, wrapper_present=present)
+        assert cmd == ["/bin/bash", "/fake/root/run-scrape.sh", "fl"]
+        assert "SCRAPE_RETRY_MAX_ATTEMPTS" not in env
+
+
 # --- the shipped config ---------------------------------------------------------------
 
 def _shipped_retry_cfg():
@@ -186,14 +221,16 @@ def _shipped_retry_cfg():
 
     cfg_path = Path(__file__).resolve().parents[1] / "config" / "sync_schedule.yaml"
     cfg = yaml.safe_load(cfg_path.read_text())
-    return cfg["openstates_scrape"]["retry"]
+    return cfg["openstates_scrape"]["scrape_retry"]
 
 
 def test_shipped_yaml_enables_exactly_the_staged_rollout():
-    """Guards the actual rollout state, so widening it is a deliberate, reviewed edit."""
+    """Guards the actual rollout state, so widening it is a deliberate, reviewed edit. MA only for
+    the first cycle -- USA is held back because its 4h SCRAPE_TIMEOUT_S is the tightest ceiling of
+    any named jurisdiction and cannot reliably fit 3 attempts plus backoff."""
     retry = _shipped_retry_cfg()
     assert retry["enabled"] is True
-    assert retry["jurisdictions"] == ["ma", "usa"]
+    assert retry["jurisdictions"] == ["ma"]
     assert retry["max_attempts"] == 3
 
 

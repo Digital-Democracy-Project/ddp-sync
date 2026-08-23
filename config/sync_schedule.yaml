@@ -225,10 +225,23 @@ openstates_scrape:
   # run-scrape.sh; that wrapper re-runs the scrape a fixed number of times and lets
   # run-scrape.sh alert exactly once, at the end, instead of once per attempt.
   #
-  # MA and USA first, per the plan's staged-rollout recommendation -- MA because it is the
-  # jurisdiction the incident happened to, USA because it is the other high-value one. A
-  # jurisdiction not listed here is invoked exactly as it is today: same script, same
+  # MA ONLY for the first cycle. The ticket says "MA/USA-first", and MA is not in question --
+  # it is the jurisdiction the 2026-08-01 incident happened to. USA is deliberately held back
+  # for one cycle on arithmetic, not taste: SCRAPE_TIMEOUT_S["usa"] is 4h, the tightest ceiling
+  # of any named jurisdiction (fl 16h, wa 8h, ma falls to the 6h default). Three attempts plus
+  # 45 minutes of backoff has to fit inside that whole ceiling, so a USA session averaging much
+  # over an hour cannot complete its third attempt before ddp-sync kills the invocation. That
+  # makes USA the worst possible first canary: a kill mid-attempt would look like the retry
+  # design failing when it was really the timeout interaction (open question 2 on OPEN-87).
+  # Add USA once that question is settled, or once its timeout is raised.
+  #
+  # A jurisdiction not listed here is invoked exactly as it is today: same script, same
   # arguments, no wrapper process at all.
+  #
+  # "One clean cycle" before widening means, concretely: the run completed without being killed
+  # by SCRAPE_TIMEOUT_S; exactly one failure alert per genuinely-failed run and none for a run
+  # that recovered on a later attempt; and total runtime still inside the ceiling with the
+  # backoff included.
   #
   # jurisdictions_excluded is not redundant with the allowlist, it outlives it. When the
   # rollout finishes and someone widens `jurisdictions` (plausibly to every jurisdiction),
@@ -254,9 +267,12 @@ openstates_scrape:
   # Rollback: set enabled: false, or empty the list. That makes future runs invoke
   # run-scrape.sh directly again. It does not stop an in-flight wrapper -- to stop one that is
   # mid-backoff you have to kill the run itself.
-  retry:
+  # Named scrape_retry, not retry: this file already has an unrelated TOP-LEVEL `retry:` block
+  # (OpenStates API call retries, max_attempts/backoff_seconds). Same word, different thing, and
+  # a reader skimming for "retry" should not have to work out which one they landed on.
+  scrape_retry:
     enabled: true
-    jurisdictions: ["ma", "usa"]      # staged rollout; widen only after a clean cycle
+    jurisdictions: ["ma"]             # USA next, after one clean MA cycle (see above)
     jurisdictions_excluded: ["mi"]    # never retry a WAF-blocked jurisdiction (OPEN-53)
     max_attempts: 3
     backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision

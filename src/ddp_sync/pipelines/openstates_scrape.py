@@ -205,8 +205,8 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     and lets run-scrape.sh fire exactly one alert at the end rather than one per
     attempt.
 
-    Two conditions, not one: opted in via retry.jurisdictions AND not named in
-    retry.jurisdictions_excluded. The exclusion is not redundant with the
+    Two conditions, not one: opted in via scrape_retry.jurisdictions AND not
+    named in scrape_retry.jurisdictions_excluded. The exclusion is not redundant with the
     allowlist -- it is what still holds when the staged rollout finishes and
     someone widens the allowlist to everything. MI must never be retried, because
     OPEN-53 established that a blind retry against a WAF worsens a block rather
@@ -214,7 +214,9 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     already distrusts. MI is the jurisdiction that actually gets WAF-blocked --
     it is why secondary.scrapebot_fallback lists exactly ["mi"].
 
-    Config lives under openstates_scrape.retry in sync_schedule.yaml, mirroring
+    Config lives under openstates_scrape.scrape_retry in sync_schedule.yaml
+    -- named scrape_retry because that file already has an unrelated top-level
+    `retry:` block for OpenStates API call retries. Mirroring
     secondary.scrapebot_fallback's shape above. Absent/disabled by default, so a
     jurisdiction that hasn't opted in is invoked exactly as it is today -- same
     script, same arguments, no wrapper process at all.
@@ -225,7 +227,7 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     that decision -- the wrapper's own SCRAPE_RETRY_EXCLUDED_JURISDICTIONS is for
     a human invoking it by hand, and is deliberately not passed from here.
     """
-    retry_cfg = (config or {}).get("retry", {})
+    retry_cfg = (config or {}).get("scrape_retry", {})
     if not retry_cfg.get("enabled", False):
         return False
     if jurisdiction in retry_cfg.get("jurisdictions_excluded", []):
@@ -338,8 +340,24 @@ async def _run_scrape(
     # retry" flag) is what makes the opt-out absolute: a jurisdiction that is not eligible does
     # not get a wrapper process at all, so its invocation is byte-identical to today's.
     retry_enabled = _retry_eligible(jurisdiction, config)
-    script_name = "run-scrape-retrying.sh" if retry_enabled else "run-scrape.sh"
-    script = os.path.join(openstates_root, script_name)
+    script = os.path.join(openstates_root, "run-scrape-retrying.sh") if retry_enabled else ""
+    if retry_enabled and not os.path.exists(script):
+        # These are two separate repos with two separate deploys, so this config can legitimately
+        # be live before the wrapper script is. Falling back matters more than it looks: without
+        # it, /bin/bash on a missing script exits 127, which is a *positive* return code -- and
+        # the returncode != 0 branch below deliberately does not alert on those, on the grounds
+        # that run-scrape.sh already alerted from inside the process. Here run-scrape.sh never
+        # ran, so nobody would alert and an opted-in jurisdiction would fail silently every
+        # cycle until someone noticed the missing data.
+        logger.warning(
+            "openstates_scrape: retry enabled but run-scrape-retrying.sh is missing — "
+            "falling back to run-scrape.sh (deploy ddp-open-states first)",
+            jurisdiction=jurisdiction,
+            expected_path=script,
+        )
+        retry_enabled = False
+    if not retry_enabled:
+        script = os.path.join(openstates_root, "run-scrape.sh")
     cmd = ["/bin/bash", script, jurisdiction]
     if session_arg:
         cmd.append(session_arg)
@@ -349,7 +367,7 @@ async def _run_scrape(
         # run-scrape-retrying.sh reads these; see _retry_eligible() for why the opt-in lives in
         # YAML rather than as a $STATE test in the script. backoff_secs is a YAML list and the
         # wrapper wants a comma string, since it is bash 3.2 and has no arrays to receive.
-        retry_cfg = (config or {}).get("retry", {})
+        retry_cfg = (config or {}).get("scrape_retry", {})
         env["SCRAPE_RETRY_MAX_ATTEMPTS"] = str(retry_cfg.get("max_attempts", 3))
         env["SCRAPE_RETRY_BACKOFF_SECS"] = ",".join(
             str(s) for s in retry_cfg.get("backoff_secs", [900, 1800])
