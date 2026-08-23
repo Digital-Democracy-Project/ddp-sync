@@ -376,6 +376,47 @@ openstates_scrape:
     enabled: false
     quiet_window: 3
 
+  # OPEN-140: let a jurisdiction's scrape cadence follow observed filing activity instead of a
+  # hand-edited sync_day. Florida currently carries this logic as a comment and a reminder --
+  # "Remove sync_day (revert to daily) once the 2027 session opens" -- and if nobody remembers in
+  # November, FL scrapes weekly through its entire session.
+  #
+  # THE FLOOR RULE (operator decision, 2026-08-23). Redis is the runtime source of truth; the
+  # sync_day value in this file is a FLOOR, not a default to be overwritten. Automation may make
+  # a jurisdiction run MORE often than this file says and never less. Nothing writes back to this
+  # file -- a process editing its own config was considered and rejected. Losing Redis therefore
+  # degrades to whatever is committed here, never to an unscheduled jurisdiction.
+  #
+  # ESCALATION IS AUTOMATIC, DEMOTION IS ONLY EVER ADVICE (same decision). The asymmetry is the
+  # point: escalating wrongly costs a few extra scrapes, demoting wrongly costs data. "No new
+  # bills" is exactly what a broken scraper looks like -- Arizona imported zero new bills across
+  # ten consecutive runs because it was wedged, so a rule that demotes after a quiet stretch
+  # would have demoted Arizona *because* it was broken, checking the broken thing less often.
+  # OPEN-22 reached the same conclusion for WAF blocks and wrote it into the escalation block
+  # below: it "deliberately does NOT skip or delay a scheduled run based on this history".
+  #
+  # So when a jurisdiction looks over-scraped this logs it and alerts, and changes nothing. Acting
+  # on that advice is a human edit to sync_day here. If a later cycle wants automatic demotion,
+  # the guards are already implemented and tested in scrape_cadence.demotion_looks_reasonable()
+  # (quiet AND every run succeeded AND it has filed at some point) -- what is missing is the
+  # decision, not the code.
+  #
+  # DISABLED for the first cycle. This needs OPEN-139's bills_new figures in the run history
+  # before it can decide anything, and those only start accumulating when OPEN-139 ships. Enable
+  # after a few weeks of history exist, the same check OPEN-139's own filing_activity block
+  # describes.
+  #
+  # excluded: MI must never be escalated. OPEN-53 established that more traffic against a WAF
+  # worsens a block, which is why MI is already excluded from scrape retries. Same key shape as
+  # scrape_retry.jurisdictions_excluded above, on purpose.
+  #
+  # Read by scrape_cadence.py via the cadence-review job.
+  dynamic_cadence:
+    enabled: false
+    escalate_window: 2      # a productive run in the last N reviews -> nightly
+    quiet_window: 4         # N quiet runs before demotion is even *suggested*
+    jurisdictions_excluded: ["mi"]
+
   patch_refresh:
     enabled: true
     sync_time_utc: "01:00"
