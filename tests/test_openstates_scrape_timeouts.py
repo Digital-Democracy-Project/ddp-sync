@@ -11,6 +11,11 @@ script's cleanup, marker writes and on_failure() alerting never run -- and opens
 already wiped the jurisdiction's data directory at scrape start. A timeout kill discards the
 whole run's work silently.
 """
+from unittest import mock
+
+import pytest
+
+import ddp_sync.pipelines.openstates_scrape as os_scrape
 from ddp_sync.pipelines.openstates_scrape import SCRAPE_TIMEOUT_S
 
 # The longest real MA full walk observed in scraper.log, in seconds (341 minutes).
@@ -67,3 +72,38 @@ def test_jurisdictions_without_an_entry_still_get_the_default():
     # The lookup contract itself, since MA's whole problem was inheriting it unnoticed.
     assert _ceiling("az") == SCRAPE_TIMEOUT_S["default"]
     assert _ceiling("va") == SCRAPE_TIMEOUT_S["default"]
+
+
+# --- the production path, not a copy of the lookup -----------------------------------
+#
+# pm-review's point: every test above reimplements `SCRAPE_TIMEOUT_S.get(j, default)` in this
+# file, so they would all still pass if the production resolution diverged from it. These two
+# assert on the value actually handed to the process runner.
+
+@pytest.mark.asyncio
+async def test_ma_resolves_to_twelve_hours_at_the_invocation_path():
+    seen = {}
+
+    def fake_run(cmd, env, timeout, cwd=None):
+        seen["timeout"] = timeout
+        return 0, b"", b"", False
+
+    with mock.patch.object(os_scrape, "_run_with_group_kill", fake_run):
+        await os_scrape._run_scrape("ma", None, "/tmp/openstates", None, {})
+
+    assert seen["timeout"] == 12 * 3600
+    assert seen["timeout"] >= MEASURED_MA_FULL_WALK_S * 1.5
+
+
+@pytest.mark.asyncio
+async def test_an_entry_less_jurisdiction_resolves_to_the_default_at_the_invocation_path():
+    seen = {}
+
+    def fake_run(cmd, env, timeout, cwd=None):
+        seen["timeout"] = timeout
+        return 0, b"", b"", False
+
+    with mock.patch.object(os_scrape, "_run_with_group_kill", fake_run):
+        await os_scrape._run_scrape("az", None, "/tmp/openstates", None, {})
+
+    assert seen["timeout"] == SCRAPE_TIMEOUT_S["default"]
