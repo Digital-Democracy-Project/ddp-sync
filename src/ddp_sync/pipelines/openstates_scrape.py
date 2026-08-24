@@ -34,8 +34,29 @@ logger = structlog.get_logger()
 DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 
 # Per-jurisdiction scrape timeouts. FL 2026 regularly takes 12+ hours.
+#
+# OPEN-128: MA needs an explicit entry. It used to filter its bill list on the sponsors'
+# ResponseDate, which never moves once a bill is filed, so a bill whose only change was an
+# action was skipped every run and its actions went stale. That filter is gone
+# (openstates-scrapers, ma/bills.py), so every MA run is now a full walk of ~11,500 bills.
+#
+# A real full walk measured 341 minutes -- 5.7h -- against the 6h `default` this previously fell
+# under. A 19-minute margin is not a margin: the walk is bound by malegislature.gov's own ~2s
+# per-page response time, which varies, so a slightly slow night would cross it. That matters
+# more than a normal timeout because of HOW the kill lands. _run_scrape uses
+# subprocess.run(timeout=...), which kills run-scrape.sh from outside its own process, so the
+# script's cleanup, marker writes and on_failure() alerting never run -- and openstates-core has
+# already wiped the jurisdiction's data directory at scrape start. A timeout kill therefore
+# discards the entire run's work, which is exactly the failure OPEN-86's import-as-you-go sweep
+# exists to bound. The comment on _alert_scrape_failure() below records that MA already came
+# within an hour of this once, at ~5h, before the walk got longer.
+#
+# 12h gives roughly 2x headroom over the measured duration and stays well under FL's 16h. If MA
+# ever genuinely approaches it, the fix is not a bigger number: ma/bills.py's scrape() already
+# takes a `scrape_chunk_number` (1-12) built to split this walk into shorter runs.
 SCRAPE_TIMEOUT_S: dict[str, int] = {
     "fl": 16 * 3600,
+    "ma": 12 * 3600,
     "wa": 8 * 3600,
     "usa": 4 * 3600,
     "default": 6 * 3600,
