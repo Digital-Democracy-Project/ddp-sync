@@ -15,6 +15,25 @@ as a hook point — must be built on the newer, Webflow-independent reach instea
 session history around that date for the context this came up in — a discussion
 of how to auto-trigger `bill_changelog` generation on a new scraped bill version).
 
+## Recurring jobs are scheduled by ddp-sync, not by CAMS
+
+Every recurring/scheduled pipeline in this stack is meant to be scheduled by **ddp-sync's own
+scheduler** (`src/ddp_sync/scheduler.py` and its YAML config) and fired into the target service
+via an on-demand API call — e.g. OpenStates scrapes/archives, bill-version checks, and votebot
+evals all work this way, each with a matching `/trigger/*` endpoint in
+`src/ddp_sync/api/routes/triggers.py` for manual/ad-hoc runs alongside the cron-driven call. CAMS
+(`ddp-agents`) must never self-schedule a recurring job internally (e.g. via its own
+`cams.scheduler.CronScheduler` registered inside `app.py`'s lifespan) — if a job needs to run on a
+cron, that cron belongs in ddp-sync, calling CAMS's existing on-demand trigger endpoint for it.
+
+If asked to change a schedule (frequency, timing) for a recurring job, check first whether it's
+actually scheduled this way — if it turns out to be self-scheduled inside CAMS or another service
+instead, that's an architecture violation to flag and fix (typically a linked pair of Jira tickets,
+one in `AGENTS` and one in `SYNC`), not just a config edit. Confirmed directly by Ramon, 2026-08-23,
+when GrantBot's weekly Notion-funder-scrape job (self-scheduled inside CAMS at `"0 7 * * 1"`) was
+found and flagged this way instead of just editing its cron string in place — see AGENTS-54 and
+SYNC-36.
+
 ## Dev/prod checkout discipline
 
 `~/Developer/repos/ddp-sync` is **production** — the `com.ddp.ddp-sync` LaunchDaemon
