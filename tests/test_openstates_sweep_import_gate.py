@@ -58,7 +58,7 @@ async def _captured_env_for(jurisdiction, config):
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(0, b"", b"", False),
+            return_value=(0, b"", b"", False, False),
         ) as helper,
         patch(
             "ddp_sync.pipelines.openstates_scrape._maybe_preseed_scrapebot_cookies",

@@ -93,7 +93,7 @@ async def _captured_call_for(jurisdiction, config, session_arg=None, wrapper_pre
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(0, b"", b"", False),
+            return_value=(0, b"", b"", False, False),
         ) as helper,
         patch(
             "ddp_sync.pipelines.openstates_scrape._maybe_preseed_scrapebot_cookies",

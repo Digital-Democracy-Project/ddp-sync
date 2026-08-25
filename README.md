@@ -259,6 +259,36 @@ Add checks for non-Voatz endpoints in `FALLBACK_CHECKS` in `src/ddp_sync/pipelin
 | GET | `/health` | Health check (scheduler, Redis, Pinecone, flow status) |
 | GET | `/schedule` | Show all scheduled jobs and next run times |
 
+### When a scrape gets killed (OPEN-155, 2026-08-25)
+
+A scrape is ended because it **stopped making progress**, not because a clock ran out. A watchdog
+inside `_run_with_group_kill` polls the jurisdiction's own scraped-data directory and kills the
+whole process group after `SCRAPE_STALL_SECONDS` (default 45 min) with no new bill file. That
+directory is the actual work product, so the signal needs no cooperation from the scraper.
+
+Wall-clock ceilings got both failure cases wrong. They killed healthy-but-slow runs — MA's full
+walk measured 5.7h and then 8.21h on consecutive attempts, a spread caused entirely by
+malegislature.gov's own response time — and they tolerated a genuinely wedged run right up until
+the ceiling expired, which for FL is sixteen hours of nothing happening.
+
+`SCRAPE_TIMEOUT_S` still exists, but it is now a **far backstop** for the one case a stall
+detector cannot see: a run making steady, genuine progress that will simply never finish. Being
+generous with those numbers is safe precisely because a wedged run no longer waits for them.
+
+Why a timeout kill is worth understanding before tuning any of this: it kills `run-scrape.sh` from
+outside its own process, so the script's cleanup, marker writes and failure alerting never run —
+and openstates-core has already wiped the jurisdiction's data directory at scrape start.
+Overshooting costs nothing; undershooting discards a whole run's collection, quietly.
+
+A stall reports `error: "stalled"` and alerts, but deliberately reuses the **`timeout`**
+`failure_reason`: OPEN-22's sustained-pattern escalation counts categories, and to that logic a
+stall and a ceiling hit are the same thing — "this jurisdiction keeps not finishing" — so a new
+category would make one repeatedly-stalling jurisdiction look like two smaller unrelated problems.
+
+**`SCRAPE_STALL_SECONDS=0` disables stall detection** and falls back to the ceilings alone, i.e.
+the pre-OPEN-155 behaviour. That is the escape hatch if it ever starts killing healthy runs — env
+var and a restart, no deploy.
+
 ## Deployment
 
 ddp-sync runs on **two hosts**, no leader election — each runs its own scheduler

@@ -122,9 +122,9 @@ async def test_run_scrape_preseeds_before_launching_the_subprocess():
     async def fake_preseed(jurisdiction, cfg, root):
         call_order.append("preseed")
 
-    def fake_run_with_group_kill(cmd, env, timeout):
+    def fake_run_with_group_kill(cmd, env, timeout, *args, **kwargs):
         call_order.append("subprocess")
-        return 0, b"", b"", False
+        return 0, b"", b"", False, False
 
     with patch(
         "ddp_sync.pipelines.openstates_scrape._maybe_preseed_scrapebot_cookies",
@@ -148,7 +148,7 @@ async def test_run_scrape_is_a_noop_preseed_when_config_omitted():
         new_callable=AsyncMock,
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-        return_value=(0, b"", b"", False),
+        return_value=(0, b"", b"", False, False),
     ):
         result = await _run_scrape("fl", "session=2026", "/fake/root")
 
@@ -176,7 +176,7 @@ async def test_run_single_scrape_job_preseeds_via_run_scrape():
         return_value="/fake/_cache/mi_waf_cookies.json",
     ), patch(
         "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-        return_value=(0, b"", b"", False),
+        return_value=(0, b"", b"", False, False),
     ):
         result = await run_single_scrape_job("mi", config)
 

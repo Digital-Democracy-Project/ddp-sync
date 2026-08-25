@@ -109,7 +109,7 @@ async def test_run_scrape_attaches_waf_block_failure_reason():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(1, b"", WAF_STDERR_TAIL.encode(), False),
+            return_value=(1, b"", WAF_STDERR_TAIL.encode(), False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
@@ -124,7 +124,7 @@ async def test_run_scrape_attaches_nonzero_exit_other_for_unrelated_failure():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(1, b"", b"some unrelated stderr", False),
+            return_value=(1, b"", b"some unrelated stderr", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
@@ -138,7 +138,7 @@ async def test_run_scrape_attaches_nonzero_exit_other_for_unrelated_failure():
 async def test_run_scrape_success_has_no_failure_reason():
     with patch(
         "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-        return_value=(0, b"", b"", False),
+        return_value=(0, b"", b"", False, False),
     ):
         result = await _run_scrape("mi", None, "/fake/root", timeout_s=10)
 

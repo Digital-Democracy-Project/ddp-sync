@@ -28,7 +28,7 @@ async def test_timeout_alerts_once():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(-9, b"", b"", True),
+            return_value=(-9, b"", b"", True, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -45,7 +45,7 @@ async def test_ordinary_nonzero_exit_does_not_alert():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(1, b"", b"some stderr", False),
+            return_value=(1, b"", b"some stderr", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -61,7 +61,7 @@ async def test_signal_killed_negative_returncode_alerts():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(-15, b"", b"", False),
+            return_value=(-15, b"", b"", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -78,7 +78,7 @@ async def test_success_does_not_alert():
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(0, b"", b"", False),
+            return_value=(0, b"", b"", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
