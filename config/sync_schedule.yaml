@@ -411,8 +411,47 @@ openstates_scrape:
   # scrape_retry.jurisdictions_excluded above, on purpose.
   #
   # Read by scrape_cadence.py via the cadence-review job.
+  # HOW IT TAKES EFFECT, and what "without a restart" actually means here. A daily review
+  # job re-decides every jurisdiction's cadence, writes any escalation to Redis, and then
+  # re-registers the scrape jobs in place. Startup deliberately does NOT read Redis: jobs
+  # are registered from the floors in this file, and overrides arrive from the first review.
+  # So a Redis outage cannot leave a jurisdiction unscheduled -- it can only mean the
+  # committed cadence stays in force, which is the safe direction.
+  #
+  # Escalating a SECONDARY jurisdiction is a move, not a trigger edit. The secondary states
+  # share one weekly job that fans out over a list; an escalated jurisdiction leaves that
+  # list and gets its own nightly job (`openstates_secondary_scrape_<juris>`). Leaving it in
+  # both would scrape it twice on the batch's day, and each run wipes the other's _data dir.
+  # Its run history keeps the `openstates_secondary_scrapes` flow name in both cadences on
+  # purpose -- that history is what the review reads, and splitting it on a cadence change
+  # would erase the evidence that caused the change.
+  #
+  # review_time_utc sits before the day's first scrape (patch refresh 01:00, FL and secondary
+  # 02:00), so a cadence decided this morning takes effect this morning rather than tomorrow.
+  #
+  # Where to see the live cadence: GET /schedule reports `openstates_cadence`, plus the jobs
+  # themselves. That endpoint is not a nicety -- the floor rule puts the runtime cadence in
+  # Redis, so it is no longer visible in a git diff and there would otherwise be no way to
+  # answer "is Florida nightly right now?" short of a redis-cli.
+  # BEFORE FLIPPING enabled TO true. Escalation increases scrape traffic, so this is the
+  # one knob here worth checking rather than just setting.
+  #   1. Confirm the history exists: each jurisdiction needs at least `escalate_window`
+  #      runs carrying a bills_new figure, which on weekly jobs is a couple of weeks.
+  #        redis-cli LRANGE ddp:flow_history:openstates_secondary_scrapes:va 0 -1
+  #      OPEN-139's filing_activity block above describes the same check in more detail.
+  #   2. Note the cadence you expect afterwards, then flip this and read GET /schedule --
+  #      `openstates_cadence` reports what actually took effect, and a jurisdiction that
+  #      escalated will have its own `openstates_secondary_scrape_<juris>` job.
+  #   3. A cadence review runs a few minutes after startup as well as at review_time_utc,
+  #      so you do not have to wait until tomorrow to see the result.
+  # Rollback is this line back to false plus a restart: no review job is registered, so
+  # nothing can escalate, and the schedule returns to the floors in this file. Any
+  # override already in Redis is simply not consulted (registration never reads it);
+  # DEL ddp:scrape_cadence:<juris> clears it for good.
   dynamic_cadence:
     enabled: false
+    review_time_utc: "00:30"
+    startup_review_delay_s: 300   # catch-up review after a restart, before the daily cron
     escalate_window: 2      # a productive run in the last N reviews -> nightly
     quiet_window: 4         # N quiet runs before demotion is even *suggested*
     jurisdictions_excluded: ["mi"]

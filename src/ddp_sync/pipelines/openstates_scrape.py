@@ -1185,18 +1185,36 @@ async def run_usa_scrapes_job(config: dict | None = None) -> dict[str, Any]:
     }
 
 
-async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any]:
+async def run_secondary_scrapes_job(
+    config: dict | None = None,
+    jurisdictions: list[str] | None = None,
+    flow_status_key: str | None = None,
+) -> dict[str, Any]:
     """Run secondary states (VA, MI, MA, UT, AZ) concurrently.
 
     Each jurisdiction uses a distinct _data/{state}/ directory so they don't
     conflict. asyncio.gather fans them out into separate threads simultaneously,
     cutting total wall-clock from ~sum(durations) to ~max(durations).
+
+    OPEN-140 added the two optional arguments, and both default to exactly
+    today's behaviour. `jurisdictions` narrows the run to a subset, because a
+    jurisdiction escalated to nightly leaves this weekly batch and gets its own
+    job -- otherwise it would be scraped twice on the batch's day.
+
+    `flow_status_key` renames only the *flow status* Redis key. The rolling
+    per-jurisdiction run HISTORY deliberately keeps the "openstates_secondary_scrapes"
+    flow name in every case: that history is keyed per jurisdiction, it is what
+    the cadence review reads to decide, and splitting it on a cadence change
+    would erase the very evidence that caused the change. The flow status is a
+    single per-flow document, though, so two jobs sharing one key would
+    overwrite each other -- hence the separate name for the split-out jobs.
     """
     openstates_root = _get_root(config)
-    jurisdictions: list[str] = (
-        (config or {}).get("secondary", {})
-        .get("jurisdictions", ["va", "mi", "ma", "ut", "az"])
-    )
+    if jurisdictions is None:
+        jurisdictions = (
+            (config or {}).get("secondary", {})
+            .get("jurisdictions", ["va", "mi", "ma", "ut", "az"])
+        )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()
 
@@ -1229,8 +1247,9 @@ async def run_secondary_scrapes_job(config: dict | None = None) -> dict[str, Any
         "openstates_secondary_scrapes", jurisdictions, results, config
     )
 
-    await _write_flow_status("openstates_secondary_scrapes", {
-        "flow": "openstates_secondary_scrapes",
+    status_key = flow_status_key or "openstates_secondary_scrapes"
+    await _write_flow_status(status_key, {
+        "flow": status_key,
         "started_at": start_time.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "status": "completed" if not failed else "completed_with_errors",
