@@ -257,7 +257,44 @@ Add checks for non-Voatz endpoints in `FALLBACK_CHECKS` in `src/ddp_sync/pipelin
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check (scheduler, Redis, Pinecone, flow status) |
-| GET | `/schedule` | Show all scheduled jobs and next run times |
+| GET | `/schedule` | Scheduled jobs, next run times, and the effective scrape cadence per jurisdiction |
+
+### Scrape cadence: where it actually lives (OPEN-140, 2026-08-25)
+
+A jurisdiction's scrape cadence is **not** simply what `sync_schedule.yaml` says. Redis is the
+runtime source of truth and the YAML `sync_day` is a **floor**: automation may make a jurisdiction
+run more often than the file says, never less, and nothing ever writes back to the file.
+
+That means the live cadence is not visible in a git diff, which is why `GET /schedule` reports
+`openstates_cadence`. **Read that, not the YAML, to answer "is Florida nightly right now?"**
+
+Two structural facts to know before changing anything here:
+
+- **Startup never reads Redis.** `start()` registers every job from the YAML floors; overrides
+  arrive from the cadence-review job, which also runs a few minutes after boot so a restart does
+  not leave a jurisdiction on its floor until the next daily review. This is deliberate — boot
+  cannot depend on Redis being up, so a Redis outage can only mean "the committed cadence stays in
+  force", never "this jurisdiction is unscheduled".
+- **Escalating a secondary jurisdiction is a move, not a trigger edit.** The secondary states share
+  one weekly job that fans out over a list; an escalated jurisdiction leaves that list and gets its
+  own `openstates_secondary_scrape_<juris>` job. Leaving it in both would scrape it twice on the
+  batch's day, and openstates-core wipes the jurisdiction's `_data` dir at scrape start, so the two
+  runs would destroy each other's output. Its run *history* keeps the shared
+  `openstates_secondary_scrapes` flow name across the move on purpose: that history is what the
+  review reads to decide, and splitting it would erase the evidence that caused the change.
+
+Escalation is automatic; **demotion is only ever advice.** "No new bills" is exactly what a broken
+scraper looks like — Arizona imported zero new bills across ten consecutive runs because it was
+wedged, so a demote-on-quiet rule would have demoted Arizona *because* it was broken and then
+checked the broken thing less often. Acting on a demotion suggestion is a human edit to `sync_day`.
+
+MI is never escalated (OPEN-53: more traffic against a WAF worsens a block). That is enforced both
+in the decision function and again in the registration path, so neither a future caller nor a
+hand-written Redis value can get it onto a nightly job.
+
+`dynamic_cadence.enabled` ships **false** — with it off, no review job is registered at all and
+cadence is exactly the YAML floors. Enablement steps and rollback are documented in
+`config/sync_schedule.yaml` beside the flag.
 
 ### When a scrape gets killed (OPEN-155, 2026-08-25)
 
