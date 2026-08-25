@@ -503,6 +503,10 @@ async def _maybe_preseed_scrapebot_cookies(
 # at all while it fetches and parses its search page, and for a no-op run it produces none ever.
 # That is safe here because a no-op run also exits quickly (VA: 90s), so it is gone long before
 # the timer matters.
+#
+# Setting SCRAPE_STALL_SECONDS=0 disables stall detection entirely and falls back to the
+# SCRAPE_TIMEOUT_S ceilings alone -- i.e. exactly the behaviour before this change. That is the
+# escape hatch if this ever starts killing healthy runs: it needs no deploy, only a restart.
 SCRAPE_STALL_SECONDS = int(os.getenv("SCRAPE_STALL_SECONDS", str(45 * 60)))
 
 # How often the watchdog looks. Cheap (one listdir) and not latency-critical -- the cost of a
@@ -556,6 +560,13 @@ def _run_with_group_kill(
                 # change", never the actual number. A missing directory reads as -1 and simply
                 # counts as "unchanged", which is right: openstates-core wipes and recreates it
                 # at scrape start, so it is legitimately absent for a moment.
+                #
+                # A count is a sound progress signal only because of how openstates-core writes:
+                # save_object() (scrape/base.py) writes one flat file per object named
+                # f"{obj._type}_{obj._id}.json" where _id is a fresh uuid1() per object. So a
+                # save never rewrites an existing file and never nests -- during a healthy run
+                # this number only goes up. If that layout ever changes, this detector has to
+                # change with it; test_progress_files_match_the_openstates_core_layout pins it.
                 try:
                     return len(os.listdir(progress_dir))
                 except OSError:
@@ -569,6 +580,13 @@ def _run_with_group_kill(
                     last_count, last_change = now_count, time.monotonic()
                     continue
                 if time.monotonic() - last_change >= stall_seconds:
+                    # The process may have finished on its own between the last poll and now --
+                    # a no-op run writes nothing at all, so it can reach the stall window and
+                    # exit cleanly in the same breath. Killing a corpse is harmless, but
+                    # *labelling* that run stalled would report a successful scrape as a
+                    # failure, so check liveness before claiming anything.
+                    if process.poll() is not None:
+                        return
                     stalled = True
                     logger.error(
                         "openstates_scrape: no new bills for the stall window — killing",

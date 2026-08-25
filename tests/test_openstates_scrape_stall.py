@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 
 import pytest
 
@@ -141,6 +142,68 @@ def test_the_whole_process_group_dies_on_a_stall(fast_poll, datadir):
     assert stalled is True
     time.sleep(3.5)
     assert not os.path.exists(marker), "grandchild survived the stall kill"
+
+
+def test_progress_files_match_the_openstates_core_layout(fast_poll, datadir):
+    """The count is only a valid progress signal because of how openstates-core writes files.
+
+    save_object() in openstates-core's scrape/base.py writes one flat file per object, named
+    f"{obj._type}_{obj._id}.json", where _id is a fresh str(uuid.uuid1()) assigned per object.
+    Two consequences, and the detector depends on both: a save never overwrites an existing
+    file, and output never nests into subdirectories. So during a healthy run the top-level
+    entry count strictly increases.
+
+    Verified against the live checkout on 2026-08-25: _data/ma/ held 11,592 flat
+    bill_<uuid>.json files and no subdirectories.
+
+    This writes files in that exact shape rather than generic touch targets, so that if the
+    upstream layout ever changes to rewriting-in-place or nesting, the assumption fails here
+    rather than silently in production as a scrape that is killed while working.
+    """
+    ids = [str(uuid.uuid1()) for _ in range(6)]
+    writes = " ".join(
+        f'printf \'{{}}\' > "{datadir}/bill_{i}.json"; sleep 0.2;' for i in ids
+    )
+    rc, _out, _err, timed_out, stalled = _run_with_group_kill(
+        ["/bin/bash", "-c", writes], dict(os.environ), timeout=25,
+        progress_dir=datadir, stall_seconds=1,
+    )
+    assert stalled is False, "distinct per-object filenames must read as continuous progress"
+    assert rc == 0
+    written = os.listdir(datadir)
+    assert len(written) == len(set(ids)) == 6, "each save must add an entry, never replace one"
+    assert all(os.path.isfile(os.path.join(datadir, f)) for f in written), "layout is flat"
+
+
+def test_a_run_that_finishes_at_the_stall_boundary_is_not_called_stalled(fast_poll, datadir):
+    """A no-op run writes nothing at all, so it can reach the stall window and exit cleanly.
+
+    The watchdog must not label that a failure. A successful scrape reported as stalled is the
+    same class of bug this whole ticket family is about — the run says one thing and the record
+    says another — only pointing the other way.
+    """
+    rc, _out, _err, timed_out, stalled = _run_with_group_kill(
+        ["/bin/bash", "-c", "sleep 1"], dict(os.environ), timeout=25,
+        progress_dir=datadir, stall_seconds=0.95,
+    )
+    assert rc == 0, "the process finished on its own"
+    assert stalled is False, "a run that exited cleanly must never be reported as stalled"
+
+
+def test_setting_the_stall_window_to_zero_disables_detection(fast_poll, datadir):
+    """0 is the documented escape hatch: falls back to the SCRAPE_TIMEOUT_S ceilings alone.
+
+    That is the pre-OPEN-155 behaviour, reachable by env var without a deploy, if stall
+    detection ever starts killing healthy runs.
+    """
+    before = threading.active_count()
+    rc, _out, _err, timed_out, stalled = _run_with_group_kill(
+        ["/bin/bash", "-c", "sleep 0.5"], dict(os.environ), timeout=25,
+        progress_dir=datadir, stall_seconds=0,
+    )
+    assert stalled is False
+    assert rc == 0
+    assert threading.active_count() <= before, "0 must start no watchdog at all"
 
 
 def test_the_stall_window_is_configurable_and_sane():
