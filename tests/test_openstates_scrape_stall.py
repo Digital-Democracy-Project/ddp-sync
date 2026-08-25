@@ -12,22 +12,25 @@ These drive the real `_run_with_group_kill` against short-lived shell processes 
 temporary directory. Nothing is mocked except the clock budget — the watchdog thread, the
 process-group kill and the directory polling are all the production code paths.
 
-TIMING DISCIPLINE IN THIS FILE (OPEN-157). Every test here races a `sleep` against a stall
-window, so the ratio between them decides whether the test is deterministic. Audited 2026-08-25;
-keep it this way when adding one:
+TIMING DISCIPLINE IN THIS FILE (OPEN-157) — the rule, then the snapshot.
 
-  * Nine tests hold a margin of 5x or more in one direction or the other — the process exits long
-    before the stall window, or the window fires long before the process would exit. Those are
-    deterministic and assert concrete outcomes.
-  * `test_setting_the_stall_window_to_zero_disables_detection` starts no watchdog at all
-    (`stall_seconds=0`), so it has no race to lose regardless of timing.
-  * **Exactly one test is deliberately racy**: `..._is_never_both`, at a ratio of 0.95. That
-    interleaving is the whole point of it — it is what `process.poll()` in the watchdog exists to
-    handle — so it asserts an INVARIANT (a run is never both stalled and successful) rather than
-    picking a winner. An earlier version asserted the outcome and failed about four runs in five.
+Every test here races a `sleep` against a stall window, so the ratio between the two decides
+whether the test is deterministic or a coin flip. THE RULE, which is what to actually apply:
 
-If a new test lands between roughly 0.5x and 2x, it is a coin flip: either separate the two
-events or assert an invariant. Do not tune the numbers until it passes on a quiet machine.
+    ratio = stall_seconds / sleep
+      <= 0.5   the window fires first, deterministically. Assert the outcome.
+      >= 2.0   the process exits first, deterministically. Assert the outcome.
+      between  it is a coin flip. Either separate the two events, or assert an INVARIANT that
+               holds whichever side wins. Never tune the numbers until it passes on this machine.
+
+Snapshot of an audit run 2026-08-25, which will drift as tests are added and is not the rule:
+every test then in the file sat at 0.03–0.17 or 5–16x except `..._is_never_both` at 0.95, which
+is deliberately racy and asserts an invariant, and
+`test_setting_the_stall_window_to_zero_disables_detection`, which starts no watchdog at all
+(`stall_seconds=0`) and so has no race to lose regardless of timing.
+
+A previous version of the boundary test asserted the outcome of the 0.95 race and failed roughly
+four runs in five, which is what prompted writing this down.
 """
 import os
 import subprocess
@@ -208,18 +211,35 @@ def test_a_run_that_finishes_at_the_stall_boundary_is_never_both(fast_poll, data
     What must hold either way is the invariant: a run may be killed as stalled, or it may exit
     successfully, but it may never be reported as both. That is exactly the contradiction the
     liveness check prevents, and it holds whichever way the race falls.
+
+    Scope, so this is not over-read (pm-review's point): a pass here does NOT prove the
+    `process.poll()` branch executed on that particular run, because the other side of the race
+    may have won. It proves the invariant survives the boundary. Deterministic coverage of "a
+    process that exits well before the window is never called stalled" is
+    `test_a_short_run_that_never_writes_anything_is_not_killed`, which separates the two events
+    by 16x and asserts the outcome directly.
     """
     rc, _out, _err, timed_out, stalled = _run_with_group_kill(
         ["/bin/bash", "-c", "sleep 1"], dict(os.environ), timeout=25,
         progress_dir=datadir, stall_seconds=0.95,
     )
-    assert not (stalled and rc == 0), (
-        f"reported stalled AND exited successfully (rc={rc}) — a successful run was recorded "
-        "as a failure"
-    )
     assert timed_out is False, "nothing here should reach the 25s ceiling"
+
+    # Exactly two outcomes are legitimate. Enumerating them rather than only forbidding the
+    # contradictory one closes a vacuous pass pm-review spotted: `rc != 0 and not stalled` would
+    # mean `sleep 1` failed for some unrelated reason -- a missing shell, a broken fixture -- and
+    # the old assertion would have sailed straight past it.
     if stalled:
-        assert rc != 0, "a stall kill must leave a kill-shaped return code"
+        # A stall kill is SIGKILL to the process group, so the direct child's status is -9.
+        # Asserting the signal rather than just "nonzero" is what makes this branch prove a
+        # group kill happened rather than merely that something went wrong.
+        assert rc == -9, f"a stall kill must show SIGKILL, got rc={rc}"
+    else:
+        assert rc == 0, (
+            f"not stalled, so the process must have exited cleanly on its own, got rc={rc} — "
+            "a nonzero code here means the subprocess failed for an unrelated reason and this "
+            "test would otherwise pass without exercising anything"
+        )
 
 
 def test_setting_the_stall_window_to_zero_disables_detection(fast_poll, datadir):
