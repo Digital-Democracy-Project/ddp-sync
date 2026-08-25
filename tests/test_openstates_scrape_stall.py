@@ -11,6 +11,23 @@ directory: the actual work product, requiring no cooperation from the scraper.
 These drive the real `_run_with_group_kill` against short-lived shell processes and a real
 temporary directory. Nothing is mocked except the clock budget — the watchdog thread, the
 process-group kill and the directory polling are all the production code paths.
+
+TIMING DISCIPLINE IN THIS FILE (OPEN-157). Every test here races a `sleep` against a stall
+window, so the ratio between them decides whether the test is deterministic. Audited 2026-08-25;
+keep it this way when adding one:
+
+  * Nine tests hold a margin of 5x or more in one direction or the other — the process exits long
+    before the stall window, or the window fires long before the process would exit. Those are
+    deterministic and assert concrete outcomes.
+  * `test_setting_the_stall_window_to_zero_disables_detection` starts no watchdog at all
+    (`stall_seconds=0`), so it has no race to lose regardless of timing.
+  * **Exactly one test is deliberately racy**: `..._is_never_both`, at a ratio of 0.95. That
+    interleaving is the whole point of it — it is what `process.poll()` in the watchdog exists to
+    handle — so it asserts an INVARIANT (a run is never both stalled and successful) rather than
+    picking a winner. An earlier version asserted the outcome and failed about four runs in five.
+
+If a new test lands between roughly 0.5x and 2x, it is a coin flip: either separate the two
+events or assert an invariant. Do not tune the numbers until it passes on a quiet machine.
 """
 import os
 import subprocess
