@@ -11,6 +11,26 @@ directory: the actual work product, requiring no cooperation from the scraper.
 These drive the real `_run_with_group_kill` against short-lived shell processes and a real
 temporary directory. Nothing is mocked except the clock budget — the watchdog thread, the
 process-group kill and the directory polling are all the production code paths.
+
+TIMING DISCIPLINE IN THIS FILE (OPEN-157) — the rule, then the snapshot.
+
+Every test here races a `sleep` against a stall window, so the ratio between the two decides
+whether the test is deterministic or a coin flip. THE RULE, which is what to actually apply:
+
+    ratio = stall_seconds / sleep
+      <= 0.5   the window fires first, deterministically. Assert the outcome.
+      >= 2.0   the process exits first, deterministically. Assert the outcome.
+      between  it is a coin flip. Either separate the two events, or assert an INVARIANT that
+               holds whichever side wins. Never tune the numbers until it passes on this machine.
+
+Snapshot of an audit run 2026-08-25, which will drift as tests are added and is not the rule:
+every test then in the file sat at 0.03–0.17 or 5–16x except `..._is_never_both` at 0.95, which
+is deliberately racy and asserts an invariant, and
+`test_setting_the_stall_window_to_zero_disables_detection`, which starts no watchdog at all
+(`stall_seconds=0`) and so has no race to lose regardless of timing.
+
+A previous version of the boundary test asserted the outcome of the 0.95 race and failed roughly
+four runs in five, which is what prompted writing this down.
 """
 import os
 import subprocess
@@ -175,19 +195,51 @@ def test_progress_files_match_the_openstates_core_layout(fast_poll, datadir):
     assert all(os.path.isfile(os.path.join(datadir, f)) for f in written), "layout is flat"
 
 
-def test_a_run_that_finishes_at_the_stall_boundary_is_not_called_stalled(fast_poll, datadir):
+def test_a_run_that_finishes_at_the_stall_boundary_is_never_both(fast_poll, datadir):
     """A no-op run writes nothing at all, so it can reach the stall window and exit cleanly.
 
     The watchdog must not label that a failure. A successful scrape reported as stalled is the
     same class of bug this whole ticket family is about — the run says one thing and the record
     says another — only pointing the other way.
+
+    Deliberately timed so the process exit and the stall deadline land together, because that
+    interleaving is what `process.poll()` in the watchdog exists to handle. Which of the two
+    wins is a genuine race and **not** something to assert: an earlier version of this test
+    pinned `rc == 0 and stalled is False` and failed roughly four runs in five, because it was
+    asserting the outcome of a coin flip rather than the guard.
+
+    What must hold either way is the invariant: a run may be killed as stalled, or it may exit
+    successfully, but it may never be reported as both. That is exactly the contradiction the
+    liveness check prevents, and it holds whichever way the race falls.
+
+    Scope, so this is not over-read (pm-review's point): a pass here does NOT prove the
+    `process.poll()` branch executed on that particular run, because the other side of the race
+    may have won. It proves the invariant survives the boundary. Deterministic coverage of "a
+    process that exits well before the window is never called stalled" is
+    `test_a_short_run_that_never_writes_anything_is_not_killed`, which separates the two events
+    by 16x and asserts the outcome directly.
     """
     rc, _out, _err, timed_out, stalled = _run_with_group_kill(
         ["/bin/bash", "-c", "sleep 1"], dict(os.environ), timeout=25,
         progress_dir=datadir, stall_seconds=0.95,
     )
-    assert rc == 0, "the process finished on its own"
-    assert stalled is False, "a run that exited cleanly must never be reported as stalled"
+    assert timed_out is False, "nothing here should reach the 25s ceiling"
+
+    # Exactly two outcomes are legitimate. Enumerating them rather than only forbidding the
+    # contradictory one closes a vacuous pass pm-review spotted: `rc != 0 and not stalled` would
+    # mean `sleep 1` failed for some unrelated reason -- a missing shell, a broken fixture -- and
+    # the old assertion would have sailed straight past it.
+    if stalled:
+        # A stall kill is SIGKILL to the process group, so the direct child's status is -9.
+        # Asserting the signal rather than just "nonzero" is what makes this branch prove a
+        # group kill happened rather than merely that something went wrong.
+        assert rc == -9, f"a stall kill must show SIGKILL, got rc={rc}"
+    else:
+        assert rc == 0, (
+            f"not stalled, so the process must have exited cleanly on its own, got rc={rc} — "
+            "a nonzero code here means the subprocess failed for an unrelated reason and this "
+            "test would otherwise pass without exercising anything"
+        )
 
 
 def test_setting_the_stall_window_to_zero_disables_detection(fast_poll, datadir):
