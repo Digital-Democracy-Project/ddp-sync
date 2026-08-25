@@ -1,7 +1,7 @@
 """Scheduler for OpenStates bill sync and data pipeline jobs."""
 
 import asyncio
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,6 +62,11 @@ class UpdateScheduler:
         self._is_running = False
         self._update_callbacks: list[Callable] = []
         self._sync_config = self._load_sync_config()
+        # OPEN-140: the effective scrape cadence per jurisdiction as last registered.
+        # Populated by _register_openstates_scrape_jobs and surfaced on /schedule,
+        # because the floor rule puts the live cadence in Redis and so takes it out of
+        # any git diff — leaving no other way to see it without a redis-cli.
+        self._openstates_cadence: dict[str, str] = {}
 
     def _load_sync_config(self) -> dict[str, Any]:
         """Load sync schedule configuration from YAML file."""
@@ -437,14 +442,38 @@ class UpdateScheduler:
             votebot_path=votebot_path,
         )
 
-    def _register_openstates_scrape_jobs(self) -> None:
+    def _register_openstates_scrape_jobs(self, cadences: dict[str, str] | None = None) -> None:
         """Register independent APScheduler jobs for each OpenStates jurisdiction.
 
         Replaces the sequential run-all-scrapes.sh launchd job. FL, WA, and
         USA run as separate daily jobs so a 12-hour FL scrape no longer delays
         WA or USA. Secondary states fan out concurrently inside their own
         Sunday job. The patch_refresh job runs at 01:00 UTC before all scrapes.
+
+        OPEN-140: `cadences` is a per-jurisdiction effective cadence resolved from
+        Redis and floored at the YAML value. Passing None -- which is what start()
+        does -- registers from the YAML floors alone. That is deliberate and is
+        what makes "Redis is down" structurally safe rather than merely handled:
+        boot never consults Redis, so it cannot leave a jurisdiction unscheduled.
+        Overrides arrive later, by the cadence-review job calling this again.
+
+        Calling this repeatedly is the supported way to change cadence without a
+        restart. Every add_job below passes replace_existing=True, and the
+        secondary section removes the job ids its new layout no longer uses, so a
+        jurisdiction that moves between the weekly batch and its own nightly job
+        leaves exactly one cron behind either way.
         """
+        # None means "startup" -- see the docstring. Captured before defaulting, because
+        # only the startup pass schedules the catch-up review; re-registration triggered
+        # BY a review must not schedule another one.
+        is_startup = cadences is None
+        cadences = dict(cadences or {})
+
+        # What each jurisdiction actually ended up on, recorded for /schedule.
+        # AC: the effective cadence has to be observable without reading Redis by
+        # hand -- which matters more here than usual, because the floor rule takes
+        # cadence out of git and a reader can no longer see it in a diff.
+        effective: dict[str, str] = {}
         from ddp_sync.pipelines.openstates_scrape import (
             run_patch_refresh_job,
             run_fl_scrapes_job,
@@ -459,6 +488,24 @@ class UpdateScheduler:
             logger.info("openstates_scrape: disabled in config — skipping")
             return
 
+        # An excluded jurisdiction can never be escalated here, whatever the caller
+        # says. cadence_review() already enforces this at the decision point, but that
+        # only covers decisions this process made -- a value hand-written into Redis, or
+        # a future caller passing a map straight to this method, would otherwise reach
+        # APScheduler unchecked. MI is the one that matters: OPEN-53 established that
+        # more traffic against a WAF worsens a block, which is why it is already barred
+        # from scrape retries. A safety property is worth asserting twice.
+        excluded_juris = set(
+            config.get("dynamic_cadence", {}).get("jurisdictions_excluded", [])
+        )
+        for j in [j for j in cadences if j in excluded_juris and cadences[j] == "nightly"]:
+            logger.error(
+                "openstates_scrape: refusing to escalate an excluded jurisdiction "
+                "— falling back to its configured cadence",
+                jurisdiction=j,
+            )
+            cadences.pop(j)
+
         day_map = {
             "monday": "mon", "tuesday": "tue", "wednesday": "wed",
             "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
@@ -472,7 +519,7 @@ class UpdateScheduler:
             async def _patch_refresh_wrapper():
                 return await run_patch_refresh_job(config)
 
-            self.scheduler.add_job(
+            self._add_job_replacing(
                 _patch_refresh_wrapper,
                 trigger=CronTrigger(hour=ph, minute=pm, timezone=_UTC),
                 id="openstates_patch_refresh",
@@ -501,13 +548,19 @@ class UpdateScheduler:
             # sync_day to run weekly; absent → daily (in-session default).
             fl_day = fl_cfg.get("sync_day")
             fl_trigger_kwargs = {"hour": flh, "minute": flm, "timezone": _UTC}
-            if fl_day:
+            # OPEN-140: the YAML sync_day is a FLOOR. An escalation may lift FL to
+            # nightly by dropping day_of_week; nothing may push it below weekly.
+            # This is the case the ticket was filed for -- FL's sync_day carries a
+            # "remove once the 2027 session opens" comment that depends on a human
+            # remembering in November.
+            fl_effective = cadences.get("fl", "weekly" if fl_day else "nightly")
+            if fl_day and fl_effective != "nightly":
                 fl_trigger_kwargs["day_of_week"] = day_map.get(fl_day.lower(), "sun")
 
             async def _fl_wrapper():
                 return await run_fl_scrapes_job(config)
 
-            self.scheduler.add_job(
+            self._add_job_replacing(
                 _fl_wrapper,
                 trigger=CronTrigger(**fl_trigger_kwargs),
                 id="openstates_fl_scrape",
@@ -521,7 +574,9 @@ class UpdateScheduler:
                 "openstates_fl_scrape: registered",
                 sync_time=fl_time,
                 sync_day=fl_day or "daily",
+                effective_cadence=fl_effective,
             )
+            effective["fl"] = fl_effective
 
         wa_cfg = primary_cfg.get("wa", {})
         if wa_cfg.get("enabled", True):
@@ -531,7 +586,7 @@ class UpdateScheduler:
             async def _wa_wrapper():
                 return await run_wa_scrape_job(config)
 
-            self.scheduler.add_job(
+            self._add_job_replacing(
                 _wa_wrapper,
                 trigger=CronTrigger(hour=wah, minute=wam, timezone=_UTC),
                 id="openstates_wa_scrape",
@@ -551,7 +606,7 @@ class UpdateScheduler:
             async def _usa_wrapper():
                 return await run_usa_scrapes_job(config)
 
-            self.scheduler.add_job(
+            self._add_job_replacing(
                 _usa_wrapper,
                 trigger=CronTrigger(hour=usah, minute=usam, timezone=_UTC),
                 id="openstates_usa_scrape",
@@ -563,37 +618,98 @@ class UpdateScheduler:
             )
             logger.info("openstates_usa_scrape: registered", sync_time=usa_time)
 
-        # --- secondary jobs (weekly) ---
+        # --- secondary jobs (weekly batch, minus anything escalated to nightly) ---
         sec_cfg = config.get("secondary", {})
         if sec_cfg.get("enabled", True):
             sec_day = sec_cfg.get("sync_day", "sunday")
             sec_time = sec_cfg.get("sync_time_utc", "02:00")
             sh, sm = map(int, sec_time.split(":"))
+            all_secondary: list[str] = list(sec_cfg.get("jurisdictions", []))
 
-            async def _secondary_wrapper():
-                return await run_secondary_scrapes_job(config)
+            # OPEN-140: the secondary states do not have one job each -- they share a
+            # single weekly job that fans out over a list. So escalating one to nightly
+            # is not a trigger edit, it is a move: the jurisdiction leaves the batch and
+            # gets a job of its own. Leaving it in the batch as well would scrape it
+            # twice on the batch's day, and each run wipes the other's _data dir.
+            #
+            # The batch keeps its own id and its own weekly day, so a jurisdiction that
+            # is never escalated is registered byte-for-byte as it is today.
+            nightly = [j for j in all_secondary if cadences.get(j) == "nightly"]
+            weekly = [j for j in all_secondary if j not in nightly]
+            for j in all_secondary:
+                effective[j] = "nightly" if j in nightly else "weekly"
 
-            self.scheduler.add_job(
-                _secondary_wrapper,
-                trigger=CronTrigger(
-                    day_of_week=day_map.get(sec_day.lower(), "sun"),
-                    hour=sh,
-                    minute=sm,
-                    timezone=_UTC,
-                ),
-                id="openstates_secondary_scrapes",
-                name="OpenStates: secondary states",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=3600,
-            )
-            logger.info(
-                "openstates_secondary_scrapes: registered",
-                jurisdictions=sec_cfg.get("jurisdictions"),
-                sync_day=sec_day,
-                sync_time=sec_time,
-            )
+            # Drop the per-jurisdiction jobs this layout no longer uses, before adding
+            # the ones it does. Without this a demotion -- or an operator lowering a
+            # floor -- would leave the old nightly cron registered alongside the batch,
+            # which is the stale-job-id hazard scheduler.py already solved once for
+            # legislator_bio_sync and is solving again here for the same reason.
+            for j in all_secondary:
+                if j in nightly:
+                    continue
+                self._remove_job_if_present(f"openstates_secondary_scrape_{j}")
+
+            for j in nightly:
+                async def _single_secondary_wrapper(_j: str = j):
+                    return await run_secondary_scrapes_job(
+                        config,
+                        jurisdictions=[_j],
+                        flow_status_key=f"openstates_secondary_scrape_{_j}",
+                    )
+
+                self._add_job_replacing(
+                    _single_secondary_wrapper,
+                    trigger=CronTrigger(hour=sh, minute=sm, timezone=_UTC),
+                    id=f"openstates_secondary_scrape_{j}",
+                    name=f"OpenStates: {j} scrape (escalated to nightly)",
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=3600,
+                )
+                logger.info(
+                    "openstates_secondary_scrape: registered nightly",
+                    jurisdiction=j,
+                    sync_time=sec_time,
+                )
+
+            if weekly:
+                async def _secondary_wrapper(_weekly: list[str] = weekly):
+                    # Pass the narrowed list explicitly rather than letting the job
+                    # re-read config: config still names every secondary jurisdiction,
+                    # including the escalated ones that now run on their own.
+                    return await run_secondary_scrapes_job(config, jurisdictions=_weekly)
+
+                self._add_job_replacing(
+                    _secondary_wrapper,
+                    trigger=CronTrigger(
+                        day_of_week=day_map.get(sec_day.lower(), "sun"),
+                        hour=sh,
+                        minute=sm,
+                        timezone=_UTC,
+                    ),
+                    id="openstates_secondary_scrapes",
+                    name="OpenStates: secondary states",
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=3600,
+                )
+                logger.info(
+                    "openstates_secondary_scrapes: registered",
+                    jurisdictions=weekly,
+                    sync_day=sec_day,
+                    sync_time=sec_time,
+                )
+            else:
+                # Every secondary jurisdiction escalated. An empty batch job would fire
+                # weekly and scrape nothing, so remove it rather than register a no-op.
+                self._remove_job_if_present("openstates_secondary_scrapes")
+                logger.info(
+                    "openstates_secondary_scrapes: not registered — every jurisdiction "
+                    "is on its own nightly job",
+                    jurisdictions=nightly,
+                )
 
         # --- people refresh (weekly) ---
         people_cfg = config.get("people_refresh", {})
@@ -605,7 +721,7 @@ class UpdateScheduler:
             async def _people_wrapper():
                 return await run_people_refresh_job(config)
 
-            self.scheduler.add_job(
+            self._add_job_replacing(
                 _people_wrapper,
                 trigger=CronTrigger(
                     day_of_week=day_map.get(p_day.lower(), "sun"),
@@ -625,6 +741,254 @@ class UpdateScheduler:
                 sync_day=p_day,
                 sync_time=p_time,
             )
+
+        self._openstates_cadence = effective
+
+        # --- cadence review (OPEN-140) ---
+        self._register_cadence_review_job(config, startup=is_startup)
+
+    def _remove_job_if_present(self, job_id: str) -> None:
+        try:
+            self.scheduler.remove_job(job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError variant
+            pass
+
+    def _add_job_replacing(self, func, **kwargs) -> None:
+        """add_job that is idempotent whether or not the scheduler has started.
+
+        `replace_existing=True` only replaces jobs in the JOBSTORE. Before start()
+        APScheduler holds everything in `_pending_jobs`, and add_job appends there
+        without consulting the flag -- so registering twice before start leaves two
+        crons for the same id.
+
+        Production does not hit that today (start() registers once, and the cadence
+        review re-registers only while running), but "exactly one cron per job" has to
+        hold in both states or it is a trap set for whoever calls this next.
+
+        The remove is deliberately confined to the not-yet-started case. On a RUNNING
+        scheduler, replace_existing=True already swaps the job in the jobstore in one
+        step, and removing first would open a window where the job does not exist --
+        so a failure between the two would leave a live jurisdiction unscheduled. There
+        is no live schedule to damage before start(), which is the only place the
+        remove is needed at all.
+        """
+        if not self.scheduler.running:
+            self._remove_job_if_present(kwargs["id"])
+        self.scheduler.add_job(func, **kwargs)
+
+    def _register_cadence_review_job(self, config: dict, startup: bool = False) -> None:
+        """Register the daily job that re-decides cadence and applies it live.
+
+        Kept out of _register_openstates_scrape_jobs' body only because that method
+        is what this job calls -- re-registering the review job from inside its own
+        re-registration is legal here (replace_existing=True) but reads as a loop.
+        """
+        cadence_cfg = config.get("dynamic_cadence", {})
+        if not cadence_cfg.get("enabled", False):
+            # Ships dark. The decision logic needs OPEN-139's bills_new figures in the
+            # run history before it can decide anything, and on weekly jobs that is
+            # weeks of accumulation. Nothing is registered, so nothing can fire.
+            logger.info("openstates_cadence_review: disabled in config — skipping")
+            self._remove_job_if_present("openstates_cadence_review")
+            return
+
+        # 00:30 UTC: after the previous night's runs have recorded their history and
+        # before the day's first scrape at 01:00 (patch refresh) / 02:00 (FL, secondary),
+        # so a cadence decided today takes effect today rather than a day late.
+        rh, rm = map(int, cadence_cfg.get("review_time_utc", "00:30").split(":"))
+
+        job_kwargs: dict[str, Any] = {}
+        if startup:
+            # Catch-up review shortly after boot, then the normal daily cron.
+            #
+            # Startup registers from the YAML floors and never reads Redis, which is
+            # what keeps a Redis outage from leaving anything unscheduled. The cost is
+            # that a restart drops any stored escalation back to its floor -- and
+            # pm-review was right that on a 00:30 cron, a 03:00 restart would leave a
+            # jurisdiction under-scraped for nearly 24 hours. ddp-sync is deployed by a
+            # launchctl kickstart, so restarts are routine, not rare.
+            #
+            # A few minutes of delay rather than immediately: the scheduler has to be
+            # running and Redis reachable before the review can do anything useful, and
+            # a review that fires into a half-warm process just fails and logs.
+            delay = int(cadence_cfg.get("startup_review_delay_s", 300))
+            job_kwargs["next_run_time"] = datetime.now(_UTC) + timedelta(seconds=delay)
+
+        self._add_job_replacing(
+            self._run_cadence_review,
+            trigger=CronTrigger(hour=rh, minute=rm, timezone=_UTC),
+            id="openstates_cadence_review",
+            name="OpenStates: scrape cadence review",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+            **job_kwargs,
+        )
+        logger.info(
+            "openstates_cadence_review: registered",
+            review_time=cadence_cfg.get("review_time_utc", "00:30"),
+            startup_catch_up=startup,
+            escalate_window=cadence_cfg.get("escalate_window", 2),
+            quiet_window=cadence_cfg.get("quiet_window", 4),
+            excluded=cadence_cfg.get("jurisdictions_excluded", []),
+        )
+
+    async def _run_cadence_review(self) -> dict[str, Any]:
+        """Re-decide every jurisdiction's cadence, persist escalations, apply them live.
+
+        This is the actuation half of OPEN-140. The decision half already exists and is
+        pure (services/scrape_cadence.py); this reads the inputs, writes the one output
+        that persists, and then re-registers the scrape jobs so the change takes effect
+        without a restart -- which was the ticket's only genuine gap, since scheduler.py
+        loads its YAML once in __init__ and builds CronTriggers at start().
+
+        Never raises. A review that cannot run must leave the existing schedule exactly
+        as it is; the jobs registered from the YAML floors are always a safe state to
+        stay in, and refusing to reschedule is strictly better than rescheduling from a
+        half-read view of Redis.
+        """
+        from ddp_sync.services.redis_store import get_redis_store
+        from ddp_sync.services.scrape_cadence import cadence_from_yaml, cadence_review
+
+        config = self._sync_config.get("openstates_scrape", {})
+        cadence_cfg = config.get("dynamic_cadence", {})
+        if not cadence_cfg.get("enabled", False):
+            return {"success": True, "skipped": "disabled"}
+
+        excluded = cadence_cfg.get("jurisdictions_excluded", [])
+        escalate_window = cadence_cfg.get("escalate_window", 2)
+        quiet_window = cadence_cfg.get("quiet_window", 4)
+
+        # Floors, straight from the committed config. Every jurisdiction whose cadence
+        # this can move has to appear here, or resolve_cadence has no floor to floor it at.
+        floors: dict[str, str] = {}
+        fl_cfg = config.get("primary", {}).get("fl", {})
+        if fl_cfg.get("enabled", True):
+            floors["fl"] = cadence_from_yaml(fl_cfg)
+        sec_cfg = config.get("secondary", {})
+        if sec_cfg.get("enabled", True):
+            # The batch's own sync_day is the floor for every jurisdiction in it.
+            sec_floor = cadence_from_yaml(sec_cfg)
+            for j in sec_cfg.get("jurisdictions", []):
+                floors[j] = sec_floor
+
+        # Read and decide for EVERY jurisdiction before writing anything. pm-review
+        # found the ordering that matters: with read-decide-write interleaved per
+        # jurisdiction, a read that throws on the fourth jurisdiction happens after the
+        # first three escalations are already stored, leaving Redis saying nightly while
+        # the live schedule stays weekly. Doing all the reads first means a read failure
+        # aborts before any write exists to disagree with.
+        try:
+            redis_store = get_redis_store()
+            cadences: dict[str, str] = {}
+            verdicts: list[dict[str, Any]] = []
+
+            for jurisdiction, floor in floors.items():
+                override = await redis_store.get_scrape_cadence(jurisdiction)
+                # History is recorded under the flow that ran the scrape. Escalated
+                # jurisdictions keep writing to the secondary flow's key on purpose --
+                # see run_secondary_scrapes_job -- so one lookup covers both cadences.
+                flow = (
+                    "openstates_fl_scrape" if jurisdiction == "fl"
+                    else "openstates_secondary_scrapes"
+                )
+                history = await redis_store.get_run_history(flow, jurisdiction)
+
+                verdict = cadence_review(
+                    jurisdiction=jurisdiction,
+                    floor=floor,
+                    current_override=override,
+                    history=history,
+                    escalate_window=escalate_window,
+                    quiet_window=quiet_window,
+                    excluded=excluded,
+                )
+                verdicts.append(verdict)
+                cadences[jurisdiction] = verdict["effective"]
+        except Exception as e:  # noqa: BLE001 — a failed review must not touch the schedule
+            logger.error(
+                "openstates_cadence_review: could not read — leaving the current "
+                "schedule alone",
+                error=str(e),
+            )
+            return {"success": False, "error": str(e)}
+
+        for verdict in verdicts:
+            if verdict["action"] != "escalate":
+                continue
+            jurisdiction = verdict["jurisdiction"]
+            try:
+                stored = await redis_store.set_scrape_cadence(
+                    jurisdiction, verdict["effective"],
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "openstates_cadence_review: escalation write failed",
+                    jurisdiction=jurisdiction,
+                    error=str(e),
+                )
+                stored = False
+            if not stored:
+                # Do not schedule from a decision we could not record: a nightly job
+                # with no override behind it would silently revert at the next restart,
+                # and a schedule that disagrees with its own stored state is worse than
+                # not escalating, because nothing would ever say so. Tomorrow's review
+                # makes the same decision again.
+                logger.error(
+                    "openstates_cadence_review: could not persist an escalation "
+                    "— leaving this jurisdiction on its floor",
+                    jurisdiction=jurisdiction,
+                    cadence=verdict["effective"],
+                )
+                cadences[jurisdiction] = verdict["previous"]
+                verdict["action"] = "none"
+                continue
+            logger.info(
+                "openstates_cadence_review: cadence changed",
+                jurisdiction=jurisdiction,
+                previous=verdict["previous"],
+                effective=verdict["effective"],
+                floor=verdict["floor"],
+                reason="observed filing activity",
+            )
+
+        changed = [v for v in verdicts if v["action"] != "none"]
+        # Always record what was resolved, even when nothing changed, so /schedule
+        # reports live values rather than only post-change ones.
+        self._openstates_cadence = cadences
+        if changed:
+            # The whole point: re-register so the new cadence is in force now, rather
+            # than at the next process restart.
+            try:
+                self._register_openstates_scrape_jobs(cadences)
+            except Exception as e:  # noqa: BLE001 — the docstring's promise, kept
+                # Redis now says nightly while the schedule still says weekly. That is
+                # the safe direction -- under-scraping, not scraping a WAF-guarded site
+                # twice a day -- and it self-heals: the next review, and any restart,
+                # re-read the stored override and apply it.
+                logger.error(
+                    "openstates_cadence_review: could not apply the new schedule; "
+                    "the stored cadence will be re-applied at the next review",
+                    error=str(e),
+                    cadences=cadences,
+                )
+                return {"success": False, "error": str(e), "cadences": cadences}
+
+        logger.info(
+            "openstates_cadence_review: completed",
+            reviewed=len(verdicts),
+            changed=len(changed),
+            rescheduled=bool(changed),
+            cadences=cadences,
+            demotion_advice=[v["jurisdiction"] for v in verdicts if v["demotion_advice"]],
+        )
+        return {
+            "success": True,
+            "cadences": cadences,
+            "changed": [v["jurisdiction"] for v in changed],
+            "verdicts": verdicts,
+        }
 
     def _register_openstates_archive_jobs(self) -> None:
         """Register one weekly APScheduler job per OpenStates archive jurisdiction.

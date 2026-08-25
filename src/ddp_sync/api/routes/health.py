@@ -103,6 +103,14 @@ async def schedule():
                 "next_run": str(job.next_run_time) if job.next_run_time else None,
                 "trigger": str(job.trigger),
             })
-        return {"status": "running", "jobs": jobs}
+        # OPEN-140: the effective scrape cadence per jurisdiction. Redis is the runtime
+        # source of truth and the YAML value is only a floor, so the live cadence no
+        # longer shows up in a git diff — without this it would take a redis-cli to
+        # answer "is Florida nightly right now?".
+        return {
+            "status": "running",
+            "jobs": jobs,
+            "openstates_cadence": getattr(scheduler, "_openstates_cadence", {}),
+        }
     except Exception as e:
         return {"status": f"error: {e}", "jobs": []}
