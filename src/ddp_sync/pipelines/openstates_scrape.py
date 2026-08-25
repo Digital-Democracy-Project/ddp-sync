@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -51,12 +52,24 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # exists to bound. The comment on _alert_scrape_failure() below records that MA already came
 # within an hour of this once, at ~5h, before the walk got longer.
 #
-# 12h gives roughly 2x headroom over the measured duration and stays well under FL's 16h. If MA
-# ever genuinely approaches it, the fix is not a bigger number: ma/bills.py's scrape() already
-# takes a `scrape_chunk_number` (1-12) built to split this walk into shorter runs.
+# OPEN-155 changes what these values are FOR. They are no longer the primary guard against a
+# run that has gone wrong -- SCRAPE_STALL_SECONDS is, and it catches a wedged run in 45 minutes
+# instead of after hours of nothing. These are now a far backstop for the one case a stall
+# detector cannot see: a run making steady, genuine progress that will simply never finish.
+#
+# That reframing resolves a real problem with MA's 12h. It was sized against a 5.7h walk, then
+# the very next walk took 8.21h -- 1.46x headroom, under the 1.5x this module's own test
+# asserts. Chasing that with a bigger number was always going to be re-litigated by the third
+# measurement, because the spread comes from malegislature.gov's own response time and not from
+# anything we control. MA now matches FL at 16h: ~2x the worst observed, and safe to be generous
+# with precisely because a wedged run no longer waits for it.
+#
+# If MA ever genuinely approaches 16h of *productive* work, the answer is still not a bigger
+# number: ma/bills.py's scrape() already takes a `scrape_chunk_number` (1-12) built to split
+# this walk into shorter runs.
 SCRAPE_TIMEOUT_S: dict[str, int] = {
     "fl": 16 * 3600,
-    "ma": 12 * 3600,
+    "ma": 16 * 3600,
     "wa": 8 * 3600,
     "usa": 4 * 3600,
     "default": 6 * 3600,
@@ -475,9 +488,36 @@ async def _maybe_preseed_scrapebot_cookies(
         )
 
 
+# OPEN-155: how long a scrape may go without producing any new bill file before it is treated
+# as stalled. This is the signal that should end a run -- "is it still doing anything" -- rather
+# than the wall-clock ceilings in SCRAPE_TIMEOUT_S, which get both cases wrong: they kill a
+# healthy run that is merely slow (MA's full walk measured 5.7h and 8.2h on consecutive
+# attempts, a 44% spread caused entirely by the site's own response time) and tolerate a wedged
+# one right up until the ceiling expires.
+#
+# 45 minutes is deliberately far above any legitimate gap between two bills. The slowest
+# jurisdiction is MI at a hard 10 requests/minute, where a bill costs a handful of requests --
+# under a minute. MA sustains ~1,390 bills/hour. A 45-minute silence is not slowness.
+#
+# It has to clear the *startup* gap too, not just the between-bills gap: a run produces no files
+# at all while it fetches and parses its search page, and for a no-op run it produces none ever.
+# That is safe here because a no-op run also exits quickly (VA: 90s), so it is gone long before
+# the timer matters.
+SCRAPE_STALL_SECONDS = int(os.getenv("SCRAPE_STALL_SECONDS", str(45 * 60)))
+
+# How often the watchdog looks. Cheap (one listdir) and not latency-critical -- the cost of a
+# coarse poll is only that a stalled run is killed up to this long after the fact.
+_STALL_POLL_SECONDS = 30
+
+
 def _run_with_group_kill(
-    cmd: list[str], env: dict, timeout: int, cwd: str | None = None
-) -> tuple[int, bytes, bytes, bool]:
+    cmd: list[str],
+    env: dict,
+    timeout: int,
+    cwd: str | None = None,
+    progress_dir: str | None = None,
+    stall_seconds: int | None = None,
+) -> tuple[int, bytes, bytes, bool, bool]:
     """Run cmd to completion or timeout, killing its whole process group on timeout.
 
     subprocess.run(timeout=...) only kills the direct child on TimeoutExpired — verified
@@ -498,16 +538,69 @@ def _run_with_group_kill(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    # OPEN-155: watch for a stall in a side thread rather than polling communicate() in a loop.
+    # communicate() drains both pipes concurrently; replacing it with repeated wait() calls
+    # would leave stdout/stderr unread and deadlock the child once a pipe buffer filled. So the
+    # blocking call stays exactly as it was and the watchdog only observes and kills.
+    stalled = False
+    stop_watch = threading.Event()
+    watchdog: threading.Thread | None = None
+
+    if progress_dir and stall_seconds:
+        def _watch() -> None:
+            nonlocal stalled
+
+            def _count() -> int:
+                # The work product itself, not the log: a scraper can log continuously while
+                # producing nothing. Counting entries is enough -- we only need "did this
+                # change", never the actual number. A missing directory reads as -1 and simply
+                # counts as "unchanged", which is right: openstates-core wipes and recreates it
+                # at scrape start, so it is legitimately absent for a moment.
+                try:
+                    return len(os.listdir(progress_dir))
+                except OSError:
+                    return -1
+
+            last_count = _count()
+            last_change = time.monotonic()
+            while not stop_watch.wait(_STALL_POLL_SECONDS):
+                now_count = _count()
+                if now_count != last_count:
+                    last_count, last_change = now_count, time.monotonic()
+                    continue
+                if time.monotonic() - last_change >= stall_seconds:
+                    stalled = True
+                    logger.error(
+                        "openstates_scrape: no new bills for the stall window — killing",
+                        progress_dir=progress_dir,
+                        stall_seconds=stall_seconds,
+                        files_seen=now_count,
+                    )
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass  # already gone; communicate() below will reap it
+                    return
+
+        watchdog = threading.Thread(target=_watch, daemon=True)
+        watchdog.start()
+
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-        return process.returncode, stdout, stderr, False
+        # A stall kill lands here, not in the TimeoutExpired branch: the process group is dead,
+        # so communicate() returns normally. `stalled` is what distinguishes the two.
+        return process.returncode, stdout, stderr, False, stalled
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass  # process (and its group) already gone
         stdout, stderr = process.communicate()  # reap; collect whatever was already buffered
-        return process.returncode, stdout, stderr, True
+        return process.returncode, stdout, stderr, True, stalled
+    finally:
+        stop_watch.set()
+        if watchdog is not None:
+            watchdog.join(timeout=_STALL_POLL_SECONDS + 5)
 
 
 async def _run_scrape(
@@ -606,10 +699,51 @@ async def _run_scrape(
 
     start = time.monotonic()
     try:
-        returncode, _stdout, stderr, timed_out = await asyncio.to_thread(
-            _run_with_group_kill, cmd, env, timeout
+        # OPEN-155: the wall-clock `timeout` is now a far backstop, not the primary guard.
+        # What ends a wedged run is the absence of new bill files in the jurisdiction's own data
+        # directory -- the actual work product. openstates-core wipes and repopulates this
+        # directory, so "count changed" is a direct read of whether the scrape is still doing
+        # anything, and it needs no cooperation from the scraper.
+        progress_dir = os.path.join(openstates_root, "openstates-scrapers", "_data", jurisdiction)
+        returncode, _stdout, stderr, timed_out, stalled = await asyncio.to_thread(
+            _run_with_group_kill, cmd, env, timeout, None, progress_dir, SCRAPE_STALL_SECONDS
         )
         duration = round(time.monotonic() - start, 1)
+
+        # OPEN-155: checked before `timed_out` because it is the more specific diagnosis. A
+        # stall says "this run wedged" -- actionable, and pointing at the scraper or the site. A
+        # ceiling hit says only "this took longer than a number someone chose", which after this
+        # change should be vanishingly rare and means the run was making steady progress the
+        # whole time. Conflating them would throw away exactly the distinction this ticket
+        # exists to draw.
+        #
+        # Alerts for the same reason a timeout does: the process group was killed from outside,
+        # so run-scrape.sh's own ERR trap never ran and nothing else will say this happened.
+        if stalled:
+            logger.error(
+                "openstates_scrape: stalled — no new bills for the stall window",
+                jurisdiction=jurisdiction,
+                session=session_arg,
+                stall_seconds=SCRAPE_STALL_SECONDS,
+                duration_seconds=duration,
+            )
+            _alert_scrape_failure(
+                label,
+                f"stalled — no new bill files for {SCRAPE_STALL_SECONDS}s "
+                f"(killed after {duration:.0f}s; the wall-clock ceiling was {timeout}s)",
+                duration,
+            )
+            return {
+                "success": False,
+                "error": "stalled",
+                # Reuses the timeout classification deliberately: OPEN-22's sustained-pattern
+                # escalation counts categories, and a stall and a ceiling hit are the same thing
+                # to it -- "this jurisdiction keeps not finishing". Adding a category would make
+                # a repeatedly-stalling jurisdiction look like two smaller unrelated problems.
+                "failure_reason": classify_failure_reason("timeout", ""),
+                "jurisdiction": label,
+                "duration_seconds": duration,
+            }
 
         if timed_out:
             logger.error(
@@ -845,7 +979,7 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
         # operations running against a half-rebuilt scraper worktree that a concurrent scrape
         # may already be reading through run-scrape.sh's READER_MARKER lock. Same reasoning as
         # _run_scrape's own use of this helper.
-        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+        returncode, _stdout, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
             _run_with_group_kill,
             ["/bin/bash", script],
             dict(os.environ),
@@ -1127,7 +1261,7 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         # leader but nothing then targets that group, so a timeout still orphaned the real work
         # (git pull, os-people to-database across every state). Routed through the helper so the
         # group actually gets killed.
-        returncode, _stdout, stderr_bytes, timed_out = await asyncio.to_thread(
+        returncode, _stdout, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
             _run_with_group_kill,
             ["/bin/bash", script],
             dict(os.environ),

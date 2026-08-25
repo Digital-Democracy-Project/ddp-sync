@@ -19,7 +19,11 @@ import ddp_sync.pipelines.openstates_scrape as os_scrape
 from ddp_sync.pipelines.openstates_scrape import SCRAPE_TIMEOUT_S
 
 # The longest real MA full walk observed in scraper.log, in seconds (341 minutes).
-MEASURED_MA_FULL_WALK_S = 341 * 60
+# Updated by OPEN-155. 341 minutes was the 2026-08-01 walk; the very next full walk, on
+# 2026-08-24, took 8.21h. Two measurements 44% apart, and the spread comes from
+# malegislature.gov's own response time rather than anything we control -- which is the argument
+# for progress detection over ceiling-chasing in the first place.
+MEASURED_MA_FULL_WALK_S = int(8.21 * 3600)
 
 
 def _ceiling(jurisdiction: str) -> int:
@@ -52,6 +56,21 @@ def test_the_old_default_would_not_have_been_enough():
     assert SCRAPE_TIMEOUT_S["default"] < MEASURED_MA_FULL_WALK_S * 1.1
 
 
+def test_ma_ceiling_is_a_backstop_not_the_primary_guard():
+    """OPEN-155: the stall detector is what ends a wedged run, in 45 minutes.
+
+    That is why MA can now be generous here. Chasing the ceiling with a bigger number was always
+    going to be re-litigated by the next measurement; being generous is only safe because a run
+    that stops producing bills no longer waits for it.
+    """
+    from ddp_sync.pipelines.openstates_scrape import SCRAPE_STALL_SECONDS
+
+    assert SCRAPE_STALL_SECONDS < _ceiling("ma"), (
+        "the stall window must fire long before the ceiling, or the ceiling is still the "
+        "primary guard and nothing has changed"
+    )
+
+
 def test_ma_does_not_exceed_the_longest_jurisdiction():
     # FL is the genuine long pole (12+ hours regularly). MA should not quietly become the
     # loosest ceiling in the table -- if it ever needs to, that is a deliberate decision and
@@ -81,17 +100,17 @@ def test_jurisdictions_without_an_entry_still_get_the_default():
 # assert on the value actually handed to the process runner.
 
 @pytest.mark.asyncio
-async def test_ma_resolves_to_twelve_hours_at_the_invocation_path():
+async def test_ma_resolves_to_sixteen_hours_at_the_invocation_path():
     seen = {}
 
-    def fake_run(cmd, env, timeout, cwd=None):
+    def fake_run(cmd, env, timeout, *args, **kwargs):
         seen["timeout"] = timeout
-        return 0, b"", b"", False
+        return 0, b"", b"", False, False
 
     with mock.patch.object(os_scrape, "_run_with_group_kill", fake_run):
         await os_scrape._run_scrape("ma", None, "/tmp/openstates", None, {})
 
-    assert seen["timeout"] == 12 * 3600
+    assert seen["timeout"] == 16 * 3600
     assert seen["timeout"] >= MEASURED_MA_FULL_WALK_S * 1.5
 
 
@@ -99,9 +118,9 @@ async def test_ma_resolves_to_twelve_hours_at_the_invocation_path():
 async def test_an_entry_less_jurisdiction_resolves_to_the_default_at_the_invocation_path():
     seen = {}
 
-    def fake_run(cmd, env, timeout, cwd=None):
+    def fake_run(cmd, env, timeout, *args, **kwargs):
         seen["timeout"] = timeout
-        return 0, b"", b"", False
+        return 0, b"", b"", False, False
 
     with mock.patch.object(os_scrape, "_run_with_group_kill", fake_run):
         await os_scrape._run_scrape("az", None, "/tmp/openstates", None, {})

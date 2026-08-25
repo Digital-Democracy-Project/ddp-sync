@@ -38,7 +38,7 @@ async def test_timeout_alerts(job, label):
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(-9, b"", b"", True),
+            return_value=(-9, b"", b"", True, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()) as st,
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
@@ -66,7 +66,7 @@ async def test_nonzero_exit_alerts_because_these_scripts_do_not_self_alert(job, 
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(1, b"", b"boom", False),
+            return_value=(1, b"", b"boom", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
@@ -87,7 +87,7 @@ async def test_success_does_not_alert(job):
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(0, b"", b"", False),
+            return_value=(0, b"", b"", False, False),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
@@ -110,7 +110,7 @@ async def test_both_jobs_go_through_the_group_kill_helper():
         with (
             patch(
                 "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-                return_value=(0, b"", b"", False),
+                return_value=(0, b"", b"", False, False),
             ) as mock_helper,
             patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
             patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
@@ -119,12 +119,19 @@ async def test_both_jobs_go_through_the_group_kill_helper():
         mock_helper.assert_called_once()
 
 
-def test_group_kill_cwd_param_is_backward_compatible():
-    """The new cwd argument must not change behaviour for the existing three-arg callers."""
+def test_group_kill_optional_params_are_backward_compatible():
+    """Every argument after `timeout` must stay optional for the existing three-arg callers.
+
+    Updated for OPEN-155, which added progress_dir/stall_seconds. Deliberately asserts the
+    *property* that matters -- three-arg calls still work and everything else defaults to None --
+    rather than an exact parameter list, which pinned the signature so tightly that adding an
+    optional argument failed the test without anything actually breaking.
+    """
     import inspect
 
     from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 
     params = inspect.signature(_run_with_group_kill).parameters
-    assert list(params) == ["cmd", "env", "timeout", "cwd"]
-    assert params["cwd"].default is None
+    assert list(params)[:3] == ["cmd", "env", "timeout"]
+    for name in list(params)[3:]:
+        assert params[name].default is None, f"{name} must be optional"
