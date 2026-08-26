@@ -81,7 +81,7 @@ async def test_happy_path_writes_broker():
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
-    assert result == {"id": 1, "created": True}
+    assert result == {"id": 1, "created": True, "status": "complete"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "A plain-language summary."
     assert write_kwargs["status"] == "complete"
@@ -110,7 +110,7 @@ async def test_pros_cons_content_is_json():
             **_COMMON_KWARGS, artifact_type="bill_pros_cons"
         )
 
-    assert result == {"id": 2, "created": True}
+    assert result == {"id": 2, "created": True, "status": "complete"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == '{"pros": ["Expands access."], "cons": ["Costly to implement."]}'
     assert write_kwargs["status"] == "complete"
@@ -137,7 +137,7 @@ async def test_vote_frame_happy_path_writes_broker(artifact_type, question_type)
             **_COMMON_KWARGS, artifact_type=artifact_type
         )
 
-    assert result == {"id": 4, "created": True}
+    assert result == {"id": 4, "created": True, "status": "complete"}
     mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "Vote yes if you want..."
@@ -168,7 +168,7 @@ async def test_org_types_happy_path_writes_broker(artifact_type, question_type):
             **_COMMON_KWARGS, artifact_type=artifact_type
         )
 
-    assert result == {"id": 5, "created": True}
+    assert result == {"id": 5, "created": True, "status": "complete"}
     mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
@@ -199,7 +199,7 @@ async def test_impact_analysis_happy_path_writes_broker():
             **_COMMON_KWARGS, artifact_type="bill_impact_analysis"
         )
 
-    assert result == {"id": 6, "created": True}
+    assert result == {"id": 6, "created": True, "status": "complete"}
     mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "impact_analysis")
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
@@ -227,11 +227,38 @@ async def test_insufficient_information_is_recorded_as_a_failed_artifact():
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
-    assert result == {"id": 3, "created": True}
+    assert result == {"id": 3, "created": True, "status": "failed"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "failed"
     assert write_kwargs["failure_stage"] == "generation"
     assert write_kwargs["failure_reason"] == "insufficient_information"
+
+
+@pytest.mark.asyncio
+async def test_local_status_overrides_a_conflicting_broker_response_status():
+    """SYNC-24: the broker's own write response is merged with this
+    function's own locally-known status LAST, so it always wins -- even if
+    ddp-broker-py's serializer ever started echoing back its own `status`
+    field (it doesn't today, just `id`/`created`), a stale or differently-
+    named value there could never silently override the authoritative
+    outcome _process_bill relies on to classify artifacts_generated vs
+    artifacts_failed."""
+    dispatch_result = {
+        "answer": {"text": "", "insufficient_information": True},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 3, "created": True, "status": "pending"}),
+    ):
+        result = await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert result["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +293,7 @@ async def test_bill_topics_happy_path_writes_broker():
             **_COMMON_KWARGS, artifact_type="bill_topics"
         )
 
-    assert result == {"id": 8, "created": True}
+    assert result == {"id": 8, "created": True, "status": "complete"}
     mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "bill_topics")
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "**Primary:** Criminal Justice\n\n- Criminal Justice\n- Drugs"
@@ -372,7 +399,7 @@ async def test_bill_topics_zero_survivors_is_recorded_as_a_failed_artifact():
             **_COMMON_KWARGS, artifact_type="bill_topics"
         )
 
-    assert result == {"id": 13, "created": True}
+    assert result == {"id": 13, "created": True, "status": "failed"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == ""
     assert write_kwargs["status"] == "failed"
@@ -407,7 +434,7 @@ async def test_archived_text_found_is_used_for_dispatch(archived_text_by_default
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
-    assert result == {"id": 7, "created": True}
+    assert result == {"id": 7, "created": True, "status": "complete"}
     archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "summary_500char")
 
@@ -431,7 +458,7 @@ async def test_no_archived_text_skips_dispatch_and_writes_failed_row(archived_te
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
-    assert result == {"id": 8, "created": True}
+    assert result == {"id": 8, "created": True, "status": "failed"}
     archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_not_awaited()
     write_kwargs = mock_write.await_args.kwargs
@@ -480,7 +507,7 @@ async def test_changelog_no_archived_inputs_writes_failed_row():
     ) as mock_write:
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert result == {"id": 1, "created": True}
+    assert result == {"id": 1, "created": True, "status": "failed"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "failed"
     assert write_kwargs["failure_reason"] == "no_archived_changelog_inputs"
@@ -540,7 +567,7 @@ async def test_changelog_happy_path_writes_broker_with_compare_version():
     ) as mock_write:
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert result == {"id": 2, "created": True}
+    assert result == {"id": 2, "created": True, "status": "complete"}
     mock_dispatch.assert_awaited_once_with(
         old_bill_source="Archived introduced text.",
         diff_source="--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
@@ -582,7 +609,7 @@ async def test_changelog_insufficient_information_writes_failed_row_with_compare
     ) as mock_write:
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert result == {"id": 3, "created": True}
+    assert result == {"id": 3, "created": True, "status": "failed"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "failed"
     assert write_kwargs["failure_reason"] == "diff_too_ambiguous"
@@ -592,6 +619,30 @@ async def test_changelog_insufficient_information_writes_failed_row_with_compare
     # write with no compare_version.
     assert write_kwargs["compare_version_date"] == "2026-01-01"
     assert write_kwargs["compare_version_note"] == "Introduced"
+
+
+@pytest.mark.asyncio
+async def test_changelog_local_status_overrides_a_conflicting_broker_response_status():
+    """Same merge-order guarantee as generate_and_store_bill_artifact's own
+    equivalent test -- this function's own known status always wins over
+    whatever the broker write response itself contains."""
+    dispatch_result = {
+        "answer": {"insufficient_information": True, "reason": "diff_too_ambiguous"},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 3, "created": True, "status": "pending"}),
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -679,7 +730,7 @@ async def test_changelog_always_backfills_compare_version_regardless_of_ledger_s
     ):
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert result == {"id": 2, "created": True}
+    assert result == {"id": 2, "created": True, "status": "complete"}
     mock_backfill.assert_awaited_once_with(
         bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
         jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],

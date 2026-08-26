@@ -339,7 +339,14 @@ async def generate_and_store_bill_artifact(
     that doesn't need per-call broker routing (SYNC-9's batch pipeline).
 
     Returns:
-        The BillArtifact row as ddp-broker-py's API reports it.
+        The BillArtifact write response as ddp-broker-py's API reports it
+        (today, just `id`/`created` -- that serializer doesn't echo `status`
+        back), merged with this function's own authoritative `status`
+        ("complete" or "failed") under the `status` key -- applied last, so
+        it always wins over whatever the broker response itself contains.
+        SYNC-24: callers (session_pipeline_runner.py's `_process_bill`) need
+        to know which of the two actually happened without re-deriving it
+        from failure_stage/failure_reason themselves.
     """
     if artifact_type not in _ARTIFACT_TYPE_TO_QUESTION_TYPE:
         raise ValueError(f"Unsupported artifact_type for Phase 8 dispatch: {artifact_type}")
@@ -352,7 +359,7 @@ async def generate_and_store_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             artifact_type=artifact_type,
         )
-        return await write_bill_artifact(
+        broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -366,6 +373,7 @@ async def generate_and_store_bill_artifact(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        return {**broker_result, "status": "failed"}
 
     dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
     answer = dispatch_result["answer"]
@@ -377,7 +385,7 @@ async def generate_and_store_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             artifact_type=artifact_type,
         )
-        return await write_bill_artifact(
+        broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -392,6 +400,7 @@ async def generate_and_store_bill_artifact(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        return {**broker_result, "status": "failed"}
 
     if artifact_type == "bill_topics":
         filtered = _filter_bill_topics(answer, bill_openstates_id=bill_openstates_id)
@@ -400,7 +409,7 @@ async def generate_and_store_bill_artifact(
                 "bill_topics had zero valid topics -- recording a failed artifact",
                 bill_openstates_id=bill_openstates_id,
             )
-            return await write_bill_artifact(
+            broker_result = await write_bill_artifact(
                 bill_openstates_id=bill_openstates_id,
                 jurisdiction=jurisdiction,
                 session_code=session_code,
@@ -415,12 +424,13 @@ async def generate_and_store_bill_artifact(
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
+            return {**broker_result, "status": "failed"}
         primary, topics = filtered
         content = _bill_topics_content(primary, topics)
     else:
         content = _content_from_answer(artifact_type, answer)
 
-    return await write_bill_artifact(
+    broker_result = await write_bill_artifact(
         bill_openstates_id=bill_openstates_id,
         jurisdiction=jurisdiction,
         session_code=session_code,
@@ -433,6 +443,7 @@ async def generate_and_store_bill_artifact(
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
+    return {**broker_result, "status": "complete"}
 
 
 async def generate_and_store_bill_changelog(
@@ -491,7 +502,11 @@ async def generate_and_store_bill_changelog(
             generate_and_store_bill_artifact.
 
     Returns:
-        The BillArtifact row as ddp-broker-py's API reports it.
+        The BillArtifact write response as ddp-broker-py's API reports it,
+        merged with this function's own authoritative `status` ("complete"
+        or "failed") under the `status` key -- same enrichment as
+        generate_and_store_bill_artifact's own return value; see that
+        function's docstring for why (SYNC-24).
     """
     archived = await get_archived_changelog_inputs(bill_openstates_id)
 
@@ -501,7 +516,7 @@ async def generate_and_store_bill_changelog(
             "failed artifact",
             bill_openstates_id=bill_openstates_id,
         )
-        return await write_bill_artifact(
+        broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -515,6 +530,7 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        return {**broker_result, "status": "failed"}
 
     if (
         archived["latest_version_date"] != version_date
@@ -631,7 +647,7 @@ async def generate_and_store_bill_changelog(
             "recording a failed artifact",
             bill_openstates_id=bill_openstates_id,
         )
-        return await write_bill_artifact(
+        broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -648,6 +664,7 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        return {**broker_result, "status": "failed"}
 
     content = _bill_changelog_content_from_answer(
         answer,
@@ -656,7 +673,7 @@ async def generate_and_store_bill_changelog(
     )
 
     try:
-        return await write_bill_artifact(
+        broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -671,6 +688,7 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        return {**broker_result, "status": "complete"}
     except BrokerClientError:
         # Distinguishable from other write failures, per this design's own
         # review: includes the compare_version fields that were attempted,
