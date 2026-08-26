@@ -95,8 +95,18 @@ async def test_env_var_is_absent_when_no_config_is_passed():
 
 # --- the shipped config ---------------------------------------------------------------
 
-def test_shipped_yaml_enables_exactly_the_one_canary_jurisdiction():
-    """Guards the actual rollout state, so widening it is a deliberate, reviewed edit."""
+def test_shipped_yaml_enables_exactly_the_reviewed_jurisdictions():
+    """Guards the actual rollout state, so widening it is a deliberate, reviewed edit.
+
+    Widened 2026-08-26 (OPEN-163) from the single VA canary to the three large
+    jurisdictions the sweep actually protects. This assertion is pinned to an exact
+    list on purpose: the point is not that some jurisdictions are enabled, it is
+    that adding one is a change somebody has to make here and explain.
+
+    UT and AZ are deliberately absent. OPEN-163 puts them in its own "not this
+    ticket" section -- the canary judges them plausible on extrapolated evidence
+    but wants one full run to completion first.
+    """
     from pathlib import Path
 
     import yaml
@@ -106,4 +116,4 @@ def test_shipped_yaml_enables_exactly_the_one_canary_jurisdiction():
     sweep = cfg["openstates_scrape"]["sweep_import"]
 
     assert sweep["enabled"] is True
-    assert sweep["jurisdictions"] == ["va"]
+    assert sweep["jurisdictions"] == ["va", "mi", "fl", "ma"]
