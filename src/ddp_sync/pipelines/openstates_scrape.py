@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 import structlog
@@ -494,6 +494,56 @@ def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, i
     return True, interval_days
 
 
+class _ForcedWalk(NamedTuple):
+    """A forced full walk in flight, and what it displaced.
+
+    Returned instead of a bare True so the failure path can put the marker back.
+    Truthy either way, so `if forced_full_walk:` still reads naturally.
+    """
+
+    ts_path: str
+    previous_marker: str | None
+
+
+def _restore_full_walk_marker(forced: _ForcedWalk) -> None:
+    """Put back the watermark a forced walk cleared, when that walk did not finish.
+
+    Restores the EXACT previous contents, never a fresh timestamp. Writing "now"
+    would advance the watermark past bills nothing examined -- the same trap
+    OPEN-163's sweep watermark had to avoid -- turning a failed backstop into
+    silent data loss, which is strictly worse than the repeated-full-walk loop
+    this is fixing.
+
+    Skipped when the marker could not be read before deletion, or when the run
+    already wrote a new one (a partial run that got far enough to record its own
+    cutoff owns that value; overwriting it with an older one would re-scrape work
+    that did land).
+    """
+    if forced.previous_marker is None:
+        return
+    if os.path.exists(forced.ts_path):
+        return
+    try:
+        with open(forced.ts_path, "w") as fh:
+            fh.write(forced.previous_marker)
+        logger.info(
+            "openstates_scrape: forced full walk did not complete, watermark restored "
+            "so the next run is incremental again (OPEN-162)",
+            marker=forced.ts_path,
+            restored_to=forced.previous_marker.strip()[:32],
+        )
+    except OSError as e:
+        # Worth a warning rather than silence: the consequence is that the next
+        # scheduled run full-walks again, which is exactly the loop this exists
+        # to prevent.
+        logger.warning(
+            "openstates_scrape: could not restore the full-walk watermark; the next "
+            "run will full-walk again",
+            marker=forced.ts_path,
+            error=str(e),
+        )
+
+
 def _maybe_force_full_walk(
     jurisdiction: str,
     label: str,
@@ -567,10 +617,26 @@ def _maybe_force_full_walk(
             # had a forced walk. Either way the next run is the right time.
             last_walk = "never"
 
-        # Removing the marker IS the mechanism -- absent marker means full walk.
-        # missing_ok semantics: if it is already gone the run is a full walk
-        # anyway, which is the outcome we want, so that is success not failure.
+        # Capture the marker's contents BEFORE deleting, so a failed walk can put
+        # it back (see _restore_full_walk_marker). Without this, the three
+        # behaviours here combine into a trap: the delete is the mechanism, but
+        # run-scrape.sh writes .ts only on success and _record_full_walk stamps
+        # only on success -- so a walk that dies partway leaves neither, the next
+        # scheduled run sees an absent marker, full-walks again, fails again, and
+        # MI never returns to incremental collection. Each cycle spends hours of
+        # WAF-capped requests to import a fraction of the corpus. Found by review
+        # after the first live walk died at hour four.
+        previous_marker = None
         if os.path.exists(ts_path):
+            try:
+                with open(ts_path) as fh:
+                    previous_marker = fh.read()
+            except OSError:
+                # Readable-or-not, the delete still has to happen for the walk to
+                # be a walk. A marker we could not read is one we must not invent
+                # a replacement for, so leave previous_marker None and let the
+                # restore path skip it rather than writing a guessed timestamp.
+                previous_marker = None
             os.remove(ts_path)
 
         logger.info(
@@ -579,8 +645,10 @@ def _maybe_force_full_walk(
             interval_days=interval_days,
             last_full_walk=last_walk,
             cleared_marker=ts_path,
+            marker_saved=previous_marker is not None,
         )
-        return True
+        # Truthy, so existing `if forced_full_walk:` call sites keep working.
+        return _ForcedWalk(ts_path=ts_path, previous_marker=previous_marker)
     except OSError as e:
         logger.warning(
             "openstates_scrape: could not force a full walk, proceeding incrementally",
@@ -843,6 +911,10 @@ async def _run_scrape(
         config,
         openstates_root,
     )
+    # Set only on the success path below. Read by the finally: that restores the
+    # watermark -- deliberately one place rather than a restore call at each of
+    # the four failure exits, so a fifth exit added later cannot miss it.
+    full_walk_completed = False
 
     # OPEN-87: an opted-in jurisdiction goes through the bounded-retry wrapper instead. The
     # wrapper takes the same arguments and calls run-scrape.sh itself, so nothing else about
@@ -1025,6 +1097,7 @@ async def _run_scrape(
         # complete leaves no stamp and stays due.
         if forced_full_walk:
             _record_full_walk(label, openstates_root)
+        full_walk_completed = True
         return {"success": True, "jurisdiction": label, "duration_seconds": duration}
 
     except Exception as e:
@@ -1048,6 +1121,13 @@ async def _run_scrape(
             "jurisdiction": label,
             "duration_seconds": duration,
         }
+    finally:
+        # OPEN-162: a forced walk that did not finish must give the watermark back,
+        # or MI is stranded in full-walk mode -- absent marker means full walk, and
+        # nothing else writes .ts on a failure. In `finally` rather than at each
+        # failure return so there is exactly one place this can be got wrong.
+        if forced_full_walk and not full_walk_completed:
+            _restore_full_walk_marker(forced_full_walk)
 
 
 async def _write_flow_status(flow_key: str, status: dict) -> None:
