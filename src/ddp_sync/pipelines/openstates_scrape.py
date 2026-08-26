@@ -70,6 +70,15 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 SCRAPE_TIMEOUT_S: dict[str, int] = {
     "fl": 16 * 3600,
     "ma": 16 * 3600,
+    # OPEN-162: MI needs its own ceiling because it now gets a periodic FULL walk, and a full
+    # walk is a completely different shape from its weekly incremental. ~3,924 bills against a
+    # hard 10 requests/minute WAF cap is ~6.5h; the 6h default would have killed it just short
+    # of finishing -- and a timeout kill is not an ordinary failure here. subprocess.run(timeout)
+    # kills run-scrape.sh from outside its own process, so its cleanup, marker writes and
+    # on_failure() alerting never run, and openstates-core has already wiped the data directory
+    # at scrape start. The whole walk's work would be discarded, silently, which is exactly the
+    # trap MA hit before it got its own entry.
+    "mi": 10 * 3600,
     "wa": 8 * 3600,
     "usa": 4 * 3600,
     "default": 6 * 3600,
@@ -441,6 +450,131 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in retry_cfg.get("jurisdictions", [])
 
 
+def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, int]:
+    """Is this jurisdiction opted into a periodic forced full walk (OPEN-162)?
+
+    Returns (eligible, interval_days). Config lives under
+    openstates_scrape.full_walk in sync_schedule.yaml, mirroring sweep_import's
+    shape above -- per OPEN-124 this is orchestration (who runs a full walk and
+    when), so it belongs in ddp-sync's YAML rather than as a $STATE test in bash.
+
+    Exists because MI's incremental filter has a measured blind spot and no
+    backstop. OPEN-158 found that a repeated last-action string hides real
+    intervening actions on ~1.2% of bills -- adopted substitutes, committee
+    reports, floor referrals, in one case 25 actions behind one repeated string.
+    That rate is fine *if* something eventually re-reads every bill. Nothing did:
+    run-scrape.sh full-walks only when the .ts marker is absent, and nothing in
+    production ever removed one, so MI had exactly one full walk ever (when the
+    marker was first absent) and would never have had another.
+    """
+    cfg = (config or {}).get("full_walk", {})
+    if not cfg.get("enabled", False):
+        return False, 0
+    if jurisdiction not in cfg.get("jurisdictions", []):
+        return False, 0
+    return True, int(cfg.get("interval_days", 30))
+
+
+def _maybe_force_full_walk(
+    jurisdiction: str,
+    label: str,
+    config: dict | None,
+    openstates_root: str,
+) -> bool:
+    """Clear the .ts marker when this jurisdiction's periodic full walk is due.
+
+    run-scrape.sh already full-walks when `logs/last-run/<key>.ts` is absent, so
+    forcing one needs no new scraper logic at all -- only a decision about when,
+    and a file delete. That is the whole mechanism.
+
+    **Done inline, immediately before the scrape this same call is about to
+    start, rather than from a separate scheduled job.** That ordering is the
+    design, not an implementation detail:
+
+      * A separate timer could delete the marker while a scrape was in flight.
+        run-scrape.sh reads it once at startup, so the delete would not affect
+        the running scrape -- it would land on the *next* one, at a time nobody
+        chose, and would also destroy the cutoff the in-flight run is about to
+        write. Deciding here means the clear and the run that consumes it are
+        the same event.
+      * It cannot leave a "marker cleared but no scrape ran" state, which would
+        silently promote whatever ran next -- possibly a different jurisdiction's
+        operator-triggered run -- into an unplanned full walk.
+      * Cadence becomes "the last full walk was >= N days ago" rather than a
+        calendar date, so a missed or failed run does not skip the cycle: the
+        next scrape simply still finds it due. That matches this fleet's standing
+        preference for acting on observed state over a schedule.
+
+    Due-ness is tracked in a sibling `<key>.fullwalk` stamp rather than inferred
+    from `.ts`'s mtime, because `.ts` is rewritten by *every* run and so cannot
+    distinguish "scraped recently" from "fully walked recently".
+
+    Best-effort by design: any filesystem problem here logs and returns False,
+    leaving an ordinary incremental run. A failure to force a full walk should
+    never cost the regular scrape that was going to happen anyway.
+    """
+    eligible, interval_days = _full_walk_eligible(jurisdiction, config)
+    if not eligible:
+        return False
+
+    key = scrape_key_for(label)
+    last_run_dir = os.path.join(openstates_root, "logs", "last-run")
+    ts_path = os.path.join(last_run_dir, f"{key}.ts")
+    stamp_path = os.path.join(last_run_dir, f"{key}.fullwalk")
+
+    # A root that does not exist is a misconfiguration, not a jurisdiction due for
+    # a walk. Checked rather than left to makedirs() below, which would happily
+    # build logs/last-run/ under a bogus path and report success -- littering a
+    # stray tree and claiming a full walk was forced for a scrape that is about to
+    # fail for an unrelated reason.
+    if not os.path.isdir(openstates_root):
+        logger.warning(
+            "openstates_scrape: openstates_root does not exist, not forcing a full walk",
+            jurisdiction=jurisdiction,
+            openstates_root=openstates_root,
+        )
+        return False
+
+    try:
+        now = time.time()
+        due_after = interval_days * 86400
+        if os.path.exists(stamp_path):
+            age = now - os.path.getmtime(stamp_path)
+            if age < due_after:
+                return False
+            last_walk = f"{age / 86400:.1f} days ago"
+        else:
+            # No stamp: either this jurisdiction just opted in, or it has never
+            # had a forced walk. Either way the next run is the right time.
+            last_walk = "never"
+
+        # Removing the marker IS the mechanism -- absent marker means full walk.
+        # missing_ok semantics: if it is already gone the run is a full walk
+        # anyway, which is the outcome we want, so that is success not failure.
+        if os.path.exists(ts_path):
+            os.remove(ts_path)
+
+        os.makedirs(last_run_dir, exist_ok=True)
+        with open(stamp_path, "w") as fh:
+            fh.write(datetime.now(timezone.utc).isoformat())
+
+        logger.info(
+            "openstates_scrape: forcing a full walk, periodic backstop is due (OPEN-162)",
+            jurisdiction=jurisdiction,
+            interval_days=interval_days,
+            last_full_walk=last_walk,
+            cleared_marker=ts_path,
+        )
+        return True
+    except OSError as e:
+        logger.warning(
+            "openstates_scrape: could not force a full walk, proceeding incrementally",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
+        return False
+
+
 async def _maybe_preseed_scrapebot_cookies(
     jurisdiction: str,
     config: dict | None,
@@ -642,6 +776,20 @@ async def _run_scrape(
     opted in (config defaults to None, in which case it's always a no-op).
     """
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
+
+    # OPEN-162: force a periodic full walk if one is due, by clearing the marker
+    # run-scrape.sh reads. Deliberately here -- inside the one funnel every scrape
+    # goes through, immediately before the subprocess that consumes it -- rather
+    # than in a separate job; see _maybe_force_full_walk() for why that ordering
+    # is what makes it safe against an in-flight run.
+    # Same label shape scrape_key_for() and the reporting below both use, so the
+    # marker this clears is the one run-scrape.sh will look for.
+    _maybe_force_full_walk(
+        jurisdiction,
+        f"{jurisdiction} {session_arg}" if session_arg else jurisdiction,
+        config,
+        openstates_root,
+    )
 
     # OPEN-87: an opted-in jurisdiction goes through the bounded-retry wrapper instead. The
     # wrapper takes the same arguments and calls run-scrape.sh itself, so nothing else about

@@ -263,6 +263,33 @@ openstates_scrape:
     enabled: true
     jurisdictions: ["va"]   # UT next, after one clean VA cycle
 
+  # OPEN-162: periodic forced FULL walk, the backstop MI's incremental filter was documented as
+  # having and did not.
+  #
+  # run-scrape.sh full-walks only when logs/last-run/<key>.ts is absent, and nothing in
+  # production ever removed one. So MI had exactly one full walk -- when the marker was first
+  # absent -- and every run since has been incremental against the previous run's snapshot.
+  # OPEN-158 measured what that misses: ~1.2% of bills sit behind a repeated last-action string
+  # that hides real intervening actions (adopted substitutes, committee reports, floor
+  # referrals; one bill had 25 actions behind a single repeated string). Tolerable only if
+  # something eventually re-reads every bill, which nothing did.
+  #
+  # MI only, for now. This is not free: a full walk is ~3,924 bills against a hard 10
+  # requests/minute WAF cap, so ~6.5 hours, on the fleet's most WAF-sensitive site. That is why
+  # MI also has its own 10h entry in SCRAPE_TIMEOUT_S -- the 6h default would have killed it
+  # just short of finishing. Do not add a jurisdiction here without checking its ceiling first.
+  #
+  # interval_days is a floor, not a calendar: the check is "has it been >= this long since the
+  # last forced walk", evaluated when a scrape is about to start. A missed or failed run does
+  # not skip the cycle -- the next scrape still finds it due.
+  #
+  # Rollback: set enabled: false, or empty the list. That stops FUTURE runs being promoted to
+  # full walks. It does not stop an in-flight walk; kill the run itself for that.
+  full_walk:
+    enabled: true
+    jurisdictions: ["mi"]
+    interval_days: 30
+
   # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
   # transient fault currently waits a week for its next attempt -- that is what happened to MA
   # on 2026-08-01, a network timeout on a run that would have succeeded on a re-run. When a
