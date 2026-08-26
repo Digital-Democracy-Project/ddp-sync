@@ -178,7 +178,7 @@ async def test_truncated_is_true_when_more_candidates_exist_than_limit():
     candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(3)]
     with _patch_lister(candidates), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2,
@@ -195,7 +195,7 @@ async def test_truncated_is_false_when_exactly_limit_candidates_exist():
     candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(2)]
     with _patch_lister(candidates), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2,
@@ -285,7 +285,7 @@ async def test_previously_failed_row_is_skipped_not_retried():
 async def test_missing_row_is_dispatched():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
@@ -308,7 +308,7 @@ async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_arti
         new=AsyncMock(),
     ) as mock_artifact, patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10,
@@ -327,7 +327,7 @@ async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_arti
 async def test_one_artifact_type_failure_does_not_abort_the_bill_or_batch():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(side_effect=[Exception("dispatch failed"), {"id": 2}]),
+        new=AsyncMock(side_effect=[Exception("dispatch failed"), {"id": 2, "status": "complete"}]),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10,
@@ -366,7 +366,7 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
         new=AsyncMock(side_effect=[BrokerClientError("unreachable"), None]),
     ), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
@@ -394,6 +394,139 @@ async def test_missing_version_identity_fails_the_needed_artifacts_not_the_whole
     assert bill_result["error"] is None
 
 
+# --- SYNC-24: a returned status="failed" row is a failure, not a success ---
+
+@pytest.mark.asyncio
+async def test_a_normally_returned_failed_status_is_not_counted_as_generated():
+    """generate_and_store_bill_artifact returns normally (no exception) for a
+    legitimate LegBot decline (e.g. insufficient_information) -- it still
+    writes a real status="failed" BillArtifact row. Before SYNC-24,
+    _process_bill only checked whether an exception was raised, so this
+    silently landed in artifacts_generated. This is the exact SB2500E
+    scenario from the ticket: real archived text, no exception, but the
+    model correctly declined."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={
+            "id": 1, "status": "failed", "failure_reason": "insufficient_information",
+        }),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == []
+    assert bill_result["artifacts_failed"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_normally_returned_complete_status_is_still_counted_as_generated():
+    """The success path must keep working exactly as before -- a real
+    status="complete" return still lands in artifacts_generated."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["artifacts_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_normally_returned_failed_status_is_not_counted_as_generated():
+    """Same status-inspection fix applies to the bill_changelog branch, which
+    dispatches via a separate function than every other artifact_type."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={
+            "id": 1, "status": "failed", "failure_reason": "insufficient_information",
+        }),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == []
+    assert bill_result["artifacts_failed"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_normally_returned_complete_status_is_still_counted_as_generated():
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_changelog"]
+    assert bill_result["artifacts_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_raised_exception_and_a_normal_failed_status_are_both_captured_independently():
+    """A thrown exception (a real dispatch outage) and a normally-returned
+    status="failed" (a legitimate decline) both end up in artifacts_failed,
+    but via entirely independent code paths -- proven here by triggering
+    both for two different artifact_types on the same bill in one call."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=[
+            Exception("LegBot unreachable"),
+            {"id": 2, "status": "failed", "failure_reason": "insufficient_information"},
+        ]),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    bill_result = result["results"][0]
+    assert set(bill_result["artifacts_failed"]) == {"bill_summary", "bill_pros_cons"}
+    assert bill_result["artifacts_generated"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_legbot_pipeline_artifacts_generated_excludes_declined_bills():
+    """Pipeline-level regression for AC #6: across a two-bill run, one bill's
+    dispatch completes and the other's legitimately declines (no exception)
+    -- run_legbot_pipeline's own per-bill results must not conflate the two,
+    matching the ticket's own real dispatch (16 "generated", one of which
+    -- SB2500E -- had actually declined)."""
+    candidates = [_CANDIDATE, dict(_CANDIDATE, gov_id="SB2500E", bill_openstates_id="other-uuid")]
+    with _patch_lister(candidates), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=[
+            {"id": 1, "status": "complete"},
+            {"id": 2, "status": "failed", "failure_reason": "insufficient_information"},
+        ]),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+        )
+
+    completed_bill, declined_bill = result["results"]
+    assert completed_bill["gov_id"] == "SJR 2F"
+    assert completed_bill["artifacts_generated"] == ["bill_summary"]
+    assert completed_bill["artifacts_failed"] == []
+    assert declined_bill["gov_id"] == "SB2500E"
+    assert declined_bill["artifacts_generated"] == []
+    assert declined_bill["artifacts_failed"] == ["bill_summary"]
+
+
 # --- SYNC-21: ensure_bill_exists gating (PLAN-local-openstates-migration.md §3.6) ---
 
 @pytest.mark.asyncio
@@ -402,7 +535,7 @@ async def test_ensure_called_when_archived_text_exists_and_dispatch_proceeds():
          _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
          patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
@@ -441,7 +574,7 @@ async def test_ensure_called_with_each_bills_own_openstates_id_not_a_stale_one()
          _patch_archived_text("the actual bill text"), _patch_ensure() as mock_ensure, \
          patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
         await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10, include_concept_statements=False)
 
@@ -468,7 +601,7 @@ async def test_ensure_not_called_when_no_archived_text_yet():
          _patch_archived_text(None), _patch_ensure() as mock_ensure, \
          patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
@@ -626,7 +759,7 @@ async def test_org_research_not_requested_is_never_checked():
 async def test_concept_statements_not_requested_is_never_checked():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_set",
         new=AsyncMock(),
@@ -647,7 +780,7 @@ async def test_concept_statements_skipped_when_already_published():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
          _patch_concept_set({"id": 7, "status": "published"}), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
         new=AsyncMock(),
@@ -668,7 +801,7 @@ async def test_concept_statements_dispatched_when_not_yet_published():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
          _patch_concept_set(None), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
         new=AsyncMock(return_value={"id": 9, "status": "pending"}),
@@ -976,10 +1109,10 @@ async def test_single_bill_none_artifact_types_defaults_to_all_8():
     exist."""
     with _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ):
         result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=None, dry_run=True)
 
@@ -996,7 +1129,7 @@ async def test_single_bill_never_lists_candidates():
         new=AsyncMock(),
     ) as mock_lister, _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ):
         await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
 
@@ -1039,7 +1172,7 @@ async def test_single_bill_includes_org_research_when_requested():
         {"has_rows": False, "row_count": 0}
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_organization_positions",
         new=AsyncMock(return_value=[{"org_name": "Sierra Club", "outcome": "written"}]),
@@ -1074,7 +1207,7 @@ async def test_single_bill_includes_concept_statements_when_requested():
 async def test_single_bill_result_includes_run_id():
     with _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ):
         result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
 
@@ -1092,7 +1225,7 @@ async def test_single_bill_threads_broker_override_to_coverage_check_and_dispatc
         new=AsyncMock(return_value=None),
     ) as mock_coverage, _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1}),
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ) as mock_artifact:
         await run_single_bill_full(
             **_SINGLE_BILL_KWARGS,

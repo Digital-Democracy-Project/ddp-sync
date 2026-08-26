@@ -310,7 +310,7 @@ async def test_bill_artifact_generation_bill_summary_dispatch_still_works_unchan
             artifact_type="bill_summary",
         )
 
-    assert result == {"id": 1, "created": True}
+    assert result == {"id": 1, "created": True, "status": "complete"}
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "A plain-language summary."
     assert write_kwargs["status"] == "complete"

@@ -255,7 +255,7 @@ async def _process_bill(
         dispatch_started = time.monotonic()
         try:
             if artifact_type == "bill_changelog":
-                await generate_and_store_bill_changelog(
+                artifact_result = await generate_and_store_bill_changelog(
                     bill_openstates_id=bill_openstates_id,
                     jurisdiction=jurisdiction_iso2,
                     session_code=session_code,
@@ -265,7 +265,7 @@ async def _process_bill(
                     broker_api_token=broker_api_token,
                 )
             else:
-                await generate_and_store_bill_artifact(
+                artifact_result = await generate_and_store_bill_artifact(
                     bill_openstates_id=bill_openstates_id,
                     jurisdiction=jurisdiction_iso2,
                     session_code=session_code,
@@ -275,7 +275,19 @@ async def _process_bill(
                     broker_api_base=broker_api_base,
                     broker_api_token=broker_api_token,
                 )
-            result["artifacts_generated"].append(artifact_type)
+            # SYNC-24: a normal (non-raising) return doesn't mean success --
+            # generate_and_store_bill_artifact/_changelog deliberately return
+            # normally with a written status="failed" row for a legitimate
+            # decline (insufficient_information, no_archived_bill_text,
+            # no_valid_topics, no_archived_changelog_inputs), so the actual
+            # returned status has to be inspected. Anything other than
+            # "complete" -- including "failed" or a missing/malformed status
+            # from an outdated mock -- is treated as a failure rather than
+            # ever being counted as generated.
+            if artifact_result.get("status") == "complete":
+                result["artifacts_generated"].append(artifact_type)
+            else:
+                result["artifacts_failed"].append(artifact_type)
         except Exception as exc:
             # Broad on purpose: LegBotDispatchError, BrokerClientError, and
             # bill_changelog's own ArchivedVersionMismatchError are all
@@ -472,9 +484,21 @@ async def run_legbot_pipeline(
                                         # concurrency)
                 {
                     "gov_id": str,
-                    "artifacts_generated": [str],
+                    "artifacts_generated": [str],  # dispatch returned status="complete"
                     "artifacts_skipped_present": [str],
-                    "artifacts_failed": [str],
+                    "artifacts_failed": [str],     # SYNC-24: covers BOTH a raised
+                                                    # dispatch/persistence exception AND a
+                                                    # normal return with a written
+                                                    # status="failed" row -- e.g. LegBot
+                                                    # legitimately declining via
+                                                    # insufficient_information. Both are
+                                                    # "this artifact_type produced no
+                                                    # usable content" from this summary's
+                                                    # point of view; distinguishing an
+                                                    # outage from a legitimate decline
+                                                    # requires reading the underlying
+                                                    # BillArtifact row's own
+                                                    # failure_stage/failure_reason.
                     "artifacts_skipped_failed_previously": [str],
                     "artifact_durations_seconds": {artifact_type: float},  # dispatched types only
                     "org_research_dispatched": bool,
