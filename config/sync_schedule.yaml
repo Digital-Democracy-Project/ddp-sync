@@ -259,9 +259,26 @@ openstates_scrape:
   # not do -- it stops SWEEP_IMPORT_ENABLED being injected into FUTURE runs. It does not revert
   # bills a sweep already imported, and it does not stop an in-flight run. To stop a run in
   # progress you have to kill the run itself.
+  # WIDENED 2026-08-26 (OPEN-163), on the operator's explicit instruction. The big states
+  # are the ones that actually need this: the sweep exists so a scrape killed partway does
+  # not lose everything it collected, and a jurisdiction with 11,592 bills has far more to
+  # lose than one with 895. SYNC-35 is the worked example -- AZ scraped all 895 bills, a
+  # ddp-sync restart orphaned the run, and every one of them was wiped.
+  #
+  # BLOCKED ON ddp-open-states #174 (OPEN-163). Do not merge this before that one. Until
+  # that fix is deployed, every sweep cycle re-stages the whole accumulated data directory,
+  # so the final cycle for these three runs for minutes (MI ~244s, FL ~478s, MA ~720s) while
+  # holding the import lock -- and the FINAL import blocks only LOCK_WAIT_TIMEOUT_SECS
+  # (180s) before failing the entire run. Widening first would turn a successful multi-hour
+  # scrape into a reported failure on exactly these jurisdictions.
+  #
+  # UT and AZ deliberately NOT added here. OPEN-163 puts them in its own "not this ticket"
+  # section: the canary judges them plausible (~56s/~63s final cycle, both inside the 180s
+  # wait) but on extrapolated evidence only, and wants one full run to completion first.
+  # That is a smaller separate step and does not depend on this.
   sweep_import:
     enabled: true
-    jurisdictions: ["va"]   # UT next, after one clean VA cycle
+    jurisdictions: ["va", "mi", "fl", "ma"]
 
   # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
   # transient fault currently waits a week for its next attempt -- that is what happened to MA
