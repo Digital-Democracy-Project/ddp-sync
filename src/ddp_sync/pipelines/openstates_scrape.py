@@ -472,7 +472,26 @@ def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, i
         return False, 0
     if jurisdiction not in cfg.get("jurisdictions", []):
         return False, 0
-    return True, int(cfg.get("interval_days", 30))
+
+    # Fail closed on a bad interval rather than trusting the YAML (pm-review round 1).
+    # This is worth four lines because of what the blast radius actually is: a `0`, a `-1`
+    # or a stray string would make every eligible run overdue, so MI would full-walk on
+    # *every* scrape -- ~3,924 requests at a hard 10/min cap against the fleet's most
+    # WAF-sensitive site, weekly, from a one-character config typo. int() raising would
+    # also take down the scrape path itself, which is outside the OSError handler below.
+    try:
+        interval_days = int(cfg.get("interval_days", 30))
+    except (TypeError, ValueError):
+        interval_days = 0
+    if interval_days <= 0:
+        logger.warning(
+            "openstates_scrape: full_walk.interval_days is not a positive number, "
+            "not forcing a full walk",
+            jurisdiction=jurisdiction,
+            interval_days=cfg.get("interval_days"),
+        )
+        return False, 0
+    return True, interval_days
 
 
 def _maybe_force_full_walk(
@@ -554,10 +573,6 @@ def _maybe_force_full_walk(
         if os.path.exists(ts_path):
             os.remove(ts_path)
 
-        os.makedirs(last_run_dir, exist_ok=True)
-        with open(stamp_path, "w") as fh:
-            fh.write(datetime.now(timezone.utc).isoformat())
-
         logger.info(
             "openstates_scrape: forcing a full walk, periodic backstop is due (OPEN-162)",
             jurisdiction=jurisdiction,
@@ -573,6 +588,44 @@ def _maybe_force_full_walk(
             error=str(e),
         )
         return False
+
+
+def _record_full_walk(label: str, openstates_root: str) -> None:
+    """Stamp a forced full walk as DONE, once the run that did it has succeeded.
+
+    Deliberately not written at the moment the marker is cleared (pm-review round
+    1's highest-severity finding, and it was right). Clearing the marker does not
+    mean a walk happened. The gap is real and reachable: run-scrape.sh takes the
+    per-state scrape lock itself, *after* this module has already decided, and if
+    another run for the same jurisdiction holds it the script exits
+    EXIT_DO_NOT_RETRY immediately rather than waiting. Stamping up front would
+    then record a completed backstop for a run that never scraped anything, and
+    MI would go another interval with no full walk -- silently, which is the
+    failure mode this whole ticket exists to remove.
+
+    Writing it only on success also answers "attempted or completed?" the safer
+    way. A failed, stalled or timed-out walk leaves no stamp, so the next run
+    still finds one due. The cost of that choice is at worst a repeated full
+    walk; the cost of the other choice is a missing one nobody notices.
+    """
+    key = scrape_key_for(label)
+    last_run_dir = os.path.join(openstates_root, "logs", "last-run")
+    try:
+        os.makedirs(last_run_dir, exist_ok=True)
+        with open(os.path.join(last_run_dir, f"{key}.fullwalk"), "w") as fh:
+            fh.write(datetime.now(timezone.utc).isoformat())
+        logger.info(
+            "openstates_scrape: full walk completed, backstop recorded (OPEN-162)",
+            jurisdiction=label,
+        )
+    except OSError as e:
+        # The walk itself succeeded, so this must not fail the run. Worst case the
+        # stamp is missing and the next run walks again -- wasteful, not wrong.
+        logger.warning(
+            "openstates_scrape: full walk succeeded but its stamp could not be written",
+            jurisdiction=label,
+            error=str(e),
+        )
 
 
 async def _maybe_preseed_scrapebot_cookies(
@@ -784,7 +837,7 @@ async def _run_scrape(
     # is what makes it safe against an in-flight run.
     # Same label shape scrape_key_for() and the reporting below both use, so the
     # marker this clears is the one run-scrape.sh will look for.
-    _maybe_force_full_walk(
+    forced_full_walk = _maybe_force_full_walk(
         jurisdiction,
         f"{jurisdiction} {session_arg}" if session_arg else jurisdiction,
         config,
@@ -967,6 +1020,11 @@ async def _run_scrape(
             session=session_arg,
             duration_seconds=duration,
         )
+        # OPEN-162: only now is the backstop genuinely done. Every failure path
+        # above returns before this, so a walk that was forced but did not
+        # complete leaves no stamp and stays due.
+        if forced_full_walk:
+            _record_full_walk(label, openstates_root)
         return {"success": True, "jurisdiction": label, "duration_seconds": duration}
 
     except Exception as e:

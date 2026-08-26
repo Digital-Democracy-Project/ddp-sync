@@ -10,9 +10,14 @@ Two things are worth pinning hardest, and neither is "does it delete the file":
   * **It must stay off for every jurisdiction not listed.** Promoting an
     unlisted jurisdiction to a full walk is not a cosmetic bug — for MI it is
     ~3,924 requests at a 10/min WAF cap against the fleet's most hostile site.
-  * **It must not fire every run once it is due.** The stamp has to be written
-    when the walk is triggered, or a jurisdiction past its interval would
-    full-walk on *every* subsequent scrape rather than once a month.
+  * **It must not fire every run once it is due**, or a monthly walk becomes a
+    permanent one. That is what the `.fullwalk` stamp prevents.
+  * **But the stamp must mean "a walk completed", not "a walk was requested."**
+    run-scrape.sh takes the per-state scrape lock itself, after this module has
+    already cleared the marker, and exits immediately if another run holds it.
+    Stamping at decision time would record a backstop that never ran and leave MI
+    uncovered for another interval, silently — the exact shape of failure this
+    ticket exists to remove. pm-review round 1 found this; it was right.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from ddp_sync.pipelines.openstates_scrape import (
     SCRAPE_TIMEOUT_S,
     _full_walk_eligible,
     _maybe_force_full_walk,
+    _record_full_walk,
 )
 
 MI_CFG = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": 30}}
@@ -100,16 +106,73 @@ def test_a_recent_walk_does_not_force_another(tmp_path):
     assert (tmp_path / "logs" / "last-run" / "mi.ts").exists(), "marker must survive"
 
 
-def test_triggering_writes_the_stamp_so_it_does_not_fire_every_run(tmp_path):
-    """The regression that would turn a monthly walk into a permanent one: if the
-    stamp is not written when the walk is triggered, the jurisdiction stays overdue
-    and every subsequent scrape is promoted to a full walk — ~3,924 WAF-capped
-    requests, weekly, forever."""
+def test_a_completed_walk_stops_it_firing_again(tmp_path):
+    """Once the run that did the walk succeeds, the stamp lands and the
+    jurisdiction stops being due — otherwise a monthly walk becomes a permanent
+    one: ~3,924 WAF-capped requests on every scrape, forever."""
     root = _root_with_marker(tmp_path)
     assert _maybe_force_full_walk("mi", "mi", MI_CFG, root) is True
 
-    # Second call, immediately after: now recent, so no.
+    _record_full_walk("mi", root)          # what the success path does
+
     assert _maybe_force_full_walk("mi", "mi", MI_CFG, root) is False
+
+
+# --- pm-review round 1: the stamp must mean "completed", not "attempted" ----------------
+
+def test_forcing_a_walk_does_not_by_itself_stamp_it_done(tmp_path):
+    """The highest-severity finding of round 1, and it was right.
+
+    run-scrape.sh takes the per-state scrape lock *itself*, after this module has
+    already decided — and if another run for the same jurisdiction holds it, the
+    script exits EXIT_DO_NOT_RETRY immediately rather than waiting. Verified in
+    run-scrape.sh directly, not assumed.
+
+    So clearing the marker does not mean a walk happened. If the stamp were written
+    at decision time, that lock clash would record a completed backstop for a run
+    that scraped nothing, and MI would go another full interval uncovered —
+    silently, which is the exact failure this ticket exists to remove."""
+    root = _root_with_marker(tmp_path)
+    assert _maybe_force_full_walk("mi", "mi", MI_CFG, root) is True
+
+    stamp = tmp_path / "logs" / "last-run" / "mi.fullwalk"
+    assert not stamp.exists(), "no stamp until a run actually completes"
+
+    # Still due, because nothing has completed yet.
+    assert _maybe_force_full_walk("mi", "mi", MI_CFG, root) is True
+
+
+def test_recording_a_walk_is_what_makes_it_not_due(tmp_path):
+    root = _root_with_marker(tmp_path)
+    _record_full_walk("mi", root)
+    assert (tmp_path / "logs" / "last-run" / "mi.fullwalk").exists()
+    assert _maybe_force_full_walk("mi", "mi", MI_CFG, root) is False
+
+
+def test_a_stamp_failure_never_fails_the_run(tmp_path):
+    """The walk already succeeded by then. A missing stamp costs a repeated walk,
+    which is wasteful; raising here would fail a scrape that actually worked."""
+    _record_full_walk("mi", str(tmp_path / "nope" / "still-nope"))  # must not raise
+
+
+# --- pm-review round 1: config that would cause a walk on every run --------------------
+
+@pytest.mark.parametrize("bad", [0, -1, "", "thirty", None, [30]])
+def test_a_bad_interval_fails_closed(bad):
+    """A 0, a -1 or a stray string would make every run overdue — MI full-walking
+    ~3,924 WAF-capped requests on every scrape from a one-character typo. And a
+    raising int() would take down the scrape path itself, since that call sits
+    outside the filesystem error handler."""
+    cfg = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": bad}}
+    assert _full_walk_eligible("mi", cfg)[0] is False
+
+
+def test_a_bad_interval_does_not_delete_the_marker(tmp_path):
+    """Fail-closed asserted on the filesystem, not just the return value."""
+    cfg = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": 0}}
+    root = _root_with_marker(tmp_path)
+    assert _maybe_force_full_walk("mi", "mi", cfg, root) is False
+    assert (tmp_path / "logs" / "last-run" / "mi.ts").exists()
 
 
 def test_an_unlisted_jurisdiction_never_loses_its_marker(tmp_path):
