@@ -505,11 +505,20 @@ class TestAgents42TwoPhaseTimeout:
 # --- SYNC-39: the poll interval is configuration, and it is what governs ---
 
 class TestPollInterval:
-    """The 5-second constant this replaces was why bills lost their prefilled
-    MLX cache. Measured on VA 2026S1 (2026-08-27): a bill left its worker idle
-    for ~10s -- about two poll intervals of its own bookkeeping -- while every
-    competing bill asked for a worker roughly every 5s. 17 of 22 warm workers
-    were taken within 5s of going idle.
+    """The 5-second constant this replaces cost latency on every call.
+
+    Measured on VA 2026S1 (2026-08-27) from CAMS's own un-quantised
+    timestamps: real generation ran a median of 1.72s (n=220) while the client
+    observed 5.10s, so ~3.4s of every call was this loop sleeping. That waste
+    is unconditional and is what the change is justified on.
+
+    A second, weaker effect is that the interval also sets how long a bill
+    leaves its worker idle between calls (13 of 18 cold concept_statements
+    prefills were a warm worker taken by another bill). Deliberately NOT
+    claimed here: shortening the interval shortens the competitor's cadence
+    too, so the steal rate may not improve at all. That is an open question
+    this value exists to let someone answer -- see legbot_poll_interval_seconds
+    in config.py.
     """
 
     def test_the_production_default_is_one_second(self):
