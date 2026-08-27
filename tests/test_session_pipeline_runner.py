@@ -13,7 +13,7 @@ import pytest
 
 from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.session_pipeline_runner import (
-    ALL_8_ARTIFACT_TYPES,
+    ALL_ARTIFACT_TYPES,
     run_scheduled_session_pipeline,
     run_legbot_pipeline,
     run_single_bill_full,
@@ -141,7 +141,7 @@ async def test_bill_topics_is_a_recognized_artifact_type():
     """SYNC-1: bill_topics must be dispatchable through this real caller,
     not just accepted by generate_and_store_bill_artifact directly -- the
     gap the first implementation attempt (PR #39) missed. dry_run=True
-    proves ALL_8_ARTIFACT_TYPES's own recognition check passes without
+    proves ALL_ARTIFACT_TYPES's own recognition check passes without
     ever needing a real LegBot/broker call."""
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
@@ -1116,7 +1116,7 @@ async def test_single_bill_none_artifact_types_defaults_to_all_8():
     ):
         result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=None, dry_run=True)
 
-    assert set(result["artifacts_generated"]) == ALL_8_ARTIFACT_TYPES
+    assert set(result["artifacts_generated"]) == ALL_ARTIFACT_TYPES
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1696,7 @@ class TestConcurrentOrgResearch:
 # --- SYNC-38: dispatch order is the pipeline's, not the caller's ---------
 
 class TestCanonicalDispatchOrder:
-    """Before this, ALL_8_ARTIFACT_TYPES was a frozenset and _process_bill
+    """Before this, ALL_ARTIFACT_TYPES was a frozenset and _process_bill
     dispatched in whatever order the caller's artifact_types list happened to
     use. That decided which artifact ran last, and therefore which bill's KV
     cache survived -- measured on VA 2026S1: concept_statements warm 3 times
@@ -1771,10 +1771,10 @@ class TestCanonicalDispatchOrder:
         """A type recognised but never ordered would silently never dispatch,
         and .index() would raise on a type ordered but not recognised."""
         from ddp_sync.pipelines.session_pipeline_runner import (
-            ALL_8_ARTIFACT_TYPES, ARTIFACT_DISPATCH_ORDER,
+            ALL_ARTIFACT_TYPES, ARTIFACT_DISPATCH_ORDER,
         )
-        assert set(ARTIFACT_DISPATCH_ORDER) == ALL_8_ARTIFACT_TYPES
-        assert len(ARTIFACT_DISPATCH_ORDER) == len(ALL_8_ARTIFACT_TYPES), "duplicate entry"
+        assert set(ARTIFACT_DISPATCH_ORDER) == ALL_ARTIFACT_TYPES
+        assert len(ARTIFACT_DISPATCH_ORDER) == len(ALL_ARTIFACT_TYPES), "duplicate entry"
         assert ARTIFACT_DISPATCH_ORDER[-1] == "bill_changelog"
 
     @pytest.mark.asyncio

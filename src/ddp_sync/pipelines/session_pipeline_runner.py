@@ -45,7 +45,7 @@ generation (previously the standalone, since-retired ``concept_statement_
 dispatch.py`` weekly job -- see SYNC-32) into this same per-bill batch,
 reusing its candidate enumeration and ``ensure_bill_exists()`` call. Kept as
 its own boolean option, the same shape as ``include_org_research``, rather
-than folded into ``artifact_types``/``ALL_8_ARTIFACT_TYPES`` -- a
+than folded into ``artifact_types``/``ALL_ARTIFACT_TYPES`` -- a
 ``ConceptStatementSet`` row has no ``BillVersion`` at all and a coarser,
 published-only dedup rule (no "failed" status exists for it), neither of
 which the generic per-artifact-type coverage loop below (keyed on
@@ -94,13 +94,20 @@ logger = structlog.get_logger()
 # (8 types, including bill_topics -- SYNC-1) plus bill_changelog, which
 # dispatches through a separate function (generate_and_store_bill_changelog)
 # because it needs a prior version's text + diff, not a single bill_source.
-# Name kept as ALL_8_ARTIFACT_TYPES (not renamed to ALL_9) -- SYNC-1's own
-# ticket ties any rename to the future default-artifact-set flip, not to
-# this recognition-gate fix; bill_topics is deliberately NOT part of any
-# default artifact_types list yet (see config/sync_schedule.yaml's
-# session_pipeline_batch, which hand-picks its own small subset -- nothing
-# here auto-widens to "every recognized type").
-ALL_8_ARTIFACT_TYPES = frozenset({
+# Renamed from ALL_8_ARTIFACT_TYPES (SYNC-38). The count had been wrong since
+# bill_changelog joined -- there are nine members, not eight. The old comment
+# here deferred the rename to SYNC-1's default-artifact-set flip; SYNC-1 closed
+# 2026-08-15 without the rename happening, so the deferral had simply outlived
+# the thing it was waiting on.
+#
+# The count is dropped rather than corrected to nine, so it cannot go stale the
+# same way a third time.
+#
+# bill_topics is deliberately NOT part of any default artifact_types list yet
+# (see config/sync_schedule.yaml's session_pipeline_batch, which hand-picks
+# its own small subset -- nothing here auto-widens to "every recognized
+# type").
+ALL_ARTIFACT_TYPES = frozenset({
     "bill_summary",
     "bill_pros_cons",
     "bill_vote_yes_frame",
@@ -115,7 +122,7 @@ ALL_8_ARTIFACT_TYPES = frozenset({
 # SYNC-38: the order these are dispatched in, which is a property of the
 # pipeline rather than of however the caller wrote its request body.
 #
-# ALL_8_ARTIFACT_TYPES above stays a frozenset -- it exists to validate
+# ALL_ARTIFACT_TYPES above stays a frozenset -- it exists to validate
 # membership, and a set is the right shape for that. But a set has no order,
 # so before this constant the dispatch order came from the caller's own
 # artifact_types list, and therefore so did which bill's KV cache survived.
@@ -151,8 +158,8 @@ ARTIFACT_DISPATCH_ORDER: tuple[str, ...] = (
 # in one place.
 _OWN_CACHE_KEY_TYPES = frozenset({"bill_changelog"})
 
-assert set(ARTIFACT_DISPATCH_ORDER) == ALL_8_ARTIFACT_TYPES, (
-    "ARTIFACT_DISPATCH_ORDER and ALL_8_ARTIFACT_TYPES have drifted apart; a "
+assert set(ARTIFACT_DISPATCH_ORDER) == ALL_ARTIFACT_TYPES, (
+    "ARTIFACT_DISPATCH_ORDER and ALL_ARTIFACT_TYPES have drifted apart; a "
     "type recognised but never ordered would silently never dispatch"
 )
 
@@ -717,7 +724,7 @@ async def run_legbot_pipeline(
         raise ValueError("limit must be a positive integer")
     if not artifact_types:
         raise ValueError("artifact_types must be non-empty")
-    unrecognized = set(artifact_types) - ALL_8_ARTIFACT_TYPES
+    unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
 
@@ -818,7 +825,7 @@ async def run_single_bill_full(
     broker_api_token: str | None = None,
 ) -> dict:
     """Run every requested artifact type (default: all of
-    ALL_8_ARTIFACT_TYPES) plus optional org research and concept-statement
+    ALL_ARTIFACT_TYPES) plus optional org research and concept-statement
     generation for ONE caller-specified bill, in a single call -- SYNC-15
     (include_concept_statements added SYNC-31).
 
@@ -830,7 +837,7 @@ async def run_single_bill_full(
     existing coverage-check skip logic unchanged -- this is not a
     force-regenerate mode, already-present artifacts are still skipped.
 
-    artifact_types: None means "all of them" (ALL_8_ARTIFACT_TYPES) -- the
+    artifact_types: None means "all of them" (ALL_ARTIFACT_TYPES) -- the
     one place in this module a missing value gets a real default rather than
     being rejected, since "run everything for this bill" is this function's
     whole reason to exist. An empty list is still rejected, same as
@@ -863,11 +870,11 @@ async def run_single_bill_full(
         raise ValueError("bill_source is required")
 
     resolved_artifact_types = (
-        list(ALL_8_ARTIFACT_TYPES) if artifact_types is None else artifact_types
+        list(ALL_ARTIFACT_TYPES) if artifact_types is None else artifact_types
     )
     if not resolved_artifact_types:
         raise ValueError("artifact_types must be non-empty")
-    unrecognized = set(resolved_artifact_types) - ALL_8_ARTIFACT_TYPES
+    unrecognized = set(resolved_artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
 

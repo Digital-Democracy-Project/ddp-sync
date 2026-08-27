@@ -224,7 +224,7 @@ yet built).
 
 `/trigger/legbot-analyze-bill-full` (SYNC-15) is the single-parameter "run everything for this bill"
 counterpart to `/trigger/legbot-analyze-bill` above — one call for every requested `BillArtifact` type
-(default: all of `ALL_8_ARTIFACT_TYPES`) plus optional org position research, instead of 8+ separate calls.
+(default: all of `ALL_ARTIFACT_TYPES`) plus optional org position research, instead of 8+ separate calls.
 Reuses `session_pipeline_runner.py`'s `_process_bill()` directly (the same per-bill unit
 `run_legbot_pipeline`'s batch loop already calls) via a new `run_single_bill_full()` wrapper that skips the
 jurisdiction/session candidate-listing step entirely, since the caller already knows exactly which bill they
