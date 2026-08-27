@@ -34,6 +34,40 @@ when GrantBot's weekly Notion-funder-scrape job (self-scheduled inside CAMS at `
 found and flagged this way instead of just editing its cron string in place — see AGENTS-54 and
 SYNC-36.
 
+## Dispatch poll cadence is load-bearing, not cosmetic
+
+`legbot_client.py`'s poll interval (`LEGBOT_POLL_INTERVAL_SECONDS`, default 1s)
+governs more than how promptly this service notices a task finished. It sets how
+long a bill leaves its MLX worker idle between calls, and CAMS's
+`MLXWorkerSupervisor` cannot tell an idle-but-still-needed worker from a free
+one — so a competing bill takes it, and the bill pays a fresh prefill when it
+comes back.
+
+It was 5 seconds until SYNC-39. Lowering it to 1 took a 20-bill VA 2026S1 run
+from 830s to 501s (**40%**), cut re-prefills from 27 to 2, and took
+`concept_statements`' cache hit rate from 10% to 100%. Nothing about the MLX
+work changed: real generation stayed at ~1.5s throughout. The gain was waiting
+that stopped happening.
+
+Two rules follow.
+
+**Do not raise this interval without measuring.** It looks like a politeness
+knob against a service on the same machine. It is not; it is roughly a 40%
+throughput lever.
+
+**Do not use this client's reported durations as work timings.** They include
+poll latency. Under the old 5s interval every artifact duration in a run was a
+multiple of five, and a figure derived that way ("a cold prefill costs 15-30s")
+propagated into `ddp-agents`' own CLAUDE.md and misled analysis for a session —
+the real prefill on that corpus was 0.80s. For work timing use CAMS's
+`mlx_artifact_started`→`mlx_artifact_complete` audit lines, which are not
+quantised by anything here.
+
+Full write-up and data: `ddp-agents`' `bench/legbot-throughput-2026-08-27/`.
+
+`scrapebot_client.py` has its own copy of the constant, still 5, deliberately —
+its mint holds no per-bill cache, so cadence costs it nothing there.
+
 ## Dev/prod checkout discipline
 
 `~/Developer/repos/ddp-sync` is **production** — the `com.ddp.ddp-sync` LaunchDaemon
