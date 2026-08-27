@@ -13,7 +13,7 @@ import pytest
 
 from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.session_pipeline_runner import (
-    ALL_8_ARTIFACT_TYPES,
+    ALL_ARTIFACT_TYPES,
     run_scheduled_session_pipeline,
     run_legbot_pipeline,
     run_single_bill_full,
@@ -141,7 +141,7 @@ async def test_bill_topics_is_a_recognized_artifact_type():
     """SYNC-1: bill_topics must be dispatchable through this real caller,
     not just accepted by generate_and_store_bill_artifact directly -- the
     gap the first implementation attempt (PR #39) missed. dry_run=True
-    proves ALL_8_ARTIFACT_TYPES's own recognition check passes without
+    proves ALL_ARTIFACT_TYPES's own recognition check passes without
     ever needing a real LegBot/broker call."""
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
@@ -1116,7 +1116,7 @@ async def test_single_bill_none_artifact_types_defaults_to_all_8():
     ):
         result = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=None, dry_run=True)
 
-    assert set(result["artifacts_generated"]) == ALL_8_ARTIFACT_TYPES
+    assert set(result["artifacts_generated"]) == ALL_ARTIFACT_TYPES
 
 
 @pytest.mark.asyncio
@@ -1691,3 +1691,200 @@ class TestConcurrentOrgResearch:
         status.assert_not_awaited()
         org.assert_not_awaited()
         assert result["results"][0]["org_research_dispatched"] is False
+
+
+# --- SYNC-38: dispatch order is the pipeline's, not the caller's ---------
+
+class TestCanonicalDispatchOrder:
+    """Before this, ALL_ARTIFACT_TYPES was a frozenset and _process_bill
+    dispatched in whatever order the caller's artifact_types list happened to
+    use. That decided which artifact ran last, and therefore which bill's KV
+    cache survived -- measured on VA 2026S1: concept_statements warm 3 times
+    out of 20, against 90-100% for every type that ran before bill_changelog.
+    """
+
+    @staticmethod
+    def _order_from(mock_artifact, mock_changelog):
+        calls = [c.kwargs.get("artifact_type") for c in mock_artifact.await_args_list]
+        # the changelog dispatches through its own function, so it carries no
+        # artifact_type kwarg -- its position is what matters, and it is last
+        # by construction if it was awaited at all.
+        return calls, mock_changelog.await_count
+
+    @pytest.mark.asyncio
+    async def test_same_order_regardless_of_how_the_caller_sorts(self):
+        """The point of the ticket."""
+        seen = []
+        for types in (
+            ["bill_summary", "bill_changelog", "bill_topics", "bill_pros_cons"],
+            ["bill_changelog", "bill_pros_cons", "bill_topics", "bill_summary"],
+            ["bill_topics", "bill_summary", "bill_pros_cons", "bill_changelog"],
+        ):
+            with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+                 _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}), \
+                 patch("ddp_sync.pipelines.session_pipeline_runner"
+                       ".generate_and_store_bill_changelog",
+                       new=AsyncMock(return_value={"id": 1, "status": "complete"})):
+                from ddp_sync.pipelines import session_pipeline_runner as spr
+                with patch.object(spr, "generate_and_store_bill_artifact",
+                                  new=AsyncMock(return_value={"id": 1, "status": "complete"})) as ma:
+                    await run_legbot_pipeline(
+                        "fl", "2026F", types, True, limit=10,
+                        include_concept_statements=False,
+                    )
+                    seen.append([c.kwargs.get("artifact_type") for c in ma.await_args_list])
+
+        assert seen[0] == seen[1] == seen[2], f"order followed the caller: {seen}"
+        assert seen[0] == ["bill_summary", "bill_pros_cons", "bill_topics"], seen[0]
+
+    @pytest.mark.asyncio
+    async def test_changelog_is_dispatched_after_concept_statements(self):
+        """The actual cache fix.
+
+        bill_changelog builds a two-input prompt and so takes its own cache
+        key. Running it before concept statements evicts the bill's cache and
+        makes them pay a full prefill -- which is what the run measured.
+        """
+        order = []
+        async def _changelog(**kw):
+            order.append("changelog"); return {"id": 1, "status": "complete"}
+        async def _concepts(**kw):
+            order.append("concepts"); return {"id": 1}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}), \
+             _patch_concept_set(None), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".generate_and_store_bill_changelog", new=AsyncMock(side_effect=_changelog)), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".dispatch_and_store_concept_statements", new=AsyncMock(side_effect=_concepts)):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_changelog", "bill_summary"], True, limit=10,
+                include_concept_statements=True,
+            )
+
+        assert order == ["concepts", "changelog"], (
+            f"changelog must run after concept statements, got {order}"
+        )
+
+    def test_the_order_and_the_validation_set_cannot_drift(self):
+        """A type recognised but never ordered would silently never dispatch,
+        and .index() would raise on a type ordered but not recognised."""
+        from ddp_sync.pipelines.session_pipeline_runner import (
+            ALL_ARTIFACT_TYPES, ARTIFACT_DISPATCH_ORDER,
+        )
+        assert set(ARTIFACT_DISPATCH_ORDER) == ALL_ARTIFACT_TYPES
+        assert len(ARTIFACT_DISPATCH_ORDER) == len(ALL_ARTIFACT_TYPES), "duplicate entry"
+        assert ARTIFACT_DISPATCH_ORDER[-1] == "bill_changelog"
+
+    @pytest.mark.asyncio
+    async def test_a_caller_omitting_changelog_still_works(self):
+        """own_cache_key is empty then -- phase 2 must simply do nothing."""
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
+            result = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary", "bill_topics"], True, limit=10,
+                include_concept_statements=False,
+            )
+        assert result["results"][0]["artifacts_generated"] == ["bill_summary", "bill_topics"]
+
+    @pytest.mark.asyncio
+    async def test_a_contained_concept_failure_still_dispatches_changelog(self):
+        """The failure-isolation question /pm-review raised.
+
+        Moving changelog after the concept block couples the two. For every
+        failure that block actually contains, phase 2 must still run. (The one
+        escaping case ends the whole run -- see the comment on phase 2 for why
+        that one does not get a try/finally.)
+        """
+        async def _run(concept_ctx, dispatch_ctx):
+            ran = []
+            async def _changelog(**kw):
+                ran.append("changelog"); return {"id": 1, "status": "complete"}
+            with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+                 _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}), \
+                 concept_ctx, dispatch_ctx, \
+                 patch("ddp_sync.pipelines.session_pipeline_runner"
+                       ".generate_and_store_bill_changelog",
+                       new=AsyncMock(side_effect=_changelog)):
+                result = await run_legbot_pipeline(
+                    "fl", "2026F", ["bill_changelog", "bill_summary"], True, limit=10,
+                    include_concept_statements=True,
+                )
+            return ran, result["results"][0]
+
+        # (a) the status check fails with the error the block catches
+        ran, bill = await _run(
+            _patch_concept_set(side_effect=BrokerClientError("broker down")),
+            patch("ddp_sync.pipelines.session_pipeline_runner"
+                  ".dispatch_and_store_concept_statements", new=AsyncMock()),
+        )
+        assert ran == ["changelog"], "status_check_failed skipped changelog"
+        assert "status_check_failed" in bill["concept_statements_skipped_reason"]
+
+        # (b) the dispatch itself raises -- caught by the block's broad except
+        ran, bill = await _run(
+            _patch_concept_set(None),
+            patch("ddp_sync.pipelines.session_pipeline_runner"
+                  ".dispatch_and_store_concept_statements",
+                  new=AsyncMock(side_effect=RuntimeError("dispatch blew up"))),
+        )
+        assert ran == ["changelog"], "a failed concept dispatch skipped changelog"
+        assert "dispatch_failed" in bill["concept_statements_skipped_reason"]
+
+    @pytest.mark.asyncio
+    async def test_the_full_interleaving_in_one_assertion(self):
+        """The phase contract, end to end, in the order a reader cares about."""
+        order = []
+        async def _artifact(**kw):
+            order.append(kw["artifact_type"]); return {"id": 1, "status": "complete"}
+        async def _changelog(**kw):
+            order.append("bill_changelog"); return {"id": 1, "status": "complete"}
+        async def _concepts(**kw):
+            order.append("concept_statements"); return {"id": 1}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_org_status({"has_rows": True, "row_count": 1}), _patch_concept_set(None), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".generate_and_store_bill_artifact", new=AsyncMock(side_effect=_artifact)), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".generate_and_store_bill_changelog", new=AsyncMock(side_effect=_changelog)), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".dispatch_and_store_concept_statements", new=AsyncMock(side_effect=_concepts)):
+            await run_legbot_pipeline(
+                # deliberately worst-case caller order: changelog first
+                "fl", "2026F",
+                ["bill_changelog", "bill_topics", "bill_summary", "bill_impact_analysis"],
+                True, limit=10, include_concept_statements=True,
+            )
+
+        assert order == [
+            "bill_summary", "bill_impact_analysis", "bill_topics",   # phase 1
+            "concept_statements",                                     # between
+            "bill_changelog",                                         # phase 2
+        ], order
+
+    @pytest.mark.asyncio
+    async def test_dry_run_and_missing_version_behave_as_before(self):
+        """continue -> return inside the closure: each invocation is one loop
+        iteration, so both early-exit branches must record what they always
+        did and move on to the next type."""
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
+            dry = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_changelog", "bill_summary", "bill_topics"], True,
+                limit=10, include_concept_statements=False, dry_run=True,
+            )
+        assert dry["results"][0]["artifacts_generated"] == [
+            "bill_summary", "bill_topics", "bill_changelog"
+        ], "dry_run must still record every type, in canonical order"
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(None), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
+            noversion = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_changelog", "bill_summary"], True,
+                limit=10, include_concept_statements=False,
+            )
+        r = noversion["results"][0]
+        assert r["artifacts_generated"] == []
+        assert sorted(r["artifacts_failed"]) == ["bill_changelog", "bill_summary"]

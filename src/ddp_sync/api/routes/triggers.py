@@ -102,7 +102,7 @@ class BillArtifactGenerationRequest(BaseModel):
         ...,
         description=(
             "BillArtifact types to fill in for this run (from the types "
-            "session_pipeline_runner.ALL_8_ARTIFACT_TYPES supports -- "
+            "session_pipeline_runner.ALL_ARTIFACT_TYPES supports -- "
             "bill_summary, bill_pros_cons, bill_changelog, etc.). Start "
             "with a small subset, not all of them at once."
         ),
@@ -290,7 +290,7 @@ class LegBotAnalyzeBillRequest(BaseModel):
         ...,
         description=(
             "One of the BillArtifact types "
-            "(session_pipeline_runner.ALL_8_ARTIFACT_TYPES) -- bill_summary, "
+            "(session_pipeline_runner.ALL_ARTIFACT_TYPES) -- bill_summary, "
             "bill_pros_cons, bill_changelog, etc."
         ),
     )
@@ -340,13 +340,13 @@ async def trigger_legbot_analyze_bill(
             ),
         )
 
-    from ddp_sync.pipelines.session_pipeline_runner import ALL_8_ARTIFACT_TYPES
+    from ddp_sync.pipelines.session_pipeline_runner import ALL_ARTIFACT_TYPES
 
-    if body.artifact_type not in ALL_8_ARTIFACT_TYPES:
+    if body.artifact_type not in ALL_ARTIFACT_TYPES:
         raise HTTPException(
             status_code=400,
             detail=f"Unrecognized artifact_type: {body.artifact_type!r}. "
-            f"Must be one of {sorted(ALL_8_ARTIFACT_TYPES)}.",
+            f"Must be one of {sorted(ALL_ARTIFACT_TYPES)}.",
         )
 
     broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
@@ -407,7 +407,7 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
         None,
         description=(
             "BillArtifact types to run for this bill. Omit or pass null "
-            "for all of ALL_8_ARTIFACT_TYPES -- this endpoint's whole "
+            "for all of ALL_ARTIFACT_TYPES -- this endpoint's whole "
             "point is not having to enumerate them."
         ),
     )

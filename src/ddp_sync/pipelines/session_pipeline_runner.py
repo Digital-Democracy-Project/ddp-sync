@@ -45,7 +45,7 @@ generation (previously the standalone, since-retired ``concept_statement_
 dispatch.py`` weekly job -- see SYNC-32) into this same per-bill batch,
 reusing its candidate enumeration and ``ensure_bill_exists()`` call. Kept as
 its own boolean option, the same shape as ``include_org_research``, rather
-than folded into ``artifact_types``/``ALL_8_ARTIFACT_TYPES`` -- a
+than folded into ``artifact_types``/``ALL_ARTIFACT_TYPES`` -- a
 ``ConceptStatementSet`` row has no ``BillVersion`` at all and a coarser,
 published-only dedup rule (no "failed" status exists for it), neither of
 which the generic per-artifact-type coverage loop below (keyed on
@@ -94,13 +94,20 @@ logger = structlog.get_logger()
 # (8 types, including bill_topics -- SYNC-1) plus bill_changelog, which
 # dispatches through a separate function (generate_and_store_bill_changelog)
 # because it needs a prior version's text + diff, not a single bill_source.
-# Name kept as ALL_8_ARTIFACT_TYPES (not renamed to ALL_9) -- SYNC-1's own
-# ticket ties any rename to the future default-artifact-set flip, not to
-# this recognition-gate fix; bill_topics is deliberately NOT part of any
-# default artifact_types list yet (see config/sync_schedule.yaml's
-# session_pipeline_batch, which hand-picks its own small subset -- nothing
-# here auto-widens to "every recognized type").
-ALL_8_ARTIFACT_TYPES = frozenset({
+# Renamed from ALL_8_ARTIFACT_TYPES (SYNC-38). The count had been wrong since
+# bill_changelog joined -- there are nine members, not eight. The old comment
+# here deferred the rename to SYNC-1's default-artifact-set flip; SYNC-1 closed
+# 2026-08-15 without the rename happening, so the deferral had simply outlived
+# the thing it was waiting on.
+#
+# The count is dropped rather than corrected to nine, so it cannot go stale the
+# same way a third time.
+#
+# bill_topics is deliberately NOT part of any default artifact_types list yet
+# (see config/sync_schedule.yaml's session_pipeline_batch, which hand-picks
+# its own small subset -- nothing here auto-widens to "every recognized
+# type").
+ALL_ARTIFACT_TYPES = frozenset({
     "bill_summary",
     "bill_pros_cons",
     "bill_vote_yes_frame",
@@ -111,6 +118,51 @@ ALL_8_ARTIFACT_TYPES = frozenset({
     "bill_topics",
     "bill_changelog",
 })
+
+# SYNC-38: the order these are dispatched in, which is a property of the
+# pipeline rather than of however the caller wrote its request body.
+#
+# ALL_ARTIFACT_TYPES above stays a frozenset -- it exists to validate
+# membership, and a set is the right shape for that. But a set has no order,
+# so before this constant the dispatch order came from the caller's own
+# artifact_types list, and therefore so did which bill's KV cache survived.
+#
+# The order encodes one rule: everything that can share a bill's prefilled
+# cache goes before the one thing that cannot.
+#
+#   - The 8 standard types all render the same bill text and share its
+#     prefix, so after the first call they are cache hits. Measured on VA
+#     2026S1 (2026-08-27): 90-100% warm.
+#   - concept_statements shares that prefix too, and is dispatched separately
+#     (SYNC-31) rather than as an artifact_type -- see the dispatch below.
+#   - bill_changelog cannot share it. It builds a two-input prompt (prior
+#     version text + diff), so it always takes its own cache key. Running it
+#     before concept_statements evicted the bill's cache and made concept
+#     statements pay a full prefill: 3 warm out of 20 on that same run,
+#     against 90-100% for everything else. It goes last, always.
+ARTIFACT_DISPATCH_ORDER: tuple[str, ...] = (
+    "bill_summary",
+    "bill_pros_cons",
+    "bill_vote_yes_frame",
+    "bill_vote_no_frame",
+    "bill_supporting_orgs",
+    "bill_opposing_orgs",
+    "bill_impact_analysis",
+    "bill_topics",
+    # last, and deliberately: its own cache key evicts the bill's.
+    "bill_changelog",
+)
+
+# The one type above that cannot reuse a bill's prefilled cache. Named rather
+# than written as a literal at the two places that care, so the reason lives
+# in one place.
+_OWN_CACHE_KEY_TYPES = frozenset({"bill_changelog"})
+
+assert set(ARTIFACT_DISPATCH_ORDER) == ALL_ARTIFACT_TYPES, (
+    "ARTIFACT_DISPATCH_ORDER and ALL_ARTIFACT_TYPES have drifted apart; a "
+    "type recognised but never ordered would silently never dispatch"
+)
+
 
 
 def _peak_memory_mb() -> float:
@@ -307,6 +359,12 @@ async def _process_bill_inner(
         else:
             needs_dispatch.append(artifact_type)
 
+    # SYNC-38: canonical order, not the caller's. See ARTIFACT_DISPATCH_ORDER.
+    needs_dispatch.sort(key=ARTIFACT_DISPATCH_ORDER.index)
+    cache_sharing = [t for t in needs_dispatch if t not in _OWN_CACHE_KEY_TYPES]
+    own_cache_key = [t for t in needs_dispatch if t in _OWN_CACHE_KEY_TYPES]
+
+
     # Only resolve the bill's current version identity if something actually
     # needs it -- a bill fully covered for every requested artifact_type
     # (and already researched, or org research not requested) never needs
@@ -402,17 +460,23 @@ async def _process_bill_inner(
         # see -- this is the handoff.
         org_holder["task"] = org_task
 
-    for artifact_type in needs_dispatch:
+    # SYNC-38: one dispatch body, invoked in two phases with concept
+    # statements between them. A closure rather than a helper taking a dozen
+    # parameters purely to relocate code that has not otherwise changed.
+    #
+    # `continue` became `return`: inside the old loop it meant 'skip to the
+    # next artifact_type', which per-artifact is the same thing.
+    async def _dispatch_artifact(artifact_type: str) -> None:
         if dry_run:
             result["artifacts_generated"].append(artifact_type)
-            continue
+            return  # next artifact_type
         if version is None:
             logger.warning(
                 "session_pipeline_no_version_identity",
                 run_id=run_id, gov_id=gov_id, artifact_type=artifact_type,
             )
             result["artifacts_failed"].append(artifact_type)
-            continue
+            return  # next artifact_type
         dispatch_started = time.monotonic()
         try:
             if artifact_type == "bill_changelog":
@@ -466,6 +530,10 @@ async def _process_bill_inner(
             result["artifact_durations_seconds"][artifact_type] = round(
                 time.monotonic() - dispatch_started, 3
             )
+
+    # Phase 1: everything that shares the bill's prefilled cache.
+    for artifact_type in cache_sharing:
+        await _dispatch_artifact(artifact_type)
 
     # SYNC-31: ConceptStatementSet generation, folded in from the now-retired
     # standalone concept_statement_dispatch.py weekly job (SYNC-32). No
@@ -525,6 +593,26 @@ async def _process_bill_inner(
                     result["concept_statements_duration_seconds"] = round(
                         time.monotonic() - concept_started, 3
                     )
+
+    # Phase 2: bill_changelog last, after concept statements have used the
+    # cache. Its two-input prompt takes its own key, so running it earlier is
+    # what made concept_statements pay a full prefill (SYNC-38).
+    #
+    # This is deliberately NOT wrapped in a try/finally, though /pm-review
+    # asked. Moving changelog after the concept block does create a path where
+    # it never dispatches -- but only one, and it is not a path where the
+    # answer matters. Every *contained* concept failure is caught above
+    # (BrokerClientError on the status check, broad Exception on the dispatch),
+    # and phase 2 still runs; there is a test for exactly that. The only escape
+    # is an unexpected exception from get_concept_statement_set, which
+    # propagates out of _process_bill, out of asyncio.gather (no
+    # return_exceptions) and ends the entire run -- at which point whether this
+    # one bill's changelog was written before everything stopped is not a
+    # meaningful difference, and the next run's coverage check re-dispatches it
+    # anyway. A try/finally awaiting inside a possibly-cancelled scope would be
+    # real added risk in exchange for that.
+    for artifact_type in own_cache_key:
+        await _dispatch_artifact(artifact_type)
 
     # SYNC-37: collect the organisation research launched before the artifact
     # loop. By now it has almost always finished during work that used to
@@ -650,7 +738,7 @@ async def run_legbot_pipeline(
         raise ValueError("limit must be a positive integer")
     if not artifact_types:
         raise ValueError("artifact_types must be non-empty")
-    unrecognized = set(artifact_types) - ALL_8_ARTIFACT_TYPES
+    unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
 
@@ -751,7 +839,7 @@ async def run_single_bill_full(
     broker_api_token: str | None = None,
 ) -> dict:
     """Run every requested artifact type (default: all of
-    ALL_8_ARTIFACT_TYPES) plus optional org research and concept-statement
+    ALL_ARTIFACT_TYPES) plus optional org research and concept-statement
     generation for ONE caller-specified bill, in a single call -- SYNC-15
     (include_concept_statements added SYNC-31).
 
@@ -763,7 +851,7 @@ async def run_single_bill_full(
     existing coverage-check skip logic unchanged -- this is not a
     force-regenerate mode, already-present artifacts are still skipped.
 
-    artifact_types: None means "all of them" (ALL_8_ARTIFACT_TYPES) -- the
+    artifact_types: None means "all of them" (ALL_ARTIFACT_TYPES) -- the
     one place in this module a missing value gets a real default rather than
     being rejected, since "run everything for this bill" is this function's
     whole reason to exist. An empty list is still rejected, same as
@@ -796,11 +884,11 @@ async def run_single_bill_full(
         raise ValueError("bill_source is required")
 
     resolved_artifact_types = (
-        list(ALL_8_ARTIFACT_TYPES) if artifact_types is None else artifact_types
+        list(ALL_ARTIFACT_TYPES) if artifact_types is None else artifact_types
     )
     if not resolved_artifact_types:
         raise ValueError("artifact_types must be non-empty")
-    unrecognized = set(resolved_artifact_types) - ALL_8_ARTIFACT_TYPES
+    unrecognized = set(resolved_artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
 
@@ -886,3 +974,5 @@ async def run_scheduled_session_pipeline(config: dict) -> dict:
     except ValueError as exc:
         logger.error("session_pipeline_batch_invalid_config", error=str(exc))
         return {"success": False, "error": "invalid_config", "detail": str(exc)}
+
+

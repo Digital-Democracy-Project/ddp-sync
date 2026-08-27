@@ -245,7 +245,7 @@ def test_bill_changelog_artifact_type_is_accepted():
 def test_bill_topics_artifact_type_is_accepted():
     """SYNC-1: bill_topics must be dispatchable through this second real
     caller too, not just run_legbot_pipeline -- both import the same
-    ALL_8_ARTIFACT_TYPES recognition gate."""
+    ALL_ARTIFACT_TYPES recognition gate."""
     client = _make_authed_client()
     payload = dict(_VALID_PAYLOAD, artifact_type="bill_topics")
 
