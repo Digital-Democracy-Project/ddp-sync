@@ -512,12 +512,25 @@ class TestPollInterval:
     were taken within 5s of going idle.
     """
 
-    def test_the_production_default_is_below_the_old_constant(self):
-        """The whole point. At 5s a bill's window was about double a
-        competitor's cadence; the fix is to put it under."""
+    def test_the_production_default_is_one_second(self):
+        """Exact, not a range. /pm-review's point: `< 5.0` passes on 4.9, and
+        the product decision was specifically 1.0 -- chosen to cut the ~3.4s
+        of per-call polling latency measured on VA 2026S1."""
         from ddp_sync.config import SyncSettings
-        assert SyncSettings().legbot_poll_interval_seconds < 5.0
-        assert SyncSettings().legbot_poll_interval_seconds > 0
+        assert SyncSettings().legbot_poll_interval_seconds == 1.0
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "-0.0", "abc", ""])
+    def test_an_unusable_interval_falls_back_instead_of_busy_looping(self, bad, monkeypatch):
+        """This is operator-editable, and 0 or a negative would turn the poll
+        loop into a hot loop against CAMS. Falls back rather than raising: a
+        typo in a .env should not stop the pipeline starting."""
+        from ddp_sync.config import get_settings
+        monkeypatch.setenv("LEGBOT_POLL_INTERVAL_SECONDS", bad)
+        get_settings.cache_clear()
+        try:
+            assert get_settings().legbot_poll_interval_seconds == 1.0
+        finally:
+            get_settings.cache_clear()
 
     def test_it_is_read_from_settings_not_hardcoded(self, monkeypatch):
         from ddp_sync.config import get_settings

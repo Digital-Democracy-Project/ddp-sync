@@ -6,11 +6,37 @@ Production uses Secrets Manager. Local dev uses .env.
 """
 
 import json
+import math
 import os
 import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Optional
+
+
+def _positive_float(raw: str | None, *, default: float, name: str) -> float:
+    """Parse an operator-supplied float that must be > 0 and finite.
+
+    Falls back to `default` on anything unusable rather than raising: a typo
+    in a .env should not stop the service starting, and the log line says
+    exactly what was ignored. SYNC-39 -- the value this guards is a poll
+    interval, where 0 or a negative would busy-loop against CAMS rather than
+    poll briskly.
+    """
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a number; using %s", name, raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logging.getLogger(__name__).warning(
+            "%s=%r must be a finite number greater than 0; using %s",
+            name, raw, default)
+        return default
+    return value
 
 logger = logging.getLogger(__name__)
 
@@ -166,33 +192,40 @@ class SyncSettings:
     legbot_dispatch_timeout_seconds: float = 1200.0
 
     # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
-    # finished. It was a module constant of 5 in legbot_client.py, and that
-    # number -- not anything about scheduling -- is why bills kept losing
-    # their prefilled MLX cache.
+    # finished. It was a module constant of 5 in legbot_client.py.
     #
-    # A bill's MLX call finishes, but ddp-sync does not learn that for up to
-    # one interval. It then writes the artifact to the broker, checks whether
-    # a concept set exists, and dispatches again, costing roughly another
-    # interval. Its worker sits idle for that whole time while the bill is
-    # very much not finished with it. Every other in-flight bill is polling on
-    # the same rhythm, so one of them asks for a worker about every interval,
-    # and MLXWorkerSupervisor cannot tell an idle-but-still-needed worker from
-    # a free one.
+    # The dominant cost is latency on every call, not cache loss. Measured on
+    # VA 2026S1 (2026-08-27), from CAMS's own mlx_artifact_started ->
+    # mlx_artifact_complete timestamps, which are not quantised by this poll:
     #
-    # Measured on VA 2026S1 (2026-08-27), 20 bills, 2 workers, concurrency 2:
-    #     a bill's last call -> its re-prefill    median 10s   (~2 intervals)
-    #     a competitor taking that warm worker    median  5s   (~1 interval)
-    #     taken within 5s of going idle           17 of 22
-    # The window a bill leaves open was about double the cadence at which a
-    # competitor asked, which makes the loss near-certain rather than
-    # occasional: 13 of 18 cold concept_statements prefills were exactly this.
+    #     real generation, warm call   median 1.72s   p90 3.57s   (n=220)
+    #     real prefill, cold           median 0.80s   p90 3.11s   (n=88)
+    #     client-observed per call     median 5.10s   min 5.10s
     #
-    # 1.0 puts the window under the cadence instead of over it. The cost is
-    # more HTTP polls against a service on the same machine, which is nothing
-    # next to the 15-30s prefill each lost cache costs.
+    # So roughly 3.4s of every call was this loop sleeping, on 220 calls in an
+    # 830s run. That waste is unconditional -- it happens whether or not any
+    # cache is ever lost.
     #
-    # Configurable rather than a constant so this can be tuned without a code
-    # change, and so the next person to suspect it can move it and measure.
+    # There is a second, weaker effect. A bill does not learn its own call
+    # finished for up to one interval, then spends about another on a broker
+    # write and a coverage check before dispatching again, leaving its worker
+    # idle while it still needs it; a competing bill polling on the same
+    # rhythm claims it, and MLXWorkerSupervisor cannot tell an idle-but-still-
+    # needed worker from a free one. That accounted for 13 of 18 cold
+    # concept_statements prefills.
+    #
+    # Do NOT over-claim that effect. Shortening the interval shortens the
+    # competitor's cadence too, so the ratio may be preserved and the steal
+    # rate may not improve at all. Whether it does is an open question this
+    # value exists to let someone answer -- and on a corpus like VA 2026S1 a
+    # lost prefill costs under a second anyway. It costs much more on a large
+    # bill, where prefill is genuinely expensive, which is where cache
+    # retention still matters.
+    #
+    # 1.0 is chosen to cut the per-call latency, which is the part that is
+    # measured and certain. Configurable rather than a constant per this
+    # repo's own no-hardcoded-config rule, so it can be tuned and measured
+    # without a code change.
     legbot_poll_interval_seconds: float = 1.0
 
     # AGENTS-42 (2026-08-19): a single 45-call incident (one crashed MLX
@@ -367,8 +400,13 @@ def _load_from_env() -> dict:
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),
-        "legbot_poll_interval_seconds": float(
-            os.getenv("LEGBOT_POLL_INTERVAL_SECONDS", "1")
+        # Guarded because this is operator-editable and 0 or a negative would
+        # turn the poll loop into a hot loop against CAMS rather than merely
+        # polling briskly. Falls back to the default rather than raising: a
+        # typo in a .env should not stop the pipeline starting.
+        "legbot_poll_interval_seconds": _positive_float(
+            os.getenv("LEGBOT_POLL_INTERVAL_SECONDS"), default=1.0,
+            name="LEGBOT_POLL_INTERVAL_SECONDS",
         ),
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
