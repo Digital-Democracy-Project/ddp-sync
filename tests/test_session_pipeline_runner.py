@@ -1397,3 +1397,297 @@ def test_session_pipeline_concurrency_defaults_to_one_not_four():
     value via SESSION_PIPELINE_CONCURRENCY once that validation happens.
     """
     assert SyncSettings().session_pipeline_concurrency == 1
+
+
+# --- SYNC-37: organisation research runs alongside the artifact set ------
+
+def _patch_org_dispatch(side_effect=None, return_value=None):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner"
+        ".generate_and_store_bill_organization_positions",
+        new=AsyncMock(side_effect=side_effect, return_value=return_value),
+    )
+
+
+def _patch_artifact(side_effect=None, return_value=None):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(
+            side_effect=side_effect,
+            return_value=return_value if return_value is not None
+            else {"id": 1, "status": "complete"},
+        ),
+    )
+
+
+class TestConcurrentOrgResearch:
+    """Organisation research used to sit between a bill's artifacts and its
+    concept statements, blocking both.
+
+    Traced live on the WA 2025-2026 run of 2026-08-27: eight artifacts five
+    seconds apart, every one a warm cache hit, then ~45 seconds of nothing
+    while the bill waited on a network call, then concept_statements paying a
+    full re-read because the idle MLX worker had -- correctly -- been given to
+    another bill. Six of seven full-artifact bills paid 2-3 prefills.
+    """
+
+    @pytest.mark.asyncio
+    async def test_org_research_starts_before_the_artifact_loop_finishes(self):
+        """The point of the ticket.
+
+        A test that merely observed both finishing would pass on the old
+        sequential code too, so the artifact dispatch below refuses to return
+        until org research has demonstrably begun. On the old code this can
+        never happen, and wait_for turns that into a failure rather than a
+        hung suite.
+        """
+        org_started = asyncio.Event()
+
+        async def _org(**kwargs):
+            org_started.set()
+            return None
+
+        async def _artifact(**kwargs):
+            await asyncio.wait_for(org_started.wait(), timeout=2)
+            return {"id": 1, "status": "complete"}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(side_effect=_artifact), \
+             _patch_org_status({"has_rows": False, "row_count": 0}), \
+             _patch_org_dispatch(side_effect=_org):
+            result = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], True, limit=10,
+                include_concept_statements=False,
+            )
+
+        bill_result = result["results"][0]
+        assert bill_result["artifacts_generated"] == ["bill_summary"]
+        assert bill_result["org_research_dispatched"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_result_dict_keeps_its_shape_on_every_org_outcome(self):
+        """AC3. Those three fields are assembled by a task now instead of
+        inline, and downstream readers get them by name."""
+        # Every branch _run_org_research can return through, not only the
+        # common ones -- /pm-review's point being that a task assembling
+        # these fields is only equivalent to inline assignment if *all* of
+        # them still come out the same.
+        cases = [
+            ("already_researched",
+             {"has_rows": True, "row_count": 3}, None, None, False,
+             {"org_research_dispatched": False,
+              "org_research_skipped_reason": "already_researched",
+              "org_research_duration_seconds": None}),
+            ("dispatched",
+             {"has_rows": False, "row_count": 0}, None, None, False,
+             {"org_research_dispatched": True, "org_research_skipped_reason": None}),
+            ("dispatch_failed",
+             {"has_rows": False, "row_count": 0}, RuntimeError("upstream exploded"),
+             None, False,
+             {"org_research_dispatched": False}),
+            ("status_check_failed",
+             BrokerClientError("broker down"), None, None, False,
+             {"org_research_dispatched": False,
+              "org_research_duration_seconds": None}),
+            ("no_current_version_resolved",
+             {"has_rows": False, "row_count": 0}, None, None, True,
+             {"org_research_dispatched": False,
+              "org_research_skipped_reason": "no_current_version_resolved",
+              "org_research_duration_seconds": None}),
+        ]
+        for label, org_status, org_exc, _unused, no_version, expected in cases:
+            status_patch = (
+                patch("ddp_sync.pipelines.session_pipeline_runner"
+                      ".get_bill_organization_positions_status",
+                      new=AsyncMock(side_effect=org_status))
+                if isinstance(org_status, Exception) else _patch_org_status(org_status)
+            )
+            with _patch_lister([_CANDIDATE]), _patch_coverage(None), \
+                 _patch_version(None if no_version else _VERSION_IDENTITY), \
+                 _patch_artifact(), status_patch, \
+                 _patch_org_dispatch(side_effect=org_exc):
+                result = await run_legbot_pipeline(
+                    "fl", "2026F", ["bill_summary"], True, limit=10,
+                    include_concept_statements=False,
+                )
+
+            bill_result = result["results"][0]
+            for key, value in expected.items():
+                assert bill_result[key] == value, f"{key} in the {label} case"
+            if label == "dispatch_failed":
+                assert "upstream exploded" in bill_result["org_research_skipped_reason"]
+            if label == "status_check_failed":
+                assert "broker down" in bill_result["org_research_skipped_reason"]
+            # A bill is never killed by its own organisation research.
+            assert bill_result["error"] is None, f"error set in the {label} case"
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reports_dispatched_without_dispatching(self):
+        """The dry_run branch returns before touching anything real, and it
+        is the one branch that reports dispatched=True having done nothing."""
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_org_status({"has_rows": False, "row_count": 0}), \
+             _patch_org_dispatch() as mock_org:
+            result = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], True, limit=10,
+                include_concept_statements=False, dry_run=True,
+            )
+
+        mock_org.assert_not_awaited()
+        bill_result = result["results"][0]
+        assert bill_result["org_research_dispatched"] is True
+        assert bill_result["org_research_skipped_reason"] is None
+        assert bill_result["org_research_duration_seconds"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_org_task_is_awaited_even_when_the_rest_of_the_bill_raises(self):
+        """AC2, and the real hazard in making this a task.
+
+        A task nobody awaits becomes an "exception was never retrieved"
+        warning at collection time and a silently discarded result. Here the
+        concept-statement step raises something its own handler does not
+        catch, so the exception leaves _process_bill entirely -- and the org
+        task still has to be cleaned up on the way out.
+        """
+        observed = []
+        org_in_flight = asyncio.Event()
+
+        async def _org(**kwargs):
+            org_in_flight.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                observed.append("cancelled")
+                raise
+
+        async def _artifact(**kwargs):
+            # Makes the interleaving deterministic: the org task is genuinely
+            # in flight, not merely created, by the time the bill blows up.
+            await asyncio.wait_for(org_in_flight.wait(), timeout=2)
+            return {"id": 1, "status": "complete"}
+
+        before = asyncio.all_tasks()
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(side_effect=_artifact), \
+             _patch_org_status({"has_rows": False, "row_count": 0}), \
+             _patch_org_dispatch(side_effect=_org), \
+             _patch_concept_set(side_effect=RuntimeError("not a BrokerClientError")):
+            with pytest.raises(RuntimeError, match="not a BrokerClientError"):
+                await run_legbot_pipeline(
+                    "fl", "2026F", ["bill_summary"], True, limit=10,
+                    include_concept_statements=True,
+                )
+
+        assert observed == ["cancelled"], "the org task outlived its bill"
+        assert not (asyncio.all_tasks() - before), "a task was left running"
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_run_mid_bill_does_not_orphan_the_org_task(self):
+        """AC2's other half. A run has been stopped mid-bill for real, twice,
+        under memory pressure."""
+        observed = []
+        artifact_running = asyncio.Event()
+
+        async def _org(**kwargs):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                observed.append("cancelled")
+                raise
+
+        async def _artifact(**kwargs):
+            artifact_running.set()
+            await asyncio.sleep(30)
+            return {"id": 1, "status": "complete"}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(side_effect=_artifact), \
+             _patch_org_status({"has_rows": False, "row_count": 0}), \
+             _patch_org_dispatch(side_effect=_org):
+            run = asyncio.create_task(run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], True, limit=10,
+                include_concept_statements=False,
+            ))
+            await asyncio.wait_for(artifact_running.wait(), timeout=2)
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run
+
+        assert observed == ["cancelled"], "the org task survived the cancelled run"
+
+    @pytest.mark.asyncio
+    async def test_an_already_failed_org_task_still_has_its_exception_retrieved(self):
+        """The case /pm-review caught, and the subtlest one here.
+
+        `_run_org_research` catches BrokerClientError around its status
+        lookup and broad Exception around the dispatch -- but an unexpected
+        error from the status lookup itself (a transport error, a timeout,
+        a malformed response) escapes. That was true of the old inline code
+        too and still fails the bill the same way; what is new is that the
+        failure now lands in a *task*.
+
+        A task that has already finished with an exception is `done()`. A
+        cleanup that only touches pending tasks skips it, nobody ever
+        retrieves the exception, and asyncio reports "Task exception was
+        never retrieved" at collection time with the result thrown away.
+        """
+        org_failed = asyncio.Event()
+
+        async def _status(**kwargs):
+            org_failed.set()
+            raise TimeoutError("status lookup timed out")
+
+        async def _artifact(**kwargs):
+            # Guarantees the org task is already done-with-exception by the
+            # time the bill's own failure happens.
+            await asyncio.wait_for(org_failed.wait(), timeout=2)
+            return {"id": 1, "status": "complete"}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(side_effect=_artifact), patch(
+                 "ddp_sync.pipelines.session_pipeline_runner"
+                 ".get_bill_organization_positions_status",
+                 new=AsyncMock(side_effect=_status),
+             ), _patch_concept_set(
+                 side_effect=RuntimeError("the bill's own failure")
+             ), patch(
+                 "ddp_sync.pipelines.session_pipeline_runner.logger.warning"
+             ) as mock_warning:
+            # The bill's own failure is what propagates. The org task's
+            # exception must not displace it.
+            with pytest.raises(RuntimeError, match="the bill's own failure"):
+                await run_legbot_pipeline(
+                    "fl", "2026F", ["bill_summary"], True, limit=10,
+                    include_concept_statements=True,
+                )
+
+        # ...and it must not vanish either. Retrieving the exception is what
+        # this log line proves happened: it is emitted from the same `await`
+        # that consumes the task, so it cannot be present unless the already-
+        # done task was actually awaited.
+        events = [c.args[0] for c in mock_warning.call_args_list if c.args]
+        assert "session_pipeline_org_research_task_failed" in events, (
+            f"the org task's exception was never retrieved; warnings: {events}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_started_when_org_research_is_not_requested(self):
+        """include_org_research=False must not create a task to clean up."""
+        status = AsyncMock()
+        org = AsyncMock()
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), patch(
+                 "ddp_sync.pipelines.session_pipeline_runner"
+                 ".get_bill_organization_positions_status", new=status,
+             ), patch(
+                 "ddp_sync.pipelines.session_pipeline_runner"
+                 ".generate_and_store_bill_organization_positions", new=org,
+             ):
+            result = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10,
+                include_concept_statements=False,
+            )
+
+        status.assert_not_awaited()
+        org.assert_not_awaited()
+        assert result["results"][0]["org_research_dispatched"] is False

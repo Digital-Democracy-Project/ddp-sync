@@ -118,15 +118,26 @@ async def generate_and_store_bill_organization_positions(
         )
         return []
 
-    # Longer timeout than dispatch_bill_question's own 120s default --
-    # empirically justified, not a guess: a real live validation run against
-    # FL SJR 2F (2026-08-01) completed in ~119s server-side, right at the
-    # edge of that default, and a client-side spurious timeout fired before
-    # the result could be read. find_bill_positions does real web search
-    # (potentially several searches), unlike the single-reasoning-call
-    # question types that default was calibrated for.
+    # AGENTS-74 / SYNC-37: no per-call timeout override. This used to pass
+    # timeout_seconds=240.0, raised from a then-120s default after a real FL
+    # SJR 2F run finished at ~119s and tripped a spurious client-side
+    # timeout. That default is now settings.legbot_dispatch_timeout_seconds
+    # (1200s), so the override no longer raises anything -- it lowers it.
+    #
+    # And the defect was never the duration. When this cap fires the call
+    # returns *fewer organisations than exist*, and nothing downstream can
+    # tell "found 3 organisations" from "found 3 before we cut it off": a
+    # silently truncated research pass looks exactly like a thorough one, and
+    # the missing organisations are indistinguishable from real absence.
+    # Observed calls run 25-45s, nowhere near the cap, and no log line has
+    # ever shown it firing -- so this changes nothing in the common case and
+    # only matters in the tail, which is precisely the case it corrupted.
+    #
+    # This is not unbounded. legbot_dispatch_timeout_seconds still applies
+    # here, and LEGBOT_STATE_TIMEOUT_S (7200s) bounds the CAMS side. What is
+    # gone is an arbitrary inner cap, not the backstops.
     find_result = await dispatch_bill_question(
-        resolved_bill_source, "find_bill_positions", timeout_seconds=240.0
+        resolved_bill_source, "find_bill_positions"
     )
     find_answer = find_result["answer"]
     find_model_name = find_result.get("backend")
