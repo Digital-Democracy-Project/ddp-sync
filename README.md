@@ -140,6 +140,45 @@ protection already exists one layer down (CAMS's own `_mlx_semaphore`, `ddp-agen
 shipped 2026-08-04, serializes every MLX call regardless of caller), and this pipeline dispatches sequentially
 anyway; MLX inference also has no per-call cost, unlike a metered cloud API.
 
+**Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
+**blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and
+`ensure_bill_exists()` has run — the latest point it can start, since both can still return early —
+and is awaited at the very end.
+
+**Why:** org research sat between a bill's artifact set and its concept statements, and it is a slow
+network call. Traced live on the WA 2025-2026 run of 2026-08-27: eight artifacts five seconds apart,
+every one a warm MLX cache hit, then **~45 seconds of dead MLX time** while the bill waited, then
+`concept_statements` paying a full re-prefill because the idle worker had — correctly — been given to
+another bill in the meantime. **Six of seven full-artifact bills paid 2–3 prefills instead of one.**
+The MLX fleet was not at fault; the scheduling around it was.
+
+**The task has an owner, deliberately.** A task that raises with nobody awaiting it becomes an
+unhandled-exception warning and a silently lost result. `_process_bill()` is now a thin wrapper whose
+`finally` consumes the task on every path — normal return, exception, and whole-run cancellation
+(which has happened twice under memory pressure) — with `_process_bill_inner()` handing it up through
+`org_holder` the moment it creates one. Two subtleties worth not re-deriving: the task is consumed
+**unconditionally, not only while pending**, because a task that already finished *with an exception*
+is `done()` and skipping it leaves that exception unretrieved; and an org-task failure logged from
+inside `finally` **cannot displace** whatever exception is already on its way out, so a bill that
+failed for its own reason still reports that reason.
+
+The per-bill result dict is unchanged in shape and content — `_run_org_research()` returns the three
+`org_research_*` fields and the caller merges them, rather than assigning them inline.
+
+**Also removed: `timeout_seconds=240.0` on `find_bill_positions`.** The defect was never the duration.
+When that cap fired the call returned *fewer organisations than exist*, and nothing downstream could
+tell "found 3 organisations" from "found 3 before we cut it off" — a silently truncated research pass
+looked exactly like a thorough one. Worth knowing how it got there: it was originally *raised* from a
+then-120s default, after a real FL SJR 2F run finished at ~119s and tripped a spurious client-side
+timeout. The default is now `settings.legbot_dispatch_timeout_seconds` (1200s), **so the override had
+quietly inverted into a lower cap.** This is not unbounded — that setting still applies, and
+`LEGBOT_STATE_TIMEOUT_S` (7200s) bounds the CAMS side. What is gone is an arbitrary inner cap, not the
+backstops.
+
+**Not yet measured.** Whether this actually reclaims the ~45s/bill, and whether prefills-per-bill
+falls toward 1, needs a run with both this and AGENTS-74 deployed. Tracked as **AGENTS-75**; the
+baseline to beat is AGENTS-71's 62.9% fleet idle.
+
 **Updated 2026-08-17 (SYNC-21, paired with `ddp-broker-py`'s BROKER-80):** `_process_bill()` now calls a new
 `ensure_bill_exists()` (`broker_client.py`) before dispatching any artifact/org-research work for a bill that
 isn't already fully covered — gated on `not dry_run` and on a fresh `get_archived_bill_text()` check (a bill
