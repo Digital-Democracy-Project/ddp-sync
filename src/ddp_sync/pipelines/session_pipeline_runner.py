@@ -122,9 +122,134 @@ def _peak_memory_mb() -> float:
     return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
 
 
+async def _run_org_research(
+    *,
+    bill_openstates_id: str,
+    gov_id: str,
+    jurisdiction_iso2: str,
+    session_code: str,
+    version: dict | None,
+    dry_run: bool,
+    run_id: str,
+    broker_api_base: str | None,
+    broker_api_token: str | None,
+) -> dict:
+    """One bill's organisation research, as a self-contained unit of work.
+
+    Lifted out of _process_bill unchanged (SYNC-37) so it can run as a task
+    alongside the artifact loop instead of blocking it. It returns the three
+    result fields it used to assign directly and the caller merges them, so
+    the per-bill result dict keeps exactly the shape every downstream reader
+    already expects.
+
+    It still catches its own dispatch failures, as it always did -- a bill
+    whose organisation research fails keeps its artifacts. That mattered when
+    this was inline and matters more now: an exception escaping into a task
+    nobody handles becomes an unhandled-exception warning and a silently lost
+    result.
+    """
+    out = {
+        "org_research_dispatched": False,
+        "org_research_skipped_reason": None,
+        "org_research_duration_seconds": None,
+    }
+    try:
+        org_status = await get_bill_organization_positions_status(
+            bill_openstates_id=bill_openstates_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+    except BrokerClientError as exc:
+        out["org_research_skipped_reason"] = f"status_check_failed: {exc}"
+        return out
+
+    if org_status["has_rows"]:
+        out["org_research_skipped_reason"] = "already_researched"
+        return out
+    if dry_run:
+        out["org_research_dispatched"] = True
+        return out
+    if version is None:
+        out["org_research_skipped_reason"] = "no_current_version_resolved"
+        return out
+
+    org_started = time.monotonic()
+    try:
+        await generate_and_store_bill_organization_positions(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction_iso2,
+            session_code=session_code,
+            version_date=version["version_date"],
+            version_note=version["version_note"],
+            gov_id=gov_id,
+            bill_title=version["bill_title"],
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        out["org_research_dispatched"] = True
+    except Exception as exc:
+        logger.warning(
+            "session_pipeline_org_research_dispatch_failed",
+            run_id=run_id, gov_id=gov_id, error=str(exc),
+        )
+        out["org_research_skipped_reason"] = f"dispatch_failed: {exc}"
+    finally:
+        out["org_research_duration_seconds"] = round(time.monotonic() - org_started, 3)
+    return out
+
+
 async def _process_bill(
     candidate: dict,
+    **kwargs,
+) -> dict:
+    """One bill, with its organisation-research task guaranteed cleaned up.
+
+    SYNC-37 gave _process_bill_inner a task that outlives individual awaits,
+    and a task needs an owner: one that runs on the normal return, on an
+    exception, and on the whole run being cancelled mid-bill (which has
+    happened, twice, under memory pressure). Rather than wrap 130 lines of
+    existing, unchanged bill processing in a try block -- or split it into a
+    helper taking fifteen parameters purely to give `finally` a body -- the
+    ownership lives here, and the inner function hands the task up through
+    `org_holder` the moment it creates one.
+    """
+    org_holder: dict = {}
+    try:
+        return await _process_bill_inner(candidate, org_holder=org_holder, **kwargs)
+    finally:
+        org_task = org_holder.get("task")
+        if org_task is not None:
+            # Consume it unconditionally, not only while it is still
+            # pending. /pm-review caught the difference: a task that has
+            # already finished *with an exception* is `done()`, and skipping
+            # it there leaves that exception unretrieved -- an asyncio
+            # warning at collection time and a result quietly discarded,
+            # which is the exact failure this cleanup exists to prevent.
+            if not org_task.done():
+                org_task.cancel()
+            try:
+                await org_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                # Cannot displace whatever exception is already on its way
+                # out: an `except` inside `finally` only suppresses what it
+                # catches itself. So a bill that failed for its own reason
+                # still reports that reason, and a failure belonging to the
+                # org task is logged as its own event rather than
+                # impersonating the bill's.
+                logger.warning(
+                    "session_pipeline_org_research_task_failed",
+                    run_id=kwargs.get("run_id"),
+                    gov_id=candidate.get("gov_id"),
+                    error=str(exc),
+                )
+
+
+async def _process_bill_inner(
+    candidate: dict,
     *,
+    org_holder: dict,
     jurisdiction_iso2: str,
     session_code: str,
     artifact_types: list[str],
@@ -241,6 +366,42 @@ async def _process_bill(
                 result["duration_seconds"] = round(time.monotonic() - bill_started, 3)
                 return result
 
+    # SYNC-37: organisation research starts here and is awaited at the very
+    # end, instead of running between the artifact loop and concept
+    # statements.
+    #
+    # It used to block. Traced live on the WA 2025-2026 run of 2026-08-27:
+    # eight artifacts five seconds apart, every one a warm cache hit, then
+    # ~45 seconds of nothing while this bill waited on a network call, then
+    # concept_statements paying a full re-read because the idle worker had
+    # been correctly given to another bill in the meantime. Six of seven
+    # full-artifact bills paid 2-3 prefills instead of one.
+    #
+    # This is the latest point it can start: `version` has been resolved and
+    # `ensure_bill_exists` has run, and both of those can still return early
+    # above -- launching before them would leave a task to clean up on paths
+    # that currently just return.
+    #
+    # No new concurrency machinery: run_legbot_pipeline already runs bills
+    # concurrently under a Semaphore, and this is one more await on the same
+    # loop.
+    org_task: asyncio.Task | None = None
+    if include_org_research:
+        org_task = asyncio.create_task(_run_org_research(
+            bill_openstates_id=bill_openstates_id,
+            gov_id=gov_id,
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=session_code,
+            version=version,
+            dry_run=dry_run,
+            run_id=run_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        ))
+        # The wrapper owns cleanup, and it can only clean up a task it can
+        # see -- this is the handoff.
+        org_holder["task"] = org_task
+
     for artifact_type in needs_dispatch:
         if dry_run:
             result["artifacts_generated"].append(artifact_type)
@@ -306,48 +467,6 @@ async def _process_bill(
                 time.monotonic() - dispatch_started, 3
             )
 
-    if include_org_research:
-        try:
-            org_status = await get_bill_organization_positions_status(
-                bill_openstates_id=bill_openstates_id,
-                broker_api_base=broker_api_base,
-                broker_api_token=broker_api_token,
-            )
-        except BrokerClientError as exc:
-            result["org_research_skipped_reason"] = f"status_check_failed: {exc}"
-        else:
-            if org_status["has_rows"]:
-                result["org_research_skipped_reason"] = "already_researched"
-            elif dry_run:
-                result["org_research_dispatched"] = True
-            elif version is None:
-                result["org_research_skipped_reason"] = "no_current_version_resolved"
-            else:
-                org_started = time.monotonic()
-                try:
-                    await generate_and_store_bill_organization_positions(
-                        bill_openstates_id=bill_openstates_id,
-                        jurisdiction=jurisdiction_iso2,
-                        session_code=session_code,
-                        version_date=version["version_date"],
-                        version_note=version["version_note"],
-                        gov_id=gov_id,
-                        bill_title=version["bill_title"],
-                        broker_api_base=broker_api_base,
-                        broker_api_token=broker_api_token,
-                    )
-                    result["org_research_dispatched"] = True
-                except Exception as exc:
-                    logger.warning(
-                        "session_pipeline_org_research_dispatch_failed",
-                        run_id=run_id, gov_id=gov_id, error=str(exc),
-                    )
-                    result["org_research_skipped_reason"] = f"dispatch_failed: {exc}"
-                finally:
-                    result["org_research_duration_seconds"] = round(
-                        time.monotonic() - org_started, 3
-                    )
-
     # SYNC-31: ConceptStatementSet generation, folded in from the now-retired
     # standalone concept_statement_dispatch.py weekly job (SYNC-32). No
     # `version` dependency at all -- unlike every other artifact_type/org
@@ -406,6 +525,15 @@ async def _process_bill(
                     result["concept_statements_duration_seconds"] = round(
                         time.monotonic() - concept_started, 3
                     )
+
+    # SYNC-37: collect the organisation research launched before the artifact
+    # loop. By now it has almost always finished during work that used to
+    # wait for it; if it has not, this is the same wait as before, just at
+    # the end. `_run_org_research` handles its own failures and returns the
+    # same three fields that used to be assigned inline, so the result dict
+    # below is identical in shape and content to what it was.
+    if org_task is not None:
+        result.update(await org_task)
 
     result["duration_seconds"] = round(time.monotonic() - bill_started, 3)
 

@@ -357,3 +357,45 @@ async def test_broker_write_failure_isolated_to_one_organization():
     assert result[0]["outcome"] == "broker_write_failed"
     assert result[0]["position_id"] is None
     assert result[1]["outcome"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_find_bill_positions_has_no_arbitrary_timeout_override(
+    mock_research_run_write,
+):
+    """AGENTS-74 / SYNC-37: no per-call timeout_seconds on this dispatch.
+
+    The old value was 240.0, raised from a then-120s default after a real FL
+    SJR 2F run finished at ~119s and tripped a spurious client-side timeout.
+    That default is now legbot_dispatch_timeout_seconds (1200s), so the
+    override stopped raising the ceiling and started lowering it.
+
+    The defect was never the duration, though. When the cap fires, the call
+    returns fewer organisations than exist -- and nothing downstream can tell
+    "found 3 organisations" from "found 3 before we cut it off", so a
+    truncated research pass is indistinguishable from a thorough one and the
+    missing organisations look like real absence.
+
+    This is not the same as unbounded: legbot_dispatch_timeout_seconds still
+    applies, and LEGBOT_STATE_TIMEOUT_S bounds the CAMS side. Asserting the
+    absence of the argument is the point -- a future "just put a cap back"
+    edit should have to come past this test and its reasoning.
+    """
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result([])),
+    ) as mock_dispatch:
+        await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    find_call = mock_dispatch.await_args_list[0]
+    assert find_call.args[1] == "find_bill_positions"
+    assert "timeout_seconds" not in find_call.kwargs
+
+    # And the value it falls back to, not just the absence of the argument.
+    # /pm-review's concern was that omitting the override could *lower* the
+    # effective timeout if the default were still the old 120s. It is not,
+    # and that default lives in this same repo -- there is no cross-repo
+    # version to coordinate. Asserting it here means a change to that
+    # default has to consider this call site.
+    from ddp_sync.config import SyncSettings
+    assert SyncSettings().legbot_dispatch_timeout_seconds == 1200.0
