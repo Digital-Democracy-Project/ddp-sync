@@ -1691,3 +1691,99 @@ class TestConcurrentOrgResearch:
         status.assert_not_awaited()
         org.assert_not_awaited()
         assert result["results"][0]["org_research_dispatched"] is False
+
+
+# --- SYNC-38: dispatch order is the pipeline's, not the caller's ---------
+
+class TestCanonicalDispatchOrder:
+    """Before this, ALL_8_ARTIFACT_TYPES was a frozenset and _process_bill
+    dispatched in whatever order the caller's artifact_types list happened to
+    use. That decided which artifact ran last, and therefore which bill's KV
+    cache survived -- measured on VA 2026S1: concept_statements warm 3 times
+    out of 20, against 90-100% for every type that ran before bill_changelog.
+    """
+
+    @staticmethod
+    def _order_from(mock_artifact, mock_changelog):
+        calls = [c.kwargs.get("artifact_type") for c in mock_artifact.await_args_list]
+        # the changelog dispatches through its own function, so it carries no
+        # artifact_type kwarg -- its position is what matters, and it is last
+        # by construction if it was awaited at all.
+        return calls, mock_changelog.await_count
+
+    @pytest.mark.asyncio
+    async def test_same_order_regardless_of_how_the_caller_sorts(self):
+        """The point of the ticket."""
+        seen = []
+        for types in (
+            ["bill_summary", "bill_changelog", "bill_topics", "bill_pros_cons"],
+            ["bill_changelog", "bill_pros_cons", "bill_topics", "bill_summary"],
+            ["bill_topics", "bill_summary", "bill_pros_cons", "bill_changelog"],
+        ):
+            with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+                 _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}), \
+                 patch("ddp_sync.pipelines.session_pipeline_runner"
+                       ".generate_and_store_bill_changelog",
+                       new=AsyncMock(return_value={"id": 1, "status": "complete"})):
+                from ddp_sync.pipelines import session_pipeline_runner as spr
+                with patch.object(spr, "generate_and_store_bill_artifact",
+                                  new=AsyncMock(return_value={"id": 1, "status": "complete"})) as ma:
+                    await run_legbot_pipeline(
+                        "fl", "2026F", types, True, limit=10,
+                        include_concept_statements=False,
+                    )
+                    seen.append([c.kwargs.get("artifact_type") for c in ma.await_args_list])
+
+        assert seen[0] == seen[1] == seen[2], f"order followed the caller: {seen}"
+        assert seen[0] == ["bill_summary", "bill_pros_cons", "bill_topics"], seen[0]
+
+    @pytest.mark.asyncio
+    async def test_changelog_is_dispatched_after_concept_statements(self):
+        """The actual cache fix.
+
+        bill_changelog builds a two-input prompt and so takes its own cache
+        key. Running it before concept statements evicts the bill's cache and
+        makes them pay a full prefill -- which is what the run measured.
+        """
+        order = []
+        async def _changelog(**kw):
+            order.append("changelog"); return {"id": 1, "status": "complete"}
+        async def _concepts(**kw):
+            order.append("concepts"); return {"id": 1}
+
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}), \
+             _patch_concept_set(None), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".generate_and_store_bill_changelog", new=AsyncMock(side_effect=_changelog)), \
+             patch("ddp_sync.pipelines.session_pipeline_runner"
+                   ".dispatch_and_store_concept_statements", new=AsyncMock(side_effect=_concepts)):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_changelog", "bill_summary"], True, limit=10,
+                include_concept_statements=True,
+            )
+
+        assert order == ["concepts", "changelog"], (
+            f"changelog must run after concept statements, got {order}"
+        )
+
+    def test_the_order_and_the_validation_set_cannot_drift(self):
+        """A type recognised but never ordered would silently never dispatch,
+        and .index() would raise on a type ordered but not recognised."""
+        from ddp_sync.pipelines.session_pipeline_runner import (
+            ALL_8_ARTIFACT_TYPES, ARTIFACT_DISPATCH_ORDER,
+        )
+        assert set(ARTIFACT_DISPATCH_ORDER) == ALL_8_ARTIFACT_TYPES
+        assert len(ARTIFACT_DISPATCH_ORDER) == len(ALL_8_ARTIFACT_TYPES), "duplicate entry"
+        assert ARTIFACT_DISPATCH_ORDER[-1] == "bill_changelog"
+
+    @pytest.mark.asyncio
+    async def test_a_caller_omitting_changelog_still_works(self):
+        """own_cache_key is empty then -- phase 2 must simply do nothing."""
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+             _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
+            result = await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary", "bill_topics"], True, limit=10,
+                include_concept_statements=False,
+            )
+        assert result["results"][0]["artifacts_generated"] == ["bill_summary", "bill_topics"]
