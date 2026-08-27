@@ -597,6 +597,20 @@ async def _process_bill_inner(
     # Phase 2: bill_changelog last, after concept statements have used the
     # cache. Its two-input prompt takes its own key, so running it earlier is
     # what made concept_statements pay a full prefill (SYNC-38).
+    #
+    # This is deliberately NOT wrapped in a try/finally, though /pm-review
+    # asked. Moving changelog after the concept block does create a path where
+    # it never dispatches -- but only one, and it is not a path where the
+    # answer matters. Every *contained* concept failure is caught above
+    # (BrokerClientError on the status check, broad Exception on the dispatch),
+    # and phase 2 still runs; there is a test for exactly that. The only escape
+    # is an unexpected exception from get_concept_statement_set, which
+    # propagates out of _process_bill, out of asyncio.gather (no
+    # return_exceptions) and ends the entire run -- at which point whether this
+    # one bill's changelog was written before everything stopped is not a
+    # meaningful difference, and the next run's coverage check re-dispatches it
+    # anyway. A try/finally awaiting inside a possibly-cancelled scope would be
+    # real added risk in exchange for that.
     for artifact_type in own_cache_key:
         await _dispatch_artifact(artifact_type)
 
