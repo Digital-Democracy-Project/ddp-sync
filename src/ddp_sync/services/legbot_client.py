@@ -33,7 +33,9 @@ from ddp_sync.config import get_settings
 
 logger = structlog.get_logger()
 
-_POLL_INTERVAL_SECONDS = 5
+# SYNC-39: the poll interval used to be a module constant of 5 here. It now
+# lives on SyncSettings (legbot_poll_interval_seconds), which carries the
+# measurements explaining why that number was costing real time.
 _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
@@ -303,7 +305,7 @@ async def _dispatch_and_await(
                     task_id=task_id, question_type=question_type,
                     inference_timeout_seconds=timeout_seconds,
                 )
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(settings.legbot_poll_interval_seconds)
         else:
             # SYNC-20: giving up here must not just walk away from the CAMS
             # task -- without this, it keeps running as an orphan no one is

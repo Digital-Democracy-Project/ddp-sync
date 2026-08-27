@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,6 +30,12 @@ class _FakeSettings:
     # need to think about it. Tests that DO exercise the timeout/cancel path
     # set this explicitly to whatever ceiling they want to hit quickly.
     legbot_queue_wait_timeout_seconds: float = 3600.0
+
+    # SYNC-39: real production default is 1.0. Zero here so the poll loop does
+    # not add wall-clock to a suite that fakes every HTTP call anyway -- a test
+    # asserting timeout behaviour cares about the deadline, not the cadence.
+    # The one test that cares about the interval itself sets it explicitly.
+    legbot_poll_interval_seconds: float = 0.0
 
 
 def _mock_client(
@@ -492,3 +500,65 @@ class TestAgents42TwoPhaseTimeout:
                 await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
 
         mock_client.delete.assert_awaited_once()
+
+
+# --- SYNC-39: the poll interval is configuration, and it is what governs ---
+
+class TestPollInterval:
+    """The 5-second constant this replaces was why bills lost their prefilled
+    MLX cache. Measured on VA 2026S1 (2026-08-27): a bill left its worker idle
+    for ~10s -- about two poll intervals of its own bookkeeping -- while every
+    competing bill asked for a worker roughly every 5s. 17 of 22 warm workers
+    were taken within 5s of going idle.
+    """
+
+    def test_the_production_default_is_below_the_old_constant(self):
+        """The whole point. At 5s a bill's window was about double a
+        competitor's cadence; the fix is to put it under."""
+        from ddp_sync.config import SyncSettings
+        assert SyncSettings().legbot_poll_interval_seconds < 5.0
+        assert SyncSettings().legbot_poll_interval_seconds > 0
+
+    def test_it_is_read_from_settings_not_hardcoded(self, monkeypatch):
+        from ddp_sync.config import get_settings
+        monkeypatch.setenv("LEGBOT_POLL_INTERVAL_SECONDS", "2.5")
+        get_settings.cache_clear()
+        try:
+            assert get_settings().legbot_poll_interval_seconds == 2.5
+        finally:
+            get_settings.cache_clear()
+
+    @pytest.mark.asyncio
+    async def test_the_loop_actually_sleeps_for_the_configured_interval(self, tmp_path):
+        """Asserting the default alone would pass on code that still slept 5.
+
+        This captures what asyncio.sleep is really called with, so an edit
+        that reintroduces a literal fails here rather than in production.
+        """
+        task_id = "abc123"
+        artifacts_dir = tmp_path / "artifacts"
+        (artifacts_dir / task_id).mkdir(parents=True)
+        (artifacts_dir / task_id / "task_result.json").write_text(
+            json.dumps({"answer": {"text": "x", "insufficient_information": False}})
+        )
+
+        slept = []
+        real_sleep = asyncio.sleep
+
+        async def _record(d, *a, **k):
+            slept.append(d)
+            return await real_sleep(0)
+
+        with patch(
+            "ddp_sync.services.legbot_client.get_settings",
+            return_value=_FakeSettings(
+                cams_artifacts_dir=str(artifacts_dir),
+                legbot_poll_interval_seconds=0.25,
+            ),
+        ), _patch_async_client(
+            _mock_client(statuses=["queued", "queued", "completed"], task_id=task_id)
+        ), patch("ddp_sync.services.legbot_client.asyncio.sleep", new=_record):
+            await dispatch_bill_question("bill text", "summary_500char")
+
+        assert slept, "the poll loop never slept -- did the loop change shape?"
+        assert all(d == 0.25 for d in slept), f"slept {slept}, expected 0.25s each"

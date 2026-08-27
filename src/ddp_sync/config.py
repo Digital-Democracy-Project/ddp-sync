@@ -165,6 +165,36 @@ class SyncSettings:
     # data (four artifacts silently failed) for no actual cost savings.
     legbot_dispatch_timeout_seconds: float = 1200.0
 
+    # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
+    # finished. It was a module constant of 5 in legbot_client.py, and that
+    # number -- not anything about scheduling -- is why bills kept losing
+    # their prefilled MLX cache.
+    #
+    # A bill's MLX call finishes, but ddp-sync does not learn that for up to
+    # one interval. It then writes the artifact to the broker, checks whether
+    # a concept set exists, and dispatches again, costing roughly another
+    # interval. Its worker sits idle for that whole time while the bill is
+    # very much not finished with it. Every other in-flight bill is polling on
+    # the same rhythm, so one of them asks for a worker about every interval,
+    # and MLXWorkerSupervisor cannot tell an idle-but-still-needed worker from
+    # a free one.
+    #
+    # Measured on VA 2026S1 (2026-08-27), 20 bills, 2 workers, concurrency 2:
+    #     a bill's last call -> its re-prefill    median 10s   (~2 intervals)
+    #     a competitor taking that warm worker    median  5s   (~1 interval)
+    #     taken within 5s of going idle           17 of 22
+    # The window a bill leaves open was about double the cadence at which a
+    # competitor asked, which makes the loss near-certain rather than
+    # occasional: 13 of 18 cold concept_statements prefills were exactly this.
+    #
+    # 1.0 puts the window under the cadence instead of over it. The cost is
+    # more HTTP polls against a service on the same machine, which is nothing
+    # next to the 15-30s prefill each lost cache costs.
+    #
+    # Configurable rather than a constant so this can be tuned without a code
+    # change, and so the next person to suspect it can move it and measure.
+    legbot_poll_interval_seconds: float = 1.0
+
     # AGENTS-42 (2026-08-19): a single 45-call incident (one crashed MLX
     # request wedging LegBot's single-instance MLX pool, ddp-agents'
     # legbot/reasoning.py _MLXInstancePool) burned ~14h of wall-clock time --
@@ -336,6 +366,9 @@ def _load_from_env() -> dict:
         ),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
+        ),
+        "legbot_poll_interval_seconds": float(
+            os.getenv("LEGBOT_POLL_INTERVAL_SECONDS", "1")
         ),
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
