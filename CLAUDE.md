@@ -120,8 +120,8 @@ and the same write **creates a parallel row** instead — leaving a `failed` row
 and a `complete` row for the same version and artifact type with nothing to say
 which is current. Demonstrated both ways inside a rolled-back transaction:
 delta 0 rows with them NULL, +1 row and a duplicate group with
-`prompt_version="v2"`. SYNC-42 (#85, in review as of 2026-08-28) adds a test
-in `tests/test_broker_client.py` that scans `src/` and fails, naming file and
+`prompt_version="v2"`. SYNC-42 (#85, merged) added a test in
+`tests/test_broker_client.py` that scans `src/` and fails, naming file and
 line, if anything starts populating them. Adding "proper provenance" is not a
 free improvement — it silently
 changes what a retry means, and retry semantics have to be decided first.
@@ -147,9 +147,10 @@ original design and it could not have worked.
 it is **editable by a human reviewer** in ddp-broker-py's admin Content
 fieldset. So never write it unconditionally: sending `""` on every write lets
 each regeneration silently erase a reviewer's own notes. Send the field only
-when there is something to record. SYNC-43 (`ddp-sync` #86 + `ddp-broker-py`
-#363, in review as of 2026-08-28) establishes the convention of a
-`source_support=inferred: ...` prefix there, queried with
+when there is something to record. `ddp-broker-py` #363 (merged) is what makes
+the field writable at all; SYNC-43 (`ddp-sync` #86, in review as of
+2026-08-28) establishes the convention of a `source_support=inferred: ...`
+prefix there, queried with
 `bill_version__session_code` — note `session_code` lives on `BillVersion`, not
 `BillArtifact`, and the obvious spelling raises `FieldError`.
 
