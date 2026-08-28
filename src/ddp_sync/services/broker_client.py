@@ -423,8 +423,18 @@ async def get_latest_bill_version(
     generate_and_store_bill_changelog's compare_version backfill check
     (SYNC-26 follow-up) can target the same dev/prod broker its caller
     already resolved via X-DDP-Environment, rather than whatever this
-    process's global config happens to be. No token override here since
-    this read endpoint sends no Authorization header, unlike the writes.
+    process's global config happens to be. The Bearer token comes from
+    settings only — no per-call override, because no caller has needed one
+    yet; today's sole caller (bill_version.py's check_and_reingest_version)
+    passes no base override either, so base and token always agree. Add the
+    same broker_api_token parameter the rest of this module carries before
+    giving any caller a base override, or it would send the process-wide
+    token to whichever broker the base names.
+
+    Sends Authorization: Bearer for the same reason
+    get_concept_statement_set does — see its docstring. This read is
+    public on ddp-broker-py itself, but production reaches the broker
+    through ddp-api, which authenticates every path (SYNC-40).
 
     Raises:
         BrokerClientError: ddp-broker-py rejected the request or was
@@ -437,10 +447,13 @@ async def get_latest_bill_version(
             "DDP_BROKER_API_BASE is not configured — cannot read BillVersion."
         )
 
+    headers = {"Authorization": f"Bearer {settings.ddp_broker_api_token}"}
+
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
                 f"{resolved_api_base}/api/bill-versions/latest/",
+                headers=headers,
                 params={"bill_openstates_id": bill_openstates_id},
             )
         except httpx.RequestError as exc:
@@ -553,8 +566,19 @@ async def get_concept_statement_set(
 ) -> dict | None:
     """Read the current *published* ConceptStatementSet for a bill, if any
     (ddp-infra PLAN-bill-concept-polling.md §1.1's public read endpoint,
-    GET /api/concept-statements/ — unauthenticated, resolves
+    GET /api/concept-statements/, resolving
     ConceptStatementSet.objects.current(...)).
+
+    Sends Authorization: Bearer, like every other call in this module.
+    ddp-broker-py itself does not require auth on this path, and the local
+    dev broker on http://localhost:8080 is the bare broker — which is why
+    this read shipped without a header and why the omission stayed
+    invisible. Production is not the bare broker: it sits behind ddp-api
+    at https://api.digitaldemocracyproject.org/broker, which authenticates
+    *every* path, so the headerless read returned 401 on every bill of
+    every prod-targeted run (SYNC-40). "This endpoint is public" is a fact
+    about ddp-broker-py, not about how we reach it — do not drop the
+    header again on that reasoning.
 
     broker_api_base/broker_api_token: optional per-call override, same shape
     as get_bill_artifacts' own (SYNC-10) -- None (the default) preserves
@@ -581,15 +605,19 @@ async def get_concept_statement_set(
     """
     settings = get_settings()
     resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
     if not resolved_api_base:
         raise BrokerClientError(
             "DDP_BROKER_API_BASE is not configured — cannot read ConceptStatementSet."
         )
 
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
                 f"{resolved_api_base}/api/concept-statements/",
+                headers=headers,
                 params={
                     "gov_id": gov_id,
                     "jurisdiction": jurisdiction_iso2,
