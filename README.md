@@ -133,13 +133,44 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 `/trigger/bill-artifact-generation` (SYNC-9) is `run_legbot_pipeline`'s (`pipelines/session_pipeline_runner.py`)
 first real production caller — it fills in whatever `BillArtifact` types are missing for every bill in one
 jurisdiction/session. Takes a JSON body, not query params: `jurisdiction_iso2`, `session_code`, `artifact_types`
-(list, e.g. `["bill_summary", "bill_pros_cons"]`), `include_org_research` (bool), `limit` (int), `dry_run` (bool,
-default `false`) — no field has a default except `dry_run`, matching `run_legbot_pipeline`'s own "no silent
+(list, e.g. `["bill_summary", "bill_pros_cons"]`), `include_org_research` (bool), `limit` (int),
+`retry_failed` (bool, SYNC-42), `dry_run` (bool, default `false`) — no field has a default except `dry_run`,
+matching `run_legbot_pipeline`'s own "no silent
 defaults for cost-relevant params" discipline. `limit` has no upper ceiling (removed 2026-08-15 — the previous
 hard cap of 25 assumed there was no concurrency protection for a shared CAMS/LegBot/MLX backend, but that
 protection already exists one layer down (CAMS's own `_mlx_semaphore`, `ddp-agents/src/legbot/reasoning.py`,
 shipped 2026-08-04, serializes every MLX call regardless of caller), and this pipeline dispatches sequentially
 anyway; MLX inference also has no per-call cost, unlike a metered cloud API.
+
+**Updated 2026-08-28 (SYNC-42): `retry_failed` is required, and it reaches `failed` and nothing else.**
+Once a `BillArtifact` was recorded `failed`, no later run ever retried it and there was no option to —
+so a failure caused by a bug, an outage or a since-fixed prompt stayed failed permanently, and the only
+recovery was deleting rows in the broker by hand. This was found the expensive way: a dry run meant to
+verify a LegBot prompt fix reported `gen=0` on all five bills, because the four artifacts it existed to
+re-test were precisely the ones marked `failed`.
+
+`retry_failed` has **no default on either endpoint** — omitting it is a 422 — for the same reason every
+other cost-relevant field here is required: a retry spends real inference and rewrites real rows. The one
+place it does default is `run_scheduled_session_pipeline`, to `False`, because a cron job must keep doing
+exactly what it did yesterday when a new option appears. Pair it with `dry_run=true` first; the preview
+honours the flag by construction, since it reports whatever reaches `needs_dispatch`.
+
+**`complete` is never dispatched at any value of this flag**, and the skip for it is deliberately kept a
+*separate branch* from the failed one in `session_pipeline_runner.py` so that no later edit can widen retry
+onto it by folding the two buckets together. `pending`/`processing` stay stuck, knowingly: `failed` is
+terminal and unambiguous, while a `pending` row may be genuinely in flight, and telling "stuck" from "still
+running" needs an age threshold and a way to observe in-flight dispatches — a different design.
+
+**One invariant this depends on, which is not obvious.** A retry *replaces* the failed row rather than adding
+one only while ddp-sync leaves `model_version`/`prompt_version`/`prompt_hash` unset — which it does at every
+call site today. `ddp-broker-py` resolves which row a write lands on using those fields, and its
+`unique_billartifact_generation` index includes them; because Postgres treats NULLs as distinct, that index
+does not constrain these rows at all. What actually makes the NULL case work is `_existing_ai_row`'s explicit
+both-NULL branch in the broker. Populate those fields and a retry stops matching the failed row and creates a
+parallel one instead — leaving a `failed` and a `complete` row for the same version and type with nothing to
+say which is current. **So these fields stay unset while `retry_failed` exists**, and two tests enforce it:
+one pins the wire payload, the other scans `src/` for any call site that populates them and fails naming the
+file and line.
 
 **Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
 **blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and
@@ -232,7 +263,9 @@ jurisdiction/session candidate-listing step entirely, since the caller already k
 want. Body: `bill_openstates_id`, `jurisdiction`, `session_code`, `gov_id` (required — the coverage check is
 keyed by `(jurisdiction, session, gov_id)`, not `bill_openstates_id` alone), `bill_source`, `artifact_types`
 (optional list — omit or pass `null` for all 8), `include_org_research` (no default, same "every cost-relevant
-param is a conscious choice" discipline as everything else in this file), `dry_run` (default `false`).
+param is a conscious choice" discipline as everything else in this file), `retry_failed` (no default either —
+see the SYNC-42 note above; this endpoint carries the identical field and semantics), `dry_run` (default
+`false`).
 
 **Synchronous, unlike `/trigger/legbot-analyze-bill`'s async/202 shape** — returns the full per-bill result
 payload directly. That endpoint's dispatch-and-poll design exists specifically because it's ddp-next's
