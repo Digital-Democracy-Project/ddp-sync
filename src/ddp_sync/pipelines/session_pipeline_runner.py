@@ -308,6 +308,7 @@ async def _process_bill_inner(
     include_org_research: bool,
     include_concept_statements: bool,
     dry_run: bool,
+    retry_failed: bool,
     run_id: str,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
@@ -352,9 +353,29 @@ async def _process_bill_inner(
     for artifact_type in artifact_types:
         status = (existing.get(artifact_type) or {}).get("status")
         if status == "failed":
-            result["artifacts_skipped_failed_previously"].append(artifact_type)
+            # SYNC-42: the only status retry_failed reaches. Before it, a row
+            # recorded failed stayed failed forever -- a failure caused by a
+            # bug or outage since fixed could only be recovered by deleting
+            # rows in the broker by hand.
+            if retry_failed:
+                needs_dispatch.append(artifact_type)
+            else:
+                result["artifacts_skipped_failed_previously"].append(artifact_type)
         elif status is not None:
             # complete, pending, or processing -- has a row, don't retry.
+            #
+            # SYNC-42 deliberately leaves this branch alone, and keeps it a
+            # separate branch rather than folding the two skip buckets
+            # together, so that no later edit can widen retry_failed onto
+            # `complete` by accident. `complete` must never be dispatched
+            # under any flag value.
+            #
+            # pending/processing are stuck here the same way failed was, and
+            # that is knowingly not fixed: `failed` is terminal and
+            # unambiguous, while a pending row may be genuinely in flight
+            # right now. Retrying those safely needs an age threshold and a
+            # way to tell "stuck" from "still running", which is a different
+            # design and its own ticket -- not a flag this one can widen.
             result["artifacts_skipped_present"].append(artifact_type)
         else:
             needs_dispatch.append(artifact_type)
@@ -636,15 +657,36 @@ async def run_legbot_pipeline(
     limit: int,
     *,
     include_concept_statements: bool,
+    retry_failed: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
 
-    artifact_types, include_org_research, include_concept_statements, and
-    limit all have NO default -- the caller must decide explicitly, for
-    every parameter with real cost implications. One call can trigger up to
+    artifact_types, include_org_research, include_concept_statements,
+    retry_failed, and limit all have NO default -- the caller must decide
+    explicitly, for every parameter with real cost implications.
+
+    retry_failed (SYNC-42) re-dispatches artifacts whose stored status is
+    "failed", which without it are skipped forever: nothing in this pipeline
+    ever retried a failed row, so a failure caused by a bug, an outage or a
+    prompt change since fixed could only be cleared by deleting rows in the
+    broker by hand. It reaches "failed" and nothing else. A "complete" row is
+    never re-dispatched under any value of this flag.
+
+    A retry REPLACES the failed row rather than adding one, but only while
+    ddp-sync leaves model_version/prompt_version/prompt_hash unset -- which
+    it does today, at every call site. ddp-broker-py resolves the row a write
+    lands on with those two fields in the key (its unique_billartifact_
+    generation index, and _existing_ai_row's explicit both-NULL branch). With
+    them NULL a retry finds the failed row and updates it; the moment
+    anything starts populating them, a retry would stop matching that row and
+    create a parallel one instead, leaving a failed row and a complete row
+    for the same version and type with nothing to say which is current. So:
+    **these fields stay unset while retry_failed exists.** Populating them is
+    not a free provenance improvement -- it changes what a retry means, and
+    needs retry semantics decided first. One call can trigger up to
     11 real dispatches (9 artifacts + org research + concept statements) per
     bill. include_concept_statements is keyword-only (unlike the other
     three, which are positional-or-keyword) -- added after those three
@@ -792,6 +834,7 @@ async def run_legbot_pipeline(
                 include_org_research=include_org_research,
                 include_concept_statements=include_concept_statements,
                 dry_run=dry_run,
+                retry_failed=retry_failed,
                 run_id=run_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
@@ -834,6 +877,7 @@ async def run_single_bill_full(
     artifact_types: list[str] | None,
     include_org_research: bool,
     include_concept_statements: bool,
+    retry_failed: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
@@ -919,6 +963,7 @@ async def run_single_bill_full(
         include_org_research=include_org_research,
         include_concept_statements=include_concept_statements,
         dry_run=dry_run,
+        retry_failed=retry_failed,
         run_id=run_id,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
@@ -946,7 +991,14 @@ async def run_scheduled_session_pipeline(config: dict) -> dict:
             (sync_schedule.yaml). Required keys: jurisdiction_iso2,
             session_code, artifact_types, limit. Optional:
             include_org_research (default False), include_concept_statements
-            (default False, SYNC-31), dry_run (default False).
+            (default False, SYNC-31), retry_failed (default False, SYNC-42),
+            dry_run (default False).
+
+            retry_failed defaults here even though the trigger endpoints
+            require it explicitly: a cron job must keep doing exactly what it
+            did yesterday when a new option appears, and re-dispatching every
+            previously-failed artifact on a schedule is not something a YAML
+            block should start doing by omission.
 
     Returns:
         run_legbot_pipeline's own result dict on success. On a missing
@@ -969,6 +1021,7 @@ async def run_scheduled_session_pipeline(config: dict) -> dict:
             config.get("include_org_research", False),
             config["limit"],
             include_concept_statements=config.get("include_concept_statements", False),
+            retry_failed=config.get("retry_failed", False),
             dry_run=config.get("dry_run", False),
         )
     except ValueError as exc:

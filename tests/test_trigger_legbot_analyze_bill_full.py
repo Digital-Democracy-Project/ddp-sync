@@ -28,6 +28,7 @@ _VALID_PAYLOAD = {
     "bill_source": "https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
     "include_org_research": False,
     "include_concept_statements": False,
+    "retry_failed": False,
 }
 
 _RUN_RESULT = {
@@ -282,3 +283,39 @@ def test_include_concept_statements_true_is_passed_through():
 
     assert response.status_code == 200
     assert mock_run.await_args.kwargs["include_concept_statements"] is True
+
+
+def test_retry_failed_is_required_not_defaulted():
+    """SYNC-42/AC1 on this endpoint too. /pm-review flagged that the required
+    -field and pass-through coverage only demonstrably exercised the batch
+    endpoint; both models carry the field, so both are pinned."""
+    client = _make_authed_client()
+    payload = {k: v for k, v in _VALID_PAYLOAD.items() if k != "retry_failed"}
+
+    with _patch_run() as mock_run:
+        response = client.post(
+            "/trigger/legbot-analyze-bill-full",
+            json=payload,
+            headers={"X-DDP-Environment": "dev"},
+        )
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()
+    assert any(
+        err["loc"][-1] == "retry_failed" for err in response.json()["detail"]
+    ), response.json()
+
+
+def test_retry_failed_is_passed_through():
+    client = _make_authed_client()
+
+    for value in (True, False):
+        with _patch_run() as mock_run:
+            response = client.post(
+                "/trigger/legbot-analyze-bill-full",
+                json=dict(_VALID_PAYLOAD, retry_failed=value),
+                headers={"X-DDP-Environment": "dev"},
+            )
+
+        assert response.status_code == 200
+        assert mock_run.await_args.kwargs["retry_failed"] is value
