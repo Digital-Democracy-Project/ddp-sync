@@ -399,3 +399,168 @@ async def test_find_bill_positions_has_no_arbitrary_timeout_override(
     # default has to consider this call site.
     from ddp_sync.config import SyncSettings
     assert SyncSettings().legbot_dispatch_timeout_seconds == 1200.0
+
+
+# ---------------------------------------------------------------------------
+# SYNC-41: LegBot answers that omit "verdict"
+#
+# LegBot degrades to {"insufficient_information": True, "reason": ...} --
+# with no "verdict" and no "explanation" -- whenever it fails before reaching
+# the model (backend error, unparseable JSON, unresolved URL). That is its
+# documented, intended behavior. A bare verify_answer["verdict"] subscript
+# raised KeyError on it, and because the caller wraps this whole function in
+# `except Exception`, one unverifiable citation cost the bill its entire
+# org-research pass (observed live on FL 2026E HB 5205E: a >100-page PDF the
+# Anthropic API rejected on page count).
+# ---------------------------------------------------------------------------
+
+def _degraded_verify_result(reason="backend error: a maximum of 100 PDF pages"):
+    """LegBot's pre-model degradation shape -- ddp-agents' legbot/handlers.py
+    builds exactly this in four places."""
+    return {
+        "answer": {"insufficient_information": True, "reason": reason},
+        "backend": "openai",
+    }
+
+
+@pytest.mark.asyncio
+async def test_verify_answer_without_verdict_still_writes_the_row():
+    """Acceptance criteria 2 and 5: no "verdict" key must write the row, not
+    raise."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_degraded_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 1
+    assert result[0]["outcome"] == "written"
+
+    write_kwargs = mock_write.await_args_list[0].kwargs
+    # "pending", never "" -- ddp-broker-py serializes verification_verdict as
+    # a ChoiceField over pending/confirmed/not_confirmed, so a blank string
+    # would be a 400. This asserts the value, not just the absence of a raise.
+    assert write_kwargs["verification_verdict"] == "pending"
+    assert write_kwargs["verification_insufficient_information"] is True
+    assert write_kwargs["verification_content_incomplete"] is False
+
+
+@pytest.mark.asyncio
+async def test_verify_answer_reason_is_carried_into_the_explanation():
+    """Acceptance criterion 4: the reason must reach somewhere an operator
+    can read it. A degraded answer carries "reason", not "explanation" --
+    reading only "explanation" would drop the one field saying why the page
+    could not be read, conflating it with "the page does not support the
+    claim" (AGENTS-65)."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_degraded_verify_result(reason="backend error: 100 PDF pages")),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert mock_write.await_args_list[0].kwargs["verification_explanation"] == (
+        "backend error: 100 PDF pages"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_explanation_still_wins_when_both_are_present():
+    """The reason fallback must not shadow a real model explanation."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    verify = _verify_result()
+    verify["answer"]["reason"] = "should not be used"
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=verify),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    write_kwargs = mock_write.await_args_list[0].kwargs
+    assert write_kwargs["verification_explanation"] == "explanation text"
+    assert write_kwargs["verification_verdict"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_one_unverifiable_citation_does_not_cost_the_other_organizations():
+    """Acceptance criterion 3: this is the actual damage the bug did. The
+    caller wraps this function in `except Exception`, so the KeyError did not
+    just lose one citation -- it lost org research for the whole bill."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+        {"org_name": "Audubon", "position": "support", "citation_url": "https://c.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(side_effect=[
+            _degraded_verify_result(),
+            _verify_result(),
+            _verify_result(verdict="not_confirmed"),
+        ]),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(side_effect=[{"id": 1}, {"id": 2}, {"id": 3}]),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert len(result) == 3
+    assert [r["outcome"] for r in result] == ["written", "written", "written"]
+    assert mock_write.await_count == 3
+    verdicts = [c.kwargs["verification_verdict"] for c in mock_write.await_args_list]
+    assert verdicts == ["pending", "confirmed", "not_confirmed"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_finding_is_skipped_not_fatal():
+    """The wider check SYNC-41 asked for: every field of a finding is
+    model-produced too, so a bare finding["citation_url"] was the same latent
+    bug one level up. A finding missing a required field skips itself and the
+    other organizations are still written."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support"},  # no citation_url
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 2}),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert [r["outcome"] for r in result] == ["malformed_finding", "written"]
+    assert mock_write.await_count == 1
+    assert mock_write.await_args_list[0].kwargs["org_name"] == "Chamber of Commerce"

@@ -192,10 +192,29 @@ async def generate_and_store_bill_organization_positions(
 
     results = []
     for finding in positions:
-        org_name = finding["org_name"]
-        position = finding["position"]
-        citation_url = finding["citation_url"]
+        # SYNC-41: every field of a finding is model-produced, so none of
+        # them is guaranteed to be present. A malformed entry skips itself
+        # rather than raising -- a bare subscript here would abort the whole
+        # bill, which is the same failure this ticket fixed below.
+        org_name = finding.get("org_name", "")
+        position = finding.get("position", "")
+        citation_url = finding.get("citation_url", "")
         citation_excerpt = finding.get("citation_excerpt", "")
+        if not (org_name and position and citation_url):
+            logger.warning(
+                "find_bill_positions returned a finding missing a required "
+                "field — skipping it, keeping the rest",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                present_keys=sorted(finding),
+            )
+            results.append({
+                "org_name": org_name,
+                "position": position,
+                "outcome": "malformed_finding",
+                "position_id": None,
+            })
+            continue
 
         claim = _build_claim(
             org_name=org_name,
@@ -248,11 +267,37 @@ async def generate_and_store_bill_organization_positions(
             broker_api_token=broker_api_token,
         )
         if verify_answer is not None:
+            # SYNC-41: "pending", not "" -- ddp-broker-py serializes this as
+            # a ChoiceField over pending/confirmed/not_confirmed, so a blank
+            # string is a 400, not a null. "pending" is already this field's
+            # established meaning for "verification produced no verdict"
+            # (the broker's own test_failed_verification_write_leaves_verdict
+            # _pending covers the dispatch-failure case), and it is what the
+            # else-branch below already leaves behind.
+            #
+            # LegBot omits "verdict" whenever it degrades to
+            # insufficient_information without reaching the model at all --
+            # a backend error, unparseable JSON, an unresolved URL (four
+            # such paths in ddp-agents' legbot/handlers.py). Those answers
+            # carry "reason" instead of "explanation", so fall back to it:
+            # without that, the one field saying *why* the page could not be
+            # read is dropped on the floor.
+            explanation = verify_answer.get("explanation") or verify_answer.get("reason", "")
+            if "verdict" not in verify_answer:
+                logger.warning(
+                    "verify_bill_position returned no verdict — recording the "
+                    "row as pending/insufficient rather than failing the bill",
+                    bill_openstates_id=bill_openstates_id,
+                    invocation_id=invocation_id,
+                    org_name=org_name,
+                    citation_url=citation_url,
+                    reason=explanation,
+                )
             write_kwargs.update(
-                verification_verdict=verify_answer["verdict"],
+                verification_verdict=verify_answer.get("verdict", "pending"),
                 verification_insufficient_information=verify_answer.get("insufficient_information", False),
                 verification_content_incomplete=verify_answer.get("content_looks_incomplete", False),
-                verification_explanation=verify_answer.get("explanation", ""),
+                verification_explanation=explanation,
                 verify_model_name=verify_model_name,
             )
         # else: verification_verdict stays at ddp-broker-py's own "pending"
