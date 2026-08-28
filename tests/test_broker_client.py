@@ -1103,7 +1103,9 @@ async def test_inferred_source_support_is_recorded_in_validation_notes():
 async def test_direct_source_support_writes_no_marker():
     """AC2: byte-identical to a row written before this existed."""
     payload = await _write_and_capture(source_support="direct")
-    assert payload["validation_notes"] == ""
+    # Omitted entirely, not sent as "": the field is human-editable in the
+    # broker admin, so a blank write would erase a reviewer's notes.
+    assert "validation_notes" not in payload
 
 
 @pytest.mark.asyncio
@@ -1111,7 +1113,7 @@ async def test_absent_source_support_behaves_as_direct():
     """AC3, absent half. This is every artifact until AGENTS-80 merges, so it
     must be the quiet path, not a warning on every write."""
     payload = await _write_and_capture()
-    assert payload["validation_notes"] == ""
+    assert "validation_notes" not in payload
 
 
 @pytest.mark.asyncio
@@ -1121,7 +1123,7 @@ async def test_unrecognised_source_support_behaves_as_direct_and_warns():
     with patch("ddp_sync.services.broker_client.logger") as mock_logger:
         payload = await _write_and_capture(source_support="probably_fine")
 
-    assert payload["validation_notes"] == ""
+    assert "validation_notes" not in payload
     assert mock_logger.warning.called
     assert "source_support_unusable" in mock_logger.warning.call_args.args[0]
 

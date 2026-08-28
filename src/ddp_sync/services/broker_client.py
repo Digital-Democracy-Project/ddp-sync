@@ -230,10 +230,20 @@ async def write_bill_artifact(
         "pinecone_synced_at": pinecone_synced_at,
         "compare_version_date": compare_version_date,
         "compare_version_note": compare_version_note,
-        "validation_notes": _validation_notes_for(
-            source_support, artifact_type=artifact_type
-        ),
     }
+    # SYNC-43: send validation_notes ONLY when there is a marker to write.
+    # The field is editable by a human reviewer in ddp-broker-py's admin, so
+    # sending "" on every write would let each regeneration silently erase a
+    # reviewer's own notes (/pm-review). Omitting it leaves whatever is stored
+    # alone -- the broker has no default for it, deliberately.
+    #
+    # The cost is that a marker set last run survives a run that comes back
+    # "direct", so an artifact can stay flagged after it stops being weakly
+    # grounded. That is the safe direction: over-flagging costs a human a
+    # second look, while the alternative destroys review notes irreversibly.
+    _notes = _validation_notes_for(source_support, artifact_type=artifact_type)
+    if _notes:
+        payload["validation_notes"] = _notes
     headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
