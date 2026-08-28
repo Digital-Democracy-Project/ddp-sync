@@ -505,6 +505,9 @@ async def test_get_latest_bill_version_returns_none_when_not_found():
     call = mock_client.get.await_args
     assert call.args[0] == "http://localhost:8080/api/bill-versions/latest/"
     assert call.kwargs["params"] == {"bill_openstates_id": "abc"}
+    # SYNC-40: prod reaches ddp-broker-py through ddp-api, which
+    # authenticates every path -- this read 401s without the header.
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
 
 
 @pytest.mark.asyncio
@@ -628,6 +631,10 @@ async def test_get_concept_statement_set_returns_none_when_not_found():
     assert call.kwargs["params"] == {
         "gov_id": "abc", "jurisdiction": "FL", "session": "2026",
     }
+    # SYNC-40: this read shipped with no Authorization header. The local
+    # dev broker serves it unauthenticated, so nothing here caught it;
+    # prod sits behind ddp-api and 401'd every bill of every run.
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
 
 
 @pytest.mark.asyncio
@@ -934,6 +941,30 @@ async def test_get_bill_artifacts_override_wins_over_settings():
 
     call = mock_client.get.await_args
     assert call.args[0] == "http://dev-broker:8080/api/bill-artifacts/status/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_set_override_wins_over_settings():
+    # SYNC-40: this function always accepted broker_api_token and
+    # session_pipeline_runner always passed it -- it was simply never used.
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"found": False}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(ddp_broker_api_base="http://prod-broker:8080", ddp_broker_api_token="prod-token"),
+    ), _patch_async_client(mock_client):
+        await get_concept_statement_set(
+            gov_id="SJR 2F", jurisdiction_iso2="FL", session_code="2026F",
+            broker_api_base="http://dev-broker:8080", broker_api_token="dev-token",
+        )
+
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://dev-broker:8080/api/concept-statements/"
     assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
 
 
