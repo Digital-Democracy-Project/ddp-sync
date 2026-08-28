@@ -52,3 +52,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Scratch file written by sandboxed tooling to test write access (SYNC-41:
+# one was committed by accident). Never part of the source tree.
+.sandbox-write-probe
