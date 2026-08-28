@@ -158,11 +158,20 @@ async def dispatch_bill_position_verification(
             at call time.
 
     Returns:
-        See _dispatch_and_await. answer contains "verdict"
-        ("confirmed"/"not_confirmed"), "insufficient_information",
-        "content_looks_incomplete", and "explanation" — no
-        "citation_excerpt"/"page_text" field exists in this payload or
-        answer at all.
+        See _dispatch_and_await. On a model-produced answer, answer contains
+        "verdict" ("confirmed"/"not_confirmed"),
+        "insufficient_information", "content_looks_incomplete", and
+        "explanation" — no "citation_excerpt"/"page_text" field exists in
+        this payload or answer at all.
+
+        Do not read any of those as a bare subscript. When LegBot degrades
+        before reaching the model — a backend error, unparseable JSON, an
+        unresolved URL — the answer is only
+        {"insufficient_information": True, "reason": "..."}: no "verdict",
+        no "explanation", and "reason" instead. That shape is normal and
+        expected, not a malfunction, and callers must handle it (SYNC-41,
+        where a bare answer["verdict"] cost a bill its whole org-research
+        pass).
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't
