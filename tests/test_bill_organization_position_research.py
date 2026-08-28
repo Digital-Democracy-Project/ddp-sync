@@ -564,3 +564,71 @@ async def test_malformed_finding_is_skipped_not_fatal():
     assert [r["outcome"] for r in result] == ["malformed_finding", "written"]
     assert mock_write.await_count == 1
     assert mock_write.await_args_list[0].kwargs["org_name"] == "Chamber of Commerce"
+
+
+# --- /pm-review round 1 follow-ups -----------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_object_finding_is_skipped_not_fatal():
+    """/pm-review caught this: `positions` is a JSON list straight out of the
+    model, so an entry can be a null or a bare string, not just a dict with a
+    missing key. Those reach .get() and raise AttributeError -- the same
+    whole-bill loss the KeyError caused, through a different door."""
+    positions = [
+        None,
+        "Sierra Club supports this bill",
+        {"org_name": "Chamber of Commerce", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=_verify_result()),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 3}),
+    ) as mock_write:
+        result = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    assert [r["outcome"] for r in result] == [
+        "malformed_finding", "malformed_finding", "written",
+    ]
+    assert mock_write.await_count == 1
+    assert mock_write.await_args_list[0].kwargs["org_name"] == "Chamber of Commerce"
+
+
+@pytest.mark.asyncio
+async def test_null_verdict_is_treated_as_no_verdict():
+    """A present-but-null "verdict" is a broker 400 rather than a KeyError,
+    so `.get("verdict", "pending")` alone would not have covered it
+    (/pm-review). Same for a blank string."""
+    positions = [
+        {"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid"},
+    ]
+    verify = {
+        "answer": {
+            "verdict": None,
+            "insufficient_information": True,
+            "explanation": "",
+            "reason": "backend error: could not read the page",
+        },
+        "backend": "openai",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
+        new=AsyncMock(return_value=_find_result(positions)),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_position_verification",
+        new=AsyncMock(return_value=verify),
+    ), patch(
+        "ddp_sync.pipelines.bill_organization_position_research.write_bill_organization_position",
+        new=AsyncMock(return_value={"id": 1}),
+    ) as mock_write:
+        await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+
+    write_kwargs = mock_write.await_args_list[0].kwargs
+    assert write_kwargs["verification_verdict"] == "pending"
+    # And a blank explanation falls through to reason, rather than writing
+    # the empty string -- pinning the `or` rather than fallback-on-missing.
+    assert write_kwargs["verification_explanation"] == "backend error: could not read the page"

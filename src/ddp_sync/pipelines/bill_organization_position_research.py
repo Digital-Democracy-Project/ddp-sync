@@ -192,10 +192,30 @@ async def generate_and_store_bill_organization_positions(
 
     results = []
     for finding in positions:
-        # SYNC-41: every field of a finding is model-produced, so none of
-        # them is guaranteed to be present. A malformed entry skips itself
+        # SYNC-41: a finding is model-produced, so neither its shape nor
+        # any of its fields is guaranteed. A malformed entry skips itself
         # rather than raising -- a bare subscript here would abort the whole
-        # bill, which is the same failure this ticket fixed below.
+        # bill, which is the same failure this ticket fixed below. The
+        # isinstance check is not belt-and-braces: `positions` is a JSON
+        # list straight out of the model, so a null or a bare string in it
+        # would reach .get() and raise AttributeError, costing the bill
+        # exactly what the KeyError did (caught in /pm-review).
+        if not isinstance(finding, dict):
+            logger.warning(
+                "find_bill_positions returned a non-object finding — "
+                "skipping it, keeping the rest",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                finding_type=type(finding).__name__,
+            )
+            results.append({
+                "org_name": "",
+                "position": "",
+                "outcome": "malformed_finding",
+                "position_id": None,
+            })
+            continue
+
         org_name = finding.get("org_name", "")
         position = finding.get("position", "")
         citation_url = finding.get("citation_url", "")
@@ -282,8 +302,16 @@ async def generate_and_store_bill_organization_positions(
             # carry "reason" instead of "explanation", so fall back to it:
             # without that, the one field saying *why* the page could not be
             # read is dropped on the floor.
+            # `or`, not a .get() default: /pm-review noted that "verdict"
+            # can be present-but-null or blank as easily as absent, and both
+            # are a broker 400 rather than a KeyError. An *unexpected*
+            # non-empty verdict is deliberately still sent through and left
+            # to fail the broker's own ChoiceField -- that is one organization
+            # losing its write, loudly, rather than model drift being quietly
+            # rewritten to "pending" here.
+            verdict = verify_answer.get("verdict") or "pending"
             explanation = verify_answer.get("explanation") or verify_answer.get("reason", "")
-            if "verdict" not in verify_answer:
+            if not verify_answer.get("verdict"):
                 logger.warning(
                     "verify_bill_position returned no verdict — recording the "
                     "row as pending/insufficient rather than failing the bill",
@@ -294,7 +322,7 @@ async def generate_and_store_bill_organization_positions(
                     reason=explanation,
                 )
             write_kwargs.update(
-                verification_verdict=verify_answer.get("verdict", "pending"),
+                verification_verdict=verdict,
                 verification_insufficient_information=verify_answer.get("insufficient_information", False),
                 verification_content_incomplete=verify_answer.get("content_looks_incomplete", False),
                 verification_explanation=explanation,
