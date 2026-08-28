@@ -440,6 +440,9 @@ async def generate_and_store_bill_artifact(
         content=content,
         status="complete",
         model_name=model_name,
+        # SYNC-43: AGENTS-80's source_support, recorded rather than dropped.
+        # Only "inferred" marks anything -- see _validation_notes_for.
+        source_support=answer.get("source_support"),
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
@@ -683,6 +686,7 @@ async def generate_and_store_bill_changelog(
             content=content,
             status="complete",
             model_name=model_name,
+            source_support=answer.get("source_support"),  # SYNC-43
             compare_version_date=archived["old_version_date"],
             compare_version_note=archived["old_version_note"],
             broker_api_base=broker_api_base,

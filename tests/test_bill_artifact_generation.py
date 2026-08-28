@@ -969,3 +969,115 @@ async def test_failed_row_write_itself_failing_is_swallowed_not_raised():
         await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_summary")
 
     assert mock_write.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# SYNC-43: source_support reaches write_bill_artifact from both success paths
+#
+# The mapping itself is unit-tested in test_broker_client.py. What is tested
+# here is the wiring -- `answer.get("source_support")` at the two call sites
+# that write a *complete* artifact. /pm-review pointed out this was the
+# load-bearing gap: a regression there stores inferred artifacts unmarked,
+# which is the exact failure SYNC-43 exists to prevent, and no test in either
+# file would have caught it.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_source_support_reaches_the_artifact_write():
+    dispatch_result = {
+        "answer": {
+            "text": "A plain-language summary.",
+            "source_support": "inferred",
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert mock_write.await_args.kwargs["source_support"] == "inferred"
+
+
+@pytest.mark.asyncio
+async def test_source_support_reaches_the_changelog_write():
+    dispatch_result = {
+        "answer": {
+            "sections_added": ["A new section."],
+            "sections_modified": [],
+            "sections_removed": [],
+            "policy_implications": "Broadens eligibility.",
+            "source_support": "inferred",
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        new=AsyncMock(return_value=_ARCHIVED),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 3, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert mock_write.await_args.kwargs["source_support"] == "inferred"
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_passes_direct_through_unchanged():
+    """The other half: the wiring must not hard-code "inferred"."""
+    dispatch_result = {
+        "answer": {
+            "text": "A plain-language summary.",
+            "source_support": "direct",
+            "insufficient_information": False,
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert mock_write.await_args.kwargs["source_support"] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_artifact_carries_no_source_support():
+    """A withheld answer has no grounding claim to record, so the failure
+    paths deliberately pass nothing."""
+    dispatch_result = {
+        "answer": {"insufficient_information": True, "source_support": "inferred"},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert "source_support" not in write_kwargs

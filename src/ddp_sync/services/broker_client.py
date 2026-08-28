@@ -48,6 +48,80 @@ class BrokerClientError(Exception):
     success or a silent None."""
 
 
+# SYNC-43: how LegBot's source_support (AGENTS-80) is recorded on a
+# BillArtifact.
+#
+# AGENTS-80 lets LegBot return a weakly-grounded answer instead of
+# withholding it, tagged source_support="inferred" rather than "direct".
+# Without somewhere to put that, an inferred artifact is stored looking
+# exactly like a directly-supported one -- the content is recovered, but a
+# reader cannot tell a figure quoted from the bill apart from a
+# characterisation the model supplied.
+#
+# The marker goes in validation_notes, NOT review_status. review_status
+# already defaults to pending_review for every artifact ddp-broker-py
+# stores (1278 of 1459 rows in the dev broker), and its write path resets it
+# to pending_review on every write by design -- so it does not discriminate
+# and could never have been the signal. It is also not caller-writable, on
+# purpose: a generating service must not be able to mark its own output
+# approved. validation_notes is empty on every existing row, so a note there
+# is unambiguous.
+#
+# The prefix is load-bearing, not decoration -- it is what makes the marker
+# queryable, which is SYNC-43's AC4:
+#
+#     BillArtifact.objects.filter(
+#         bill_version__session_code="2026E",
+#         validation_notes__startswith="source_support=inferred",
+#     )
+#
+# (session_code lives on BillVersion, not BillArtifact -- the join is
+# required, and writing it the obvious way raises FieldError. Verified
+# against the dev broker: 1 match out of 198 artifacts for FL 2026E.)
+#
+# Keep it stable. Anything that reformats this string breaks that query.
+_SOURCE_SUPPORT_INFERRED_NOTE = (
+    "source_support=inferred: LegBot classified this answer as derived from "
+    "the bill text rather than stated in it (AGENTS-80). Needs a human read "
+    "before it is treated as quoted fact."
+)
+
+
+def _validation_notes_for(source_support: str | None, *, artifact_type: str) -> str:
+    """Map LegBot's source_support onto the note stored with the artifact.
+
+    "direct", absent, and unrecognised all produce an empty note, so the row
+    is byte-identical to one written before this existed. Only "inferred"
+    marks anything -- treating an unrecognised value as direct is LegBot's
+    own compatibility rule (AGENTS-80), and the safer direction here would
+    arguably be the opposite, but matching the producer matters more than
+    picking a different default on the consumer side.
+
+    The two non-inferred cases are logged differently on purpose. An
+    unrecognised value is a real anomaly -- a producer/consumer mismatch --
+    so it warns. An ABSENT value is simply every artifact until AGENTS-80
+    merges, so warning on it would put a line on every artifact of every
+    run; it is logged at debug, where it is still countable without
+    drowning the signal.
+    """
+    if source_support == "inferred":
+        return _SOURCE_SUPPORT_INFERRED_NOTE
+    if source_support == "direct":
+        return ""
+    if source_support is None:
+        logger.debug(
+            "AUDIT ddp_sync_source_support_absent",
+            artifact_type=artifact_type,
+        )
+        return ""
+    logger.warning(
+        "AUDIT ddp_sync_source_support_unusable — treating as direct",
+        artifact_type=artifact_type,
+        source_support=source_support,
+    )
+    return ""
+
+
 async def write_bill_artifact(
     *,
     bill_openstates_id: str,
@@ -70,6 +144,7 @@ async def write_bill_artifact(
     pinecone_synced_at: str | None = None,
     compare_version_date: str | None = None,
     compare_version_note: str | None = None,
+    source_support: str | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -156,6 +231,19 @@ async def write_bill_artifact(
         "compare_version_date": compare_version_date,
         "compare_version_note": compare_version_note,
     }
+    # SYNC-43: send validation_notes ONLY when there is a marker to write.
+    # The field is editable by a human reviewer in ddp-broker-py's admin, so
+    # sending "" on every write would let each regeneration silently erase a
+    # reviewer's own notes (/pm-review). Omitting it leaves whatever is stored
+    # alone -- the broker has no default for it, deliberately.
+    #
+    # The cost is that a marker set last run survives a run that comes back
+    # "direct", so an artifact can stay flagged after it stops being weakly
+    # grounded. That is the safe direction: over-flagging costs a human a
+    # second look, while the alternative destroys review notes irreversibly.
+    _notes = _validation_notes_for(source_support, artifact_type=artifact_type)
+    if _notes:
+        payload["validation_notes"] = _notes
     headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:

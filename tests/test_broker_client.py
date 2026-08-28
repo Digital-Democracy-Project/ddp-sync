@@ -1114,3 +1114,95 @@ def test_no_production_call_site_populates_artifact_provenance():
         "retry stops replacing the failed row and starts creating a parallel "
         f"one. Decide retry semantics first. Sites: {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# SYNC-43: LegBot's source_support (AGENTS-80) recorded as a review marker
+#
+# AGENTS-80 lets LegBot return a weakly-grounded answer instead of
+# withholding it, tagged source_support="inferred". Without this, ddp-sync
+# dropped the value and stored an inferred artifact looking identical to a
+# directly-supported one -- content recovered, but no way for a reader to
+# tell a quoted figure from a characterisation the model supplied.
+# ---------------------------------------------------------------------------
+
+def _artifact_write_kwargs(**overrides):
+    base = {
+        "bill_openstates_id": "abc",
+        "jurisdiction": "FL",
+        "session_code": "2026E",
+        "version_date": "2026-01-05",
+        "version_note": "Introduced",
+        "artifact_type": "bill_summary",
+        "content": "A summary.",
+    }
+    base.update(overrides)
+    return base
+
+
+async def _write_and_capture(**overrides):
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 1, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(**_artifact_write_kwargs(**overrides))
+
+    return mock_client.post.await_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_inferred_source_support_is_recorded_in_validation_notes():
+    """AC1. The marker has to actually reach the wire, not just the docstring."""
+    payload = await _write_and_capture(source_support="inferred")
+
+    assert payload["validation_notes"].startswith("source_support=inferred")
+    # review_status is NOT sent: it already defaults to pending_review for
+    # every artifact, so it cannot discriminate, and it is deliberately not
+    # caller-writable -- a generating service must not mark its own output
+    # approved.
+    assert "review_status" not in payload
+
+
+@pytest.mark.asyncio
+async def test_direct_source_support_writes_no_marker():
+    """AC2: byte-identical to a row written before this existed."""
+    payload = await _write_and_capture(source_support="direct")
+    # Omitted entirely, not sent as "": the field is human-editable in the
+    # broker admin, so a blank write would erase a reviewer's notes.
+    assert "validation_notes" not in payload
+
+
+@pytest.mark.asyncio
+async def test_absent_source_support_behaves_as_direct():
+    """AC3, absent half. This is every artifact until AGENTS-80 merges, so it
+    must be the quiet path, not a warning on every write."""
+    payload = await _write_and_capture()
+    assert "validation_notes" not in payload
+
+
+@pytest.mark.asyncio
+async def test_unrecognised_source_support_behaves_as_direct_and_warns():
+    """AC3, unrecognised half. A producer/consumer mismatch is a real anomaly,
+    unlike a merely absent value, so this one is loud."""
+    with patch("ddp_sync.services.broker_client.logger") as mock_logger:
+        payload = await _write_and_capture(source_support="probably_fine")
+
+    assert "validation_notes" not in payload
+    assert mock_logger.warning.called
+    assert "source_support_unusable" in mock_logger.warning.call_args.args[0]
+
+
+def test_the_marker_prefix_is_the_queryable_contract():
+    """AC4 depends on this prefix being stable: an operator lists a session's
+    artifacts awaiting review with
+    validation_notes__startswith="source_support=inferred". Reformatting the
+    note breaks that query, so the prefix is pinned separately from the prose."""
+    from ddp_sync.services.broker_client import _SOURCE_SUPPORT_INFERRED_NOTE
+
+    assert _SOURCE_SUPPORT_INFERRED_NOTE.startswith("source_support=inferred")
