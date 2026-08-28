@@ -105,6 +105,54 @@ live checkout (`git checkout main && git pull origin main` in `~/Developer/repos
 separate, deliberate step — check `git status`/`git log` there first to confirm it's actually on
 `main` with no uncommitted work before pulling.
 
+## Writing BillArtifacts: two invariants that look like free improvements
+
+Both of these were established by measurement against the dev broker
+(2026-08-28, SYNC-42 and SYNC-43), and both look like obvious upgrades until
+you check what they actually do.
+
+**Leave `model_version` / `prompt_version` / `prompt_hash` unset.** `ddp-sync`
+passes none of them at any call site today, and all 1,459 artifact rows in the
+dev broker have them NULL. That is load-bearing, not an oversight. ddp-broker-py
+resolves the row a write lands on with those fields in the key, so with them
+NULL a regeneration or retry **updates the existing row**; populate any of them
+and the same write **creates a parallel row** instead — leaving a `failed` row
+and a `complete` row for the same version and artifact type with nothing to say
+which is current. Demonstrated both ways inside a rolled-back transaction:
+delta 0 rows with them NULL, +1 row and a duplicate group with
+`prompt_version="v2"`. SYNC-42 (#85, in review as of 2026-08-28) adds a test
+in `tests/test_broker_client.py` that scans `src/` and fails, naming file and
+line, if anything starts populating them. Adding "proper provenance" is not a
+free improvement — it silently
+changes what a retry means, and retry semantics have to be decided first.
+
+Worth knowing why the constraint does not save you: the
+`unique_billartifact_generation` partial index includes both fields, and
+Postgres treats NULLs as distinct, so **that index does not constrain these
+rows at all**. What makes the NULL case work is an explicit both-NULL branch in
+ddp-broker-py's `_existing_ai_row`. The safety is deliberate application code,
+not the database.
+
+**`review_status` is not a signal you can use, and `validation_notes` must not
+be blanked.** `review_status` defaults to `pending_review` for every artifact
+the broker stores (1,278 of 1,459 rows), and its write path deliberately
+*resets* it to `pending_review` on every write, because an approval belongs to
+specific text. So it does not discriminate — "list everything awaiting review"
+returns nearly the whole table — and it is deliberately not caller-writable,
+since a generating service must not be able to mark its own output approved.
+Do not reach for it as a "this one needs a look" marker; that was SYNC-43's
+original design and it could not have worked.
+
+`validation_notes` is the discriminator instead (empty on all 1,459 rows), and
+it is **editable by a human reviewer** in ddp-broker-py's admin Content
+fieldset. So never write it unconditionally: sending `""` on every write lets
+each regeneration silently erase a reviewer's own notes. Send the field only
+when there is something to record. SYNC-43 (`ddp-sync` #86 + `ddp-broker-py`
+#363, in review as of 2026-08-28) establishes the convention of a
+`source_support=inferred: ...` prefix there, queried with
+`bill_version__session_code` — note `session_code` lives on `BillVersion`, not
+`BillArtifact`, and the obvious spelling raises `FieldError`.
+
 ## No CI
 
 None of `ddp-open-states`, `openstates-core`, `openstates-scrapers`, or `ddp-sync` have CI
