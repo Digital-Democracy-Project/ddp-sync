@@ -138,6 +138,22 @@ class BillArtifactGenerationRequest(BaseModel):
             "a cost or concurrency one."
         ),
     )
+    retry_failed: bool = Field(
+        ...,
+        description=(
+            "Whether to re-dispatch artifacts whose stored status is "
+            "'failed' (SYNC-42). Without this, a failed artifact is skipped "
+            "by every later run forever -- so a failure caused by a bug, an "
+            "outage or a prompt change since fixed can only be cleared by "
+            "deleting rows in the broker by hand. Reaches 'failed' and "
+            "nothing else: a 'complete' artifact is never re-dispatched at "
+            "any value of this flag, and neither are 'pending'/'processing'. "
+            "Retrying costs real inference and rewrites real rows, so like "
+            "every other cost-relevant field here it has no default. Pair it "
+            "with dry_run=true first -- the preview honours it and lists "
+            "exactly what a real retry would dispatch."
+        ),
+    )
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
 
 
@@ -229,6 +245,7 @@ async def trigger_bill_artifact_generation(
             body.include_org_research,
             body.limit,
             include_concept_statements=body.include_concept_statements,
+            retry_failed=body.retry_failed,
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
@@ -421,6 +438,22 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
             "if none is already published (SYNC-31)."
         ),
     )
+    retry_failed: bool = Field(
+        ...,
+        description=(
+            "Whether to re-dispatch artifacts whose stored status is "
+            "'failed' (SYNC-42). Without this, a failed artifact is skipped "
+            "by every later run forever -- so a failure caused by a bug, an "
+            "outage or a prompt change since fixed can only be cleared by "
+            "deleting rows in the broker by hand. Reaches 'failed' and "
+            "nothing else: a 'complete' artifact is never re-dispatched at "
+            "any value of this flag, and neither are 'pending'/'processing'. "
+            "Retrying costs real inference and rewrites real rows, so like "
+            "every other cost-relevant field here it has no default. Pair it "
+            "with dry_run=true first -- the preview honours it and lists "
+            "exactly what a real retry would dispatch."
+        ),
+    )
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
 
 
@@ -472,6 +505,7 @@ async def trigger_legbot_analyze_bill_full(
             artifact_types=body.artifact_types,
             include_org_research=body.include_org_research,
             include_concept_statements=body.include_concept_statements,
+            retry_failed=body.retry_failed,
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,

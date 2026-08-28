@@ -23,6 +23,7 @@ _VALID_PAYLOAD = {
     "artifact_types": ["bill_summary", "bill_pros_cons"],
     "include_org_research": False,
     "include_concept_statements": False,
+    "retry_failed": False,
     "limit": 10,
 }
 
@@ -86,7 +87,7 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
     assert response.status_code == 200
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500,
-        include_concept_statements=False, dry_run=False,
+        include_concept_statements=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None,
     )
 
@@ -118,7 +119,7 @@ def test_valid_payload_returns_200_and_calls_pipeline_with_exact_args():
     assert response.json() == {"bills_considered": 3, "results": []}
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=False, dry_run=False,
+        include_concept_statements=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None,
     )
 
@@ -277,3 +278,38 @@ def test_x_ddp_environment_prod_without_prod_configured_returns_503():
 
     assert response.status_code == 503
     mock_run.assert_not_awaited()
+
+
+def test_retry_failed_is_required_not_defaulted():
+    """SYNC-42/AC1. Retrying spends real inference and rewrites real rows, so
+    it is a conscious choice per call -- omitting it is a 422, not a silent
+    False. This is the same discipline every other cost-relevant field on
+    this model already follows."""
+    client = _make_authed_client()
+    payload = {k: v for k, v in _VALID_PAYLOAD.items() if k != "retry_failed"}
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()
+    assert any(
+        err["loc"][-1] == "retry_failed" for err in response.json()["detail"]
+    ), response.json()
+
+
+def test_retry_failed_true_is_passed_through():
+    client = _make_authed_client()
+    payload = dict(_VALID_PAYLOAD, retry_failed=True)
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 0, "results": []}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["retry_failed"] is True

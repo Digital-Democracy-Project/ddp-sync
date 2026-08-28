@@ -1044,3 +1044,73 @@ async def test_write_bill_organization_research_run_override_wins_over_settings(
     call = mock_client.post.await_args
     assert call.args[0] == "http://dev-broker:8080/api/bill-organization-research-runs/"
     assert call.kwargs["headers"]["Authorization"] == "Bearer dev-token"
+
+
+@pytest.mark.asyncio
+async def test_ddp_sync_never_sends_model_or_prompt_version():
+    """SYNC-42/AC7, made executable rather than left in a docstring.
+
+    A retry only REPLACES a failed BillArtifact row while these three fields
+    are unset. ddp-broker-py picks the row a write lands on with
+    model_version/prompt_version in the key -- its unique_billartifact_
+    generation index includes both, and _existing_ai_row has an explicit
+    both-NULL branch. With them NULL a retry updates the failed row; populate
+    either one and the same retry creates a PARALLEL row instead, leaving a
+    failed row and a complete row for the same version and artifact type with
+    nothing to say which is current. Demonstrated against the dev broker:
+    delta 0 rows with them NULL, +1 row and a duplicate group with
+    prompt_version set.
+
+    So this asserts the wire payload, not the signature default: if anyone
+    starts populating these, this test fails and points at the retry
+    semantics that have to be decided first. /pm-review asked for exactly
+    this guard.
+    """
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 1, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026E",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="text",
+        )
+
+    payload = mock_client.post.await_args.kwargs["json"]
+    assert payload["model_version"] is None
+    assert payload["prompt_version"] is None
+    assert payload["prompt_hash"] is None
+
+
+def test_no_production_call_site_populates_artifact_provenance():
+    """The other half of the same guard: the test above pins the default, this
+    pins that nothing in src/ overrides it."""
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "src"
+    offenders = [
+        f"{path.relative_to(src)}:{i}"
+        for path in src.rglob("*.py")
+        for i, line in enumerate(path.read_text().splitlines(), 1)
+        if any(
+            f"{field}=" in line and not line.lstrip().startswith(("#", "*"))
+            for field in ("model_version", "prompt_version", "prompt_hash")
+        )
+        and "find_" not in line and "verify_" not in line  # org-position fields, not artifacts
+        and ": str | None = None" not in line               # the definitions themselves
+    ]
+    assert offenders == [], (
+        "SYNC-42/AC7: something now sets BillArtifact provenance fields. A "
+        "retry stops replacing the failed row and starts creating a parallel "
+        f"one. Decide retry semantics first. Sites: {offenders}"
+    )
