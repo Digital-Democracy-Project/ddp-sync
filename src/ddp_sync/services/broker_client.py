@@ -425,8 +425,11 @@ async def get_latest_bill_version(
     already resolved via X-DDP-Environment, rather than whatever this
     process's global config happens to be. The Bearer token comes from
     settings only — no per-call override, because no caller has needed one
-    yet; add the same broker_api_token parameter the rest of this module
-    carries when one does.
+    yet; today's sole caller (bill_version.py's check_and_reingest_version)
+    passes no base override either, so base and token always agree. Add the
+    same broker_api_token parameter the rest of this module carries before
+    giving any caller a base override, or it would send the process-wide
+    token to whichever broker the base names.
 
     Sends Authorization: Bearer for the same reason
     get_concept_statement_set does — see its docstring. This read is
