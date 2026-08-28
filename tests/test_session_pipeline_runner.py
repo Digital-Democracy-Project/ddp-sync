@@ -109,31 +109,31 @@ def _default_no_archived_text(monkeypatch):
 @pytest.mark.asyncio
 async def test_rejects_empty_jurisdiction():
     with pytest.raises(ValueError, match="jurisdiction_iso2"):
-        await run_legbot_pipeline("", "2026F", ["bill_summary"], False, 10, include_concept_statements=False)
+        await run_legbot_pipeline("", "2026F", ["bill_summary"], False, 10, include_concept_statements=False, retry_failed=False)
 
 
 @pytest.mark.asyncio
 async def test_rejects_empty_session_code():
     with pytest.raises(ValueError, match="session_code"):
-        await run_legbot_pipeline("fl", "", ["bill_summary"], False, 10, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "", ["bill_summary"], False, 10, include_concept_statements=False, retry_failed=False)
 
 
 @pytest.mark.asyncio
 async def test_rejects_non_positive_limit():
     with pytest.raises(ValueError, match="limit"):
-        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, 0, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, 0, include_concept_statements=False, retry_failed=False)
 
 
 @pytest.mark.asyncio
 async def test_rejects_empty_artifact_types():
     with pytest.raises(ValueError, match="artifact_types"):
-        await run_legbot_pipeline("fl", "2026F", [], False, 10, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "2026F", [], False, 10, include_concept_statements=False, retry_failed=False)
 
 
 @pytest.mark.asyncio
 async def test_rejects_unrecognized_artifact_type():
     with pytest.raises(ValueError, match="Unrecognized"):
-        await run_legbot_pipeline("fl", "2026F", ["not_a_real_type"], False, 10, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "2026F", ["not_a_real_type"], False, 10, include_concept_statements=False, retry_failed=False)
 
 
 @pytest.mark.asyncio
@@ -150,6 +150,7 @@ async def test_bill_topics_is_a_recognized_artifact_type():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_topics"], False, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -183,6 +184,7 @@ async def test_truncated_is_true_when_more_candidates_exist_than_limit():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert result["truncated"] is True
@@ -200,6 +202,7 @@ async def test_truncated_is_false_when_exactly_limit_candidates_exist():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=2,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert result["truncated"] is False
@@ -209,7 +212,7 @@ async def test_truncated_is_false_when_exactly_limit_candidates_exist():
 @pytest.mark.asyncio
 async def test_lister_called_with_limit_plus_one():
     with _patch_lister([]) as mock_lister:
-        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, limit=5, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], False, limit=5, include_concept_statements=False, retry_failed=False)
 
     mock_lister.assert_awaited_once_with("fl", session_code="2026F", limit=6)
 
@@ -231,6 +234,7 @@ async def test_dry_run_dispatches_nothing():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_changelog"], True, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -254,6 +258,7 @@ async def test_present_complete_row_is_skipped_not_regenerated():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -273,6 +278,7 @@ async def test_previously_failed_row_is_skipped_not_retried():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -290,6 +296,7 @@ async def test_missing_row_is_dispatched():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_awaited_once()
@@ -313,6 +320,7 @@ async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_arti
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -332,6 +340,7 @@ async def test_one_artifact_type_failure_does_not_abort_the_bill_or_batch():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -353,6 +362,7 @@ async def test_a_version_mismatch_exception_is_caught_the_same_as_any_other():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert result["results"][0]["artifacts_failed"] == ["bill_changelog"]
@@ -371,6 +381,7 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert result["bills_processed"] == 2
@@ -387,6 +398,7 @@ async def test_missing_version_identity_fails_the_needed_artifacts_not_the_whole
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -414,6 +426,7 @@ async def test_a_normally_returned_failed_status_is_not_counted_as_generated():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -432,6 +445,7 @@ async def test_a_normally_returned_complete_status_is_still_counted_as_generated
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -452,6 +466,7 @@ async def test_bill_changelog_normally_returned_failed_status_is_not_counted_as_
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -468,6 +483,7 @@ async def test_bill_changelog_normally_returned_complete_status_is_still_counted
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_changelog"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -491,6 +507,7 @@ async def test_a_raised_exception_and_a_normal_failed_status_are_both_captured_i
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -516,6 +533,7 @@ async def test_run_legbot_pipeline_artifacts_generated_excludes_declined_bills()
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     completed_bill, declined_bill = result["results"]
@@ -540,6 +558,7 @@ async def test_ensure_called_when_archived_text_exists_and_dispatch_proceeds():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_ensure.assert_awaited_once()
@@ -576,7 +595,7 @@ async def test_ensure_called_with_each_bills_own_openstates_id_not_a_stale_one()
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), _patch_org_status({"has_rows": True, "row_count": 0}):
-        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10, include_concept_statements=False)
+        await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10, include_concept_statements=False, retry_failed=False)
 
     assert mock_ensure.await_count == 2
     # Pair by gov_id (also passed on the same call) rather than just
@@ -606,6 +625,7 @@ async def test_ensure_not_called_when_no_archived_text_yet():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_ensure.assert_not_awaited()
@@ -627,6 +647,7 @@ async def test_ensure_not_called_when_bill_is_already_fully_covered():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_ensure.assert_not_awaited()
@@ -641,6 +662,7 @@ async def test_ensure_not_called_when_version_identity_fails():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_ensure.assert_not_awaited()
@@ -658,6 +680,7 @@ async def test_ensure_never_called_under_dry_run():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_ensure.assert_not_awaited()
@@ -680,6 +703,7 @@ async def test_ensure_failure_prevents_dispatch_and_org_research_with_its_own_er
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_artifact.assert_not_awaited()
@@ -706,6 +730,7 @@ async def test_org_research_skipped_when_already_researched():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_org.assert_not_awaited()
@@ -725,6 +750,7 @@ async def test_org_research_dispatched_when_not_yet_researched():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_org.assert_awaited_once()
@@ -746,6 +772,7 @@ async def test_org_research_not_requested_is_never_checked():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_status.assert_not_awaited()
@@ -767,6 +794,7 @@ async def test_concept_statements_not_requested_is_never_checked():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     mock_get_concept_set.assert_not_awaited()
@@ -788,6 +816,7 @@ async def test_concept_statements_skipped_when_already_published():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     mock_dispatch.assert_not_awaited()
@@ -809,6 +838,7 @@ async def test_concept_statements_dispatched_when_not_yet_published():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     mock_dispatch.assert_awaited_once()
@@ -839,6 +869,7 @@ async def test_concept_statements_no_row_created_is_not_a_failure():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -857,6 +888,7 @@ async def test_concept_statements_dispatch_failure_is_isolated():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -872,6 +904,7 @@ async def test_concept_statements_status_check_failure_is_isolated():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     bill_result = result["results"][0]
@@ -888,7 +921,7 @@ async def test_concept_statements_dry_run_dispatches_nothing():
     ) as mock_dispatch:
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
-            include_concept_statements=True, dry_run=True,
+            include_concept_statements=True, retry_failed=False, dry_run=True,
         )
 
     mock_dispatch.assert_not_awaited()
@@ -911,6 +944,7 @@ async def test_concept_statements_does_not_need_version_identity():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
         )
 
     mock_dispatch.assert_awaited_once()
@@ -931,6 +965,7 @@ async def test_concept_statements_broker_override_threads_through():
         await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10,
             include_concept_statements=True,
+            retry_failed=False,
             broker_api_base="http://dev-broker:8080",
             broker_api_token="dev-token",
         )
@@ -962,7 +997,7 @@ async def test_scheduled_wrapper_maps_full_config_to_run_legbot_pipeline():
 
     mock_run.assert_awaited_once_with(
         "FL", "2026F", ["bill_summary", "bill_pros_cons"], True, 10,
-        include_concept_statements=False, dry_run=True,
+        include_concept_statements=False, retry_failed=False, dry_run=True,
     )
     assert result == {"bills_considered": 2}
 
@@ -977,7 +1012,7 @@ async def test_scheduled_wrapper_defaults_org_research_and_dry_run_when_absent()
 
     mock_run.assert_awaited_once_with(
         "FL", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=False, dry_run=False,
+        include_concept_statements=False, retry_failed=False, dry_run=False,
     )
 
 
@@ -992,7 +1027,7 @@ async def test_scheduled_wrapper_maps_include_concept_statements_when_present():
 
     mock_run.assert_awaited_once_with(
         "FL", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=True, dry_run=False,
+        include_concept_statements=True, retry_failed=False, dry_run=False,
     )
 
 
@@ -1056,6 +1091,7 @@ _SINGLE_BILL_KWARGS = dict(
     bill_source=_CANDIDATE["live_url_fallback"],
     include_org_research=False,
     include_concept_statements=False,
+    retry_failed=False,
 )
 
 
@@ -1297,6 +1333,7 @@ async def test_bills_are_processed_with_real_concurrency_not_strictly_one_at_a_t
         await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert max_seen["value"] > 1
@@ -1325,6 +1362,7 @@ async def test_concurrency_is_capped_at_session_pipeline_concurrency():
         await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert max_seen["value"] == 2
@@ -1350,6 +1388,7 @@ async def test_results_preserve_candidate_order_even_when_completion_order_diffe
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert [r["gov_id"] for r in result["results"]] == ["HB 0", "HB 1", "HB 2", "HB 3"]
@@ -1378,6 +1417,7 @@ async def test_concurrency_of_one_is_effectively_sequential():
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
             include_concept_statements=False,
+            retry_failed=False,
         )
 
     assert max_seen["value"] == 1
@@ -1458,6 +1498,7 @@ class TestConcurrentOrgResearch:
             result = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_summary"], True, limit=10,
                 include_concept_statements=False,
+                retry_failed=False,
             )
 
         bill_result = result["results"][0]
@@ -1509,6 +1550,7 @@ class TestConcurrentOrgResearch:
                 result = await run_legbot_pipeline(
                     "fl", "2026F", ["bill_summary"], True, limit=10,
                     include_concept_statements=False,
+                    retry_failed=False,
                 )
 
             bill_result = result["results"][0]
@@ -1530,7 +1572,7 @@ class TestConcurrentOrgResearch:
              _patch_org_dispatch() as mock_org:
             result = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_summary"], True, limit=10,
-                include_concept_statements=False, dry_run=True,
+                include_concept_statements=False, retry_failed=False, dry_run=True,
             )
 
         mock_org.assert_not_awaited()
@@ -1576,6 +1618,7 @@ class TestConcurrentOrgResearch:
                 await run_legbot_pipeline(
                     "fl", "2026F", ["bill_summary"], True, limit=10,
                     include_concept_statements=True,
+                    retry_failed=False,
                 )
 
         assert observed == ["cancelled"], "the org task outlived its bill"
@@ -1607,6 +1650,7 @@ class TestConcurrentOrgResearch:
             run = asyncio.create_task(run_legbot_pipeline(
                 "fl", "2026F", ["bill_summary"], True, limit=10,
                 include_concept_statements=False,
+                retry_failed=False,
             ))
             await asyncio.wait_for(artifact_running.wait(), timeout=2)
             run.cancel()
@@ -1659,6 +1703,7 @@ class TestConcurrentOrgResearch:
                 await run_legbot_pipeline(
                     "fl", "2026F", ["bill_summary"], True, limit=10,
                     include_concept_statements=True,
+                    retry_failed=False,
                 )
 
         # ...and it must not vanish either. Retrieving the exception is what
@@ -1686,6 +1731,7 @@ class TestConcurrentOrgResearch:
             result = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_summary"], False, limit=10,
                 include_concept_statements=False,
+                retry_failed=False,
             )
 
         status.assert_not_awaited()
@@ -1731,6 +1777,7 @@ class TestCanonicalDispatchOrder:
                     await run_legbot_pipeline(
                         "fl", "2026F", types, True, limit=10,
                         include_concept_statements=False,
+                        retry_failed=False,
                     )
                     seen.append([c.kwargs.get("artifact_type") for c in ma.await_args_list])
 
@@ -1761,6 +1808,7 @@ class TestCanonicalDispatchOrder:
             await run_legbot_pipeline(
                 "fl", "2026F", ["bill_changelog", "bill_summary"], True, limit=10,
                 include_concept_statements=True,
+                retry_failed=False,
             )
 
         assert order == ["concepts", "changelog"], (
@@ -1785,6 +1833,7 @@ class TestCanonicalDispatchOrder:
             result = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_summary", "bill_topics"], True, limit=10,
                 include_concept_statements=False,
+                retry_failed=False,
             )
         assert result["results"][0]["artifacts_generated"] == ["bill_summary", "bill_topics"]
 
@@ -1810,6 +1859,7 @@ class TestCanonicalDispatchOrder:
                 result = await run_legbot_pipeline(
                     "fl", "2026F", ["bill_changelog", "bill_summary"], True, limit=10,
                     include_concept_statements=True,
+                    retry_failed=False,
                 )
             return ran, result["results"][0]
 
@@ -1855,7 +1905,7 @@ class TestCanonicalDispatchOrder:
                 # deliberately worst-case caller order: changelog first
                 "fl", "2026F",
                 ["bill_changelog", "bill_topics", "bill_summary", "bill_impact_analysis"],
-                True, limit=10, include_concept_statements=True,
+                True, limit=10, include_concept_statements=True, retry_failed=False,
             )
 
         assert order == [
@@ -1873,7 +1923,7 @@ class TestCanonicalDispatchOrder:
              _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
             dry = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_changelog", "bill_summary", "bill_topics"], True,
-                limit=10, include_concept_statements=False, dry_run=True,
+                limit=10, include_concept_statements=False, retry_failed=False, dry_run=True,
             )
         assert dry["results"][0]["artifacts_generated"] == [
             "bill_summary", "bill_topics", "bill_changelog"
@@ -1883,8 +1933,197 @@ class TestCanonicalDispatchOrder:
              _patch_artifact(), _patch_org_status({"has_rows": True, "row_count": 1}):
             noversion = await run_legbot_pipeline(
                 "fl", "2026F", ["bill_changelog", "bill_summary"], True,
-                limit=10, include_concept_statements=False,
+                limit=10, include_concept_statements=False, retry_failed=False,
             )
         r = noversion["results"][0]
         assert r["artifacts_generated"] == []
         assert sorted(r["artifacts_failed"]) == ["bill_changelog", "bill_summary"]
+
+
+# ---------------------------------------------------------------------------
+# SYNC-42: retry_failed
+#
+# Before this flag, a BillArtifact recorded `failed` was skipped by every
+# later run forever, with no way to override it -- so a failure caused by a
+# bug, an outage or a prompt change since fixed could only be cleared by
+# deleting rows in the broker by hand. Found when a dry run intended to
+# verify the AGENTS-79 prompt fix reported gen=0 on all five bills, because
+# the four artifacts it meant to re-test were exactly the failed ones.
+#
+# The hard constraint is that `complete` is never dispatched at any value of
+# the flag. test_retry_failed_never_dispatches_complete is the test that
+# guards it.
+# ---------------------------------------------------------------------------
+
+_MIXED_COVERAGE = {
+    "bill_version_id": 2,
+    "artifacts": {
+        "bill_summary": {"status": "complete"},
+        "bill_pros_cons": {"status": "failed"},
+        "bill_topics": {"status": "failed"},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_true_dispatches_the_failed_rows():
+    """AC3: a failed artifact is dispatched and reported under
+    artifacts_generated, not artifacts_skipped_failed_previously."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "failed"}}}
+    ), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=True,
+        )
+
+    mock_artifact.assert_awaited_once()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["artifacts_skipped_failed_previously"] == []
+    assert bill_result["artifacts_skipped_present"] == []
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_never_dispatches_complete():
+    """AC4, the hard constraint. A bill carrying both complete and failed
+    artifacts: retry_failed reaches the failed ones and must not touch the
+    complete one, whose content may be approved and live on the public site.
+    """
+    dispatched = []
+
+    async def _record(**kwargs):
+        dispatched.append(kwargs["artifact_type"])
+        return {"id": 1, "status": "complete"}
+
+    with _patch_lister([_CANDIDATE]), _patch_coverage(_MIXED_COVERAGE), \
+         _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(side_effect=_record),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary", "bill_pros_cons", "bill_topics"],
+            True, limit=10,
+            include_concept_statements=False,
+            retry_failed=True,
+        )
+
+    assert "bill_summary" not in dispatched, "a complete artifact was re-dispatched"
+    assert sorted(dispatched) == ["bill_pros_cons", "bill_topics"]
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_skipped_present"] == ["bill_summary"]
+    assert sorted(bill_result["artifacts_generated"]) == ["bill_pros_cons", "bill_topics"]
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_false_leaves_the_skip_buckets_exactly_as_before():
+    """AC2. Same mixed bill, flag off: the failed rows go back to their own
+    bucket and nothing is dispatched at all. Read together with the test
+    above, this is the byte-identical-when-false assertion -- and the rest of
+    this file is the broader evidence, since every pre-existing test in it
+    passes unchanged with retry_failed=False."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(_MIXED_COVERAGE), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary", "bill_pros_cons", "bill_topics"],
+            True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_skipped_present"] == ["bill_summary"]
+    assert sorted(bill_result["artifacts_skipped_failed_previously"]) == [
+        "bill_pros_cons", "bill_topics",
+    ]
+    assert bill_result["artifacts_generated"] == []
+
+
+@pytest.mark.asyncio
+async def test_dry_run_with_retry_failed_previews_exactly_what_would_dispatch():
+    """AC5. The preview an operator runs first has to agree with the real
+    run, or it is worse than no preview. Asserts the dry_run listing against
+    the same mixed bill the real run above dispatches from."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(_MIXED_COVERAGE), \
+         _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary", "bill_pros_cons", "bill_topics"],
+            True, limit=10,
+            include_concept_statements=False, retry_failed=True, dry_run=True,
+        )
+
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    # Exactly the set test_retry_failed_never_dispatches_complete really
+    # dispatches -- same coverage fixture, same requested types.
+    assert sorted(bill_result["artifacts_generated"]) == ["bill_pros_cons", "bill_topics"]
+    assert bill_result["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_does_not_reach_pending_or_processing():
+    """The scope decision, pinned so it is a choice rather than an accident.
+    pending/processing are stuck the same way failed was, but `failed` is
+    terminal while a pending row may be genuinely in flight right now --
+    retrying those needs an age threshold and a way to tell stuck from
+    running, which is a different design and its own ticket."""
+    coverage = {
+        "bill_version_id": 2,
+        "artifacts": {
+            "bill_summary": {"status": "pending"},
+            "bill_pros_cons": {"status": "processing"},
+        },
+    }
+    with _patch_lister([_CANDIDATE]), _patch_coverage(coverage), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary", "bill_pros_cons"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=True,
+        )
+
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert sorted(bill_result["artifacts_skipped_present"]) == [
+        "bill_pros_cons", "bill_summary",
+    ]
+    assert bill_result["artifacts_generated"] == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_defaults_retry_failed_to_false_when_absent():
+    """A cron job must keep doing exactly what it did yesterday when a new
+    option appears. Re-dispatching every previously-failed artifact on a
+    schedule is not something a YAML block should start doing by omission."""
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_run:
+        await run_scheduled_session_pipeline(dict(_VALID_BATCH_CONFIG))
+
+    assert mock_run.await_args.kwargs["retry_failed"] is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wrapper_passes_retry_failed_when_set():
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_run:
+        await run_scheduled_session_pipeline(
+            dict(_VALID_BATCH_CONFIG, retry_failed=True)
+        )
+
+    assert mock_run.await_args.kwargs["retry_failed"] is True

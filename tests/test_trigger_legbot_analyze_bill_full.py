@@ -28,6 +28,7 @@ _VALID_PAYLOAD = {
     "bill_source": "https://flsenate.gov/Session/Bill/2026/123/BillText/Filed/PDF",
     "include_org_research": False,
     "include_concept_statements": False,
+    "retry_failed": False,
 }
 
 _RUN_RESULT = {
