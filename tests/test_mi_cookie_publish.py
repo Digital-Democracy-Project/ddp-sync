@@ -113,3 +113,65 @@ async def test_never_raises_when_publish_fails(monkeypatch):
 
     assert result["success"] is False
     assert result["reason"] == "publish_failed"
+
+
+@pytest.mark.asyncio
+async def test_never_raises_when_publish_times_out(monkeypatch):
+    monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
+    with patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+        return_value=_MINT_RESULT,
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="fake-s3-wrapper", timeout=60),
+    ):
+        result = await run_mi_cookie_publish_job()
+
+    assert result == {"success": False, "reason": "publish_timed_out"}
+
+
+@pytest.mark.asyncio
+async def test_never_raises_when_write_cookie_cache_raises(monkeypatch):
+    """pm-review: the docstring's "never raises" claim wasn't actually enforced past the
+    mint step -- a write_cookie_cache failure (disk full, permissions, ...) must also come
+    back as a structured failure, not propagate."""
+    monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
+    with patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+        return_value=_MINT_RESULT,
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache",
+        side_effect=OSError("disk full"),
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run"
+    ) as mock_run:
+        result = await run_mi_cookie_publish_job()
+
+    mock_run.assert_not_called()
+    assert result["success"] is False
+    assert result["reason"] == "unexpected_error"
+
+
+@pytest.mark.asyncio
+async def test_never_raises_when_the_s3_wrapper_is_not_executable(monkeypatch):
+    """A missing/non-executable SCRAPER_MEMORY_S3_CMD raises FileNotFoundError from
+    subprocess.run itself -- must come back structured, not crash the scheduler."""
+    monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
+    with patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+        return_value=_MINT_RESULT,
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run",
+        side_effect=FileNotFoundError("no such file: fake-s3-wrapper"),
+    ):
+        result = await run_mi_cookie_publish_job()
+
+    assert result["success"] is False
+    assert result["reason"] == "unexpected_error"

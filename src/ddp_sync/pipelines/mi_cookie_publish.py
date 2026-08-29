@@ -77,22 +77,43 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
         )
         return {"success": False, "reason": "mint_failed", "error": str(e)}
 
-    with tempfile.TemporaryDirectory(prefix="mi-cookie-publish-") as tmp:
-        local_path = os.path.join(tmp, CACHE_FILENAME)
-        scrapebot_client.write_cookie_cache(
-            local_path, cookies=mint_result["cookies"], user_agent=mint_result["user_agent"]
-        )
-        key = _publish_key(prefix)
-        proc = subprocess.run(
-            [bucket_cmd, "put", local_path, key], capture_output=True, text=True
-        )
-        if proc.returncode != 0:
-            logger.error(
-                "mi_cookie_publish: publish to S3 failed -- the previously published "
-                "cookie (if any) is unchanged",
-                stderr=proc.stderr,
+    # pm-review: the docstring's "never raises" claim wasn't actually true past this point --
+    # a malformed mint_result, a write_cookie_cache failure, a missing/non-executable
+    # bucket_cmd (FileNotFoundError), or subprocess.run hanging indefinitely (no timeout) could
+    # all have raised out of this best-effort job and crashed the scheduler. Caught broadly and
+    # explicitly, with a timeout, rather than letting any of them propagate.
+    key = _publish_key(prefix)
+    try:
+        with tempfile.TemporaryDirectory(prefix="mi-cookie-publish-") as tmp:
+            local_path = os.path.join(tmp, CACHE_FILENAME)
+            scrapebot_client.write_cookie_cache(
+                local_path, cookies=mint_result["cookies"], user_agent=mint_result["user_agent"]
             )
-            return {"success": False, "reason": "publish_failed", "error": proc.stderr}
+            proc = subprocess.run(
+                [bucket_cmd, "put", local_path, key],
+                capture_output=True, text=True, timeout=60,
+            )
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "mi_cookie_publish: publish to S3 timed out -- the previously published cookie "
+            "(if any) is unchanged"
+        )
+        return {"success": False, "reason": "publish_timed_out"}
+    except Exception as e:  # noqa: BLE001 -- a bad tick must never crash the scheduler
+        logger.error(
+            "mi_cookie_publish: unexpected error while writing/publishing the cookie -- the "
+            "previously published cookie (if any) is unchanged",
+            error=str(e),
+        )
+        return {"success": False, "reason": "unexpected_error", "error": str(e)}
+
+    if proc.returncode != 0:
+        logger.error(
+            "mi_cookie_publish: publish to S3 failed -- the previously published "
+            "cookie (if any) is unchanged",
+            stderr=proc.stderr,
+        )
+        return {"success": False, "reason": "publish_failed", "error": proc.stderr}
 
     logger.info("mi_cookie_publish: published fresh Michigan WAF cookies", key=key)
     return {"success": True, "key": key}
