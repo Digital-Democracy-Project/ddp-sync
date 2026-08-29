@@ -278,6 +278,9 @@ class UpdateScheduler:
         # --- OpenStates bill-document archive (independent of scrape schedule) ---
         self._register_openstates_archive_jobs()
 
+        # --- Michigan WAF cookie publish (OPEN-188, independent of scrape schedule) ---
+        self._register_mi_cookie_publish_job()
+
         # Concept-statement dispatch's own standalone scheduled batch job
         # (ddp-infra PLAN-bill-concept-polling.md §0.4) retired here (SYNC-32)
         # -- ConceptStatementSet generation now runs through this same
@@ -1060,6 +1063,40 @@ class UpdateScheduler:
                 sync_day=sync_day,
                 sync_time=archive_time,
             )
+
+    def _register_mi_cookie_publish_job(self) -> None:
+        """OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory
+        store on an independent schedule, decoupled from whether a Michigan scrape is
+        actually running right now -- see mi_cookie_publish.py's own module docstring for
+        why this is a separate schedule rather than reusing the scrape's own pre-seed.
+
+        Config lives under openstates_scrape.mi_cookie_publish, disabled by default so
+        nothing mints or publishes unless explicitly turned on.
+        """
+        from ddp_sync.pipelines.mi_cookie_publish import run_mi_cookie_publish_job
+
+        config = self._sync_config.get("openstates_scrape", {})
+        publish_cfg = config.get("mi_cookie_publish", {})
+        if not publish_cfg.get("enabled", False):
+            logger.info("mi_cookie_publish: disabled in config — skipping")
+            return
+
+        interval_hours = publish_cfg.get("interval_hours", 6)
+
+        async def _mi_cookie_publish_wrapper():
+            return await run_mi_cookie_publish_job(config)
+
+        self._add_job_replacing(
+            _mi_cookie_publish_wrapper,
+            trigger=IntervalTrigger(hours=interval_hours),
+            id="mi_cookie_publish",
+            name="OpenStates: publish Michigan WAF cookies",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("mi_cookie_publish: registered", interval_hours=interval_hours)
 
     def _register_session_pipeline_batch_job(self) -> None:
         """Register the session-targeted BillArtifact batch job (SYNC-9).
