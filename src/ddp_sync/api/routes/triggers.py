@@ -111,7 +111,15 @@ class BillArtifactGenerationRequest(BaseModel):
         ...,
         description=(
             "Whether to also dispatch Organization Position Research for "
-            "bills not yet researched."
+            "bills not yet researched. THE ONLY PARAMETER HERE THAT COSTS "
+            "MONEY: this is the one dispatch that leaves the local MLX model "
+            "for a metered cloud API with server-side web search. Measured "
+            "2026-08-28 on FL 2026E: 17 calls, $7.26 -- about $0.43 per bill "
+            "researched, against $0 for all nine artifact_types combined. "
+            "Scales per bill, so a 200-bill session is on the order of $85. "
+            "Already-researched bills are skipped and cost nothing, which is "
+            "why the figure is per bill researched rather than per bill "
+            "considered."
         ),
     )
     include_concept_statements: bool = Field(
@@ -429,7 +437,16 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
         ),
     )
     include_org_research: bool = Field(
-        ..., description="Whether to also dispatch Organization Position Research for this bill."
+        ...,
+        description=(
+            "Whether to also dispatch Organization Position Research for this "
+            "bill. THE ONLY PARAMETER HERE THAT COSTS MONEY -- roughly $0.43 "
+            "per bill against $0 for every artifact type, because it is the "
+            "one dispatch that uses a metered cloud API with server-side web "
+            "search rather than the local MLX model. See "
+            "BillArtifactGenerationRequest.include_org_research for the "
+            "measurement this came from."
+        ),
     )
     include_concept_statements: bool = Field(
         ...,
