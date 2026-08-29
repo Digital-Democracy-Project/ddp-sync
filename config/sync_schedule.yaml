@@ -709,6 +709,15 @@ votebot_eval:
 # yet for ANY LegBot artifact type, concept statements included. Leave this
 # false here; exercise concept-statement generation via the on-demand route
 # only until a real cadence decision is made.
+#
+# include_org_research is additionally the ONLY setting in this block that
+# costs money, and the only reason to think twice before raising `limit`.
+# Every artifact_type runs on the local MLX model at $0; org research is a
+# metered cloud API call with server-side web search, measured 2026-08-28 at
+# $7.26 for 17 bills (~$0.43 each) on FL 2026E. It scales per bill, so
+# turning this true on a scheduled weekly job over a full session is a
+# recurring five-to-high-two-figure bill per run, not a one-off. If a cadence
+# decision ever turns it on, decide `limit` and this flag together.
 session_pipeline_batch:
   enabled: false
   frequency: weekly
