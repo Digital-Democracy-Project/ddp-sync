@@ -554,6 +554,95 @@ async def test_changelog_version_mismatch_raises_and_writes_nothing():
     mock_write.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# SYNC-46: a bill whose true latest version has no diff of its own (so it
+# never becomes any transition's target) must not be treated as stale --
+# observed live on Utah 2026: SB 59 has 6 versions and 5 real archived
+# transitions, and produced zero changelogs because "Enrolled" (real,
+# current, simply undiffed) didn't match transitions[-1]'s own target
+# ("Substitute #2", the last version that DOES have a diff).
+# ---------------------------------------------------------------------------
+
+_RESOLVED_LATEST_HAS_NO_DIFF = {
+    "transitions": [_ONE_TRANSITION],  # Introduced -> Engrossed, same as above
+    "versions": [
+        {"date": "2025-12-01", "note": "Filed"},
+        {"date": "2026-01-01", "note": "Introduced"},
+        {"date": "2026-02-01", "note": "Engrossed"},
+        # The true latest version -- real, current, but api-v3 never
+        # attached it a diff_from_previous_version, so it's absent from
+        # `transitions` above entirely (get_archived_version_transitions
+        # already skips a hop with no diff -- this fixture just adds the
+        # version itself to the raw list, matching what api-v3 would
+        # actually return).
+        {"date": "2026-03-01", "note": "Enrolled"},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_changelog_generates_ready_transitions_when_true_latest_has_no_diff():
+    """AC1: the caller requests a changelog for "Enrolled" -- the bill's
+    real, current version, per get_current_version_identity()'s own
+    versions[-1] convention -- which has no diff of its own. This must not
+    raise, and must generate the transition that IS ready."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_LATEST_HAS_NO_DIFF),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 5, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(
+            bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
+            jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
+            session_code=_CHANGELOG_KWARGS["session_code"],
+            version_date="2026-03-01",
+            version_note="Enrolled",
+        )
+
+    # AC1 + AC2: succeeds, and is NOT reported as a failure.
+    assert result["status"] == "complete"
+    # AC4: nothing is written against "Enrolled" itself -- the one write
+    # that happens targets "Engrossed" (the ready transition's own target).
+    assert mock_write.await_args.kwargs["version_note"] == "Engrossed"
+
+
+@pytest.mark.asyncio
+async def test_changelog_still_raises_for_a_version_absent_from_the_archive_entirely():
+    """AC3: a requested version that isn't in the bill's archived version
+    list at all -- not even as the true latest -- is still the genuine
+    stale-caller case this guard exists for, and must still raise without
+    writing anything."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_LATEST_HAS_NO_DIFF),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_write:
+        with pytest.raises(ArchivedVersionMismatchError):
+            await generate_and_store_bill_changelog(
+                bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
+                jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
+                session_code=_CHANGELOG_KWARGS["session_code"],
+                version_date="2026-04-01",
+                version_note="Vetoed",
+            )
+
+    mock_dispatch.assert_not_called()
+    mock_write.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_changelog_happy_path_writes_broker_with_compare_version():
     dispatch_result = {

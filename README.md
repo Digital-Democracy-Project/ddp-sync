@@ -196,15 +196,33 @@ a real, retryable failure and got retried forever). A pathologically long versio
 `_MAX_CHANGELOG_TRANSITIONS_PER_CALL` (10) LegBot dispatches per call, since each transition takes its
 own uncached LegBot call inside a still-synchronous HTTP request.
 
-**What this does not fix, and cannot from this repo alone.** `ddp-sync` has no way to ask
-`ddp-broker-py` which of a bill's *past*, non-latest versions already have a `bill_changelog` — the only
-coverage read (`GET /api/bill-artifacts/status/`) resolves a bill's current latest version only. This
-function is therefore only ever reached (via `session_pipeline_runner.py`'s per-bill coverage check)
-when the bill's *current* latest version has no `bill_changelog` yet, which is exactly right for a bill
-this pipeline has never generated one for at all, but means a bill that already has a (possibly
-wrong-pair) changelog on its current latest version is never revisited, even after this fix, until the
-broker exposes an all-versions read. The six real FL 2026E bills that motivated this ticket are in
-exactly that state today — filed as [BROKER-130](https://digitaldemocracyproject.atlassian.net/browse/BROKER-130).
+**Updated 2026-08-29 (SYNC-44's AC2, once [BROKER-130](https://digitaldemocracyproject.atlassian.net/browse/BROKER-130) merged):**
+`generate_and_store_bill_changelog` now takes an optional `gov_id` and, when given, reads coverage
+across *every* version of the bill (`?versions=all` on the existing status endpoint) and skips any
+transition whose target already has a `bill_changelog` of any status — a repeat call (e.g. because the
+bill gained a new version) generates only what's missing rather than re-walking and re-dispatching
+everything, which previously churned already-approved changelogs back through `ddp-broker-py`'s
+BROKER-105 revision-review path on every re-run. `session_pipeline_runner.py`'s batch callers pass
+`gov_id` through; the on-demand single-bill endpoint (`/trigger/legbot-analyze-bill`) doesn't carry
+`gov_id` in its request body and keeps the pre-BROKER-130 behavior, since it's a one-shot user-triggered
+dispatch rather than a recurring batch. Six real FL 2026E bills that already carry a wrong-pair
+changelog on their current latest version are **not** retroactively corrected by this — the per-bill
+coverage gate one level up (`session_pipeline_runner.py`'s own `get_bill_artifacts` call) still only
+checks the current latest version, so it never re-opens for them at all; that gap is
+[SYNC-45](https://digitaldemocracyproject.atlassian.net/browse/SYNC-45).
+
+**Updated 2026-08-29 (SYNC-46):** the version-mismatch guard (`ArchivedVersionMismatchError`) used to
+compare the caller's version against the *last transition's own target* — the newest version that
+happens to have an archived diff — rather than the bill's true latest archived version. Those two are
+not always the same: a version can be real and current while having no diff of its own (its
+predecessor's text is byte-identical, or an extraction gap), in which case it never becomes any
+transition's target at all. That mismatch cost a bill its **entire** changelog history rather than the
+one un-analysable hop — observed live on a Utah 2026 dev run: SB 59 has 6 versions and 5 real archived
+transitions, all with genuine diffs, and produced **zero** changelogs because "Enrolled" (real, current,
+simply undiffed) didn't match the last transition's target ("Substitute #2"). Fixed by comparing against
+`versions[-1]` — the same value `get_current_version_identity()` resolves as "current" for this exact
+caller — instead. A genuinely stale caller (a requested version absent from the bill's archived list
+entirely) still raises and still writes nothing, unchanged.
 
 **Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
 **blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and

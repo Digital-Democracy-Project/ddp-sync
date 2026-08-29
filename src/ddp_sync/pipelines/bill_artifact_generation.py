@@ -640,6 +640,15 @@ async def generate_and_store_bill_changelog(
     up, which is not a failure any more than its earliest version having
     nothing to diff against is (see below).
 
+    SYNC-46 (2026-08-29): the version-mismatch guard below now compares the
+    caller's version against the bill's true latest ARCHIVED version, not
+    against transitions[-1]'s own target -- see that check's own comment
+    for the live Utah case (SB 59: 6 versions, 5 real archived transitions,
+    zero changelogs produced) this fixes. A version can be real and current
+    while having no diff of its own; that is not staleness, and previously
+    cost a bill its entire changelog history rather than degrading to
+    "generate what is ready."
+
     A bill with no version transition ready yet -- either it has only one
     archived version ever (nothing precedes it to diff against, not a
     failure, just not yet applicable) or its very next transition's diff/
@@ -652,10 +661,12 @@ async def generate_and_store_bill_changelog(
 
     Raises:
         ArchivedVersionMismatchError: the caller's version_date/version_note
-            don't match the LAST transition's target that
-            get_archived_version_transitions resolved -- a stale caller, or
-            the bill has moved on to a newer version since the caller looked
-            it up. Deliberately raises *without writing anything at all*, not
+            don't match the bill's TRUE LATEST ARCHIVED version (SYNC-46:
+            not transitions[-1]'s own target, which can legitimately lag
+            behind when the true latest has no diff of its own) -- a stale
+            caller, or the bill has moved on to a newer version since the
+            caller looked it up. Deliberately raises *without writing
+            anything at all*, not
             a failed row: writing a failed row here would upsert via
             write_bill_artifact's own (bill_version, artifact_type,
             model_version, prompt_version) key, which resolves from this
@@ -715,26 +726,44 @@ async def generate_and_store_bill_changelog(
         return {"status": "not_applicable"}
 
     transitions = resolved["transitions"]
-    latest_transition = transitions[-1]
+
+    # SYNC-46: compare against the bill's true latest ARCHIVED version --
+    # api-v3's own versions[-1] (SYNC-16/OPEN-92), the same value
+    # get_current_version_identity() resolves as "current" for this exact
+    # caller -- not against transitions[-1]'s own target. Those two are NOT
+    # always the same version: a version can be real and current while
+    # having no diff of its own (its predecessor's text is byte-identical,
+    # or an extraction gap), in which case it never becomes any
+    # transition's target at all. The previous check compared against
+    # transitions[-1] and raised in exactly that normal situation --
+    # observed live on Utah 2026: SB 59 has 6 versions and 5 archived
+    # transitions, all with real diffs, and produced zero changelogs
+    # because "Enrolled" (real, current, no diff of its own) didn't match
+    # transitions[-1]'s target ("Substitute #2", the last version WITH a
+    # diff). Comparing against the true latest fixes this without weakening
+    # the guard: a version that isn't even in the bill's archived list at
+    # all -- the actual stale/moved-on case this guard exists for -- still
+    # fails this comparison and still raises.
+    true_latest_version = resolved["versions"][-1]
 
     if (
-        latest_transition["new_version_date"] != version_date
-        or latest_transition["new_version_note"] != version_note
+        true_latest_version.get("date", "") != version_date
+        or true_latest_version.get("note", "") != version_note
     ):
         logger.warning(
             "bill_changelog_archived_version_mismatch",
             bill_openstates_id=bill_openstates_id,
             requested_version_date=version_date,
             requested_version_note=version_note,
-            archived_latest_version_date=latest_transition["new_version_date"],
-            archived_latest_version_note=latest_transition["new_version_note"],
+            archived_latest_version_date=true_latest_version.get("date", ""),
+            archived_latest_version_note=true_latest_version.get("note", ""),
         )
         raise ArchivedVersionMismatchError(
             f"Requested a bill_changelog for version_date={version_date!r}/"
             f"version_note={version_note!r}, but get_archived_version_transitions "
-            f"resolved the current latest version as "
-            f"{latest_transition['new_version_date']!r}/"
-            f"{latest_transition['new_version_note']!r} -- refusing to write a "
+            f"resolved the bill's true latest archived version as "
+            f"{true_latest_version.get('date', '')!r}/"
+            f"{true_latest_version.get('note', '')!r} -- refusing to write a "
             "changelog under a stale or mismatched version identity."
         )
 
