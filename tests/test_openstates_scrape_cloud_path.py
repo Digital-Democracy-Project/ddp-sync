@@ -27,7 +27,6 @@ import pytest
 
 from ddp_sync.pipelines.openstates_scrape import (
     _cloud_path_owns,
-    _maybe_preseed_scrapebot_cookies,
     _memory_backend_enabled,
     _run_scrape,
     run_single_scrape_job,
