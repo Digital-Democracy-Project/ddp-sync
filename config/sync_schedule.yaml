@@ -618,6 +618,27 @@ openstates_scrape:
     sync_day: sunday
     sync_time_utc: "10:00"     # after secondary (~06:00) and USA (~09:00) finish
 
+  # OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory store on
+  # an independent schedule (PLAN-scraper-execution-migration.md §6, "publish, do not call
+  # in"). Runs regardless of whether a Michigan scrape is happening right now -- no inbound
+  # path, no availability coupling at scrape time. Uses the same ScrapeBot mint path as
+  # scrapebot_fallback above; this is a SEPARATE schedule, not a replacement for it -- the
+  # mac's own local pre-seed still runs before each scheduled scrape (secondary.
+  # scrapebot_fallback), and this job additionally publishes to S3 for a cloud run to read.
+  #
+  # interval_hours is a conservative starting point, not a measured optimum -- ScrapeBot's
+  # mint is a real, several-minute CAPTCHA-solving task (scrapebot_client.py's own timeout
+  # budget runs to 240s+), so this trades a wider staleness window for not over-minting.
+  # Revisit once real cookie lifetimes from OPEN-189's live tests are known.
+  #
+  # Disabled by default: turning this on is step one of OPEN-188's own scope ("not gated, do
+  # this first") -- the reader-side staleness refusal (cloud_collector.py, gated on OPEN-200)
+  # is what actually makes a bare Michigan run impossible by construction, and that is a
+  # separate change in a separate repo.
+  mi_cookie_publish:
+    enabled: false
+    interval_hours: 6
+
 # Split out from openstates_scrape (2026-07-31) — bill-document archiving to DDP-HOT used to
 # run as the last step of each scrape job, gating that job's incremental-cutoff marker write on
 # the archive step finishing too. A run whose archive step ran long or died left the cutoff
