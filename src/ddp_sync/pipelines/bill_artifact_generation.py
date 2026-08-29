@@ -63,6 +63,7 @@ import structlog
 
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    get_bill_artifact_coverage_all_versions,
     write_bill_artifact,
 )
 from ddp_sync.services.legbot_client import (
@@ -555,6 +556,7 @@ async def generate_and_store_bill_changelog(
     session_code: str,
     version_date: str,
     version_note: str,
+    gov_id: str | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -599,20 +601,44 @@ async def generate_and_store_bill_changelog(
     it (the very first transition's compare_version) or an earlier iteration
     of this same loop just wrote a real artifact against it.
 
-    One structural limitation this does NOT solve, and cannot from this repo
-    alone (SYNC-44's own spike conclusion, tracked as BROKER-130): ddp-sync
-    has no way to ask ddp-broker-py which of a bill's PAST, non-latest
-    versions already have a bill_changelog -- the only coverage read
-    (GET /api/bill-artifacts/status/) resolves the bill's current latest
-    version only. This function is therefore only ever reached (via its one
-    caller, session_pipeline_runner.py's per-bill coverage check) when the
-    bill's CURRENT latest version has no bill_changelog yet -- which is
-    exactly right for a bill that has never had one at all, but means a bill
-    that already has a (possibly wrong-pair) changelog on its current latest
-    version is never revisited by this function, even after this fix ships,
-    until BROKER-130 lands. Six real FL 2026E bills are in exactly that
-    state today; fixing them needs the broker-side read, not more logic
-    here -- see BROKER-130 and this ticket's own spike comment.
+    AC2 (2026-08-29, /pm-review on the first version of this fix): a bill
+    with 3+ versions is only ever re-checked at the OUTER level (session_
+    pipeline_runner.py's per-bill coverage check) against its CURRENT latest
+    version -- so the moment a bill this pipeline already processed gains a
+    new version, the outer gate opens again and this function would
+    otherwise re-walk and re-dispatch EVERY transition, including ones that
+    already have a complete changelog. Demonstrated live: calling this
+    function twice against the same 3-version bill produced 4 LegBot
+    dispatches for 2 real transitions. Re-writing an already-`complete`
+    changelog isn't just wasted MLX time -- ddp-broker-py's BROKER-105
+    revision path queues a fresh review for what the reviewer had already
+    approved, so a bill that keeps gaining versions would keep churning its
+    entire changelog history back through review, not just its newest hop.
+
+    Fixed by BROKER-130 (merged 2026-08-29): `gov_id`, when provided, is
+    used to read artifact coverage across EVERY version of the bill
+    (get_bill_artifact_coverage_all_versions, `?versions=all` on the same
+    status endpoint the outer single-version coverage check already calls)
+    and skip any transition whose target version already carries a
+    bill_changelog row of ANY status -- matching this design's existing
+    "never regenerate, never overwrite" posture (see
+    ArchivedVersionMismatchError below) rather than inventing a new,
+    separate retry policy for non-latest versions. `gov_id` is optional
+    because it identifies a bill by a different natural key
+    (jurisdiction/session/gov_id) than every write in this function uses
+    (bill_openstates_id) -- session_pipeline_runner.py's batch callers
+    already have it on hand from their own candidate listing and pass it
+    through; SYNC-10's on-demand single-bill endpoint (dispatch_and_record_
+    bill_artifact) does not carry gov_id in its request body at all today,
+    so it keeps this function's pre-BROKER-130 behavior (walk and dispatch
+    every transition every call) unchanged -- appropriate for a one-shot,
+    explicitly user-triggered dispatch rather than a recurring batch job,
+    and not something this ticket's ACs ask to change.
+
+    If every transition is already covered once filtered, this writes
+    nothing and returns status="not_applicable" -- the bill is fully caught
+    up, which is not a failure any more than its earliest version having
+    nothing to diff against is (see below).
 
     A bill with no version transition ready yet -- either it has only one
     archived version ever (nothing precedes it to diff against, not a
@@ -644,10 +670,16 @@ async def generate_and_store_bill_changelog(
             will dispatch it again.
         LegBotDispatchError: LegBot unreachable/timed out -- propagates
             uncaught, same convention as generate_and_store_bill_artifact.
-        BrokerClientError: ddp-broker-py rejected a write or was unreachable
-            -- propagates uncaught, same convention as
-            generate_and_store_bill_artifact. Raised mid-walk, this leaves
-            whichever earlier transitions in this same call already wrote
+        BrokerClientError: ddp-broker-py rejected a request or was
+            unreachable -- propagates uncaught, same convention as
+            generate_and_store_bill_artifact. Two distinct sources when
+            `gov_id` is provided: the all-versions coverage read itself
+            (including a deliberate raise if the target broker predates
+            BROKER-130 and silently ignores `?versions=all` -- see
+            get_bill_artifact_coverage_all_versions' own docstring for why
+            that must fail loudly rather than look like "nothing covered
+            yet"), and a write failing mid-walk, which leaves whichever
+            earlier transitions in this same call already wrote
             successfully in place (each is its own natural-key upsert on its
             own version, so nothing is left half-written) -- a later run,
             once the bill's current latest version still shows no
@@ -705,6 +737,42 @@ async def generate_and_store_bill_changelog(
             f"{latest_transition['new_version_note']!r} -- refusing to write a "
             "changelog under a stale or mismatched version identity."
         )
+
+    # AC2/BROKER-130 (2026-08-29): skip any transition whose target version
+    # already carries a bill_changelog, of any status -- never regenerate,
+    # never overwrite. Matched by version_note alone: ddp-broker-py's
+    # all-versions coverage response doesn't expose version_date per entry
+    # (BillVersion.version_date is blank on over half of all rows anyway),
+    # and version_note is the natural key that actually distinguishes a
+    # bill's own versions from each other in practice.
+    #
+    # gov_id is optional -- see this function's own docstring for why. When
+    # it's absent (SYNC-10's on-demand endpoint), this is a no-op and every
+    # transition is dispatched every call, exactly as before this fix.
+    if gov_id is not None:
+        coverage = await get_bill_artifact_coverage_all_versions(
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            gov_id=gov_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        already_covered_notes = {
+            entry["version_note"]
+            for entry in (coverage["versions"] + coverage["unclassified_versions"])
+            if "bill_changelog" in entry["artifacts"]
+        } if coverage is not None else set()
+
+        transitions = [
+            t for t in transitions if t["new_version_note"] not in already_covered_notes
+        ]
+        if not transitions:
+            logger.info(
+                "Every archived transition already has a bill_changelog -- "
+                "nothing new to write",
+                bill_openstates_id=bill_openstates_id,
+            )
+            return {"status": "not_applicable"}
 
     # SYNC-26 follow-up: run_legbot_pipeline (this call's own caller) never
     # goes through check_and_reingest_version, so a bill this pipeline is

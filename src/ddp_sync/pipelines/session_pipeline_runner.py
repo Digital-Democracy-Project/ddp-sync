@@ -508,6 +508,14 @@ async def _process_bill_inner(
                     session_code=session_code,
                     version_date=version["version_date"],
                     version_note=version["version_note"],
+                    # AC2/BROKER-130: lets generate_and_store_bill_changelog
+                    # skip transitions it has already generated a changelog
+                    # for on a NON-latest version, which this caller's own
+                    # coverage check above (get_bill_artifacts) cannot see --
+                    # that call is scoped to the bill's current latest
+                    # version only. gov_id is already on hand from this
+                    # bill's own candidate listing.
+                    gov_id=gov_id,
                     broker_api_base=broker_api_base,
                     broker_api_token=broker_api_token,
                 )

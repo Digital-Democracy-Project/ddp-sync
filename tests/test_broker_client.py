@@ -12,6 +12,7 @@ from ddp_sync.services.broker_client import (
     BrokerClientError,
     create_concept_statement_set,
     ensure_bill_exists,
+    get_bill_artifact_coverage_all_versions,
     get_bill_artifacts,
     get_bill_organization_positions_status,
     get_concept_statement_set,
@@ -823,6 +824,109 @@ async def test_get_bill_artifacts_raises_on_error_status():
     ), _patch_async_client(mock_client):
         with pytest.raises(BrokerClientError, match="401"):
             await get_bill_artifacts(jurisdiction="FL", session_code="2026F", gov_id="SJR 2F")
+
+
+# ---------------------------------------------------------------------------
+# get_bill_artifact_coverage_all_versions (BROKER-130, SYNC-44's AC2 fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_all_versions_coverage_returns_none_when_not_found():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"found": False}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_artifact_coverage_all_versions(
+            jurisdiction="FL", session_code="2026F", gov_id="SJR 2F",
+        )
+
+    assert result is None
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-artifacts/status/"
+    assert call.kwargs["params"] == {
+        "jurisdiction": "FL", "session": "2026F", "gov_id": "SJR 2F", "versions": "all",
+    }
+
+
+@pytest.mark.asyncio
+async def test_all_versions_coverage_returns_versions_and_unclassified():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "found": True,
+        "versions": [
+            {
+                "bill_version_id": 19, "version_note": "e1",
+                "artifacts": {"bill_changelog": {"status": "complete", "compare_version_id": 380}},
+            },
+            {"bill_version_id": 18, "version_note": "er", "artifacts": {}},
+        ],
+        "unclassified_versions": [],
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_artifact_coverage_all_versions(
+            jurisdiction="FL", session_code="2026F", gov_id="SJR 2F",
+        )
+
+    assert [v["version_note"] for v in result["versions"]] == ["e1", "er"]
+    assert result["unclassified_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_all_versions_coverage_raises_when_broker_predates_broker_130():
+    """A `found: true` response with no `versions` key means an undeployed
+    broker silently ignored `?versions=all` and returned get_bill_artifacts'
+    own single-version shape instead -- this must fail loudly, not be read
+    as "nothing covered yet" (which would make every already-generated
+    transition look unprocessed and get silently regenerated)."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "found": True,
+        "bill_version_id": 18,
+        "artifacts": {"bill_changelog": {"status": "complete"}},
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="predates BROKER-130"):
+            await get_bill_artifact_coverage_all_versions(
+                jurisdiction="FL", session_code="2026F", gov_id="SJR 2F",
+            )
+
+
+@pytest.mark.asyncio
+async def test_all_versions_coverage_raises_on_error_status():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 401
+    response.text = '{"detail": "Authentication credentials were not provided."}'
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="401"):
+            await get_bill_artifact_coverage_all_versions(
+                jurisdiction="FL", session_code="2026F", gov_id="SJR 2F",
+            )
 
 
 @pytest.mark.asyncio

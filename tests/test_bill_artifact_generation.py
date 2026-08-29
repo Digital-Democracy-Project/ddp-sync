@@ -869,6 +869,198 @@ async def test_changelog_reports_the_first_failed_transition_not_the_last():
 
 
 # ---------------------------------------------------------------------------
+# AC2/BROKER-130 (2026-08-29): a subsequent run must skip transitions that
+# already have a bill_changelog, gated on gov_id being supplied. This is the
+# gap /pm-review's SECOND pass found live: calling generate_and_store_
+# bill_changelog twice against the same bill produced 4 LegBot dispatches
+# for 2 real transitions, because nothing filtered out the already-complete
+# ones once the bill gained a new version and the outer (latest-version
+# -only) coverage gate opened again.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_changelog_skips_a_transition_already_covered_when_gov_id_given():
+    """The AC2 fix itself: with gov_id supplied, a transition whose target
+    already has a bill_changelog (any status) of its own is never
+    re-dispatched -- only the genuinely new one is."""
+    coverage = {
+        "versions": [
+            {
+                "bill_version_id": 19, "version_note": "Introduced",
+                "artifacts": {"bill_changelog": {"status": "complete", "compare_version_id": 380}},
+            },
+            {"bill_version_id": 18, "version_note": "Engrossed", "artifacts": {}},
+        ],
+        "unclassified_versions": [],
+    }
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source):
+        dispatch_calls.append(old_bill_source)
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=coverage),
+    ) as mock_coverage, patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        result = await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS, gov_id="SJR 2F",
+        )
+
+    mock_coverage.assert_awaited_once_with(
+        jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
+        session_code=_CHANGELOG_KWARGS["session_code"],
+        gov_id="SJR 2F",
+        broker_api_base=None,
+        broker_api_token=None,
+    )
+    # Only the Introduced -> Engrossed hop dispatched -- Filed -> Introduced
+    # already has a changelog on "Introduced" and is skipped.
+    assert dispatch_calls == ["Archived introduced text."]
+    assert result["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_changelog_returns_not_applicable_when_every_transition_already_covered():
+    coverage = {
+        "versions": [
+            {"bill_version_id": 19, "version_note": "Introduced",
+             "artifacts": {"bill_changelog": {"status": "complete", "compare_version_id": 380}}},
+            {"bill_version_id": 18, "version_note": "Engrossed",
+             "artifacts": {"bill_changelog": {"status": "complete", "compare_version_id": 19}}},
+        ],
+        "unclassified_versions": [],
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=coverage),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS, gov_id="SJR 2F",
+        )
+
+    mock_dispatch.assert_not_called()
+    mock_write.assert_not_called()
+    assert result == {"status": "not_applicable"}
+
+
+@pytest.mark.asyncio
+async def test_changelog_without_gov_id_never_calls_the_coverage_read():
+    """SYNC-10's on-demand endpoint has no gov_id in its request body at all
+    -- omitting it must be a pure no-op for the coverage filter, not an
+    error, and every transition dispatches exactly as it did before this
+    fix (the pre-existing multi-transition test above already covers this;
+    this test only asserts the coverage read itself is never attempted)."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(),
+    ) as mock_coverage, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    mock_coverage.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changelog_propagates_when_broker_predates_broker_130():
+    """get_bill_artifact_coverage_all_versions raises BrokerClientError when
+    the target broker doesn't support ?versions=all yet -- this must
+    propagate uncaught (same convention as every other BrokerClientError
+    here), not be swallowed as "nothing covered" (which would silently
+    regenerate everything, the exact bug this fix exists to prevent)."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(side_effect=BrokerClientError("predates BROKER-130")),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch:
+        with pytest.raises(BrokerClientError, match="predates BROKER-130"):
+            await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS, gov_id="SJR 2F")
+
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changelog_coverage_filter_matches_unclassified_versions_too():
+    coverage = {
+        "versions": [
+            {"bill_version_id": 18, "version_note": "Engrossed", "artifacts": {}},
+        ],
+        # "Introduced" -- the Filed->Introduced transition's own target --
+        # shows up here, not in `versions`, to prove the filter checks both
+        # lists rather than only the lineage one.
+        "unclassified_versions": [
+            {
+                "bill_version_id": 19, "version_note": "Introduced",
+                "artifacts": {"bill_changelog": {"status": "failed", "compare_version_id": None}},
+            },
+        ],
+    }
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source):
+        dispatch_calls.append(old_bill_source)
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=coverage),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS, gov_id="SJR 2F")
+
+    # "Introduced" already has a bill_changelog row (a failed one -- still
+    # "any status", per this fix's own never-regenerate posture) even
+    # though it's unclassified rather than in the lineage -- still skipped,
+    # so only the Introduced -> Engrossed hop dispatches.
+    assert dispatch_calls == ["Archived introduced text."]
+
+
+# ---------------------------------------------------------------------------
 # SYNC-26 follow-up: run_legbot_pipeline's own compare_version backfill.
 # check_and_reingest_version (the daily sync job) already backfills missing
 # older BillVersion rows on a bill's first sighting -- run_legbot_pipeline
