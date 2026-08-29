@@ -755,22 +755,24 @@ async def test_changelog_generates_every_transition_oldest_first():
     ]
     assert [w["version_note"] for w in write_calls] == ["Introduced", "Engrossed"]
     assert [w["compare_version_note"] for w in write_calls] == ["Filed", "Introduced"]
-    # The return value reflects the LAST transition processed.
+    # The return value reflects the LAST transition processed -- both
+    # succeeded here, so this is the same as reporting the first failure
+    # (there isn't one). See test_changelog_reports_the_first_failed_
+    # transition_not_the_last below for the mixed-result case.
     assert result == {"id": 2, "created": True, "status": "complete"}
 
 
 @pytest.mark.asyncio
-async def test_changelog_history_is_capped_for_a_pathologically_long_bill():
-    """SYNC-44's own "Volume" concern: an unbounded walk is an unbounded
-    number of sequential LegBot dispatches inside one still-synchronous HTTP
-    request. Only the most recent _MAX_CHANGELOG_TRANSITIONS_PER_CALL
-    transitions are dispatched when there are more than that many ready --
-    the mismatch check (against the true last transition) still applies to
-    all of them, uncapped."""
-    from ddp_sync.pipelines.bill_artifact_generation import (
-        _MAX_CHANGELOG_TRANSITIONS_PER_CALL,
-    )
-
+async def test_changelog_processes_every_transition_uncapped():
+    """/pm-review caught a real bug in an earlier version of this function: a
+    hardcoded cap kept only the most recent N transitions, but since this
+    function is only ever reached again once the bill's CURRENT LATEST
+    version lacks a changelog, writing the latest transition (always inside
+    the kept window) meant the outer coverage gate would never call this
+    function for this bill again -- silently and PERMANENTLY stranding
+    whatever older transitions the cap dropped, with no continuation
+    mechanism to ever pick them back up. There is no cap: a long version
+    history costs more sequential LegBot dispatches, not lost history."""
     many_transitions = [
         {
             "old_bill_source": f"text {i}",
@@ -780,7 +782,7 @@ async def test_changelog_history_is_capped_for_a_pathologically_long_bill():
             "new_version_date": f"2026-01-{i + 1:02d}",
             "new_version_note": f"v{i + 1}",
         }
-        for i in range(_MAX_CHANGELOG_TRANSITIONS_PER_CALL + 3)
+        for i in range(15)
     ]
     resolved = {
         "transitions": many_transitions,
@@ -817,10 +819,53 @@ async def test_changelog_history_is_capped_for_a_pathologically_long_bill():
             }
         )
 
-    assert len(dispatch_calls) == _MAX_CHANGELOG_TRANSITIONS_PER_CALL
-    # The oldest transitions are the ones dropped -- the most recent history
-    # survives the cap.
-    assert dispatch_calls == [t["old_bill_source"] for t in many_transitions[3:]]
+    assert dispatch_calls == [t["old_bill_source"] for t in many_transitions]
+
+
+@pytest.mark.asyncio
+async def test_changelog_reports_the_first_failed_transition_not_the_last():
+    """/pm-review's other real catch: if only the LAST transition's result
+    were returned, an earlier transition failing (e.g. LegBot reports
+    insufficient_information) while a later one succeeds would report the
+    whole call as "complete" to session_pipeline_runner.py -- hiding a real
+    failed row that nothing ever revisits (the outer coverage gate only
+    looks at the bill's current latest version, and the later transition
+    just made that look fully covered). Both transitions are still written
+    for real regardless -- only the REPORTED status changes."""
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": len(write_calls), "created": True}
+
+    async def _fake_dispatch(*, old_bill_source, diff_source):
+        if old_bill_source == "Archived filed text.":
+            return {
+                "answer": {"insufficient_information": True, "reason": "diff_too_ambiguous"},
+                "backend": "mlx",
+            }
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    # Both transitions were written for real...
+    assert [w["version_note"] for w in write_calls] == ["Introduced", "Engrossed"]
+    assert [w["status"] for w in write_calls] == ["failed", "complete"]
+    # ...but the overall call reports the failure, not the later success.
+    assert result["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

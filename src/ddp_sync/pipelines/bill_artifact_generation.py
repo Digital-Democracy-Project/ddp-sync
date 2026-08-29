@@ -115,20 +115,6 @@ _BILL_TOPICS_MAX = 4  # matches the YAML's max_topics
 
 _BILL_TOPICS_CANONICAL_BY_FOLD = {name.casefold(): name for name in _BILL_TOPICS_TAXONOMY}
 
-# SYNC-44: a sanity bound on generate_and_store_bill_changelog's full-history
-# walk. Real jurisdictions' stage tables (STAGE_INTRODUCED..STAGE_ENACTED,
-# openstates-core's version_ordering.py) top out around 5-6 real stages, so
-# this only ever bites a pathological outlier -- a bill with an unusually
-# long amendment history seen for the first time. bill_changelog dispatches
-# to LegBot sequentially and each transition takes its own (non-cache
-# -shared) LegBot call, so an unbounded walk is an unbounded number of
-# sequential dispatches inside one still-synchronous HTTP request (see
-# run_single_bill_full's own docstring on this endpoint's synchronous
-# shape). Ledger-only backfill (BillVersionSyncService._backfill_missing_
-# versions) still covers every version regardless of this cap -- only how
-# many transitions get an LLM dispatch in one call is bounded.
-_MAX_CHANGELOG_TRANSITIONS_PER_CALL = 10
-
 
 class ArchivedVersionMismatchError(Exception):
     """Raised when get_archived_changelog_inputs resolved a different version as
@@ -670,15 +656,21 @@ async def generate_and_store_bill_changelog(
             update to that same row, not a duplicate.
 
     Returns:
-        The BillArtifact write response as ddp-broker-py's API reports it
-        for the LAST transition processed, merged with this function's own
-        authoritative `status` ("complete", "failed", or "not_applicable")
-        under the `status` key -- same enrichment as
-        generate_and_store_bill_artifact's own return value; see that
-        function's docstring for why (SYNC-24). Earlier transitions in a
-        multi-transition walk are written for real but not individually
-        reflected in this return value, the same "one artifact_type, one
-        result" shape session_pipeline_runner.py's caller already expects.
+        The BillArtifact write response as ddp-broker-py's API reports it,
+        merged with this function's own authoritative `status` ("complete",
+        "failed", or "not_applicable") under the `status` key -- same
+        enrichment as generate_and_store_bill_artifact's own return value;
+        see that function's docstring for why (SYNC-24). Every transition is
+        written for real regardless, but this returns the FIRST failing
+        transition's own result if any failed, and only the last
+        transition's result if every one succeeded -- an earlier version of
+        this function returned whichever transition ran last unconditionally,
+        which let one failed transition (e.g. LegBot reporting
+        insufficient_information) hide behind a later, successful one and
+        get reported as "complete" to session_pipeline_runner.py's caller,
+        even though a real failed row was left behind with nothing left to
+        revisit it (the outer coverage gate only ever looks at the bill's
+        current latest version).
     """
     resolved = await get_archived_version_transitions(bill_openstates_id)
 
@@ -713,15 +705,6 @@ async def generate_and_store_bill_changelog(
             f"{latest_transition['new_version_note']!r} -- refusing to write a "
             "changelog under a stale or mismatched version identity."
         )
-
-    if len(transitions) > _MAX_CHANGELOG_TRANSITIONS_PER_CALL:
-        logger.warning(
-            "bill_changelog_history_capped",
-            bill_openstates_id=bill_openstates_id,
-            total_transitions=len(transitions),
-            processed_transitions=_MAX_CHANGELOG_TRANSITIONS_PER_CALL,
-        )
-        transitions = transitions[-_MAX_CHANGELOG_TRANSITIONS_PER_CALL:]
 
     # SYNC-26 follow-up: run_legbot_pipeline (this call's own caller) never
     # goes through check_and_reingest_version, so a bill this pipeline is
@@ -812,9 +795,20 @@ async def generate_and_store_bill_changelog(
     # transition's compare_version as a ledger-only row; every later
     # transition's compare_version is a version an earlier iteration of this
     # same loop just wrote a real artifact against.
-    result: dict = {"status": "not_applicable"}
+    #
+    # /pm-review caught a real gap in an earlier version of this loop: it
+    # kept only the LAST transition's result, so an older transition failing
+    # (e.g. LegBot reports insufficient_information) while a later one
+    # succeeds reported the whole call as "complete" -- silently hiding a
+    # real failed row that nothing revisits afterward (the outer coverage
+    # gate only ever looks at the bill's current latest version, which the
+    # later, successful transition just made look fully covered). Every
+    # transition still gets written for real regardless -- this only changes
+    # what status is REPORTED back to the caller when one of them failed.
+    first_failure: dict | None = None
+    last_result: dict = {"status": "not_applicable"}
     for transition in transitions:
-        result = await _dispatch_and_write_changelog(
+        last_result = await _dispatch_and_write_changelog(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -827,7 +821,9 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
-    return result
+        if first_failure is None and last_result.get("status") != "complete":
+            first_failure = last_result
+    return first_failure if first_failure is not None else last_result
 
 
 async def dispatch_and_record_bill_artifact(
