@@ -629,15 +629,14 @@ async def test_changelog_still_raises_for_a_version_absent_from_the_archive_enti
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(),
-    ) as mock_write:
-        with pytest.raises(ArchivedVersionMismatchError):
-            await generate_and_store_bill_changelog(
-                bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
-                jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
-                session_code=_CHANGELOG_KWARGS["session_code"],
-                version_date="2026-04-01",
-                version_note="Vetoed",
-            )
+    ) as mock_write, pytest.raises(ArchivedVersionMismatchError):
+        await generate_and_store_bill_changelog(
+            bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
+            jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
+            session_code=_CHANGELOG_KWARGS["session_code"],
+            version_date="2026-04-01",
+            version_note="Vetoed",
+        )
 
     mock_dispatch.assert_not_called()
     mock_write.assert_not_called()
