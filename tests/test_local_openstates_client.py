@@ -15,6 +15,7 @@ import pytest
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
     get_archived_changelog_inputs,
+    get_archived_version_transitions,
     get_current_version_identity,
     list_current_session_bill_candidates,
 )
@@ -802,6 +803,178 @@ async def test_changelog_inputs_none_when_no_local_api_base_configured():
         return_value=_FakeSettings(local_openstates_api_base=""),
     ):
         result = await get_archived_changelog_inputs("some-uuid")
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# get_archived_version_transitions (SYNC-44)
+# ---------------------------------------------------------------------------
+
+def _three_version_response(*, engrossed_diff="present", enrolled_diff="present"):
+    """Filed -> Introduced -> Engrossed, in api-v3's own guaranteed order
+    (unknown-stage first, then chronological -- here, no unknown-stage
+    entries, so this is just chronological). Only Introduced and Engrossed
+    carry a diff_from_previous_version -- Filed is the earliest version and
+    has nothing to diff against, matching what api-v3 itself would return.
+    """
+    filed = {
+        "note": "Filed", "date": "2025-12-01",
+        "links": [{"url": "https://x/filed.pdf", "raw_text": "Archived filed text."}],
+    }
+    introduced = {
+        "note": "Introduced", "date": "2026-01-01",
+        "links": [{"url": "https://x/introduced.pdf", "raw_text": "Archived introduced text."}],
+    }
+    if engrossed_diff is not None:
+        introduced["diff_from_previous_version"] = (
+            "--- Filed\n+++ Introduced\n@@ -1 +1 @@\n-a\n+b\n"
+        )
+    engrossed = {
+        "note": "Engrossed", "date": "2026-02-01",
+        "links": [{"url": "https://x/engrossed.pdf", "raw_text": "Archived engrossed text."}],
+    }
+    if enrolled_diff is not None:
+        engrossed["diff_from_previous_version"] = (
+            "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+    return {"versions": [filed, introduced, engrossed]}
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_walks_every_hop_not_just_the_last():
+    """SYNC-44's whole point: a 3-version bill must resolve BOTH transitions
+    (Filed->Introduced and Introduced->Engrossed), not just the last one
+    get_archived_changelog_inputs would have picked."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = _three_version_response()
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("a3afb726-fac4-41e7-b428-0cae1f4ddada")
+
+    transitions = result["transitions"]
+    assert [t["new_version_note"] for t in transitions] == ["Introduced", "Engrossed"]
+    assert transitions[0]["old_version_note"] == "Filed"
+    assert transitions[0]["old_bill_source"] == "Archived filed text."
+    assert transitions[1]["old_version_note"] == "Introduced"
+    assert transitions[1]["old_bill_source"] == "Archived introduced text."
+    # Oldest-transition-first -- api-v3's own array order, walked forward.
+    assert transitions[0]["new_version_date"] < transitions[1]["new_version_date"]
+    assert [v["note"] for v in result["versions"]] == ["Filed", "Introduced", "Engrossed"]
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_skips_a_hop_with_no_diff_yet():
+    """A transition api-v3 hasn't computed/archived a diff for yet (still
+    unclassifiable, or its predecessor's text just isn't archived) is
+    skipped, not treated as an error -- self-correcting on a later run, per
+    this function's own docstring. Only the second hop has a diff here."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = _three_version_response(engrossed_diff=None)
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+
+    assert [t["new_version_note"] for t in result["transitions"]] == ["Engrossed"]
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_none_when_no_hop_has_a_diff():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = _three_version_response(engrossed_diff=None, enrolled_diff=None)
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_none_for_a_single_version_bill():
+    """AC4: a bill's earliest (and here, only) version has nothing to diff
+    against -- not a failure, just nothing available yet."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [{"note": "Introduced", "date": "2026-01-01", "links": []}]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_skips_a_hop_missing_old_raw_text():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [
+            {"note": "Filed", "date": "2025-12-01", "links": []},  # no raw_text archived
+            {
+                "note": "Introduced", "date": "2026-01-01",
+                "links": [{"url": "https://x/introduced.pdf", "raw_text": "Archived introduced text."}],
+                "diff_from_previous_version": "--- Filed\n+++ Introduced\n@@ -1 +1 @@\n-a\n+b\n",
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_none_on_unreachable_local_api():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_version_transitions_none_when_no_local_api_base_configured():
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(local_openstates_api_base=""),
+    ):
+        result = await get_archived_version_transitions("some-uuid")
 
     assert result is None
 

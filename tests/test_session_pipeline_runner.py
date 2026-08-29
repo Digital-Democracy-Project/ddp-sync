@@ -329,6 +329,25 @@ async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_arti
     assert result["results"][0]["artifacts_generated"] == ["bill_changelog"]
 
 
+@pytest.mark.asyncio
+async def test_bill_changelog_dispatch_threads_gov_id_for_the_ac2_coverage_filter():
+    """AC2/BROKER-130: generate_and_store_bill_changelog needs gov_id to look
+    up coverage across every version of the bill (the outer coverage check
+    right above is scoped to the current latest version only) -- this
+    caller already has it from its own candidate listing."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 0}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert mock_changelog.await_args.kwargs["gov_id"] == _CANDIDATE["gov_id"]
+
+
 # --- failure isolation -------------------------------------------------
 
 @pytest.mark.asyncio

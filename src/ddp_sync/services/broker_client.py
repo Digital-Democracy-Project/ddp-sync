@@ -880,6 +880,99 @@ async def get_bill_artifacts(
     return result
 
 
+async def get_bill_artifact_coverage_all_versions(
+    *,
+    jurisdiction: str,
+    session_code: str,
+    gov_id: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict | None:
+    """Read BillArtifact coverage across EVERY version of a bill, not just
+    its current latest -- BROKER-130 (merged 2026-08-29), the read SYNC-44's
+    own spike identified as the one genuine blocker for generating a
+    bill_changelog per version transition without ever regenerating one
+    that already exists.
+
+    Calls the same GET /api/bill-artifacts/status/ endpoint get_bill_artifacts
+    above does, with `?versions=all` -- an opt-in query param BROKER-130
+    added specifically so every existing caller's default (single-version)
+    response stays byte-for-byte unchanged.
+
+    Returns:
+        None if no Bill/BillVersion exists for this identity at all (the
+        {"found": false} case), same convention as get_bill_artifacts.
+        Otherwise {"versions": [...], "unclassified_versions": [...]},
+        each a list of {"bill_version_id", "version_note", "artifacts":
+        {artifact_type: {"status": str, "compare_version_id": int|None}}}.
+        `versions` is chronologically ordered oldest-first (ddp-broker-py's
+        own stage-aware BillVersionQuerySet.ordered_by_stage(), the same
+        classifier api-v3/openstates-core use -- never version_date, which
+        is blank on over half of all rows, or insertion order).
+        `unclassified_versions` holds versions ddp-broker-py's classifier
+        can't place in that lineage at all, kept separate rather than
+        interleaved at a guessed position, matching api-v3's own
+        `versions` response shape SYNC-44's `get_archived_version_
+        transitions` already reads.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request or was
+            unreachable -- same as get_bill_artifacts. ALSO raised if the
+            response has `"found": true` but no `"versions"` key at all --
+            an undeployed ddp-broker-py that predates BROKER-130 silently
+            ignores `?versions=all` and returns get_bill_artifacts' own
+            single-version shape instead, which looks like a valid,
+            *empty* answer rather than an error. Per BROKER-130's own
+            closing note, a caller must fail loudly here rather than treat
+            a missing `versions` key as "this bill has no other versions
+            with coverage" -- the latter would make every already
+            -generated transition look unprocessed and get silently
+            regenerated on every run, precisely the bug this function
+            exists to prevent.
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot read BillArtifact status."
+        )
+
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{resolved_api_base}/api/bill-artifacts/status/",
+                headers=headers,
+                params={
+                    "jurisdiction": jurisdiction,
+                    "session": session_code,
+                    "gov_id": gov_id,
+                    "versions": "all",
+                },
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the all-versions BillArtifact status read "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    if not result.pop("found", False):
+        return None
+    if "versions" not in result:
+        raise BrokerClientError(
+            "ddp-broker-py returned a 'found' response with no 'versions' key for "
+            "?versions=all -- this broker instance predates BROKER-130 and does not "
+            "support the all-versions coverage read yet."
+        )
+    return result
+
+
 async def get_bill_organization_positions_status(
     *,
     bill_openstates_id: str,

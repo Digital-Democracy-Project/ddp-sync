@@ -63,6 +63,7 @@ import structlog
 
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    get_bill_artifact_coverage_all_versions,
     write_bill_artifact,
 )
 from ddp_sync.services.legbot_client import (
@@ -72,7 +73,7 @@ from ddp_sync.services.legbot_client import (
 )
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
-    get_archived_changelog_inputs,
+    get_archived_version_transitions,
 )
 
 logger = structlog.get_logger()
@@ -449,75 +450,46 @@ async def generate_and_store_bill_artifact(
     return {**broker_result, "status": "complete"}
 
 
-async def generate_and_store_bill_changelog(
+async def _dispatch_and_write_changelog(
     *,
     bill_openstates_id: str,
     jurisdiction: str,
     session_code: str,
     version_date: str,
     version_note: str,
-    broker_api_base: str | None = None,
-    broker_api_token: str | None = None,
+    old_bill_source: str,
+    diff_source: str,
+    old_version_date: str,
+    old_version_note: str,
+    broker_api_base: str | None,
+    broker_api_token: str | None,
 ) -> dict:
-    """Dispatch bill_changelog to LegBot, then persist the result to
-    ddp-broker-py -- the 8th BillArtifact type, not part of
-    generate_and_store_bill_artifact above because it needs a prior
-    version's text plus a precomputed diff, not a single bill_source.
+    """Dispatch one already-resolved version transition to LegBot and persist
+    it as a bill_changelog BillArtifact attached to version_date/version_note
+    (the transition's newer/target version), diffed against old_version_date/
+    old_version_note.
 
-    Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
-    docstring.
-
-    ddp-infra's PLAN-bill-document-provenance.md, "bill_changelog's missing
-    BillArtifact write path" (approved 2026-08-01 after 5 rounds of
-    /pm-review).
-
-    Latest-version-only by construction: get_archived_changelog_inputs only
-    ever resolves the single most recent version transition, with no way to
-    look up an arbitrary older one. Callers must only invoke this for a
-    bill's actual current/latest version.
-
-    No live-refetch-and-diff fallback, unlike bill_version.py's legacy
-    _generate_and_ingest_changelog -- one real diff-computation path
-    (ddp-open-states, at scrape time), not two. If nothing's archived yet,
-    this reports a failed row rather than re-deriving a diff itself.
-
-    Raises:
-        ArchivedVersionMismatchError: the caller's version_date/version_note
-            don't match the version get_archived_changelog_inputs resolved
-            as latest -- a stale caller, or the bill has moved on to a newer
-            version since the caller looked it up. Deliberately raises
-            *without writing anything at all*, not a failed row: writing a
-            failed row here would upsert via write_bill_artifact's own
-            (bill_version, artifact_type, model_version, prompt_version) key,
-            which resolves from this call's own (stale) version_date/
-            version_note -- exactly the row a real, already-successful
-            changelog for that version might already occupy. This is a
-            caller/timing bug, not a "couldn't analyze this bill" outcome;
-            there is no correct row to write for it, and the one thing that
-            must never happen is silently overwriting a good row with a bad
-            one. Safe to simply retry later with fresh version info -- since
-            nothing was written, a future coverage check still sees this bill
-            as missing bill_changelog and will dispatch it again.
-        LegBotDispatchError: LegBot unreachable/timed out -- propagates
-            uncaught, same convention as generate_and_store_bill_artifact.
-        BrokerClientError: ddp-broker-py rejected the write or was
-            unreachable -- propagates uncaught, same convention as
-            generate_and_store_bill_artifact.
-
-    Returns:
-        The BillArtifact write response as ddp-broker-py's API reports it,
-        merged with this function's own authoritative `status` ("complete"
-        or "failed") under the `status` key -- same enrichment as
-        generate_and_store_bill_artifact's own return value; see that
-        function's docstring for why (SYNC-24).
+    SYNC-44: the write-side body shared by generate_and_store_bill_changelog's
+    two callers below (the single latest transition, and its own full-history
+    walk) -- both resolve WHICH transition(s) to generate differently, but
+    dispatch and persist a single, already-resolved one identically. Neither
+    caller wraps this in a try/except for LegBotDispatchError or
+    BrokerClientError -- both propagate uncaught, same convention as
+    generate_and_store_bill_artifact.
     """
-    archived = await get_archived_changelog_inputs(bill_openstates_id)
+    dispatch_result = await dispatch_bill_changelog(
+        old_bill_source=old_bill_source,
+        diff_source=diff_source,
+    )
+    answer = dispatch_result["answer"]
+    model_name = dispatch_result.get("backend")
 
-    if archived is None:
+    if answer.get("insufficient_information"):
         logger.info(
-            "No archived changelog inputs for bill_changelog -- recording a "
-            "failed artifact",
+            "LegBot reported insufficient_information for bill_changelog -- "
+            "recording a failed artifact",
             bill_openstates_id=bill_openstates_id,
+            version_note=version_note,
         )
         broker_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
@@ -529,32 +501,298 @@ async def generate_and_store_bill_changelog(
             content="",
             status="failed",
             failure_stage="generation",
-            failure_reason="no_archived_changelog_inputs",
+            failure_reason=answer.get("reason", "insufficient_information"),
+            model_name=model_name,
+            compare_version_date=old_version_date,
+            compare_version_note=old_version_note,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
         return {**broker_result, "status": "failed"}
 
+    content = _bill_changelog_content_from_answer(
+        answer,
+        old_version_note=old_version_note,
+        new_version_note=version_note,
+    )
+
+    try:
+        broker_result = await write_bill_artifact(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            artifact_type="bill_changelog",
+            content=content,
+            status="complete",
+            model_name=model_name,
+            source_support=answer.get("source_support"),  # SYNC-43
+            compare_version_date=old_version_date,
+            compare_version_note=old_version_note,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        return {**broker_result, "status": "complete"}
+    except BrokerClientError:
+        # Distinguishable from other write failures, per this design's own
+        # review: includes the compare_version fields that were attempted,
+        # so an operator can tell a compare_version FK-resolution failure
+        # (api-v3 has archived a version ddp-broker-py's BillVersion table
+        # hasn't synced yet -- rare) apart from any other rejection.
+        logger.exception(
+            "bill_changelog_write_failed",
+            bill_openstates_id=bill_openstates_id,
+            compare_version_date=old_version_date,
+            compare_version_note=old_version_note,
+        )
+        raise
+
+
+async def generate_and_store_bill_changelog(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    version_date: str,
+    version_note: str,
+    gov_id: str | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Dispatch bill_changelog to LegBot, then persist the result(s) to
+    ddp-broker-py -- the 8th BillArtifact type, not part of
+    generate_and_store_bill_artifact above because it needs a prior
+    version's text plus a precomputed diff, not a single bill_source.
+
+    Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
+    docstring.
+
+    ddp-infra's PLAN-bill-document-provenance.md, "bill_changelog's missing
+    BillArtifact write path" (approved 2026-08-01 after 5 rounds of
+    /pm-review); SYNC-44 (2026-08-28) rewrote this to walk every version
+    transition, not just the one immediately before the bill's current
+    version.
+
+    SYNC-44 bug this replaces: taking versions[-2]/versions[-1] unconditionally
+    means a bill that has reached enrollment always gets a changelog for
+    engrossed -> enrolled -- the typesetting-only step -- and never for the
+    earlier transitions that actually carried policy content. Confirmed
+    against FL 2026E: all six multi-version bills that produced a changelog
+    described only whitespace/formatting, with zero genuinely new lines
+    across all six.
+
+    Fix: get_archived_version_transitions (services/local_openstates_client.py)
+    resolves EVERY transition api-v3 has already archived a diff for, oldest
+    -first, and every transition is dispatched and attached to its own
+    (newer) BillVersion -- ddp-broker-py already supports this (spiked live
+    against the dev broker: two bill_changelog rows coexisted on two
+    different versions of the same bill, no schema change needed).
+
+    Each transition's target version must exist as a write target before a
+    later transition can name it as compare_version -- ddp-broker-py
+    auto-creates a write's own target version but refuses to auto-create a
+    referenced compare_version (confirmed live during this ticket's spike:
+    "No BillVersion exists for bill=..., compare_version_note=... --
+    compare_version must already be synced before it can be referenced").
+    Processing oldest-first, after backfilling every version as a ledger
+    -only row up front, satisfies this naturally: by the time a transition's
+    own compare_version is referenced, either the backfill already created
+    it (the very first transition's compare_version) or an earlier iteration
+    of this same loop just wrote a real artifact against it.
+
+    AC2 (2026-08-29, /pm-review on the first version of this fix): a bill
+    with 3+ versions is only ever re-checked at the OUTER level (session_
+    pipeline_runner.py's per-bill coverage check) against its CURRENT latest
+    version -- so the moment a bill this pipeline already processed gains a
+    new version, the outer gate opens again and this function would
+    otherwise re-walk and re-dispatch EVERY transition, including ones that
+    already have a complete changelog. Demonstrated live: calling this
+    function twice against the same 3-version bill produced 4 LegBot
+    dispatches for 2 real transitions. Re-writing an already-`complete`
+    changelog isn't just wasted MLX time -- ddp-broker-py's BROKER-105
+    revision path queues a fresh review for what the reviewer had already
+    approved, so a bill that keeps gaining versions would keep churning its
+    entire changelog history back through review, not just its newest hop.
+
+    Fixed by BROKER-130 (merged 2026-08-29): `gov_id`, when provided, is
+    used to read artifact coverage across EVERY version of the bill
+    (get_bill_artifact_coverage_all_versions, `?versions=all` on the same
+    status endpoint the outer single-version coverage check already calls)
+    and skip any transition whose target version already carries a
+    bill_changelog row of ANY status -- matching this design's existing
+    "never regenerate, never overwrite" posture (see
+    ArchivedVersionMismatchError below) rather than inventing a new,
+    separate retry policy for non-latest versions. `gov_id` is optional
+    because it identifies a bill by a different natural key
+    (jurisdiction/session/gov_id) than every write in this function uses
+    (bill_openstates_id) -- session_pipeline_runner.py's batch callers
+    already have it on hand from their own candidate listing and pass it
+    through; SYNC-10's on-demand single-bill endpoint (dispatch_and_record_
+    bill_artifact) does not carry gov_id in its request body at all today,
+    so it keeps this function's pre-BROKER-130 behavior (walk and dispatch
+    every transition every call) unchanged -- appropriate for a one-shot,
+    explicitly user-triggered dispatch rather than a recurring batch job,
+    and not something this ticket's ACs ask to change.
+
+    If every transition is already covered once filtered, this writes
+    nothing and returns status="not_applicable" -- the bill is fully caught
+    up, which is not a failure any more than its earliest version having
+    nothing to diff against is (see below).
+
+    A bill with no version transition ready yet -- either it has only one
+    archived version ever (nothing precedes it to diff against, not a
+    failure, just not yet applicable) or its very next transition's diff/
+    prior text simply isn't archived -- writes nothing at all and returns
+    status="not_applicable" (SYNC-44/AC4), replacing the blanket `failed`/
+    "no_archived_changelog_inputs" row this used to write for both cases.
+    That row was actively harmful once SYNC-42's retry_failed shipped: a
+    bill's permanently-not-applicable first version looked identical to a
+    real, retryable failure and got retried forever.
+
+    Raises:
+        ArchivedVersionMismatchError: the caller's version_date/version_note
+            don't match the LAST transition's target that
+            get_archived_version_transitions resolved -- a stale caller, or
+            the bill has moved on to a newer version since the caller looked
+            it up. Deliberately raises *without writing anything at all*, not
+            a failed row: writing a failed row here would upsert via
+            write_bill_artifact's own (bill_version, artifact_type,
+            model_version, prompt_version) key, which resolves from this
+            call's own (stale) version_date/version_note -- exactly the row
+            a real, already-successful changelog for that version might
+            already occupy. This is a caller/timing bug, not a "couldn't
+            analyze this bill" outcome; there is no correct row to write for
+            it, and the one thing that must never happen is silently
+            overwriting a good row with a bad one. Safe to simply retry later
+            with fresh version info -- since nothing was written, a future
+            coverage check still sees this bill as missing bill_changelog and
+            will dispatch it again.
+        LegBotDispatchError: LegBot unreachable/timed out -- propagates
+            uncaught, same convention as generate_and_store_bill_artifact.
+        BrokerClientError: ddp-broker-py rejected a request or was
+            unreachable -- propagates uncaught, same convention as
+            generate_and_store_bill_artifact. Two distinct sources when
+            `gov_id` is provided: the all-versions coverage read itself
+            (including a deliberate raise if the target broker predates
+            BROKER-130 and silently ignores `?versions=all` -- see
+            get_bill_artifact_coverage_all_versions' own docstring for why
+            that must fail loudly rather than look like "nothing covered
+            yet"), and a write failing mid-walk, which leaves whichever
+            earlier transitions in this same call already wrote
+            successfully in place (each is its own natural-key upsert on its
+            own version, so nothing is left half-written) -- a later run,
+            once the bill's current latest version still shows no
+            bill_changelog, re-walks from the start; re-dispatching an
+            already-succeeded transition again is a harmless idempotent
+            update to that same row, not a duplicate.
+
+    Returns:
+        The BillArtifact write response as ddp-broker-py's API reports it,
+        merged with this function's own authoritative `status` ("complete",
+        "failed", or "not_applicable") under the `status` key -- same
+        enrichment as generate_and_store_bill_artifact's own return value;
+        see that function's docstring for why (SYNC-24). Every transition is
+        written for real regardless, but this returns the FIRST failing
+        transition's own result if any failed, and only the last
+        transition's result if every one succeeded -- an earlier version of
+        this function returned whichever transition ran last unconditionally,
+        which let one failed transition (e.g. LegBot reporting
+        insufficient_information) hide behind a later, successful one and
+        get reported as "complete" to session_pipeline_runner.py's caller,
+        even though a real failed row was left behind with nothing left to
+        revisit it (the outer coverage gate only ever looks at the bill's
+        current latest version).
+    """
+    resolved = await get_archived_version_transitions(bill_openstates_id)
+
+    if resolved is None:
+        logger.info(
+            "No archived version transition ready for bill_changelog yet -- "
+            "not a failure, nothing to write",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return {"status": "not_applicable"}
+
+    transitions = resolved["transitions"]
+    latest_transition = transitions[-1]
+
     if (
-        archived["latest_version_date"] != version_date
-        or archived["latest_version_note"] != version_note
+        latest_transition["new_version_date"] != version_date
+        or latest_transition["new_version_note"] != version_note
     ):
         logger.warning(
             "bill_changelog_archived_version_mismatch",
             bill_openstates_id=bill_openstates_id,
             requested_version_date=version_date,
             requested_version_note=version_note,
-            archived_latest_version_date=archived["latest_version_date"],
-            archived_latest_version_note=archived["latest_version_note"],
+            archived_latest_version_date=latest_transition["new_version_date"],
+            archived_latest_version_note=latest_transition["new_version_note"],
         )
         raise ArchivedVersionMismatchError(
             f"Requested a bill_changelog for version_date={version_date!r}/"
-            f"version_note={version_note!r}, but get_archived_changelog_inputs "
+            f"version_note={version_note!r}, but get_archived_version_transitions "
             f"resolved the current latest version as "
-            f"{archived['latest_version_date']!r}/{archived['latest_version_note']!r} "
-            "-- refusing to write a changelog under a stale or mismatched "
-            "version identity."
+            f"{latest_transition['new_version_date']!r}/"
+            f"{latest_transition['new_version_note']!r} -- refusing to write a "
+            "changelog under a stale or mismatched version identity."
         )
+
+    # AC2/BROKER-130 (2026-08-29): skip any transition whose target version
+    # already carries a bill_changelog, of any status -- never regenerate,
+    # never overwrite. Matched by version_note alone: ddp-broker-py's
+    # all-versions coverage response doesn't expose version_date per entry
+    # (BillVersion.version_date is blank on over half of all rows anyway),
+    # and version_note is the natural key that actually distinguishes a
+    # bill's own versions from each other in practice. Accepted, documented
+    # limitation (raised on /pm-review's second pass): if a single bill ever
+    # has two distinct versions sharing an identical note, this could skip a
+    # transition that genuinely still needs generating. Not observed in any
+    # real bill this ticket's own investigation looked at, and the failure
+    # mode if it ever happens is a missed changelog, not a corrupted or
+    # wrongly-overwritten one -- the same category of imprecision this
+    # module already accepts elsewhere (version_date itself being blank on
+    # most real rows). Fixing it properly needs ddp-broker-py to expose a
+    # stable per-version identifier in this response, a further BROKER
+    # ticket, not more logic here.
+    #
+    # gov_id is optional -- see this function's own docstring for why. When
+    # it's absent (SYNC-10's on-demand endpoint), this is a no-op and every
+    # transition is dispatched every call, exactly as before this fix.
+    if gov_id is not None:
+        coverage = await get_bill_artifact_coverage_all_versions(
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            gov_id=gov_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        # .get(..., default) throughout, not direct indexing (/pm-review's
+        # second-pass catch): a response missing a key this code didn't
+        # explicitly ask ddp-broker-py to guarantee should degrade to "no
+        # extra coverage found" for that piece, not crash this bill's whole
+        # dispatch with a raw KeyError. The one shape violation that DOES
+        # need to fail loudly -- a "found" response with no `versions` key
+        # at all, meaning the broker predates BROKER-130 -- is already
+        # handled inside get_bill_artifact_coverage_all_versions itself.
+        already_covered_notes = {
+            entry.get("version_note")
+            for entry in (
+                (coverage.get("versions") or []) + (coverage.get("unclassified_versions") or [])
+            )
+            if "bill_changelog" in (entry.get("artifacts") or {})
+        } if coverage is not None else set()
+
+        transitions = [
+            t for t in transitions if t["new_version_note"] not in already_covered_notes
+        ]
+        if not transitions:
+            logger.info(
+                "Every archived transition already has a bill_changelog -- "
+                "nothing new to write",
+                bill_openstates_id=bill_openstates_id,
+            )
+            return {"status": "not_applicable"}
 
     # SYNC-26 follow-up: run_legbot_pipeline (this call's own caller) never
     # goes through check_and_reingest_version, so a bill this pipeline is
@@ -612,100 +850,68 @@ async def generate_and_store_bill_changelog(
     # function's own prior behavior, which failed outright, every time,
     # for every bill in this shape.
     #
-    # SYNC-30: pass archived["versions"] -- the bill's COMPLETE archived
-    # version list -- rather than a synthetic 2-element [old, new] list.
-    # SYNC-28's own fix above only ever covered the ONE compare_version
-    # this function itself needs; a bill with 3+ real versions (confirmed
-    # live, FL SB 2506E: Filed -> e1 -> er) still never got its oldest
-    # version(s) backfilled at all, because nothing in that narrower fix
-    # ever looked past "old" and "new". _backfill_missing_versions already
+    # SYNC-30/SYNC-44: pass resolved["versions"] -- the bill's COMPLETE
+    # archived version list -- rather than a synthetic 2-element [old, new]
+    # list. A bill with 3+ real versions (confirmed live, FL SB 2506E:
+    # Filed -> e1 -> er) needs every older version backfilled as a ledger
+    # -only row, not just the one immediately-previous compare_version a
+    # single transition would need -- _backfill_missing_versions already
     # loops over every entry in `versions` other than `latest_version`
-    # (SYNC-26) -- passing the real full list here, which
-    # get_archived_changelog_inputs now also returns, costs no extra I/O
-    # (it already fetched this list to resolve old/diff) and closes that
-    # gap for exactly the same reason SYNC-26's own first-sighting backfill
-    # already covers full depth when it fires.
+    # (SYNC-26); passing the real full list here, which
+    # get_archived_version_transitions already fetched to resolve every
+    # transition, costs no extra I/O.
     from ddp_sync.pipelines.bill_version import BillVersionSyncService
 
+    latest_version_raw = resolved["versions"][-1]
     await BillVersionSyncService._backfill_missing_versions(
         bill_openstates_id=bill_openstates_id,
         jurisdiction_code=jurisdiction,
         session_code=session_code,
-        versions=archived["versions"],
-        latest_version={"date": version_date, "note": version_note},
+        versions=resolved["versions"],
+        latest_version={
+            "date": latest_version_raw.get("date", ""),
+            "note": latest_version_raw.get("note", ""),
+        },
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
 
-    dispatch_result = await dispatch_bill_changelog(
-        old_bill_source=archived["old_bill_source"],
-        diff_source=archived["diff_source"],
-    )
-    answer = dispatch_result["answer"]
-    model_name = dispatch_result.get("backend")
-
-    if answer.get("insufficient_information"):
-        logger.info(
-            "LegBot reported insufficient_information for bill_changelog -- "
-            "recording a failed artifact",
-            bill_openstates_id=bill_openstates_id,
-        )
-        broker_result = await write_bill_artifact(
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            version_date=version_date,
-            version_note=version_note,
-            artifact_type="bill_changelog",
-            content="",
-            status="failed",
-            failure_stage="generation",
-            failure_reason=answer.get("reason", "insufficient_information"),
-            model_name=model_name,
-            compare_version_date=archived["old_version_date"],
-            compare_version_note=archived["old_version_note"],
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
-        return {**broker_result, "status": "failed"}
-
-    content = _bill_changelog_content_from_answer(
-        answer,
-        old_version_note=archived["old_version_note"],
-        new_version_note=version_note,
-    )
-
-    try:
-        broker_result = await write_bill_artifact(
+    # Oldest-first (see this function's own docstring on why order matters
+    # here): each transition's target version must exist before the NEXT
+    # transition can reference it as compare_version.
+    # _backfill_missing_versions above already covers the very first
+    # transition's compare_version as a ledger-only row; every later
+    # transition's compare_version is a version an earlier iteration of this
+    # same loop just wrote a real artifact against.
+    #
+    # /pm-review caught a real gap in an earlier version of this loop: it
+    # kept only the LAST transition's result, so an older transition failing
+    # (e.g. LegBot reports insufficient_information) while a later one
+    # succeeds reported the whole call as "complete" -- silently hiding a
+    # real failed row that nothing revisits afterward (the outer coverage
+    # gate only ever looks at the bill's current latest version, which the
+    # later, successful transition just made look fully covered). Every
+    # transition still gets written for real regardless -- this only changes
+    # what status is REPORTED back to the caller when one of them failed.
+    first_failure: dict | None = None
+    last_result: dict = {"status": "not_applicable"}
+    for transition in transitions:
+        last_result = await _dispatch_and_write_changelog(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
-            version_date=version_date,
-            version_note=version_note,
-            artifact_type="bill_changelog",
-            content=content,
-            status="complete",
-            model_name=model_name,
-            source_support=answer.get("source_support"),  # SYNC-43
-            compare_version_date=archived["old_version_date"],
-            compare_version_note=archived["old_version_note"],
+            version_date=transition["new_version_date"],
+            version_note=transition["new_version_note"],
+            old_bill_source=transition["old_bill_source"],
+            diff_source=transition["diff_source"],
+            old_version_date=transition["old_version_date"],
+            old_version_note=transition["old_version_note"],
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
-        return {**broker_result, "status": "complete"}
-    except BrokerClientError:
-        # Distinguishable from other write failures, per this design's own
-        # review: includes the compare_version fields that were attempted,
-        # so an operator can tell a compare_version FK-resolution failure
-        # (api-v3 has archived a version ddp-broker-py's BillVersion table
-        # hasn't synced yet -- rare) apart from any other rejection.
-        logger.exception(
-            "bill_changelog_write_failed",
-            bill_openstates_id=bill_openstates_id,
-            compare_version_date=archived["old_version_date"],
-            compare_version_note=archived["old_version_note"],
-        )
-        raise
+        if first_failure is None and last_result.get("status") != "complete":
+            first_failure = last_result
+    return first_failure if first_failure is not None else last_result
 
 
 async def dispatch_and_record_bill_artifact(
@@ -780,7 +986,7 @@ async def dispatch_and_record_bill_artifact(
 
     try:
         if artifact_type == "bill_changelog":
-            await generate_and_store_bill_changelog(
+            changelog_result = await generate_and_store_bill_changelog(
                 bill_openstates_id=bill_openstates_id,
                 jurisdiction=jurisdiction,
                 session_code=session_code,
@@ -789,6 +995,33 @@ async def dispatch_and_record_bill_artifact(
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
+            if changelog_result.get("status") == "not_applicable":
+                # SYNC-44: unlike session_pipeline_runner.py's batch caller
+                # (which never writes a placeholder row and is happy to
+                # leave nothing behind for a not-yet-applicable bill), this
+                # caller already wrote a `pending` row above and ddp-next is
+                # polling it -- leaving it pending forever would hang that
+                # poll. There's no broker-side "not_applicable" status (only
+                # pending/processing/complete/failed), so this resolves the
+                # placeholder to `failed` with a reason string that reads
+                # distinctly from a real generation failure -- this repo has
+                # no scheduled retry sweep against this on-demand endpoint,
+                # so unlike the batch path's own AC4 concern, there's no
+                # retry_failed loop for this to get stuck in.
+                await write_bill_artifact(
+                    bill_openstates_id=bill_openstates_id,
+                    jurisdiction=jurisdiction,
+                    session_code=session_code,
+                    version_date=version_date,
+                    version_note=version_note,
+                    artifact_type=artifact_type,
+                    content="",
+                    status="failed",
+                    failure_stage="generation",
+                    failure_reason="no_version_transition_available",
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
+                )
         else:
             await generate_and_store_bill_artifact(
                 bill_openstates_id=bill_openstates_id,
