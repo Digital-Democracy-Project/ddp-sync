@@ -27,6 +27,7 @@ import pytest
 
 from ddp_sync.pipelines.openstates_scrape import (
     _cloud_path_owns,
+    _maybe_preseed_scrapebot_cookies,
     _memory_backend_enabled,
     _run_scrape,
     run_single_scrape_job,
@@ -105,6 +106,29 @@ async def test_run_scrape_never_invokes_the_subprocess_for_a_cloud_owned_jurisdi
     assert result["success"] is True
     assert result["skipped"] is True
     assert result["reason"] == "cloud_path_owns"
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_skips_before_scrapebot_preseed_for_a_cloud_owned_jurisdiction():
+    """The docstring's ordering claim, pinned down: the ownership check runs BEFORE
+    ScrapeBot cookie pre-seeding, so a cloud-owned jurisdiction never triggers a real
+    cookie mint against its WAF (MI's, in practice) for a scrape the mac isn't going
+    to run. Regression coverage for pm-review's "assert the ordering, not just the
+    non-invocation" finding on this PR."""
+    config = _config(jurisdictions=("mi",))
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._maybe_preseed_scrapebot_cookies",
+        ) as mock_preseed,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+        ) as mock_run,
+    ):
+        result = await _run_scrape("mi", None, "/fake/root", config=config)
+
+    mock_preseed.assert_not_called()
+    mock_run.assert_not_called()
+    assert result["skipped"] is True
 
 
 @pytest.mark.asyncio
