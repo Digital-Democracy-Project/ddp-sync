@@ -379,6 +379,39 @@ openstates_scrape:
     max_attempts: 3
     backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision
 
+  # OPEN-208: exactly one path owns a jurisdiction (PLAN-scraper-execution-migration.md §3).
+  #
+  # `run-scrape.sh`'s all-in-one collect-and-load keeps working the whole migration -- but
+  # nothing before this stopped the SAME jurisdiction running on both the mac path and the
+  # AWS Fargate path at once, which doubles request rate against a source site (the exact
+  # thing OPEN-19/21/22/23/52/53/54/106/132's resilience work exists to avoid) and races
+  # OPEN-203's import lock. `_cloud_path_owns()` (pipelines/openstates_scrape.py) is checked
+  # inside `_run_scrape()` itself -- the one funnel every launch path already goes through
+  # (scheduled jobs, the manual `/trigger/openstates-scrape/<state>` endpoint, and retry) --
+  # so "refuses rather than running" holds for all of them by construction.
+  #
+  # Absent/disabled by default, so every jurisdiction is mac-owned exactly as today. As of
+  # this writing NOTHING is listed here -- OPEN-190 is what actually moves a jurisdiction,
+  # this ticket only builds and tests the switch itself.
+  #
+  # TWO LISTS, NOT ONE, mirroring dynamic_cadence's own floor-not-default rule below.
+  # `jurisdictions` is who cloud owns RIGHT NOW; rolling back means removing a name from
+  # here (the mac path picks it back up at the next scheduled run -- an in-flight run is
+  # never interrupted, and OPEN-187's shared lock makes that safe even mid-transition).
+  # `memory_backend_jurisdictions` is a FLOOR: who has EVER been split. Add a name here at
+  # the SAME TIME as adding it to `jurisdictions`, and never remove it on rollback -- a
+  # jurisdiction coming back to the mac path has no local watermark at all (the mac never
+  # ran it while cloud owned it), so its first run back needs S3-backed memory (OPEN-181)
+  # to hydrate the real cutoff, not silently fall back to "no local file, full walk".
+  #
+  # Rollback is therefore two separate edits with two separate effects: remove from
+  # `jurisdictions` to stop cloud collecting it (mac resumes); `memory_backend_jurisdictions`
+  # stays as it is, permanently, once a jurisdiction has ever appeared there.
+  cloud_path:
+    enabled: false
+    jurisdictions: []
+    memory_backend_jurisdictions: []
+
   # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
   #
   # Reads run-scrape.sh's per-run `.imported` marker (ddp-open-states, same ticket) and folds the
