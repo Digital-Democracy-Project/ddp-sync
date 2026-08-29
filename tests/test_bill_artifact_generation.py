@@ -1060,6 +1060,40 @@ async def test_changelog_coverage_filter_matches_unclassified_versions_too():
     assert dispatch_calls == ["Archived introduced text."]
 
 
+@pytest.mark.asyncio
+async def test_changelog_coverage_filter_tolerates_a_malformed_response():
+    """/pm-review's second-pass catch: a coverage response missing a key
+    this code didn't itself guarantee (e.g. no `unclassified_versions`, or
+    an entry with no `artifacts`) must degrade to "no extra coverage found
+    there", not crash this bill's dispatch with a raw KeyError. The one
+    shape violation that IS fatal -- no `versions` key at all -- is a
+    separate, already-tested BrokerClientError raised inside
+    get_bill_artifact_coverage_all_versions itself."""
+    incomplete_coverage = {
+        "versions": [{"bill_version_id": 18, "version_note": "Engrossed"}],
+        # unclassified_versions deliberately omitted.
+    }
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=incomplete_coverage),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        result = await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS, gov_id="SJR 2F",
+        )
+
+    assert result["status"] == "complete"
+
+
 # ---------------------------------------------------------------------------
 # SYNC-26 follow-up: run_legbot_pipeline's own compare_version backfill.
 # check_and_reingest_version (the daily sync job) already backfills missing

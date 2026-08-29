@@ -744,7 +744,17 @@ async def generate_and_store_bill_changelog(
     # all-versions coverage response doesn't expose version_date per entry
     # (BillVersion.version_date is blank on over half of all rows anyway),
     # and version_note is the natural key that actually distinguishes a
-    # bill's own versions from each other in practice.
+    # bill's own versions from each other in practice. Accepted, documented
+    # limitation (raised on /pm-review's second pass): if a single bill ever
+    # has two distinct versions sharing an identical note, this could skip a
+    # transition that genuinely still needs generating. Not observed in any
+    # real bill this ticket's own investigation looked at, and the failure
+    # mode if it ever happens is a missed changelog, not a corrupted or
+    # wrongly-overwritten one -- the same category of imprecision this
+    # module already accepts elsewhere (version_date itself being blank on
+    # most real rows). Fixing it properly needs ddp-broker-py to expose a
+    # stable per-version identifier in this response, a further BROKER
+    # ticket, not more logic here.
     #
     # gov_id is optional -- see this function's own docstring for why. When
     # it's absent (SYNC-10's on-demand endpoint), this is a no-op and every
@@ -757,10 +767,20 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        # .get(..., default) throughout, not direct indexing (/pm-review's
+        # second-pass catch): a response missing a key this code didn't
+        # explicitly ask ddp-broker-py to guarantee should degrade to "no
+        # extra coverage found" for that piece, not crash this bill's whole
+        # dispatch with a raw KeyError. The one shape violation that DOES
+        # need to fail loudly -- a "found" response with no `versions` key
+        # at all, meaning the broker predates BROKER-130 -- is already
+        # handled inside get_bill_artifact_coverage_all_versions itself.
         already_covered_notes = {
-            entry["version_note"]
-            for entry in (coverage["versions"] + coverage["unclassified_versions"])
-            if "bill_changelog" in entry["artifacts"]
+            entry.get("version_note")
+            for entry in (
+                (coverage.get("versions") or []) + (coverage.get("unclassified_versions") or [])
+            )
+            if "bill_changelog" in (entry.get("artifacts") or {})
         } if coverage is not None else set()
 
         transitions = [
