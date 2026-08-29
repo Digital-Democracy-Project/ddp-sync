@@ -148,9 +148,8 @@ it is **editable by a human reviewer** in ddp-broker-py's admin Content
 fieldset. So never write it unconditionally: sending `""` on every write lets
 each regeneration silently erase a reviewer's own notes. Send the field only
 when there is something to record. `ddp-broker-py` #363 (merged) is what makes
-the field writable at all; SYNC-43 (`ddp-sync` #86, in review as of
-2026-08-28) establishes the convention of a `source_support=inferred: ...`
-prefix there, queried with
+the field writable at all; SYNC-43 (`ddp-sync` #86, merged) establishes the
+convention of a `source_support=inferred: ...` prefix there, queried with
 `bill_version__session_code` — note `session_code` lives on `BillVersion`, not
 `BillArtifact`, and the obvious spelling raises `FieldError`.
 
