@@ -450,6 +450,67 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     return jurisdiction in retry_cfg.get("jurisdictions", [])
 
 
+def _cloud_path_owns(jurisdiction: str, config: dict | None) -> bool:
+    """Does the AWS Fargate path own this jurisdiction right now (OPEN-208)?
+
+    Every phase of the scraper-execution migration rolls out per jurisdiction and rolls
+    back per jurisdiction, and `run-scrape.sh`'s all-in-one collect-and-load keeps working
+    the whole time (PLAN-scraper-execution-migration.md §3). That is deliberate -- but it
+    does not by itself stop the SAME jurisdiction running on both paths at once, which
+    doubles request rate against a source site (OPEN-19/21/22/23/52/53/54/106/132's
+    resilience work exists precisely because that is expensive) and reproduces the
+    duplicate-delivery hazard OPEN-203's import lock exists to survive.
+
+    This is the "exactly one path owns a jurisdiction" gate, and it is a config check, not
+    a new mechanism -- `sync_schedule.yaml` already decides per-jurisdiction eligibility in
+    one place (OPEN-124/OPEN-140: _scrapebot_eligible/_sweep_import_eligible/_retry_eligible
+    above), and this is one more thing it decides. Config lives under
+    openstates_scrape.cloud_path, mirroring their shape. Absent/disabled by default, so
+    every jurisdiction is mac-owned exactly as today until one is explicitly listed here --
+    which as of this writing is none; OPEN-190 is what actually moves one.
+
+    Checked inside _run_scrape() itself -- the one funnel every launch path already goes
+    through (scheduled jobs, the manual-trigger endpoint via run_single_scrape_job(), and
+    retry via run-scrape-retrying.sh, since that wrapper is chosen INSIDE this same
+    function) -- rather than at each call site, so "refuses rather than running" is true
+    for all of them by construction, not by remembering to add the check everywhere.
+
+    Ownership transfers at the NEXT scheduled run, not at the moment this config changes:
+    an in-flight run keeps going, uninterrupted, and OPEN-187's shared lock is what makes
+    that safe even in the window where this file says one thing and a run started under
+    the old answer is still finishing.
+    """
+    cloud_cfg = (config or {}).get("cloud_path", {})
+    if not cloud_cfg.get("enabled", False):
+        return False
+    return jurisdiction in cloud_cfg.get("jurisdictions", [])
+
+
+def _memory_backend_enabled(jurisdiction: str, config: dict | None) -> bool:
+    """Should THIS mac-side run externalise its memory to S3 (OPEN-181) for this
+    jurisdiction (OPEN-208's rollback requirement)?
+
+    Deliberately a FLOOR, not tied 1:1 to _cloud_path_owns() -- a jurisdiction rolled back
+    from cloud to mac ownership has no local watermark at all (the mac never ran it while
+    it was cloud-owned), so its first run back needs to HYDRATE from the S3 store rather
+    than silently fall back to "no local file found" and full-walk. Turning memory off the
+    moment a jurisdiction leaves cloud_path.jurisdictions would be exactly the "rollback
+    with the backend disabled, caught rather than silently re-collecting" failure this
+    function exists to prevent.
+
+    So there are two lists, not one, mirroring dynamic_cadence's own floor-not-default
+    rule elsewhere in this file: `jurisdictions` is who cloud owns RIGHT NOW (rolls back by
+    removing a name); `memory_backend_jurisdictions` is who has EVER been split (an
+    operator adds a name here at the same time as adding it to `jurisdictions`, and never
+    removes it on rollback -- only `jurisdictions` shrinks). A jurisdiction in either list
+    gets the S3 backend.
+    """
+    cloud_cfg = (config or {}).get("cloud_path", {})
+    if jurisdiction in cloud_cfg.get("jurisdictions", []):
+        return True
+    return jurisdiction in cloud_cfg.get("memory_backend_jurisdictions", [])
+
+
 def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, int]:
     """Is this jurisdiction opted into a periodic forced full walk (OPEN-162)?
 
@@ -896,6 +957,24 @@ async def _run_scrape(
     now rather than reactive-after-failure. A no-op for every jurisdiction not
     opted in (config defaults to None, in which case it's always a no-op).
     """
+    # OPEN-208: checked first, before anything else -- including ScrapeBot pre-seeding and
+    # full-walk forcing below, both of which would be wasted work (and, for ScrapeBot, a
+    # real mint against MI's WAF) for a jurisdiction this mac is not supposed to touch at
+    # all. Every caller of _run_scrape() funnels through here, so this one check covers
+    # scheduled jobs, the manual-trigger endpoint, and retry alike.
+    if _cloud_path_owns(jurisdiction, config):
+        logger.info(
+            "openstates_scrape: skipping -- this jurisdiction is cloud-owned (OPEN-208)",
+            jurisdiction=jurisdiction,
+        )
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "cloud_path_owns",
+            "jurisdiction": jurisdiction,
+            "duration_seconds": 0.0,
+        }
+
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
 
     # OPEN-162: force a periodic full walk if one is due, by clearing the marker
@@ -945,6 +1024,17 @@ async def _run_scrape(
         cmd.append(session_arg)
 
     env = {**os.environ, "SKIP_PATCHES": "1"}
+    if _memory_backend_enabled(jurisdiction, config):
+        # scraper-memory.sh reads these; see _memory_backend_enabled() for why this is a
+        # floor (once split, always memory-backed) rather than tied 1:1 to current cloud
+        # ownership. "prod" matches cloud_collector.py's own MEMORY_PREFIX convention --
+        # both sides have to agree on the namespace or they hydrate from empty air.
+        env["SCRAPER_MEMORY_BACKEND"] = "s3"
+        env["SCRAPER_MEMORY_PREFIX"] = "prod"
+        logger.info(
+            "openstates_scrape: S3-backed memory enabled for this run (OPEN-208)",
+            jurisdiction=jurisdiction,
+        )
     if _sweep_import_eligible(jurisdiction, config):
         # run-scrape.sh reads this; see _sweep_import_eligible() for why it exists and why the
         # opt-in lives in YAML rather than as a $STATE test in the script.
