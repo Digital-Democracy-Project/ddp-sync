@@ -91,7 +91,7 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
             )
             proc = subprocess.run(
                 [bucket_cmd, "put", local_path, key],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=60, check=False,
             )
     except subprocess.TimeoutExpired:
         logger.error(
