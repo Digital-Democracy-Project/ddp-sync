@@ -360,6 +360,137 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
     }
 
 
+async def get_archived_version_transitions(bill_openstates_id: str) -> dict | None:
+    """Look up EVERY already-archived version transition for bill_changelog --
+    SYNC-44's full-history walk. A sibling of get_archived_changelog_inputs
+    above, not a replacement for it: that function still serves
+    bill_version.py's separate, Webflow-CMS-driven legacy changelog path
+    (out of scope for SYNC-44, and this repo's CLAUDE.md is explicit that
+    nothing new should be built on that path), and is otherwise unchanged.
+
+    SYNC-44's bug: get_archived_changelog_inputs (and, before this ticket,
+    generate_and_store_bill_changelog) only ever resolves ONE transition --
+    versions[-2] -> versions[-1] -- no matter how many versions a bill has.
+    For any bill that reached enrollment, that pair is almost always
+    engrossed -> enrolled, the typesetting-only step, so the changelog is
+    accurate and describes nothing of substance. This function instead
+    walks every consecutive pair in api-v3's own `versions` array.
+
+    Per Ramon's correction on this ticket: **do not re-derive version order
+    here.** api-v3 already returns `versions` skip-stage-classified and
+    ordered (openstates-core's version_sort_key, OPEN-92/OPEN-118) -- unknown
+    -stage entries first in their original relative order, then every
+    classifiable version in true chronological order, each already carrying
+    its own precomputed `diff_from_previous_version` (against its real diff
+    -lineage predecessor, not necessarily the literal previous array index)
+    and archived `raw_text`. So this function never classifies a version's
+    stage itself -- it only walks consecutive array pairs and trusts
+    whichever of those pairs api-v3 already attached a diff to. A pair
+    api-v3 never diffed (an unknown-stage version, a version whose true
+    predecessor's text isn't archived yet, or the very first classifiable
+    version, which has nothing to diff against by definition) is simply
+    skipped -- self-correcting once the missing input actually appears
+    archived on a later run, never guessed at.
+
+    Args:
+        bill_openstates_id: bare UUID, same convention as
+            get_archived_changelog_inputs.
+
+    Returns:
+        {"transitions": [...], "versions": versions} if at least one
+        transition's old_bill_source + diff_source are both archived and
+        non-empty, else None -- covering every "not available" case
+        identically (no versions at all, exactly one version, no version
+        pair with a computed diff yet, local api-v3 unreachable/rejecting/
+        non-JSON, or the bill not found), same never-abort, pre-check-not-
+        a-required-read posture as get_archived_changelog_inputs.
+
+        Each transition dict: {"old_bill_source", "diff_source",
+        "old_version_date", "old_version_note", "new_version_date",
+        "new_version_note"} -- shaped like get_archived_changelog_inputs's
+        own return value, just per-hop instead of once. Ordered oldest
+        -transition-first (api-v3's own array order, walked forward, never
+        re-sorted) -- SYNC-26/SYNC-28's compare_version-must-already-exist
+        constraint means a caller writing these needs to create each
+        transition's own target version before a later transition can name
+        it as compare_version, and processing in this order does that
+        naturally.
+
+        versions: the bill's complete raw version list, unfiltered and
+        untransformed, for a caller's own BillVersion-ledger backfill (same
+        purpose SYNC-30 added it to get_archived_changelog_inputs for).
+    """
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return None
+
+    params: dict[str, str] = {"include": "versions"}
+    if settings.local_openstates_api_key:
+        params["apikey"] = settings.local_openstates_api_key
+
+    url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, params=params)
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Local api-v3 unreachable -- falling back to live-refetch changelog inputs",
+            bill_openstates_id=bill_openstates_id,
+            error=str(exc),
+        )
+        return None
+
+    if resp.status_code >= 400:
+        # Covers 404 (bill not in the local archive at all) and any other
+        # rejection identically -- both fall back the same way.
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "Local api-v3 returned a non-JSON response -- falling back to live-refetch "
+            "changelog inputs",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return None
+
+    versions = data.get("versions") or []
+    transitions: list[dict] = []
+    for i in range(1, len(versions)):
+        newer = versions[i]
+        diff_source = newer.get("diff_from_previous_version")
+        if not diff_source:
+            # Either `newer` is itself unclassifiable (api-v3 never attaches
+            # a diff to a STAGE_UNKNOWN version) or its true diff-lineage
+            # predecessor's text simply isn't archived yet -- either way,
+            # nothing to generate for this hop right now.
+            continue
+        older = versions[i - 1]
+        old_bill_source = None
+        for link in older.get("links") or []:
+            raw_text = link.get("raw_text")
+            if raw_text:
+                old_bill_source = raw_text
+                break
+        if not old_bill_source:
+            continue
+        transitions.append({
+            "old_bill_source": old_bill_source,
+            "diff_source": diff_source,
+            "old_version_date": older.get("date", ""),
+            "old_version_note": older.get("note", ""),
+            "new_version_date": newer.get("date", ""),
+            "new_version_note": newer.get("note", ""),
+        })
+
+    if not transitions:
+        return None
+
+    return {"transitions": transitions, "versions": versions}
+
+
 # api-v3's own enforced ceiling on a single page's size (confirmed live,
 # 2026-08-01: per_page=50 rejected with "invalid per_page, must be in
 # [1, 20]"). Used to cap the actual per-request page size regardless of

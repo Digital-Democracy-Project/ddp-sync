@@ -322,6 +322,7 @@ async def _process_bill_inner(
         "artifacts_skipped_present": [],
         "artifacts_failed": [],
         "artifacts_skipped_failed_previously": [],
+        "artifacts_not_applicable": [],
         "artifact_durations_seconds": {},
         "org_research_dispatched": False,
         "org_research_skipped_reason": None,
@@ -525,13 +526,22 @@ async def _process_bill_inner(
             # generate_and_store_bill_artifact/_changelog deliberately return
             # normally with a written status="failed" row for a legitimate
             # decline (insufficient_information, no_archived_bill_text,
-            # no_valid_topics, no_archived_changelog_inputs), so the actual
-            # returned status has to be inspected. Anything other than
-            # "complete" -- including "failed" or a missing/malformed status
-            # from an outdated mock -- is treated as a failure rather than
-            # ever being counted as generated.
-            if artifact_result.get("status") == "complete":
+            # no_valid_topics), so the actual returned status has to be
+            # inspected. Anything other than "complete"/"not_applicable" --
+            # including "failed" or a missing/malformed status from an
+            # outdated mock -- is treated as a failure rather than ever being
+            # counted as generated.
+            #
+            # SYNC-44: "not_applicable" is bill_changelog-only -- a bill with
+            # no version transition ready yet (its earliest version, or a
+            # diff not archived yet) writes no row at all, which is neither a
+            # generation nor a failure. See generate_and_store_bill_
+            # changelog's own docstring for why this replaced a `failed` row.
+            status = artifact_result.get("status")
+            if status == "complete":
                 result["artifacts_generated"].append(artifact_type)
+            elif status == "not_applicable":
+                result["artifacts_not_applicable"].append(artifact_type)
             else:
                 result["artifacts_failed"].append(artifact_type)
         except Exception as exc:

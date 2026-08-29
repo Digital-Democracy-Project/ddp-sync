@@ -172,6 +172,40 @@ say which is current. **So these fields stay unset while `retry_failed` exists**
 one pins the wire payload, the other scans `src/` for any call site that populates them and fails naming the
 file and line.
 
+**Updated 2026-08-28 (SYNC-44): `bill_changelog` now generates one changelog per version transition,
+not just the last one.** `generate_and_store_bill_changelog` used to diff only `versions[-2]` against
+`versions[-1]` — the bill's current version against its immediate predecessor — no matter how many
+versions the bill actually has. For any bill that reached enrollment, that pair is almost always
+*engrossed → enrolled*, the typesetting-only step, so the changelog it produced was accurate and
+described nothing of substance. Confirmed against FL 2026E: all six multi-version bills that produced a
+changelog described only whitespace/formatting, with zero genuinely new lines across all six, while the
+`Filed → e1` pair those same bills never got diffed was one to two orders of magnitude larger.
+
+Fixed by walking every version transition api-v3 has already archived a diff for
+(`get_archived_version_transitions`, `services/local_openstates_client.py`), oldest-first, and writing
+each one as its own `bill_changelog` attached to its own (newer) `BillVersion` — `ddp-broker-py` already
+supports two changelogs coexisting on two different versions of the same bill (spiked live against the
+dev broker, no schema change needed). Order is never re-derived on this side: api-v3 already returns
+`versions` stage-classified and ordered (`openstates-core`'s `version_sort_key`, OPEN-92/OPEN-118), each
+entry already carrying its own precomputed `diff_from_previous_version` — a transition this function
+walks past without a diff attached (an unclassifiable version, or a predecessor whose text isn't
+archived yet) is simply skipped, not guessed at. A bill's earliest version has nothing to diff against
+and is not a failure — it writes no row at all, replacing the old blanket `failed`/
+`no_archived_changelog_inputs` row (actively harmful once `retry_failed` shipped: it looked identical to
+a real, retryable failure and got retried forever). A pathologically long version history is capped at
+`_MAX_CHANGELOG_TRANSITIONS_PER_CALL` (10) LegBot dispatches per call, since each transition takes its
+own uncached LegBot call inside a still-synchronous HTTP request.
+
+**What this does not fix, and cannot from this repo alone.** `ddp-sync` has no way to ask
+`ddp-broker-py` which of a bill's *past*, non-latest versions already have a `bill_changelog` — the only
+coverage read (`GET /api/bill-artifacts/status/`) resolves a bill's current latest version only. This
+function is therefore only ever reached (via `session_pipeline_runner.py`'s per-bill coverage check)
+when the bill's *current* latest version has no `bill_changelog` yet, which is exactly right for a bill
+this pipeline has never generated one for at all, but means a bill that already has a (possibly
+wrong-pair) changelog on its current latest version is never revisited, even after this fix, until the
+broker exposes an all-versions read. The six real FL 2026E bills that motivated this ticket are in
+exactly that state today — filed as [BROKER-130](https://digitaldemocracyproject.atlassian.net/browse/BROKER-130).
+
 **Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
 **blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and
 `ensure_bill_exists()` has run — the latest point it can start, since both can still return early —

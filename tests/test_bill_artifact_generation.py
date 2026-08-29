@@ -476,18 +476,28 @@ _CHANGELOG_KWARGS = dict(
     version_note="Engrossed",
 )
 
-_ARCHIVED = {
+# SYNC-44: get_archived_version_transitions' return shape -- a list of
+# transitions (oldest-first) plus the bill's complete raw version list.
+# One transition here (Introduced -> Engrossed) is the same single-hop shape
+# the old get_archived_changelog_inputs-based design always produced; the
+# multi-transition tests below add a second, earlier hop (Filed ->
+# Introduced) on top of this same "Filed" entry already present in
+# `versions`.
+_ONE_TRANSITION = {
     "old_bill_source": "Archived introduced text.",
     "diff_source": "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
     "old_version_date": "2026-01-01",
     "old_version_note": "Introduced",
-    "latest_version_date": "2026-02-01",
-    "latest_version_note": "Engrossed",
-    # SYNC-30: a real bill can have more than the two versions
-    # (old/latest) this function's own diff resolution needs -- "Filed" here
-    # is older than either, matching FL SB 2506E's real 3-version shape
-    # (Filed -> e1 -> er) that motivated widening the backfill below to the
-    # bill's full archived history.
+    "new_version_date": "2026-02-01",
+    "new_version_note": "Engrossed",
+}
+
+_RESOLVED_ONE_TRANSITION = {
+    "transitions": [_ONE_TRANSITION],
+    # SYNC-30: a real bill can have more than the versions any single
+    # transition's own diff resolution needs -- "Filed" here is older than
+    # either, matching FL SB 2506E's real 3-version shape (Filed -> e1 -> er)
+    # that motivated backfilling the bill's full archived history.
     "versions": [
         {"date": "2025-12-01", "note": "Filed"},
         {"date": "2026-01-01", "note": "Introduced"},
@@ -497,22 +507,23 @@ _ARCHIVED = {
 
 
 @pytest.mark.asyncio
-async def test_changelog_no_archived_inputs_writes_failed_row():
+async def test_changelog_no_transitions_returns_not_applicable_and_writes_nothing():
+    """SYNC-44/AC4: a bill with no version transition ready yet (its
+    earliest version, or a diff not archived yet) is not a failure -- it
+    writes nothing at all, replacing the old blanket `failed`/
+    "no_archived_changelog_inputs" row (actively harmful once retry_failed
+    existed: it looked identical to a real, retryable failure)."""
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
         new=AsyncMock(return_value=None),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
-        new=AsyncMock(return_value={"id": 1, "created": True}),
+        new=AsyncMock(),
     ) as mock_write:
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert result == {"id": 1, "created": True, "status": "failed"}
-    write_kwargs = mock_write.await_args.kwargs
-    assert write_kwargs["status"] == "failed"
-    assert write_kwargs["failure_reason"] == "no_archived_changelog_inputs"
-    assert write_kwargs["content"] == ""
-    assert "compare_version_date" not in write_kwargs
+    assert result == {"status": "not_applicable"}
+    mock_write.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -525,8 +536,8 @@ async def test_changelog_version_mismatch_raises_and_writes_nothing():
     version.
     """
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(),
@@ -556,8 +567,8 @@ async def test_changelog_happy_path_writes_broker_with_compare_version():
         "backend": "mlx",
     }
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
@@ -598,8 +609,8 @@ async def test_changelog_insufficient_information_writes_failed_row_with_compare
         "backend": "mlx",
     }
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
@@ -631,8 +642,8 @@ async def test_changelog_local_status_overrides_a_conflicting_broker_response_st
         "backend": "mlx",
     }
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
@@ -658,8 +669,8 @@ async def test_changelog_broker_write_failure_propagates():
         "backend": "mlx",
     }
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
@@ -669,6 +680,147 @@ async def test_changelog_broker_write_failure_propagates():
     ):
         with pytest.raises(BrokerClientError):
             await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+
+# ---------------------------------------------------------------------------
+# SYNC-44: the full-history walk itself -- a bill with more than one
+# transition ready must generate every one of them, oldest-first, not just
+# the one immediately before its current latest version.
+# ---------------------------------------------------------------------------
+
+_EARLIER_TRANSITION = {
+    "old_bill_source": "Archived filed text.",
+    "diff_source": "--- Filed\n+++ Introduced\n@@ -1 +1 @@\n-a\n+b\n",
+    "old_version_date": "2025-12-01",
+    "old_version_note": "Filed",
+    "new_version_date": "2026-01-01",
+    "new_version_note": "Introduced",
+}
+
+_RESOLVED_TWO_TRANSITIONS = {
+    "transitions": [_EARLIER_TRANSITION, _ONE_TRANSITION],
+    "versions": _RESOLVED_ONE_TRANSITION["versions"],
+}
+
+_CHANGELOG_DISPATCH_RESULT = {
+    "answer": {
+        "insufficient_information": False,
+        "sections_added": [],
+        "sections_removed": [],
+        "sections_modified": [],
+        "policy_implications": "",
+    },
+    "backend": "mlx",
+}
+
+
+@pytest.mark.asyncio
+async def test_changelog_generates_every_transition_oldest_first():
+    """SYNC-44's whole point: a bill with two ready transitions gets a
+    bill_changelog for EACH one, in oldest-first order -- not just the last
+    hop, which is what produced whitespace-only changelogs on FL 2026E."""
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source):
+        dispatch_calls.append((old_bill_source, diff_source))
+        return _CHANGELOG_DISPATCH_RESULT
+
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": len(write_calls), "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert dispatch_calls == [
+        ("Archived filed text.", "--- Filed\n+++ Introduced\n@@ -1 +1 @@\n-a\n+b\n"),
+        (
+            "Archived introduced text.",
+            "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
+        ),
+    ]
+    assert [w["version_note"] for w in write_calls] == ["Introduced", "Engrossed"]
+    assert [w["compare_version_note"] for w in write_calls] == ["Filed", "Introduced"]
+    # The return value reflects the LAST transition processed.
+    assert result == {"id": 2, "created": True, "status": "complete"}
+
+
+@pytest.mark.asyncio
+async def test_changelog_history_is_capped_for_a_pathologically_long_bill():
+    """SYNC-44's own "Volume" concern: an unbounded walk is an unbounded
+    number of sequential LegBot dispatches inside one still-synchronous HTTP
+    request. Only the most recent _MAX_CHANGELOG_TRANSITIONS_PER_CALL
+    transitions are dispatched when there are more than that many ready --
+    the mismatch check (against the true last transition) still applies to
+    all of them, uncapped."""
+    from ddp_sync.pipelines.bill_artifact_generation import (
+        _MAX_CHANGELOG_TRANSITIONS_PER_CALL,
+    )
+
+    many_transitions = [
+        {
+            "old_bill_source": f"text {i}",
+            "diff_source": f"diff {i}",
+            "old_version_date": f"2026-01-{i:02d}",
+            "old_version_note": f"v{i}",
+            "new_version_date": f"2026-01-{i + 1:02d}",
+            "new_version_note": f"v{i + 1}",
+        }
+        for i in range(_MAX_CHANGELOG_TRANSITIONS_PER_CALL + 3)
+    ]
+    resolved = {
+        "transitions": many_transitions,
+        "versions": [
+            {"date": t["new_version_date"], "note": t["new_version_note"]}
+            for t in many_transitions
+        ],
+    }
+
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source):
+        dispatch_calls.append(old_bill_source)
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=resolved),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        await generate_and_store_bill_changelog(
+            **{
+                **_CHANGELOG_KWARGS,
+                "version_date": many_transitions[-1]["new_version_date"],
+                "version_note": many_transitions[-1]["new_version_note"],
+            }
+        )
+
+    assert len(dispatch_calls) == _MAX_CHANGELOG_TRANSITIONS_PER_CALL
+    # The oldest transitions are the ones dropped -- the most recent history
+    # survives the cap.
+    assert dispatch_calls == [t["old_bill_source"] for t in many_transitions[3:]]
 
 
 # ---------------------------------------------------------------------------
@@ -688,18 +840,6 @@ async def test_changelog_broker_write_failure_propagates():
 # the actually-missing OLDER (compare_version) row every single time.
 # ---------------------------------------------------------------------------
 
-_CHANGELOG_DISPATCH_RESULT = {
-    "answer": {
-        "insufficient_information": False,
-        "sections_added": [],
-        "sections_removed": [],
-        "sections_modified": [],
-        "policy_implications": "",
-    },
-    "backend": "mlx",
-}
-
-
 @pytest.mark.asyncio
 async def test_changelog_always_backfills_compare_version_regardless_of_ledger_state():
     """SYNC-28: the backfill call is now unconditional -- this function no
@@ -716,8 +856,8 @@ async def test_changelog_always_backfills_compare_version_regardless_of_ledger_s
     test_backfill_return_count_excludes_already_present_versions; this test
     only needs to prove THIS caller invokes it unconditionally."""
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
         new=AsyncMock(return_value=1),
@@ -735,7 +875,7 @@ async def test_changelog_always_backfills_compare_version_regardless_of_ledger_s
         bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
         jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
         session_code=_CHANGELOG_KWARGS["session_code"],
-        versions=_ARCHIVED["versions"],
+        versions=_RESOLVED_ONE_TRANSITION["versions"],
         latest_version={"date": "2026-02-01", "note": "Engrossed"},
         broker_api_base=None,
         broker_api_token=None,
@@ -751,8 +891,8 @@ async def test_changelog_backfill_covers_full_version_history_not_just_old_and_n
     anything older (confirmed live: FL SB 2506E's "Filed" version never
     got a BillVersion row, while "e1"/"er" did)."""
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
         new=AsyncMock(return_value=1),
@@ -775,8 +915,8 @@ async def test_changelog_backfill_threads_broker_target_override():
     """The X-DDP-Environment-resolved broker target must reach the backfill
     call -- not silently fall back to this process's own global config."""
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
         new=AsyncMock(return_value=1),
@@ -797,7 +937,7 @@ async def test_changelog_backfill_threads_broker_target_override():
         bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
         jurisdiction_code=_CHANGELOG_KWARGS["jurisdiction"],
         session_code=_CHANGELOG_KWARGS["session_code"],
-        versions=_ARCHIVED["versions"],
+        versions=_RESOLVED_ONE_TRANSITION["versions"],
         latest_version={"date": "2026-02-01", "note": "Engrossed"},
         broker_api_base="http://localhost:8080",
         broker_api_token="dev-token",
@@ -873,6 +1013,32 @@ async def test_bill_changelog_routes_to_changelog_function_not_artifact_one():
     assert "bill_source" not in call_kwargs
     assert call_kwargs["broker_api_base"] == "http://localhost:8080"
     assert call_kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_not_applicable_resolves_the_pending_row_to_failed():
+    """SYNC-44: generate_and_store_bill_changelog now returns status=
+    "not_applicable" without writing anything for a bill with no version
+    transition ready yet. session_pipeline_runner.py's batch caller is fine
+    with that (nothing to skip past). This caller already wrote a `pending`
+    row above before dispatching, though, and ddp-next polls it -- left
+    untouched, it would hang forever. There's no broker-side
+    "not_applicable" status, so this resolves the placeholder to `failed`
+    with a reason string distinct from a real generation failure."""
+    mock_write = AsyncMock(side_effect=[{"id": 1, "created": True}, {"id": 1, "created": False}])
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "not_applicable"}),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    assert mock_write.await_count == 2
+    resolved_kwargs = mock_write.await_args_list[1].kwargs
+    assert resolved_kwargs["status"] == "failed"
+    assert resolved_kwargs["failure_reason"] == "no_version_transition_available"
 
 
 @pytest.mark.asyncio
@@ -1020,8 +1186,8 @@ async def test_source_support_reaches_the_changelog_write():
         "backend": "mlx",
     }
     with patch(
-        "ddp_sync.pipelines.bill_artifact_generation.get_archived_changelog_inputs",
-        new=AsyncMock(return_value=_ARCHIVED),
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
         new=AsyncMock(return_value=dispatch_result),
