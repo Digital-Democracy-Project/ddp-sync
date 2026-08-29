@@ -272,3 +272,29 @@ Only after ruling out schema mismatch should you suspect URL-trailing-slash, ema
 1. Add a Zapier "Paths" step on the webhook trigger; branch on `alert_type`.
 2. Path A (`user_sync_complete`) → existing voatz-brevo Slack template.
 3. Path B (`legislator_bio_sync_complete`) → new bio-sync Slack template using fields like `{{summary}}`, `{{patched}}`, `{{errors}}`, `{{failure_warning}}`, `{{large_changes_warning}}`.
+
+---
+
+## Bill Artifact Generation (LegBot `bill_changelog`)
+
+### A bill with several ready changelogs produces none at all
+
+**Symptom:** `generate_and_store_bill_changelog` raises `ArchivedVersionMismatchError` for a bill that has multiple archived version transitions with real, substantial diffs. The bill ends up with zero `bill_changelog` rows.
+
+**Root cause (fixed 2026-08-29, SYNC-46):** The version-mismatch guard compared the caller's requested version against `transitions[-1]`'s own target — the newest version that happens to have an archived diff — instead of the bill's true latest archived version. Those two differ whenever the newest version legitimately has no diff of its own (its text is byte-identical to the version before it, or an extraction gap) — normal, not staleness. Observed live on Utah 2026 (dev): SB 59 had 6 versions and 5 real archived transitions (9–16 KB diffs each) and produced nothing, because "Enrolled" (real, current, simply undiffed) didn't match the last diffed transition's target.
+
+**Fix:** `pipelines/bill_artifact_generation.py`'s mismatch guard now compares against `resolved["versions"][-1]` (the bill's true latest archived version, same value `local_openstates_client.get_current_version_identity()` resolves as current) rather than the last transition's target. A version genuinely absent from the bill's archived list at all still raises and still writes nothing.
+
+**Files:** `pipelines/bill_artifact_generation.py`
+
+### A bill that gains a new version regenerates its whole changelog history
+
+**Symptom:** A bill with several existing, `complete` `bill_changelog` rows gets ALL of them re-dispatched to LegBot (and re-written) the next time it gains a new version — not just the new transition. In ddp-broker-py, this re-queues already-approved changelog content for human review via the BROKER-105 revision path.
+
+**Root cause (fixed 2026-08-29, SYNC-44's AC2):** `generate_and_store_bill_changelog` walks every archived version transition on every call, with no way to know which ones already had a changelog — the only broker read available at the time (`GET /api/bill-artifacts/status/`) reported the bill's current latest version only.
+
+**Fix:** Once [BROKER-130](https://digitaldemocracyproject.atlassian.net/browse/BROKER-130) shipped an all-versions coverage read (`?versions=all` on the same endpoint), `generate_and_store_bill_changelog` gained an optional `gov_id` parameter — when the caller (`session_pipeline_runner.py`'s batch callers) supplies it, the function reads coverage across every version and skips any transition whose target already has a `bill_changelog` of any status. The on-demand single-bill endpoint (`/trigger/legbot-analyze-bill`) doesn't carry `gov_id` in its request body and still re-walks every call — a known, accepted gap for that one-shot, user-triggered path.
+
+**Files:** `pipelines/bill_artifact_generation.py`, `services/broker_client.py` (`get_bill_artifact_coverage_all_versions`)
+
+**Related, not yet fixed:** bills that already picked up a wrong-pair changelog on their current latest version *before* this fix shipped are not retroactively corrected — the per-bill coverage gate one level up (`session_pipeline_runner.py`'s own `get_bill_artifacts` call) still only checks the current latest version, so it never re-opens for them at all. Tracked as [SYNC-45](https://digitaldemocracyproject.atlassian.net/browse/SYNC-45).
