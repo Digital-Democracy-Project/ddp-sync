@@ -631,12 +631,13 @@ openstates_scrape:
   # budget runs to 240s+), so this trades a wider staleness window for not over-minting.
   # Revisit once real cookie lifetimes from OPEN-189's live tests are known.
   #
-  # Disabled by default: turning this on is step one of OPEN-188's own scope ("not gated, do
-  # this first") -- the reader-side staleness refusal (cloud_collector.py, gated on OPEN-200)
-  # is what actually makes a bare Michigan run impossible by construction, and that is a
-  # separate change in a separate repo.
+  # Enabled 2026-08-30: the reader-side staleness refusal this was waiting on
+  # (cloud_collector.py's _mi_waf_cookies_are_fresh gate, gated on OPEN-200) is built and was
+  # verified live -- a real Fargate `mi` task correctly refused with zero site traffic when no
+  # fresh cookie was published, exactly the "bare run impossible by construction" property this
+  # publisher exists to feed.
   mi_cookie_publish:
-    enabled: false
+    enabled: true
     interval_hours: 6
 
 # Split out from openstates_scrape (2026-07-31) — bill-document archiving to DDP-HOT used to
