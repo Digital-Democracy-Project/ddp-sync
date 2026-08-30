@@ -77,6 +77,7 @@ from ddp_sync.pipelines.concept_statement_dispatch import (
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     ensure_bill_exists,
+    get_bill_artifact_coverage_all_versions,
     get_bill_artifacts,
     get_bill_organization_positions_status,
     get_concept_statement_set,
@@ -298,6 +299,113 @@ async def _process_bill(
                 )
 
 
+async def _changelog_fully_covered(
+    *,
+    jurisdiction: str,
+    session_code: str,
+    gov_id: str,
+    broker_api_base: str | None,
+    broker_api_token: str | None,
+) -> bool:
+    """SYNC-45: is every version that could hold a ``bill_changelog`` already
+    holding one?
+
+    ``get_bill_artifacts`` reports on a bill's *current latest* version only, so
+    the per-bill gate below saw one ``bill_changelog`` row there and marked the
+    type covered -- and ``generate_and_store_bill_changelog``'s own
+    per-transition filter (SYNC-44 AC2) lives *inside* the function the gate had
+    already decided not to call. Six FL 2026E bills are stuck in exactly that
+    state: a changelog of the ``e1 -> er`` typesetting pass, and no changelog of
+    the substantive ``Filed -> e1`` transition, permanently.
+
+    A changelog belongs to the newer version of its pair, so the oldest
+    classified version can never hold one and every later one can. That is
+    answerable from BROKER-130's all-versions response alone -- no api-v3 read
+    and no transition walk here, both of which the inner function already does.
+
+    Why ``versions[1:]`` is the exact transition universe and not an
+    approximation of it (/pm-review round 1 challenged this, correctly, because
+    getting it wrong would make a partially-covered bill look done and the fix
+    inert). Two contracts combine:
+
+    * ``get_archived_version_transitions`` walks **consecutive pairs of api-v3's
+      own array** and keeps only pairs api-v3 already attached a diff to. It
+      never classifies a stage itself. api-v3 orders that array unknown-stage
+      entries first, then classifiable versions chronologically.
+    * openstates-core gives an unknown-stage version
+      ``diff_from_previous_version=None`` unconditionally -- it "never updates or
+      reads a baseline at all" (``archive_bill_versions``). So no unclassified
+      version can ever be a transition *target*.
+
+    Together: a transition's target is always a classified version, and never the
+    oldest classified one (its diff lineage has no predecessor, so it carries no
+    diff either). ``versions[1:]`` over ddp-broker-py's stage-ordered classified
+    list is therefore the same set, not a subset of it -- which is why
+    ``unclassified_versions`` are excluded here even though the inner filter
+    still consults them when deciding what NOT to rewrite. Those are different
+    questions: "could this version need a changelog" versus "does this version
+    already have one".
+
+    One status subtlety, deliberately matching the inner filter rather than
+    improving on it: coverage is judged by artifact *presence*, ignoring status.
+    A ``failed`` changelog on a non-latest version therefore reads as covered and
+    is never retried, even under ``retry_failed``. That gap is pre-existing in
+    SYNC-44's own filter, and the two must agree -- a stricter rule here would
+    dispatch a bill the inner filter then declines to act on, every run, forever.
+    Fixing it means changing both together and belongs to SYNC-42's territory.
+
+    Deliberately approximate in one direction, and only that one: a version with
+    no archived diff cannot produce a changelog at all (SYNC-46), so a bill
+    holding one of those never satisfies this check and is re-offered to the
+    inner function on every run. That costs one api-v3 read and one broker read
+    per run for such a bill, after which the inner filter returns
+    ``not_applicable`` -- no model call, no write, no artifact regenerated,
+    because SYNC-44's filter is what actually decides. The alternative
+    imprecision is the current bug, where a missing changelog is never generated
+    at all. Cheap repeated reads beat permanently missing content.
+
+    Returns True (treat as covered, do not dispatch) if the read cannot answer,
+    so a broker problem degrades to today's behaviour rather than to
+    re-dispatching every bill in a session.
+    """
+    try:
+        coverage = await get_bill_artifact_coverage_all_versions(
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            gov_id=gov_id,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+    except BrokerClientError as exc:
+        # Includes the explicit raise for a ddp-broker-py predating BROKER-130,
+        # which is the case that matters most: treating "cannot tell" as "not
+        # covered" there would re-offer every bill in the session on every run.
+        logger.warning(
+            "all-versions changelog coverage read failed -- treating "
+            "bill_changelog as covered for this bill",
+            gov_id=gov_id,
+            error=str(exc),
+        )
+        return True
+
+    if coverage is None:
+        # No Bill/BillVersion at all for this identity. Nothing to be covered
+        # for; leave the decision to the existing single-version gate.
+        return True
+
+    versions = coverage.get("versions") or []
+    if len(versions) < 2:
+        # Fewer than two classified versions means no transition exists, so
+        # there is nothing a changelog could describe.
+        return True
+
+    # `versions` is oldest-first by ddp-broker-py's stage-aware ordering. Skip
+    # the oldest: it has no predecessor, so it can never carry a changelog.
+    return all(
+        "bill_changelog" in (entry.get("artifacts") or {}) for entry in versions[1:]
+    )
+
+
 async def _process_bill_inner(
     candidate: dict,
     *,
@@ -363,6 +471,22 @@ async def _process_bill_inner(
             else:
                 result["artifacts_skipped_failed_previously"].append(artifact_type)
         elif status is not None:
+            # SYNC-45: bill_changelog is the one type that is per-TRANSITION
+            # rather than per-bill, so a row on the *latest* version does not
+            # mean the type is done. Escalate to the all-versions read only
+            # here -- when the cheap single-version check already says
+            # "covered", which is precisely where the miss hides. A bill whose
+            # latest version has no changelog takes the else branch below and
+            # costs no extra read at all.
+            if artifact_type == "bill_changelog" and not await _changelog_fully_covered(
+                jurisdiction=jurisdiction_iso2,
+                session_code=session_code,
+                gov_id=gov_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            ):
+                needs_dispatch.append(artifact_type)
+                continue
             # complete, pending, or processing -- has a row, don't retry.
             #
             # SYNC-42 deliberately leaves this branch alone, and keeps it a

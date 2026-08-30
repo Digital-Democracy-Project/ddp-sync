@@ -2146,3 +2146,366 @@ async def test_scheduled_wrapper_passes_retry_failed_when_set():
         )
 
     assert mock_run.await_args.kwargs["retry_failed"] is True
+
+
+# --- SYNC-45: bill_changelog coverage is per-transition, not per-bill --------
+
+
+def _patch_all_versions(result=None, side_effect=None):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner."
+        "get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=result, side_effect=side_effect),
+    )
+
+
+def _versions(*specs):
+    """Build a BROKER-130 all-versions response. Each spec is (note, has_changelog),
+    oldest-first, matching ddp-broker-py's own stage-aware ordering."""
+    return {
+        "versions": [
+            {
+                "bill_version_id": i + 1,
+                "version_note": note,
+                "artifacts": (
+                    {"bill_changelog": {"status": "complete", "compare_version_id": i}}
+                    if has
+                    else {}
+                ),
+            }
+            for i, (note, has) in enumerate(specs)
+        ],
+        "unclassified_versions": [],
+    }
+
+
+# The FL 2026E shape this ticket exists for: three versions, and only the newest
+# transition (e1 -> er, a typesetting pass) ever got a changelog.
+_FL_PARTIAL = _versions(("S 7026 Filed", False), ("S 7026 e1", False), ("S 7026 er", True))
+_FL_COVERED = _versions(("S 7026 Filed", False), ("S 7026 e1", True), ("S 7026 er", True))
+
+
+@pytest.mark.asyncio
+async def test_changelog_on_latest_version_no_longer_hides_missing_transitions():
+    """The bug. Six FL 2026E bills have a bill_changelog on their newest version
+    and none on the substantive Filed -> e1 transition. get_bill_artifacts reports
+    the latest version only, so the gate marked the type covered and never called
+    generate_and_store_bill_changelog -- whose own per-transition filter (SYNC-44
+    AC2) lives inside the function the gate had decided to skip."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(_FL_PARTIAL), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_awaited_once()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_skipped_present"] == []
+
+
+@pytest.mark.asyncio
+async def test_every_transition_covered_is_still_not_dispatched():
+    """AC2: no regression to the churn SYNC-44 fixed. The oldest version can never
+    hold a changelog, so coverage means every version AFTER it has one."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(_FL_COVERED), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+async def test_no_extra_read_when_the_latest_version_has_no_changelog():
+    """The escalation is targeted: a bill that the cheap single-version check
+    already routes to dispatch must not pay for the all-versions read at all."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {}}
+    ), _patch_all_versions(_FL_PARTIAL) as mock_all, _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_awaited_once()
+    mock_all.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_bill_changelog_escalates():
+    """Every other artifact type is genuinely per-bill, so a present row means
+    done and must not trigger the extra read."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
+    ), _patch_all_versions(_FL_PARTIAL) as mock_all, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_all.assert_not_awaited()
+    mock_artifact.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_broker_that_predates_broker_130_does_not_redispatch_everything():
+    """get_bill_artifact_coverage_all_versions raises BrokerClientError when the
+    broker silently ignores ?versions=all (its own documented contract). Treating
+    "cannot tell" as "not covered" would re-offer every bill in the session on
+    every run, which is worse than the bug being fixed -- so it degrades to
+    today's behaviour instead. The prod broker's BROKER-130 status is unconfirmed,
+    which is exactly why this path matters."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(side_effect=BrokerClientError("no versions key")), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+async def test_a_single_version_bill_is_not_dispatched():
+    """One version means no transition exists, so there is nothing a changelog
+    could describe -- and the eleven single-version FL 2026E bills must stay
+    untouched (this ticket's AC4)."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(_versions(("S 7026 Filed", False))), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_changelog_row_still_belongs_to_retry_failed():
+    """SYNC-42 owns `failed`; this change must not reach into it. A failed row
+    takes the retry_failed branch before the escalation is considered, so no
+    extra read happens and the existing skip bucket is unchanged."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "failed"}}}
+    ), _patch_all_versions(_FL_PARTIAL) as mock_all, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_all.assert_not_awaited()
+    mock_changelog.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_skipped_failed_previously"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+async def test_unclassified_versions_do_not_count_toward_coverage():
+    """`unclassified_versions` are versions ddp-broker-py's classifier cannot
+    place in the lineage. They are excluded from this check deliberately: an
+    unplaceable version has no defined predecessor, so it cannot be the target of
+    a transition, and counting it would make a partially-covered bill look done.
+    The inner filter still consults them when skipping already-written work."""
+    coverage = _FL_PARTIAL.copy()
+    coverage["unclassified_versions"] = [
+        {
+            "bill_version_id": 99,
+            "version_note": "???",
+            "artifacts": {"bill_changelog": {"status": "complete"}},
+        }
+    ]
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(coverage), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_awaited_once()
+
+
+# --- SYNC-45 /pm-review round 1: the unclassified-position and status cases ---
+
+
+def _with_unclassified(base, *notes_and_coverage):
+    out = {
+        "versions": [dict(v) for v in base["versions"]],
+        "unclassified_versions": [
+            {
+                "bill_version_id": 900 + i,
+                "version_note": note,
+                "artifacts": (
+                    {"bill_changelog": {"status": "complete"}} if has else {}
+                ),
+            }
+            for i, (note, has) in enumerate(notes_and_coverage)
+        ],
+    }
+    return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unclassified",
+    [
+        pytest.param((("??? early", False),), id="unclassified-with-no-changelog"),
+        pytest.param((("??? early", True),), id="unclassified-with-a-changelog"),
+        pytest.param(
+            (("??? one", False), ("??? two", True)), id="several-unclassified"
+        ),
+    ],
+)
+async def test_unclassified_versions_never_make_a_partial_bill_look_covered(unclassified):
+    """Round 1's central objection: if an unclassified version could precede the
+    oldest classified one, or be a transition target itself, then `versions[1:]`
+    would skip a transition that genuinely needs generating and the fix would be
+    inert for that bill.
+
+    It cannot, and the reason is a contract rather than an observation.
+    `get_archived_version_transitions` walks consecutive pairs of api-v3's array
+    and keeps only pairs api-v3 attached a diff to; openstates-core gives an
+    unknown-stage version `diff_from_previous_version=None` unconditionally. So an
+    unclassified version is never a transition target, whatever position it holds
+    or artifacts it carries.
+
+    Pinned across all three positions the review named, and with the unclassified
+    entry both carrying and not carrying a changelog, so no arrangement of them
+    can flip the decision."""
+    coverage = _with_unclassified(_FL_PARTIAL, *unclassified)
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(coverage), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    # still partial -> still dispatched, regardless of the unclassified entries
+    mock_changelog.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unclassified_entries_cannot_complete_an_otherwise_covered_bill():
+    """The mirror of the case above: a fully covered bill stays covered, and an
+    unclassified entry without a changelog must not drag it back into dispatch."""
+    coverage = _with_unclassified(_FL_COVERED, ("??? early", False))
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(coverage), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_status", ["failed", "pending", "processing"])
+async def test_coverage_is_presence_not_status_on_earlier_versions(earlier_status):
+    """Documented limitation, pinned so it is a decision rather than an accident
+    (round 1 raised it as a possible bypass of SYNC-42).
+
+    Coverage is judged by artifact presence, ignoring status -- so a `failed`
+    changelog on a NON-latest version reads as covered and is never retried, even
+    under retry_failed. That rule is not chosen here: SYNC-44's inner filter
+    already works this way (`"bill_changelog" in entry["artifacts"]`), and the two
+    must agree. A stricter rule in this gate would dispatch a bill the inner
+    filter then declines to act on -- every run, forever, with no progress.
+
+    Fixing it properly means changing both together and deciding what a retry of
+    one historical transition even means, which is SYNC-42's territory."""
+    versions = _versions(("S 7026 Filed", False), ("S 7026 e1", False), ("S 7026 er", True))
+    versions["versions"][1]["artifacts"] = {
+        "bill_changelog": {"status": earlier_status, "compare_version_id": 1}
+    }
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(versions), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_changelog"]
+
+
+@pytest.mark.asyncio
+async def test_a_bill_with_no_classified_versions_at_all_is_not_dispatched():
+    """Every version unclassifiable means no transition can exist. Guards the
+    `len(versions) < 2` early return against an empty classified list rather than
+    just a single-entry one."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(
+        {"versions": [], "unclassified_versions": [
+            {"bill_version_id": 1, "version_note": "???", "artifacts": {}}
+        ]}
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_not_awaited()
