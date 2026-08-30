@@ -323,6 +323,37 @@ async def _changelog_fully_covered(
     answerable from BROKER-130's all-versions response alone -- no api-v3 read
     and no transition walk here, both of which the inner function already does.
 
+    Why ``versions[1:]`` is the exact transition universe and not an
+    approximation of it (/pm-review round 1 challenged this, correctly, because
+    getting it wrong would make a partially-covered bill look done and the fix
+    inert). Two contracts combine:
+
+    * ``get_archived_version_transitions`` walks **consecutive pairs of api-v3's
+      own array** and keeps only pairs api-v3 already attached a diff to. It
+      never classifies a stage itself. api-v3 orders that array unknown-stage
+      entries first, then classifiable versions chronologically.
+    * openstates-core gives an unknown-stage version
+      ``diff_from_previous_version=None`` unconditionally -- it "never updates or
+      reads a baseline at all" (``archive_bill_versions``). So no unclassified
+      version can ever be a transition *target*.
+
+    Together: a transition's target is always a classified version, and never the
+    oldest classified one (its diff lineage has no predecessor, so it carries no
+    diff either). ``versions[1:]`` over ddp-broker-py's stage-ordered classified
+    list is therefore the same set, not a subset of it -- which is why
+    ``unclassified_versions`` are excluded here even though the inner filter
+    still consults them when deciding what NOT to rewrite. Those are different
+    questions: "could this version need a changelog" versus "does this version
+    already have one".
+
+    One status subtlety, deliberately matching the inner filter rather than
+    improving on it: coverage is judged by artifact *presence*, ignoring status.
+    A ``failed`` changelog on a non-latest version therefore reads as covered and
+    is never retried, even under ``retry_failed``. That gap is pre-existing in
+    SYNC-44's own filter, and the two must agree -- a stricter rule here would
+    dispatch a bill the inner filter then declines to act on, every run, forever.
+    Fixing it means changing both together and belongs to SYNC-42's territory.
+
     Deliberately approximate in one direction, and only that one: a version with
     no archived diff cannot produce a changelog at all (SYNC-46), so a bill
     holding one of those never satisfies this check and is re-offered to the
