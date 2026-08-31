@@ -22,14 +22,16 @@ not a re-fetch — or with any other scrape.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any
 
+import requests
 import structlog
 
+from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
 
 logger = structlog.get_logger()
@@ -50,9 +52,18 @@ DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al",
 # thousands/tens-of-thousands for the state jurisdictions) — its first several
 # weekly runs are a cold backfill, not steady-state, so it gets the longest
 # runway here.
+#
+# SYNC-2: `mi` needs its own entry rather than falling through to `default`.
+# MI's document backlog is ~8k docs at ~10s/doc via os-text-extract -- 20h+ for
+# a healthy run -- so the 4h default kills a run that is making genuine
+# progress every single day, not just on a bad day. Given `us`'s 24h for a
+# comparable cold-backfill shape, mi gets the same runway rather than a
+# number sized to one measurement that the next run then exceeds (the same
+# trap openstates_scrape.py's SCRAPE_TIMEOUT_S comment describes for MA).
 ARCHIVE_TIMEOUT_S: dict[str, int] = {
     "fl": 16 * 3600,
     "wa": 8 * 3600,
+    "mi": 24 * 3600,
     "us": 24 * 3600,
     "default": 4 * 3600,
 }
@@ -60,6 +71,68 @@ ARCHIVE_TIMEOUT_S: dict[str, int] = {
 
 def _get_root(config: dict | None) -> str:
     return (config or {}).get("openstates_root", DEFAULT_OPENSTATES_ROOT)
+
+
+def _alert_archive_failure(jurisdiction: str, error: str, duration_seconds: float) -> None:
+    """Best-effort Slack + CAMS alert for an archive run that ddp-sync itself gave up on.
+
+    Mirrors openstates_scrape.py's _alert_scrape_failure exactly (same channel/token
+    convention, same CAMS payload shape) -- SYNC-2: the archive pipeline never got any of
+    the scrape pipeline's operational hardening. run-archive.sh has its own ERR trap that
+    posts to Slack #automation-errors and CAMS on an ordinary in-process failure, but that
+    only fires from *inside* the script's own process. A ddp-sync group-kill on timeout, a
+    signal delivered straight to run-archive.sh's own process, or an exception raised here
+    before/while invoking the subprocess all happen outside that process entirely, so
+    run-archive.sh never gets a chance to alert on any of them. Before this, all three were
+    100% silent: logged at ERROR and written to a Redis flow-status key nothing surfaces.
+    Real incident 2026-08-07: MI's 4h archive timeout killed the wrapper, its own alert
+    never fired, and the orphaned os-text-extract archiver ran ~24h more with no one told.
+    Never raises -- same convention as every other alerting call site in this codebase.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if token:
+        channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
+        text = (
+            f":red_circle: *OpenStates archive failed: {jurisdiction}* — {error} "
+            f"(after {duration_seconds:.0f}s) — check ddp-sync logs / os-text-extract logs"
+        )
+        try:
+            resp = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"channel": channel, "text": text},
+                timeout=15,
+            )
+            if not (resp.ok and resp.json().get("ok")):
+                logger.error("openstates_archive: Slack alert failed", response=resp.text[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.error("openstates_archive: Slack alert error", error=str(e))
+    else:
+        logger.warning(
+            "openstates_archive: SLACK_BOT_TOKEN not set — cannot alert on archive failure"
+        )
+
+    cams_token = os.getenv("CAMS_API_TOKEN", "")
+    if cams_token:
+        cams_url = os.getenv("CAMS_BASE_URL", "http://localhost:8000")
+        payload = {
+            "v": 1,
+            "service": "ddp-sync",
+            "error_type": "ArchiveTimeoutOrSubprocessError",
+            "message": f"archive failed for {jurisdiction}: {error} (after {duration_seconds:.0f}s)",
+            "metadata": {"jurisdiction": jurisdiction},
+        }
+        try:
+            resp = requests.post(
+                f"{cams_url}/api/v1/failures",
+                headers={"Authorization": f"Bearer {cams_token}", "Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=10,
+            )
+            if not resp.ok:
+                logger.error("openstates_archive: CAMS report failed", status=resp.status_code)
+        except Exception as e:  # noqa: BLE001
+            logger.error("openstates_archive: CAMS report error", error=str(e))
 
 
 def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
@@ -136,6 +209,18 @@ async def _run_archive(
     scrapebot_fallback -- see _maybe_preseed_scrapebot_cookies()'s docstring. A
     no-op for every jurisdiction not opted in (config defaults to None, in which
     case it's always a no-op).
+
+    SYNC-2: uses openstates_scrape's _run_with_group_kill rather than a bare
+    subprocess.run(timeout=...). subprocess.run(timeout=...) only kills the direct
+    child (run-archive.sh itself) on TimeoutExpired -- start_new_session=True makes
+    the wrapper the leader of its own process group, but nothing then targets that
+    group, so its grandchildren (os-text-extract archive <state> and its tee)
+    survive, orphaned and unsupervised, in the detached session. Observed live
+    2026-08-07: MI's archiver kept running headless for ~24h after its 4h wrapper
+    timeout killed only the wrapper. _run_with_group_kill's timeout path instead
+    killpg()s the whole group, reaching the grandchildren too. Only that half of
+    the helper is used here -- progress_dir/stall_seconds are left unset, so no
+    stall watchdog runs; OPEN-155's stall detection is out of this ticket's scope.
     """
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
 
@@ -148,27 +233,51 @@ async def _run_archive(
 
     start = time.monotonic()
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            capture_output=True,
-            timeout=timeout,
-            start_new_session=True,  # kill grandchildren on timeout
+        returncode, _stdout, stderr, timed_out, _stalled = await asyncio.to_thread(
+            _run_with_group_kill, cmd, dict(os.environ), timeout
         )
         duration = round(time.monotonic() - start, 1)
 
-        if result.returncode != 0:
-            stderr_tail = (result.stderr or b"").decode(errors="replace")[-500:]
+        if timed_out:
+            logger.error(
+                "openstates_archive: timeout",
+                jurisdiction=jurisdiction,
+                timeout_s=timeout,
+                duration_seconds=duration,
+            )
+            # Whole process group killed above, before run-archive.sh's own ERR trap ever got
+            # a chance to run -- it never alerted on this one. We're the only ones who know it
+            # happened, so we're the only ones who can alert.
+            _alert_archive_failure(jurisdiction, f"timed out after {timeout}s", duration)
+            return {
+                "success": False,
+                "error": "timeout",
+                "jurisdiction": jurisdiction,
+                "duration_seconds": duration,
+            }
+
+        if returncode != 0:
+            stderr_tail = (stderr or b"").decode(errors="replace")[-500:]
             logger.error(
                 "openstates_archive: failed",
                 jurisdiction=jurisdiction,
-                returncode=result.returncode,
+                returncode=returncode,
                 stderr_tail=stderr_tail,
                 duration_seconds=duration,
             )
+            if returncode < 0:
+                # Negative returncode = killed by a signal that didn't originate from our own
+                # timeout handling above (OOM killer, an operator's `kill`, another supervisor).
+                # run-archive.sh's own ERR trap only fires on an ordinary command failure inside
+                # the script, not on the script's own process receiving a terminating signal --
+                # so unlike a plain nonzero exit, this one was never self-alerted.
+                _alert_archive_failure(jurisdiction, f"killed by signal {-returncode}", duration)
+            # else (positive returncode): run-archive.sh's own ERR trap already fired its
+            # Slack/CAMS alert from inside the process before exiting nonzero -- alerting again
+            # here would double-page for the exact same failure.
             return {
                 "success": False,
-                "error": f"exit_code_{result.returncode}",
+                "error": f"exit_code_{returncode}",
                 "jurisdiction": jurisdiction,
                 "duration_seconds": duration,
             }
@@ -180,20 +289,6 @@ async def _run_archive(
         )
         return {"success": True, "jurisdiction": jurisdiction, "duration_seconds": duration}
 
-    except subprocess.TimeoutExpired:
-        duration = round(time.monotonic() - start, 1)
-        logger.error(
-            "openstates_archive: timeout",
-            jurisdiction=jurisdiction,
-            timeout_s=timeout,
-            duration_seconds=duration,
-        )
-        return {
-            "success": False,
-            "error": "timeout",
-            "jurisdiction": jurisdiction,
-            "duration_seconds": duration,
-        }
     except Exception as e:
         duration = round(time.monotonic() - start, 1)
         logger.error(
@@ -202,6 +297,10 @@ async def _run_archive(
             error=str(e),
             duration_seconds=duration,
         )
+        # Something failed before/while invoking the subprocess itself (e.g. the script or
+        # openstates_root path doesn't exist) -- run-archive.sh never started, so it never had
+        # a chance to alert either.
+        _alert_archive_failure(jurisdiction, str(e), duration)
         return {
             "success": False,
             "error": str(e),

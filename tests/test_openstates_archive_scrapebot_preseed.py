@@ -15,7 +15,7 @@ result).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -34,12 +34,8 @@ def _config(*, enabled=True, jurisdictions=("mi",)):
     }
 
 
-def _completed_process():
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.stdout = b""
-    proc.stderr = b""
-    return proc
+# (returncode, stdout, stderr, timed_out, stalled) -- _run_with_group_kill's success shape.
+_SUCCESSFUL_GROUP_KILL_RESULT = (0, b"", b"", False, False)
 
 
 def test_eligible_true_when_enabled_and_listed():
@@ -128,16 +124,16 @@ async def test_run_archive_preseeds_before_launching_the_subprocess():
     async def fake_preseed(jurisdiction, cfg, root):
         call_order.append("preseed")
 
-    def fake_subprocess_run(*args, **kwargs):
+    def fake_group_kill(*args, **kwargs):
         call_order.append("subprocess")
-        return _completed_process()
+        return _SUCCESSFUL_GROUP_KILL_RESULT
 
     with patch(
         "ddp_sync.pipelines.openstates_archive._maybe_preseed_scrapebot_cookies",
         side_effect=fake_preseed,
     ), patch(
-        "ddp_sync.pipelines.openstates_archive.subprocess.run",
-        side_effect=fake_subprocess_run,
+        "ddp_sync.pipelines.openstates_archive._run_with_group_kill",
+        side_effect=fake_group_kill,
     ):
         result = await _run_archive("mi", "/fake/root", config=config)
 
@@ -153,8 +149,8 @@ async def test_run_archive_is_a_noop_preseed_when_config_omitted():
         "ddp_sync.pipelines.openstates_archive.scrapebot_client.dispatch_mint_cookies",
         new_callable=AsyncMock,
     ) as mock_dispatch, patch(
-        "ddp_sync.pipelines.openstates_archive.subprocess.run",
-        return_value=_completed_process(),
+        "ddp_sync.pipelines.openstates_archive._run_with_group_kill",
+        return_value=_SUCCESSFUL_GROUP_KILL_RESULT,
     ):
         result = await _run_archive("fl", "/fake/root")
 
@@ -180,8 +176,8 @@ async def test_run_single_archive_job_preseeds_via_run_archive():
         "ddp_sync.pipelines.openstates_archive.scrapebot_client.cache_path_for",
         return_value="/fake/_cache/mi_waf_cookies.json",
     ), patch(
-        "ddp_sync.pipelines.openstates_archive.subprocess.run",
-        return_value=_completed_process(),
+        "ddp_sync.pipelines.openstates_archive._run_with_group_kill",
+        return_value=_SUCCESSFUL_GROUP_KILL_RESULT,
     ):
         result = await run_single_archive_job("mi", config)
 
