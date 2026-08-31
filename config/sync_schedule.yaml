@@ -594,6 +594,16 @@ openstates_scrape:
       - ma
       - ut
       - az
+      # OPEN-231 Stage 2 (PLAN-push-button-onboarding.md §5): nc is Phase 1's chosen pilot
+      # candidate (OPEN-230 — probed YELLOW, only blocking gap is a probe-tooling limitation,
+      # not a real scraper defect). Uses the same default 6h SCRAPE_TIMEOUT_S / 4h
+      # ARCHIVE_TIMEOUT_S as va/ut/az below — no nc-specific entry exists yet because no real
+      # run has measured one. This is the FIRST SUPERVISED RUN: merging this line schedules a
+      # real production scrape against the live Postgres, so watch the first Sunday cycle by
+      # hand (per Stage 2/3's human sign-off) rather than assuming it lands cleanly. archive
+      # is intentionally NOT enabled for nc below yet -- that's Stage 4, gated on watching this
+      # first scrape succeed.
+      - nc
 
     # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
     # WAF block from MI having been blocked for a month straight -- every weekly failure got
