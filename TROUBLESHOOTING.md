@@ -297,4 +297,26 @@ Only after ruling out schema mismatch should you suspect URL-trailing-slash, ema
 
 **Files:** `pipelines/bill_artifact_generation.py`, `services/broker_client.py` (`get_bill_artifact_coverage_all_versions`)
 
-**Related, not yet fixed:** bills that already picked up a wrong-pair changelog on their current latest version *before* this fix shipped are not retroactively corrected — the per-bill coverage gate one level up (`session_pipeline_runner.py`'s own `get_bill_artifacts` call) still only checks the current latest version, so it never re-opens for them at all. Tracked as [SYNC-45](https://digitaldemocracyproject.atlassian.net/browse/SYNC-45).
+**Related, fixed 2026-08-31 ([SYNC-45](https://digitaldemocracyproject.atlassian.net/browse/SYNC-45)):** bills that already picked up a wrong-pair changelog on their current latest version *before* the SYNC-44 fix shipped were not retroactively corrected — the per-bill coverage gate one level up (`session_pipeline_runner.py`'s own `get_bill_artifacts` call) still only checked the current latest version, so it never re-opened for them at all. Fixed by having that gate escalate to `get_bill_artifact_coverage_all_versions()` (checking every classified version, not just the latest) specifically for `bill_changelog`, and only when the cheap single-version check already says "covered" — so the common already-fully-covered case pays no extra broker read. The six FL 2026E bills this surfaced on now correctly get dispatched for their missing `Filed`→`e1` transition.
+
+## OpenStates Archive & Scrape Reliability
+
+### A timed-out archive run leaves an orphaned process running for hours, with no alert
+
+**Symptom:** `openstates_archive`'s nightly job times out (`ARCHIVE_TIMEOUT_S`) and the log shows the timeout, but no "Archiving done" line ever appears and nothing in Slack or CAMS reports a failure. `ps` later shows `os-text-extract archive <state>` still running, unsupervised, long after the timeout should have ended it.
+
+**Root cause (fixed 2026-08-31, SYNC-2):** `_run_archive()` launched `run-archive.sh` via `subprocess.run(..., timeout=..., start_new_session=True)`. On `TimeoutExpired`, `subprocess.run` kills only the direct child (the bash wrapper) — not the grandchildren (`os-text-extract archive <state>` and its `tee`), which the detached session leaves running orphaned to PID 1. Killing the wrapper is worse than killing nothing: the wrapper's own `ERR` trap owned the Slack/CAMS alerting, so a timed-out run alerted nobody, while the orphaned archiver kept running headless. Observed live 2026-08-07: a timed-out MI archive run (4h default) left its archiver running ~24h more, discovered only by chance.
+
+**Fix:** `_run_archive()` now reuses `openstates_scrape.py`'s `_run_with_group_kill()` to kill the whole process group (not just the wrapper) on timeout, and gained its own `_alert_archive_failure()` — Slack `#automation-errors` + CAMS `/api/v1/failures`, mirroring the scrape pipeline's `_alert_scrape_failure()` — for the timeout, signal-kill, and pre-subprocess-exception paths. Deliberately *not* triggered for an ordinary nonzero exit, since `run-archive.sh`'s own in-process trap already alerts on that case and re-alerting would double-page. MI's `ARCHIVE_TIMEOUT_S` also raised from the 4h default to 24h, since its ~8k-document backlog at ~10s/doc needs 20h+ to clear and was getting killed partway through every night.
+
+**Files:** `pipelines/openstates_archive.py`
+
+### The sustained-WAF-block escalation (OPEN-22) never actually fires
+
+**Symptom:** A jurisdiction (e.g. MI) has been hitting WAF blocks for weeks, but the distinct "sustained block" Slack alert never appears — only the generic per-run failure alert, indistinguishable from a one-off network blip.
+
+**Root cause (fixed 2026-08-31, SYNC-3):** `classify_failure_reason()` only ever inspected the scrape's external stdout/stderr tail. A real `WafBlockDetected` block signature is written only to `logs/scraper.log`, redirected there inside `run-scrape.sh`'s own `tee` pipeline — it never reaches the external stderr this classifier could see. So a genuine block always classified as generic `nonzero_exit_other`, and the OPEN-22 windowed escalation (which counts `waf_block`-classified runs) could never accumulate the records it needs to fire.
+
+**Fix:** The classifier now additionally reads a bounded tail of `logs/scraper.log`, anchored to a byte offset captured *before* the subprocess launches. The anchor is the important part, not an incidental detail: `scraper.log` is a long-lived, cross-run file, so a naive "read the last N bytes/lines" approach could pick up a stale, already-resolved block signature from a previous run's failure and misattribute it to today's unrelated failure. Anchoring to this run's own pre-launch offset means only bytes this run's subprocess could plausibly have written are ever considered.
+
+**Files:** `pipelines/openstates_scrape.py`
