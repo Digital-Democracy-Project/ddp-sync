@@ -169,9 +169,21 @@ def test_alert_archive_failure_never_raises_when_cams_returns_error():
 
 
 def test_alert_archive_failure_includes_jurisdiction_in_the_message():
-    """The ticket's own acceptance line: the alert must name the jurisdiction."""
+    """The ticket's own acceptance line: the alert must name the jurisdiction.
+
+    CAMS_API_TOKEN is forced empty here, not left to whatever the ambient environment
+    happens to have -- this repo's own .env sets a real one, and when it's present
+    _alert_archive_failure() makes a SECOND requests.post call (to CAMS, using data=
+    rather than json=). mock_post.call_args reflects the LAST call, so without this the
+    test passes or fails depending on suite run order / whether .env got loaded first,
+    rather than on anything this test is actually about (the Slack message content).
+    """
     with (
-        patch.dict("os.environ", {"SLACK_BOT_TOKEN": "fake-token"}, clear=False),
+        patch.dict(
+            "os.environ",
+            {"SLACK_BOT_TOKEN": "fake-token", "CAMS_API_TOKEN": ""},
+            clear=False,
+        ),
         patch("ddp_sync.pipelines.openstates_archive.requests.post") as mock_post,
     ):
         mock_post.return_value.ok = True
