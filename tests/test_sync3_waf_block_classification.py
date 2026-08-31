@@ -28,6 +28,7 @@ from ddp_sync.pipelines.openstates_scrape import (
     _check_sustained_blocking,
     _read_scraper_log_tail,
     _run_scrape,
+    _scraper_log_size,
     classify_failure_reason,
 )
 
@@ -116,7 +117,61 @@ def test_read_scraper_log_tail_missing_file_returns_empty(tmp_path):
     assert _read_scraper_log_tail(str(tmp_path)) == ""
 
 
+def test_read_scraper_log_tail_ignores_content_before_since_offset(tmp_path):
+    """Round-1 PM review fold: a stale marker written before this run started must not be
+    attributed to it. `since_offset` anchors the read to what was appended AFTER that point,
+    not to a fixed distance before end-of-file."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "scraper.log"
+    log_path.write_text(REALISTIC_BLOCKED_RUN_LOG_TAIL)  # an old, already-resolved block
+    offset_after_old_block = log_path.stat().st_size
+
+    log_path.write_text(
+        log_path.read_text() + "[2026-08-30 09:00:01] ERROR: scrape/import failed for mi\n"
+        "[2026-08-30 09:00:01] Failure for mi classified as a network error, will retry\n"
+    )
+
+    tail = _read_scraper_log_tail(str(tmp_path), since_offset=offset_after_old_block)
+
+    assert "consecutive waf blocks detected" not in tail.lower()
+    assert "network error" in tail.lower()
+
+
+def test_read_scraper_log_tail_falls_back_to_full_read_if_rotated_below_offset(tmp_path):
+    """If the file is now smaller than since_offset (rotated mid-run), a rotation-adjacent run
+    still deserves a best-effort look at whatever is there, rather than losing its own signal
+    to a coincidental rotation -- not a reason to return nothing."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "scraper.log").write_text(REALISTIC_BLOCKED_RUN_LOG_TAIL)
+
+    tail = _read_scraper_log_tail(str(tmp_path), since_offset=999_999_999)
+
+    assert "consecutive waf blocks detected" in tail.lower()
+
+
+def test_scraper_log_size_missing_file_returns_zero(tmp_path):
+    assert _scraper_log_size(str(tmp_path)) == 0
+
+
 # -- End-to-end through _run_scrape() --
+
+
+def _fake_run_that_appends_to_scraper_log(log_path, text, returncode=90):
+    """Build a _run_with_group_kill replacement that appends `text` to scraper.log when called
+    -- simulating a real run-scrape.sh invocation's tee pipeline writing WHILE the subprocess
+    runs, which happens strictly after _run_scrape() has already captured its pre-run
+    _scraper_log_size() offset. This is what makes these tests actually exercise the
+    since_offset anchor rather than coincidentally passing because the fixture was written
+    before the offset was captured."""
+
+    def _fake(*args, **kwargs):
+        with open(log_path, "a") as f:
+            f.write(text)
+        return (returncode, b"", b"exit status 1\n", False, False)
+
+    return _fake
 
 
 @pytest.mark.asyncio
@@ -126,12 +181,12 @@ async def test_run_scrape_classifies_waf_block_from_scraper_log_when_stderr_is_c
     here, same as a real run-scrape.sh invocation would leave behind) carries the WAF marker."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    (log_dir / "scraper.log").write_text(REALISTIC_BLOCKED_RUN_LOG_TAIL)
+    log_path = log_dir / "scraper.log"
 
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(90, b"", b"exit status 1\n", False, False),
+            side_effect=_fake_run_that_appends_to_scraper_log(log_path, REALISTIC_BLOCKED_RUN_LOG_TAIL),
         ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
@@ -139,6 +194,39 @@ async def test_run_scrape_classifies_waf_block_from_scraper_log_when_stderr_is_c
 
     assert result["success"] is False
     assert result["failure_reason"] == "waf_block"
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_does_not_misattribute_a_stale_pre_existing_waf_marker(tmp_path):
+    """The regression this fix exists to prevent (round-1 PM review fold): scraper.log is a
+    long-lived file shared across every run of every jurisdiction, rotated in place at 50MB, not
+    reset per run. Without the since_offset anchor, an old WAF marker from an already-resolved
+    block could sit in the tail for many subsequent runs and get misattributed to a LATER,
+    unrelated failure -- inverting the exact distinction ("one bad Sunday" vs. "MI has been dark
+    for a month") this escalation exists to draw. Here: a real WAF marker is already in
+    scraper.log from a prior run, and THIS run's own subprocess writes only an unrelated
+    network-error line -- the result must not classify as waf_block."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "scraper.log"
+    log_path.write_text(REALISTIC_BLOCKED_RUN_LOG_TAIL)  # an old, already-resolved block
+
+    unrelated_failure = (
+        "[2026-08-30 09:00:01] ERROR: scrape/import failed for mi\n"
+        "[2026-08-30 09:00:01] Failure for mi classified as a network error, will retry\n"
+    )
+
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+            side_effect=_fake_run_that_appends_to_scraper_log(log_path, unrelated_failure),
+        ),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
+        result = await _run_scrape("mi", None, str(tmp_path), timeout_s=10)
+
+    assert result["success"] is False
+    assert result["failure_reason"] != "waf_block"
 
 
 # -- Evidence bar item 2: the windowed escalation actually fires --
@@ -149,20 +237,35 @@ async def test_sustained_block_alert_fires_after_window_size_4_threshold_3(tmp_p
     """Seed sync_schedule.yaml's window_size=4/threshold=3 worth of consecutive block records,
     each produced the real way (via _run_scrape(), from a clean stderr plus a scraper.log-only
     WAF signature -- not a hand-written failure_reason), and confirm the distinct
-    sustained-block Slack alert (_alert_sustained_block) actually fires."""
+    sustained-block Slack alert (_alert_sustained_block) actually fires.
+
+    Round-1 PM review fold: each of the 4 calls appends its OWN fresh WAF marker to scraper.log
+    (mirroring 4 real, separate runs each hitting a real block), rather than reading one static
+    file unchanged 4 times -- the original version of this test passed even when the underlying
+    fix misattributed one single stale marker to 4 unrelated runs, which is the exact bug
+    round 1 found. This version would fail under that bug, since since_offset would make calls
+    2-4 see no new content past what call 1 already consumed."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    (log_dir / "scraper.log").write_text(REALISTIC_BLOCKED_RUN_LOG_TAIL)
+    log_path = log_dir / "scraper.log"
+    log_path.touch()
 
     results = []
-    with (
-        patch(
-            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-            return_value=(90, b"", b"exit status 1\n", False, False),
-        ),
-        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
-    ):
-        for _ in range(4):
+    for i in range(4):
+        marker = (
+            f"[2026-08-30 0{i}:00:00] ERROR: scrape/import failed for mi\n"
+            f"openstates.exceptions.ScrapeError: MI bill scrape aborted: 3 consecutive WAF "
+            f"blocks detected fetching bill pages (run {i})\n"
+            f"[2026-08-30 0{i}:00:00] Failure for mi classified as a WAF block — terminal, "
+            "will not be retried (OPEN-53)\n"
+        )
+        with (
+            patch(
+                "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+                side_effect=_fake_run_that_appends_to_scraper_log(log_path, marker),
+            ),
+            patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+        ):
             results.append(await _run_scrape("mi", None, str(tmp_path), timeout_s=10))
 
     assert [r["failure_reason"] for r in results] == ["waf_block"] * 4

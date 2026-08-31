@@ -240,8 +240,31 @@ WAF_BLOCK_MARKERS = ("consecutive waf blocks detected", "waf block detected")
 SCRAPER_LOG_TAIL_BYTES = 8192
 
 
-def _read_scraper_log_tail(openstates_root: str, tail_bytes: int = SCRAPER_LOG_TAIL_BYTES) -> str:
-    """Read the tail of run-scrape.sh's shared scraper.log (SYNC-3 / OPEN-22 AC0b).
+def _scraper_log_size(openstates_root: str) -> int:
+    """Current size in bytes of run-scrape.sh's shared scraper.log, or 0 if it doesn't exist yet.
+
+    Call this immediately before launching a run and pass the result as `since_offset` to
+    `_read_scraper_log_tail()` after it finishes, so the read is anchored to what THIS run
+    appended rather than to a static tail of an ever-growing, cross-run log file (round-1 PM
+    review fold, SYNC-3: reading an unanchored tail let a stale marker from an old, already-
+    resolved WAF block sit in the last N bytes and get misattributed to a later, unrelated
+    failure -- exactly the "one bad Sunday" vs. "MI has been dark for a month" distinction this
+    escalation exists to draw, inverted).
+    """
+    path = os.path.join(openstates_root, "logs", "scraper.log")
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _read_scraper_log_tail(
+    openstates_root: str,
+    since_offset: int = 0,
+    tail_bytes: int = SCRAPER_LOG_TAIL_BYTES,
+) -> str:
+    """Read what run-scrape.sh's shared scraper.log gained since `since_offset` (SYNC-3 / OPEN-22
+    AC0b), bounded to at most `tail_bytes`.
 
     A real WAF block's detail (WafBlockDetected, raised from scrapers/mi/_waf_circuit_breaker.py)
     only ever reaches scraper.log: it is written to the scrape subprocess's own stdout/stderr,
@@ -251,23 +274,42 @@ def _read_scraper_log_tail(openstates_root: str, tail_bytes: int = SCRAPER_LOG_T
     only ever gets handed the 500-byte stderr tail of run-scrape.sh's own process, a real WAF
     block always classifies as generic "nonzero_exit_other", and OPEN-22's windowed escalation
     can never accumulate the waf_block records it counts (that was true as of 07fde76 and is
-    still true today -- see PR description for the re-confirmation). This makes the tail of
-    scraper.log part of what gets classified, alongside the existing stderr tail.
+    still true today -- see PR description for the re-confirmation). This makes what scraper.log
+    gained during this run part of what gets classified, alongside the existing stderr tail.
+
+    `since_offset` (round-1 PM review fold) is the file's size immediately before this run's
+    subprocess was launched (`_scraper_log_size()`, called by `_run_scrape()`) -- reading starts
+    there, not from a fixed distance before end-of-file. Without this anchor, scraper.log being
+    a long-lived file shared across every run of every jurisdiction (rotated in place at 50MB,
+    not reset per run) meant an old WAF marker could sit in the last `tail_bytes` for many
+    subsequent runs after the block that produced it was already resolved, misattributing a
+    later, unrelated failure (a network blip, a code bug) as `waf_block`. Anchoring to
+    `since_offset` means only bytes this run's own subprocess could plausibly have appended are
+    ever considered. Still bounded by `tail_bytes` from the END of that new region (not from
+    `since_offset` forward) in case this run itself wrote an unusually large amount -- the marker
+    this run wrote, if any, is near where its own output ends, not near where it began.
+
+    If the file is now smaller than `since_offset` (rotated away mid-run) or doesn't exist,
+    reads from the start instead of returning nothing -- a rotation-adjacent run still deserves a
+    best-effort look at whatever is there, rather than silently losing its own WAF signal to a
+    coincidental rotation.
 
     Best-effort and read-only, matching every other alerting/classification call site in this
-    module: scraper.log is shared across concurrent jurisdiction runs and is rotated in place at
-    50MB by run-scrape.sh, so this is a bounded tail read rather than a precise per-run slice --
-    good enough to catch the marker in the common case (this run's own failure is the most
-    recent thing appended), not a guarantee against ever reading a concurrent run's tail instead.
-    Any read failure (missing file, path does not exist, mid-rotation) returns "" so the caller
-    falls back to whatever it already had (the stderr tail alone) -- exactly today's behaviour.
+    module: still shared across concurrent jurisdiction runs (another jurisdiction's own output
+    interleaved in the same window is a real, accepted imprecision this offset anchor does not
+    fully remove, since the log has no per-line jurisdiction tag to key on), so this narrows the
+    stale-marker cross-contamination case, not every cross-run one. Any read failure (missing
+    file, path does not exist, mid-rotation) returns "" so the caller falls back to whatever it
+    already had (the stderr tail alone) -- exactly today's behaviour.
     """
     path = os.path.join(openstates_root, "logs", "scraper.log")
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - tail_bytes))
+            start = since_offset if since_offset <= size else 0
+            start = max(start, size - tail_bytes)
+            f.seek(start)
             return f.read().decode(errors="replace")
     except OSError:
         return ""
@@ -1133,6 +1175,9 @@ async def _run_scrape(
         # directory, so "count changed" is a direct read of whether the scrape is still doing
         # anything, and it needs no cooperation from the scraper.
         progress_dir = os.path.join(openstates_root, "openstates-scrapers", "_data", jurisdiction)
+        # SYNC-3: captured before launch so a WAF marker in scraper.log can only ever be
+        # attributed to what THIS run appended -- see _read_scraper_log_tail's docstring.
+        scraper_log_offset = _scraper_log_size(openstates_root)
         returncode, _stdout, stderr, timed_out, stalled = await asyncio.to_thread(
             _run_with_group_kill, cmd, env, timeout, None, progress_dir, SCRAPE_STALL_SECONDS
         )
@@ -1198,7 +1243,7 @@ async def _run_scrape(
             # SYNC-3: stderr_tail alone cannot see a WAF block -- see _read_scraper_log_tail's
             # docstring for why. Concatenated (not swapped in) so a real stderr message is never
             # discarded, and so the WAF-marker search below still works when this read fails.
-            scraper_log_tail = _read_scraper_log_tail(openstates_root)
+            scraper_log_tail = _read_scraper_log_tail(openstates_root, since_offset=scraper_log_offset)
             classification_tail = f"{stderr_tail}\n{scraper_log_tail}"
             logger.error(
                 "openstates_scrape: failed",
