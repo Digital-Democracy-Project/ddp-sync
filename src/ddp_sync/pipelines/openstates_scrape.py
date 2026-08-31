@@ -221,7 +221,7 @@ def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
         logger.error("openstates_scrape: quiet-jurisdiction Slack alert error", error=str(e))
 
 
-# Substring markers matched against a failed run's stderr tail to classify *why* it failed
+# Substring markers matched against a failed run's output tail to classify *why* it failed
 # (OPEN-22 AC0b), so a sustained WAF-block pattern can be told apart from an unrelated network
 # blip or code bug. Matched against this same GitHub org's own first-party ScrapeError message
 # text (scrapers/mi/_waf_circuit_breaker.py's MAX_CONSECUTIVE_WAF_BLOCKS abort message, OPEN-18/
@@ -230,17 +230,62 @@ def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
 # reuse-before-reinvent.md warns against.
 WAF_BLOCK_MARKERS = ("consecutive waf blocks detected", "waf block detected")
 
+# SYNC-3: how much of run-scrape.sh's shared scraper.log to read after a failed run, looking
+# for a WAF block signature classify_failure_reason() cannot otherwise see (see
+# _read_scraper_log_tail's docstring for the full story). Generous relative to the 500-byte
+# stderr tail elsewhere in this module because scraper.log is shared across concurrent
+# jurisdiction runs (secondary states fan out concurrently -- see this module's own docstring),
+# so the line this run actually wrote can sit behind other jurisdictions' output; small enough
+# that reading it after every failed run is still a cheap, bounded file read.
+SCRAPER_LOG_TAIL_BYTES = 8192
 
-def classify_failure_reason(error: str, stderr_tail: str) -> str:
+
+def _read_scraper_log_tail(openstates_root: str, tail_bytes: int = SCRAPER_LOG_TAIL_BYTES) -> str:
+    """Read the tail of run-scrape.sh's shared scraper.log (SYNC-3 / OPEN-22 AC0b).
+
+    A real WAF block's detail (WafBlockDetected, raised from scrapers/mi/_waf_circuit_breaker.py)
+    only ever reaches scraper.log: it is written to the scrape subprocess's own stdout/stderr,
+    which run-scrape.sh's scrape_attempt() pipes through `tee` into this file and nowhere else
+    -- never into run-scrape.sh's own external stdout/stderr, which is the only thing
+    _run_scrape()'s subprocess capture can otherwise see. Without this, classify_failure_reason()
+    only ever gets handed the 500-byte stderr tail of run-scrape.sh's own process, a real WAF
+    block always classifies as generic "nonzero_exit_other", and OPEN-22's windowed escalation
+    can never accumulate the waf_block records it counts (that was true as of 07fde76 and is
+    still true today -- see PR description for the re-confirmation). This makes the tail of
+    scraper.log part of what gets classified, alongside the existing stderr tail.
+
+    Best-effort and read-only, matching every other alerting/classification call site in this
+    module: scraper.log is shared across concurrent jurisdiction runs and is rotated in place at
+    50MB by run-scrape.sh, so this is a bounded tail read rather than a precise per-run slice --
+    good enough to catch the marker in the common case (this run's own failure is the most
+    recent thing appended), not a guarantee against ever reading a concurrent run's tail instead.
+    Any read failure (missing file, path does not exist, mid-rotation) returns "" so the caller
+    falls back to whatever it already had (the stderr tail alone) -- exactly today's behaviour.
+    """
+    path = os.path.join(openstates_root, "logs", "scraper.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def classify_failure_reason(error: str, output_tail: str) -> str:
     """Classify a failed run's reason for OPEN-22's sustained-pattern escalation.
 
-    Returns one of "waf_block", "timeout", "network_error", "nonzero_exit_other". Best-effort:
-    good enough to distinguish the one thing OPEN-22's escalation looks for (a WAF-block-
-    classified failure) from everything else, not an exhaustive failure taxonomy.
+    `output_tail` is whatever text this run's failure has available to search -- the failing
+    subprocess's own stderr tail, the tail of run-scrape.sh's shared scraper.log (SYNC-3), or
+    both concatenated. Returns one of "waf_block", "timeout", "network_error",
+    "nonzero_exit_other". Best-effort: good enough to distinguish the one thing OPEN-22's
+    escalation looks for (a WAF-block-classified failure) from everything else, not an
+    exhaustive failure taxonomy.
     """
     if error == "timeout":
         return "timeout"
-    haystack = stderr_tail.lower()
+    haystack = output_tail.lower()
     if any(marker in haystack for marker in WAF_BLOCK_MARKERS):
         return "waf_block"
     if error.startswith("exit_code_"):
@@ -768,13 +813,15 @@ async def _maybe_preseed_scrapebot_cookies(
 
     Reactive seeding (mint only after a run classified its own failure as
     waf_block) never actually fired against a real production run: the detailed
-    WafBlockDetected error only ever reaches scraper.log (redirected there inside
+    WafBlockDetected error only ever reached scraper.log (redirected there inside
     run-scrape.sh's own scrape_attempt() tee pipeline), never run-scrape.sh's
-    external stdout/stderr -- the only thing classify_failure_reason() can see.
-    So a real MI WAF block always classified as nonzero_exit_other, never
-    waf_block, and the reactive fallback silently never triggered. Proactive
-    minting sidesteps that gap entirely: always start with fresh cookies, never
-    depend on detecting the failure after the fact.
+    external stdout/stderr -- the only thing classify_failure_reason() could see
+    at the time. So a real MI WAF block always classified as nonzero_exit_other,
+    never waf_block, and the reactive fallback silently never triggered. SYNC-3
+    later taught classify_failure_reason() to also read the tail of scraper.log
+    directly, closing that specific gap -- but proactive minting stays regardless,
+    since it sidesteps the detection question entirely: always start with fresh
+    cookies, never depend on detecting the failure after the fact.
 
     Best-effort: a mint failure here must never block or fail the actual scrape
     that follows -- it just proceeds with whatever's already cached, or
@@ -1148,6 +1195,11 @@ async def _run_scrape(
 
         if returncode != 0:
             stderr_tail = (stderr or b"").decode(errors="replace")[-500:]
+            # SYNC-3: stderr_tail alone cannot see a WAF block -- see _read_scraper_log_tail's
+            # docstring for why. Concatenated (not swapped in) so a real stderr message is never
+            # discarded, and so the WAF-marker search below still works when this read fails.
+            scraper_log_tail = _read_scraper_log_tail(openstates_root)
+            classification_tail = f"{stderr_tail}\n{scraper_log_tail}"
             logger.error(
                 "openstates_scrape: failed",
                 jurisdiction=jurisdiction,
@@ -1171,7 +1223,7 @@ async def _run_scrape(
             return {
                 "success": False,
                 "error": error,
-                "failure_reason": classify_failure_reason(error, stderr_tail),
+                "failure_reason": classify_failure_reason(error, classification_tail),
                 "jurisdiction": label,
                 "duration_seconds": duration,
             }
