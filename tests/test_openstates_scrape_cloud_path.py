@@ -94,26 +94,41 @@ def test_memory_backend_disabled_when_config_missing_entirely():
 
 
 @pytest.mark.asyncio
-async def test_run_scrape_never_invokes_the_subprocess_for_a_cloud_owned_jurisdiction():
+async def test_run_scrape_routes_a_cloud_owned_jurisdiction_to_the_cloud_trigger():
+    """OPEN-193: cloud ownership used to be a bare skip -- now it's what actually triggers
+    the Fargate collection + RDS load. The local mac-side subprocess must still never run
+    (OPEN-208's "exactly one path" invariant), but "nothing happens" is no longer correct."""
     config = _config(jurisdictions=("mi",))
-    with patch(
-        "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-    ) as mock_run:
+    cloud_result = {
+        "success": True,
+        "jurisdiction": "mi",
+        "duration_seconds": 42.0,
+        "cloud_run_id": "mi-abc123",
+    }
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+        ) as mock_run,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.run_cloud_scrape",
+            return_value=cloud_result,
+        ) as mock_cloud,
+    ):
         result = await _run_scrape("mi", None, "/fake/root", config=config)
 
     mock_run.assert_not_called()
-    assert result["success"] is True
-    assert result["skipped"] is True
-    assert result["reason"] == "cloud_path_owns"
+    mock_cloud.assert_called_once_with("mi", None, "/fake/root", config)
+    assert result == cloud_result
 
 
 @pytest.mark.asyncio
-async def test_run_scrape_skips_before_scrapebot_preseed_for_a_cloud_owned_jurisdiction():
+async def test_run_scrape_triggers_cloud_before_scrapebot_preseed_for_a_cloud_owned_jurisdiction():
     """The docstring's ordering claim, pinned down: the ownership check runs BEFORE
     ScrapeBot cookie pre-seeding, so a cloud-owned jurisdiction never triggers a real
     cookie mint against its WAF (MI's, in practice) for a scrape the mac isn't going
-    to run. Regression coverage for pm-review's "assert the ordering, not just the
-    non-invocation" finding on this PR."""
+    to run -- that stays true now that the cloud branch does real work instead of a
+    no-op skip. Regression coverage for pm-review's "assert the ordering, not just the
+    non-invocation" finding on the original PR."""
     config = _config(jurisdictions=("mi",))
     with (
         patch(
@@ -122,12 +137,16 @@ async def test_run_scrape_skips_before_scrapebot_preseed_for_a_cloud_owned_juris
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
         ) as mock_run,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.run_cloud_scrape",
+            return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0},
+        ),
     ):
         result = await _run_scrape("mi", None, "/fake/root", config=config)
 
     mock_preseed.assert_not_called()
     mock_run.assert_not_called()
-    assert result["skipped"] is True
+    assert result["success"] is True
 
 
 @pytest.mark.asyncio
@@ -159,19 +178,26 @@ async def test_run_scrape_is_a_noop_gate_when_config_omitted():
 
 
 @pytest.mark.asyncio
-async def test_run_single_scrape_job_also_refuses_for_a_cloud_owned_jurisdiction():
+async def test_run_single_scrape_job_also_routes_to_the_cloud_trigger():
     """The manual-trigger endpoint (POST /trigger/openstates-scrape/<state>) funnels
     through _run_scrape() too -- proving OPEN-208's "a manual invocation for a
-    jurisdiction owned by the other path refuses rather than running" criterion for
+    jurisdiction owned by the other path never runs the local subprocess" criterion for
     free, not via a separate check duplicated at the trigger route."""
     config = _config(jurisdictions=("mi",))
-    with patch(
-        "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
-    ) as mock_run:
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+        ) as mock_run,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.run_cloud_scrape",
+            return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0},
+        ) as mock_cloud,
+    ):
         result = await run_single_scrape_job("mi", config)
 
     mock_run.assert_not_called()
-    assert result["skipped"] is True
+    mock_cloud.assert_called_once()
+    assert result["success"] is True
 
 
 # ── _run_scrape: the memory-backend env vars actually reach the subprocess ─────────────────

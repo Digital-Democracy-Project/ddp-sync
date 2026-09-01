@@ -28,6 +28,7 @@ from typing import Any, NamedTuple
 import requests
 import structlog
 
+from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
 
 logger = structlog.get_logger()
@@ -1052,17 +1053,19 @@ async def _run_scrape(
     # all. Every caller of _run_scrape() funnels through here, so this one check covers
     # scheduled jobs, the manual-trigger endpoint, and retry alike.
     if _cloud_path_owns(jurisdiction, config):
+        # OPEN-193: this used to be a bare skip -- every cloud-owned run before this was a
+        # human running `aws ecs run-task` and `cloud_loader.py` by hand (the OPEN-191
+        # rehearsal). Now the same funnel that refuses to run run-scrape.sh for a cloud-owned
+        # jurisdiction is what actually triggers its cloud run, so "exactly one path owns a
+        # jurisdiction" (OPEN-208) keeps meaning something once cloud ownership does something.
         logger.info(
-            "openstates_scrape: skipping -- this jurisdiction is cloud-owned (OPEN-208)",
+            "openstates_scrape: cloud-owned -- triggering Fargate collection + RDS load "
+            "(OPEN-193)",
             jurisdiction=jurisdiction,
         )
-        return {
-            "success": True,
-            "skipped": True,
-            "reason": "cloud_path_owns",
-            "jurisdiction": jurisdiction,
-            "duration_seconds": 0.0,
-        }
+        return await asyncio.to_thread(
+            run_cloud_scrape, jurisdiction, session_arg, openstates_root, config
+        )
 
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)
 
