@@ -423,3 +423,34 @@ def test_default_subprocess_runner_passes_the_configured_load_timeout():
         runner(["python3", "cloud_loader.py"], {})
 
     assert mock_run.call_args.kwargs["timeout"] == 1234
+
+
+# ── malformed config shapes (independent review, round 2) ─────────────────────────────────
+
+
+def test_non_dict_fargate_config_returns_clean_failure_instead_of_attributeerror():
+    """The exact repro from independent review: cloud_path.fargate present but the wrong
+    type (a plausible hand-authored YAML mistake) used to raise AttributeError instead of
+    the documented failure dict -- which escaped uncaught all the way past _run_scrape()
+    (no handler of its own) into openstates_secondary_scrapes()'s bare asyncio.gather(),
+    cancelling every other jurisdiction's in-flight scrape in the same batch."""
+    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert:
+        result = cst.run_cloud_scrape(
+            "fl", None, "/tmp", {"cloud_path": {"fargate": "oops-not-a-dict"}}
+        )
+
+    assert result["success"] is False
+    assert result["failure_reason"] == "config_error"
+    assert "must be a mapping" in result["error"]
+    mock_alert.assert_called_once()
+
+
+def test_non_dict_cloud_path_returns_clean_failure_instead_of_attributeerror():
+    """Same class of bug, one level up: cloud_path itself the wrong type."""
+    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert:
+        result = cst.run_cloud_scrape("fl", None, "/tmp", {"cloud_path": "also-not-a-dict"})
+
+    assert result["success"] is False
+    assert result["failure_reason"] == "config_error"
+    assert "must be a mapping" in result["error"]
+    mock_alert.assert_called_once()

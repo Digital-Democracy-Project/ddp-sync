@@ -111,7 +111,30 @@ def _generate_run_id(jurisdiction: str) -> str:
 
 
 def _fargate_config(config: dict | None) -> dict:
-    cfg = ((config or {}).get("cloud_path") or {}).get("fargate") or {}
+    """Raises ValueError -- never anything else -- for every malformed shape, including a
+    hand-authored YAML mistake that makes `cloud_path` or `cloud_path.fargate` the wrong type
+    (found in independent review: the original version called `.get()` on whatever was there
+    unconditionally, so a non-dict value raised `AttributeError` instead, which escaped past
+    `run_cloud_scrape()`'s own `except ValueError` uncaught -- and past `_run_scrape()`, which
+    has no handler of its own, into `openstates_secondary_scrapes()`'s bare `asyncio.gather()`,
+    cancelling every other jurisdiction's in-flight scrape in the same batch over one bad
+    config value for a single jurisdiction)."""
+    # ValueError, not TypeError, deliberately (ruff TRY004 disagrees) -- every config problem
+    # this function finds, wrong-shaped or missing, needs to classify identically as
+    # "config_error" at the one call site that catches it; splitting the exception type here
+    # would just move that classification logic there instead of gaining anything.
+    cloud_path_cfg = (config or {}).get("cloud_path") or {}
+    if not isinstance(cloud_path_cfg, dict):
+        raise ValueError(  # noqa: TRY004
+            f"cloud_path must be a mapping, got {type(cloud_path_cfg).__name__}"
+        )
+
+    cfg = cloud_path_cfg.get("fargate") or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(  # noqa: TRY004
+            f"cloud_path.fargate must be a mapping, got {type(cfg).__name__}"
+        )
+
     required = ("cluster", "task_definition", "subnets", "security_groups")
     missing = [k for k in required if not cfg.get(k)]
     if missing:
@@ -308,20 +331,30 @@ def run_cloud_scrape(
     start = time.monotonic()
 
     try:
-        fargate_cfg = _fargate_config(config)
-    except ValueError as e:
-        duration = round(time.monotonic() - start, 1)
-        logger.error("cloud_scrape: bad config", jurisdiction=jurisdiction, error=str(e))
-        _alert_scrape_failure(label, str(e), duration)
-        return {
-            "success": False,
-            "error": str(e),
-            "failure_reason": "config_error",
-            "jurisdiction": label,
-            "duration_seconds": duration,
-        }
+        # Nested rather than a separate try/except ValueError at this call site alone
+        # (independent review found exactly that gap): _fargate_config() raising something
+        # OTHER than ValueError -- a hand-authored YAML mistake making cloud_path or
+        # cloud_path.fargate the wrong type raised AttributeError before that function
+        # validated its own input -- escaped a narrower catch here uncaught, then propagated
+        # past _run_scrape() (no handler of its own) into openstates_secondary_scrapes()'s
+        # bare asyncio.gather(), cancelling every other jurisdiction's in-flight scrape in the
+        # same batch. _fargate_config() itself now only ever raises ValueError (see its own
+        # docstring), but nesting this inside the outer catch-all below means that guarantee
+        # no longer has to hold perfectly forever for this function's own promise to hold.
+        try:
+            fargate_cfg = _fargate_config(config)
+        except ValueError as e:
+            duration = round(time.monotonic() - start, 1)
+            logger.error("cloud_scrape: bad config", jurisdiction=jurisdiction, error=str(e))
+            _alert_scrape_failure(label, str(e), duration)
+            return {
+                "success": False,
+                "error": str(e),
+                "failure_reason": "config_error",
+                "jurisdiction": label,
+                "duration_seconds": duration,
+            }
 
-    try:
         run_id = _generate_run_id(jurisdiction)
 
         # pm-review, round 1: check this BEFORE triggering an hours-long Fargate collection,
