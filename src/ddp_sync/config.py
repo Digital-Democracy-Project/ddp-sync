@@ -304,6 +304,31 @@ class SyncSettings:
     # contention -- both remain open, tracked on AGENTS-37.
     session_pipeline_concurrency: int = 1
 
+    # SYNC-48: independent enable flag for an automated scraper-completion
+    # caller of run_legbot_pipeline (pipelines/scraper_triggered_legbot.py).
+    # Deliberately NOT the same switch as LEGBOT_ENABLED (ddp-agents/CAMS
+    # side) -- that one is the last-resort "stop everything, including
+    # manual Agent Smith dispatches" switch and isn't meant to be toggled
+    # routinely. This flag pauses only the automated path; manual dispatches
+    # via /trigger/bill-artifact-generation are unaffected either way.
+    # Defaults to disabled: no automated caller exists yet (see that
+    # module's own docstring for what's still a named follow-up), so there
+    # is nothing for an operator to opt into today.
+    session_pipeline_scraper_trigger_enabled: bool = False
+
+    # SYNC-48: TTL for the overlap-rejection lock in
+    # scraper_triggered_legbot.py, keyed per (jurisdiction, session). A
+    # coarse ceiling, not a correctness mechanism -- see that module's own
+    # docstring for why a lock that occasionally expires early (letting a
+    # second run start) or late (rejecting one extra trigger) is safe by
+    # construction, not something this TTL needs to get exactly right.
+    # Sized generously: real throughput after SYNC-37/38/39's 2026-08-27
+    # measurements was ~25s/bill on a 20-bill session (see PLAN-legbot.md),
+    # so a few hundred-bill session is on the order of an hour or two at
+    # session_pipeline_concurrency's default of 1 (sequential) -- 4 hours
+    # leaves real headroom above that without being unboundable.
+    session_pipeline_scraper_trigger_lock_ttl_seconds: int = 14400
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -412,6 +437,12 @@ def _load_from_env() -> dict:
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
+        "session_pipeline_scraper_trigger_enabled": (
+            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_ENABLED", "false").lower() == "true"
+        ),
+        "session_pipeline_scraper_trigger_lock_ttl_seconds": int(
+            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_LOCK_TTL_SECONDS", "14400")
+        ),
     }
 
 
