@@ -24,6 +24,20 @@ Both scripts live in the `ddp-open-states` repo (`openstates_root`), not this on
 separate repos with two separate deploys, the same reasoning `_run_scrape()` already gives for
 checking whether `run-scrape-retrying.sh` exists before trusting it is deployed.
 
+`run_cloud_scrape()`'s whole body runs inside one outer try/except (pm-review, round 1): any
+unexpected exception anywhere in this module -- `boto3.client("ecs")` construction,
+`describe_tasks` throttling or a transient network blip mid-poll, anything -- must still come
+back as this function's normal failure-dict shape and still alert, exactly like `_run_scrape()`
+already guarantees for its own mac-side branch (its own top-level `except Exception`). Without
+that guarantee, an AWS hiccup on a background thread would raise past `asyncio.to_thread()`
+uncaught instead of being logged and reported as one failed run.
+
+Two same-day fixes worth calling out, both landed after the first round of pm-review found
+them: a run that gives up waiting (`max_wait_seconds` exceeded) now best-effort `stop_task`s
+the orphaned ECS task rather than leaving it running unbounded, and the load subprocess now
+carries its own wall-clock timeout (`cloud_path.fargate.load_timeout_seconds`) rather than
+being able to hang forever on a stuck database connection.
+
 What this deliberately does NOT do, scoped out rather than silently missing (OPEN-193's own
 acceptance criteria list "load runs next to the database; ddp-sync runs on EC2" and re-
 measured freshness -- not full local-path parity):
@@ -34,6 +48,13 @@ measured freshness -- not full local-path parity):
     collector inside the container is bounded by `cloud_collector.py`'s own internal
     timeouts, not by anything on this side of the boundary -- a real gap if that turns out to
     be insufficient, but not one to guess a replacement mechanism for here.
+  * No same-jurisdiction concurrency lock of this module's own. `cloud_collector.py` already
+    acquires OPEN-187's cross-machine `SourceLock`, keyed on the jurisdiction alone, the moment
+    it starts -- the OPEN-191 rehearsal confirmed live that a second concurrent launch for the
+    same source correctly refuses rather than racing (`infra/rds/README.md`). A second lock
+    here would duplicate that mechanism rather than add a real guarantee; what this module adds
+    on top is only the `stop_task`-on-timeout behavior above, so a run this side gave up on
+    doesn't keep occupying that lock indefinitely once ECS itself has genuinely finished with it.
   * No bounded-retry wrapper integration (`_retry_eligible()` / `run-scrape-retrying.sh`).
     That wrapper is mac/bash-specific; a cloud-side retry policy is a real design question
     (retry the whole run under a fresh run_id, or resume?) left open rather than answered by
@@ -43,12 +64,6 @@ measured freshness -- not full local-path parity):
     Fargate task definition's own environment, not something set from here) -- there is no
     mac-side fallback path for a run that already executes in the cloud, so the floor that
     function exists to enforce does not apply on this side.
-  * No alerting for a `run_cloud_scrape()` caller who already alerts on the returned dict.
-    `_alert_scrape_failure()` IS called from inside the failure branches here, though --
-    unlike the mac-side branch (which skips it for a positive returncode because
-    run-scrape.sh's own `on_failure()` already paged from inside the process),
-    `cloud_collector.py`/`cloud_loader.py` have no Slack/CAMS client of their own, so nothing
-    else will page on a cloud-side failure if this doesn't.
 """
 
 from __future__ import annotations
@@ -79,6 +94,12 @@ _POLL_INTERVAL_S = 30
 # same reasoning SCRAPE_TIMEOUT_S in openstates_scrape.py already uses for the mac-side ceiling.
 _DEFAULT_MAX_WAIT_S = 12 * 3600
 
+# Default backstop for cloud_loader.py itself (pm-review, round 1: this had no timeout at all).
+# The OPEN-191 rehearsal's loads were minutes, not hours, even against multi-thousand-row
+# jurisdictions -- collection is what takes hours, not the import -- so this is generous
+# headroom for a real load, not a number sized to the collection side's own ceiling.
+_DEFAULT_LOAD_TIMEOUT_S = 2 * 3600
+
 
 def _generate_run_id(jurisdiction: str) -> str:
     """The handoff contract (PLAN-scraper-execution-migration.md SS1) leaves run_id "supplied
@@ -98,6 +119,21 @@ def _fargate_config(config: dict | None) -> dict:
     return cfg
 
 
+def _stop_orphaned_task(ecs_client, cluster: str, task_arn: str) -> str:
+    """Best-effort cleanup for a task this function gave up waiting on (pm-review, round 1:
+    the ECS task kept running past max_wait_seconds with nothing on this side ever stopping
+    it, which could let a later retry or scheduled run start a second collection for the same
+    jurisdiction while the first was still going). Never raises -- a failed stop_task here is
+    still better reported as "gave up waiting" than as an exception replacing that message."""
+    try:
+        ecs_client.stop_task(
+            cluster=cluster, task=task_arn, reason="ddp-sync: max_wait_seconds exceeded"
+        )
+        return "task stop requested"
+    except Exception as e:  # noqa: BLE001 -- cleanup best-effort, never let this mask the timeout
+        return f"stop_task also failed: {e}"
+
+
 def _run_fargate_collection(
     jurisdiction: str,
     session_arg: str | None,
@@ -110,7 +146,8 @@ def _run_fargate_collection(
     Returns (started, exit_code, detail). `started=False` means run_task itself failed
     (capacity, config, IAM -- the task never actually ran); `exit_code=None` with
     `started=True` covers a task that stopped without ever reporting one (killed by ECS
-    itself -- OOM, spot interruption -- or this function's own wait gave up first).
+    itself -- OOM, spot interruption -- or this function's own wait gave up first, in which
+    case it also asked ECS to stop the task -- see `_stop_orphaned_task()`).
     """
     command = ["python3", "cloud_collector.py", jurisdiction]
     if session_arg:
@@ -156,14 +193,31 @@ def _run_fargate_collection(
         desc = ecs_client.describe_tasks(cluster=fargate_cfg["cluster"], tasks=[task_arn])
         described = desc.get("tasks", [])
         if described and described[0].get("lastStatus") == _STOPPED:
-            containers = described[0].get("containers", [])
+            task = described[0]
+            containers = task.get("containers", [])
             match = next((c for c in containers if c.get("name") == container_name), None)
             exit_code = match.get("exitCode") if match else None
-            reason = (match or described[0]).get("reason", "")
+            # A container-level `reason` (e.g. "OutOfMemoryError") is the more specific
+            # diagnosis when present; `stoppedReason` is the task-level fallback ECS sets for
+            # failures the container itself never got a chance to report (image pull failure,
+            # essential-container-exited-without-one, resource init failure). pm-review, round
+            # 1: the original version only ever read the container-level field, which could be
+            # empty for exactly the failures worth diagnosing most.
+            reason = (match or {}).get("reason") or task.get("stoppedReason", "")
             return True, exit_code, reason
         if time.monotonic() >= deadline:
-            return True, None, f"gave up waiting after {max_wait}s (task_arn={task_arn})"
+            stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
+            return True, None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
         time.sleep(_POLL_INTERVAL_S)
+
+
+def _default_subprocess_runner(load_timeout_s: int):
+    def _run(cmd, env):
+        return subprocess.run(
+            cmd, env=env, capture_output=True, check=False, timeout=load_timeout_s
+        )
+
+    return _run
 
 
 def _run_load(
@@ -182,6 +236,11 @@ def _run_load(
     silently point the mac's own local scrapes at RDS, or this load at the mac's local
     database -- two very different failure modes from one typo. A dedicated name makes that
     class of mistake impossible rather than merely documented against.
+
+    `run_cloud_scrape()` already refuses before spending hours on a Fargate collection if
+    `RDS_DATABASE_URL` is unset (pm-review, round 1: the original version only discovered this
+    here, after the collection had already run). This function keeps its own check too, so a
+    caller that invokes it directly -- tests included -- gets the same guarantee.
     """
     rds_url = os.environ.get("RDS_DATABASE_URL")
     if not rds_url:
@@ -199,9 +258,13 @@ def _run_load(
         "MEMORY_PREFIX": fargate_cfg.get("memory_prefix", "prod"),
     }
 
+    runner = subprocess_runner or _default_subprocess_runner(
+        fargate_cfg.get("load_timeout_seconds", _DEFAULT_LOAD_TIMEOUT_S)
+    )
+
     try:
-        result = subprocess_runner(cmd, env)
-    except Exception as e:  # noqa: BLE001
+        result = runner(cmd, env)
+    except Exception as e:  # noqa: BLE001 -- includes subprocess.TimeoutExpired
         return False, str(e)
 
     if result.returncode != 0:
@@ -241,11 +304,6 @@ def run_cloud_scrape(
         classify_failure_reason,
     )
 
-    ecs_client = ecs_client or boto3.client("ecs")
-    subprocess_runner = subprocess_runner or (
-        lambda cmd, env: subprocess.run(cmd, env=env, capture_output=True, check=False)
-    )
-
     label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
     start = time.monotonic()
 
@@ -263,84 +321,128 @@ def run_cloud_scrape(
             "duration_seconds": duration,
         }
 
-    run_id = _generate_run_id(jurisdiction)
-    logger.info(
-        "cloud_scrape: triggering Fargate collection", jurisdiction=jurisdiction, run_id=run_id
-    )
+    try:
+        run_id = _generate_run_id(jurisdiction)
 
-    started, exit_code, detail = _run_fargate_collection(
-        jurisdiction, session_arg, run_id, fargate_cfg, ecs_client
-    )
-    if not started:
-        duration = round(time.monotonic() - start, 1)
-        logger.error(
-            "cloud_scrape: run_task failed to start", jurisdiction=jurisdiction, detail=detail
-        )
-        error = f"run_task_failed: {detail}"
-        _alert_scrape_failure(label, error, duration)
-        return {
-            "success": False,
-            "error": error,
-            "failure_reason": classify_failure_reason("exit_code_launch", detail),
-            "jurisdiction": label,
-            "duration_seconds": duration,
-            "cloud_run_id": run_id,
-        }
+        # pm-review, round 1: check this BEFORE triggering an hours-long Fargate collection,
+        # not only inside _run_load() after the fact -- a missing RDS target is knowable up
+        # front and shouldn't cost real AWS spend to discover.
+        if not os.environ.get("RDS_DATABASE_URL"):
+            duration = round(time.monotonic() - start, 1)
+            error = "RDS_DATABASE_URL not set -- refusing to load without a target database"
+            logger.error("cloud_scrape: missing load prerequisite", jurisdiction=jurisdiction)
+            _alert_scrape_failure(label, error, duration)
+            return {
+                "success": False,
+                "error": error,
+                "failure_reason": "config_error",
+                "jurisdiction": label,
+                "duration_seconds": duration,
+                "cloud_run_id": run_id,
+            }
 
-    if exit_code != 0:
-        duration = round(time.monotonic() - start, 1)
-        error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
-        logger.error(
-            "cloud_scrape: collection failed",
+        client = ecs_client or boto3.client("ecs")
+
+        logger.info(
+            "cloud_scrape: triggering Fargate collection",
             jurisdiction=jurisdiction,
             run_id=run_id,
-            exit_code=exit_code,
-            detail=detail,
         )
-        _alert_scrape_failure(label, f"collection {error}: {detail}", duration)
-        return {
-            "success": False,
-            "error": error,
-            "failure_reason": classify_failure_reason(error, detail),
-            "jurisdiction": label,
-            "duration_seconds": duration,
-            "cloud_run_id": run_id,
-        }
+        started, exit_code, detail = _run_fargate_collection(
+            jurisdiction, session_arg, run_id, fargate_cfg, client
+        )
+        if not started:
+            duration = round(time.monotonic() - start, 1)
+            logger.error(
+                "cloud_scrape: run_task failed to start",
+                jurisdiction=jurisdiction,
+                detail=detail,
+            )
+            error = f"run_task_failed: {detail}"
+            _alert_scrape_failure(label, error, duration)
+            return {
+                "success": False,
+                "error": error,
+                "failure_reason": classify_failure_reason("exit_code_launch", detail),
+                "jurisdiction": label,
+                "duration_seconds": duration,
+                "cloud_run_id": run_id,
+            }
 
-    logger.info(
-        "cloud_scrape: collection done, loading into RDS",
-        jurisdiction=jurisdiction,
-        run_id=run_id,
-    )
-    load_ok, load_detail = _run_load(
-        jurisdiction, session_arg, run_id, openstates_root, fargate_cfg, subprocess_runner
-    )
-    duration = round(time.monotonic() - start, 1)
+        if exit_code != 0:
+            duration = round(time.monotonic() - start, 1)
+            error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
+            logger.error(
+                "cloud_scrape: collection failed",
+                jurisdiction=jurisdiction,
+                run_id=run_id,
+                exit_code=exit_code,
+                detail=detail,
+            )
+            _alert_scrape_failure(label, f"collection {error}: {detail}", duration)
+            return {
+                "success": False,
+                "error": error,
+                "failure_reason": classify_failure_reason(error, detail),
+                "jurisdiction": label,
+                "duration_seconds": duration,
+                "cloud_run_id": run_id,
+            }
 
-    if not load_ok:
-        logger.error(
-            "cloud_scrape: load failed",
+        logger.info(
+            "cloud_scrape: collection done, loading into RDS",
             jurisdiction=jurisdiction,
             run_id=run_id,
-            detail=load_detail,
         )
-        error = f"load_failed: {load_detail}"
-        _alert_scrape_failure(label, error, duration)
+        load_ok, load_detail = _run_load(
+            jurisdiction, session_arg, run_id, openstates_root, fargate_cfg, subprocess_runner
+        )
+        duration = round(time.monotonic() - start, 1)
+
+        if not load_ok:
+            logger.error(
+                "cloud_scrape: load failed",
+                jurisdiction=jurisdiction,
+                run_id=run_id,
+                detail=load_detail,
+            )
+            error = f"load_failed: {load_detail}"
+            _alert_scrape_failure(label, error, duration)
+            return {
+                "success": False,
+                "error": error,
+                "failure_reason": classify_failure_reason("exit_code_load", load_detail),
+                "jurisdiction": label,
+                "duration_seconds": duration,
+                "cloud_run_id": run_id,
+            }
+
+        logger.info(
+            "cloud_scrape: done",
+            jurisdiction=jurisdiction,
+            run_id=run_id,
+            duration_seconds=duration,
+        )
         return {
-            "success": False,
-            "error": error,
-            "failure_reason": classify_failure_reason("exit_code_load", load_detail),
+            "success": True,
             "jurisdiction": label,
             "duration_seconds": duration,
             "cloud_run_id": run_id,
         }
-
-    logger.info(
-        "cloud_scrape: done", jurisdiction=jurisdiction, run_id=run_id, duration_seconds=duration
-    )
-    return {
-        "success": True,
-        "jurisdiction": label,
-        "duration_seconds": duration,
-        "cloud_run_id": run_id,
-    }
+    except Exception as e:  # noqa: BLE001 -- the guarantee this whole function makes to its
+        # caller (pm-review, round 1): NOTHING escapes uncaught. boto3 client construction,
+        # a describe_tasks throttling error mid-poll, anything -- all come back as this same
+        # failure-dict shape and still alert, exactly like _run_scrape()'s own mac-side branch
+        # already guarantees via its own top-level `except Exception`.
+        duration = round(time.monotonic() - start, 1)
+        logger.error(
+            "cloud_scrape: unexpected error", jurisdiction=jurisdiction, error=str(e)
+        )
+        _alert_scrape_failure(label, str(e), duration)
+        return {
+            "success": False,
+            "error": str(e),
+            "failure_reason": classify_failure_reason("exit_code_unexpected", str(e)),
+            "jurisdiction": label,
+            "duration_seconds": duration,
+        }

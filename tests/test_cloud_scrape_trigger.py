@@ -11,6 +11,7 @@ re-verifying botocore's request/response validation.
 from __future__ import annotations
 
 import os
+import subprocess
 from unittest.mock import patch
 
 from ddp_sync.pipelines import cloud_scrape_trigger as cst
@@ -28,15 +29,23 @@ def _fargate_config(**overrides):
 
 
 class FakeEcsClient:
-    """Records run_task calls; describe_tasks replays a scripted sequence of responses so a
-    test can simulate "still running" polls before "stopped"."""
+    """Records run_task/stop_task calls; describe_tasks replays a scripted sequence of
+    responses so a test can simulate "still running" polls before "stopped"."""
 
-    def __init__(self, run_task_response=None, run_task_error=None, describe_responses=None):
+    def __init__(
+        self,
+        run_task_response=None,
+        run_task_error=None,
+        describe_responses=None,
+        describe_error=None,
+    ):
         self._run_task_response = run_task_response
         self._run_task_error = run_task_error
         self._describe_responses = list(describe_responses or [])
+        self._describe_error = describe_error
         self.run_task_calls = []
         self.describe_calls = []
+        self.stop_task_calls = []
 
     def run_task(self, **kwargs):
         self.run_task_calls.append(kwargs)
@@ -46,16 +55,24 @@ class FakeEcsClient:
 
     def describe_tasks(self, **kwargs):
         self.describe_calls.append(kwargs)
+        if self._describe_error:
+            raise self._describe_error
         return self._describe_responses.pop(0)
 
+    def stop_task(self, **kwargs):
+        self.stop_task_calls.append(kwargs)
+        return {}
 
-def _stopped_response(*, exit_code=0, container_name="scraper", reason=""):
+
+def _stopped_response(*, exit_code=0, container_name="scraper", container_reason="", stopped_reason=""):
     return {
         "tasks": [
             {
                 "lastStatus": "STOPPED",
-                "reason": reason,
-                "containers": [{"name": container_name, "exitCode": exit_code}],
+                "stoppedReason": stopped_reason,
+                "containers": [
+                    {"name": container_name, "exitCode": exit_code, "reason": container_reason}
+                ],
             }
         ]
     }
@@ -93,7 +110,10 @@ def test_missing_fargate_config_fails_without_touching_ecs():
 
 def test_run_task_exception_fails_cleanly():
     ecs = FakeEcsClient(run_task_error=RuntimeError("no capacity"))
-    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"):
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
 
     assert result["success"] is False
@@ -105,7 +125,10 @@ def test_run_task_failures_list_fails_cleanly():
     ecs = FakeEcsClient(
         run_task_response={"failures": [{"reason": "RESOURCE:FARGATE"}], "tasks": []}
     )
-    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"):
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
 
     assert result["success"] is False
@@ -184,7 +207,10 @@ def test_nonzero_exit_code_skips_the_load_entirely():
         subprocess_runner_called.append(cmd)
         return FakeSubprocessResult(returncode=0)
 
-    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert:
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+    ):
         result = cst.run_cloud_scrape(
             "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
             subprocess_runner=fake_subprocess,
@@ -201,7 +227,10 @@ def test_task_stopped_with_no_matching_container_reports_exit_code_none():
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
         describe_responses=[_stopped_response(container_name="not-the-scraper")],
     )
-    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"):
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
 
     assert result["success"] is False
@@ -213,7 +242,10 @@ def test_max_wait_exceeded_gives_up_without_looping_forever():
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
         describe_responses=[_running_response()],
     )
-    with patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"):
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
         result = cst.run_cloud_scrape(
             "mi", None, "/fake/root", _fargate_config(max_wait_seconds=0), ecs_client=ecs,
         )
@@ -221,16 +253,53 @@ def test_max_wait_exceeded_gives_up_without_looping_forever():
     assert result["success"] is False
     assert result["error"] == "exit_code_none"
     assert len(ecs.describe_calls) == 1  # gave up on the very first poll, no real sleep needed
+    # pm-review, round 1: a timed-out run must not leave the ECS task running unbounded.
+    assert ecs.stop_task_calls == [{"cluster": "ddp-scrapers-prototype", "task": "arn:task/1",
+                                     "reason": "ddp-sync: max_wait_seconds exceeded"}]
+
+
+def test_describe_tasks_exception_mid_poll_is_caught_and_reported():
+    """pm-review, round 1: a throttling error or transient network blip from describe_tasks
+    must come back as this function's normal failure dict, not escape uncaught out of
+    asyncio.to_thread and crash the scheduler."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_error=RuntimeError("ThrottlingException: Rate exceeded"),
+    )
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+    ):
+        result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
+
+    assert result["success"] is False
+    assert "ThrottlingException" in result["error"]
+    mock_alert.assert_called_once()
+
+
+def test_ecs_client_construction_failure_is_caught_and_reported():
+    """Same guarantee, for the other place an unexpected exception could originate:
+    boto3.client("ecs") itself, when no ecs_client is injected."""
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("boto3.client", side_effect=RuntimeError("no region configured")),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+    ):
+        result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config())
+
+    assert result["success"] is False
+    assert "no region configured" in result["error"]
+    mock_alert.assert_called_once()
 
 
 # ── load step ────────────────────────────────────────────────────────────────────────────────
 
 
-def test_missing_rds_database_url_fails_without_invoking_a_subprocess():
-    ecs = FakeEcsClient(
-        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
-        describe_responses=[_stopped_response(exit_code=0)],
-    )
+def test_missing_rds_database_url_refuses_before_touching_ecs_at_all():
+    """pm-review, round 1: the original version only discovered a missing RDS target after an
+    hours-long collection had already run. Now it's the very first thing checked -- neither
+    ECS nor the loader subprocess is ever touched."""
+    ecs = FakeEcsClient()
     subprocess_calls = []
 
     def fake_subprocess(cmd, env):
@@ -249,8 +318,21 @@ def test_missing_rds_database_url_fails_without_invoking_a_subprocess():
 
     assert result["success"] is False
     assert "RDS_DATABASE_URL" in result["error"]
+    assert ecs.run_task_calls == []
     assert subprocess_calls == []
     mock_alert.assert_called_once()
+
+
+def test_run_load_directly_also_refuses_without_rds_database_url():
+    """_run_load() keeps its own check too (not just run_cloud_scrape()'s earlier one), so a
+    caller that invokes it directly -- including a future retry/resume path -- still gets the
+    same guarantee."""
+    env_without_rds_url = {k: v for k, v in os.environ.items() if k != "RDS_DATABASE_URL"}
+    with patch.dict(os.environ, env_without_rds_url, clear=True):
+        ok, detail = cst._run_load("mi", None, "run-1", "/fake/root", _fargate_config()["cloud_path"]["fargate"], None)
+
+    assert ok is False
+    assert "RDS_DATABASE_URL" in detail
 
 
 def test_loader_nonzero_returncode_fails():
@@ -304,3 +386,40 @@ def test_loader_never_reuses_the_ambient_database_url():
         )
 
     assert captured["env"]["DATABASE_URL"] == "postgresql://rds/openstates"
+
+
+def test_loader_timeout_fails_instead_of_hanging_forever():
+    """pm-review, round 1: the loader subprocess had no timeout at all -- a stuck database
+    connection could block this orchestration indefinitely. subprocess.TimeoutExpired is just
+    another exception to the existing broad catch in _run_load()."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+
+    def hanging_subprocess(cmd, env):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=7200)
+
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+    ):
+        result = cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
+            subprocess_runner=hanging_subprocess,
+        )
+
+    assert result["success"] is False
+    assert "load_failed" in result["error"]
+    mock_alert.assert_called_once()
+
+
+def test_default_subprocess_runner_passes_the_configured_load_timeout():
+    """The default runner (used when no subprocess_runner is injected) must actually apply
+    cloud_path.fargate.load_timeout_seconds to subprocess.run, not just accept it in config."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = FakeSubprocessResult(returncode=0)
+        runner = cst._default_subprocess_runner(load_timeout_s=1234)
+        runner(["python3", "cloud_loader.py"], {})
+
+    assert mock_run.call_args.kwargs["timeout"] == 1234

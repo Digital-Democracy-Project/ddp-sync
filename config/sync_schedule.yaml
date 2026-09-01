@@ -429,6 +429,8 @@ openstates_scrape:
       memory_bucket: ""         # S3 bucket cloud_collector.py/cloud_loader.py share memory in
       memory_prefix: "prod"     # matches cloud_collector.py's own MEMORY_PREFIX convention
       max_wait_seconds: 43200   # 12h backstop; MA's cold-start rehearsal run took ~9.5h
+      load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
+                                  # loads were minutes even for multi-thousand-row jurisdictions
 
   # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
   #
