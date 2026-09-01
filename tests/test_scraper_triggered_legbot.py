@@ -102,6 +102,37 @@ async def test_redis_unavailable_returns_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_redis_error_during_lock_acquisition_returns_error_not_raise(
+    monkeypatch,
+):
+    """PM review (SYNC-48): the acquire call itself must not raise either --
+    a Redis timeout/connection drop there must still return redis_unavailable
+    rather than propagating out of a function documented as never raising."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(),
+    )
+    flaky = MagicMock()
+    flaky._client = AsyncMock()
+    flaky._client.set = AsyncMock(side_effect=ConnectionError("redis dropped"))
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: flaky
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        result = await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+        )
+
+    assert result == {"success": False, "error": "redis_unavailable"}
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_overlap_rejected_while_a_trigger_is_in_flight(
     fake_redis_store, monkeypatch
 ):

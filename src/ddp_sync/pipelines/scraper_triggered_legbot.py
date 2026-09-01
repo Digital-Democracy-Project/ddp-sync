@@ -129,10 +129,26 @@ async def trigger_scraper_session_pipeline(
     lock_key = _lock_key(jurisdiction_iso2, session_code)
     lock_ttl = settings.session_pipeline_scraper_trigger_lock_ttl_seconds
 
-    acquired = await redis_store._client.set(lock_key, run_id, nx=True, ex=lock_ttl)
+    # PM review (SYNC-48): acquisition itself must not raise either -- a
+    # Redis timeout/connection drop here previously would have propagated
+    # out of this function despite the "never raises" contract documented
+    # above. Same fenceable failure mode as the pre-pipeline branch further
+    # down; both convert to redis_unavailable rather than escaping.
+    try:
+        acquired = await redis_store._client.set(lock_key, run_id, nx=True, ex=lock_ttl)
+        if not acquired:
+            existing = await redis_store._client.get(lock_key)
+            existing_id = existing.decode() if isinstance(existing, bytes) else existing
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "scraper_triggered_legbot_redis_unavailable",
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=session_code,
+            error=str(e),
+        )
+        return {"success": False, "error": "redis_unavailable"}
+
     if not acquired:
-        existing = await redis_store._client.get(lock_key)
-        existing_id = existing.decode() if isinstance(existing, bytes) else existing
         logger.warning(
             "scraper_triggered_legbot_overlap_rejected",
             jurisdiction_iso2=jurisdiction_iso2,
