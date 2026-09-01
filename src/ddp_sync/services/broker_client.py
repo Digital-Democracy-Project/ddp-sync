@@ -86,6 +86,34 @@ _SOURCE_SUPPORT_INFERRED_NOTE = (
     "before it is treated as quoted fact."
 )
 
+# SYNC-47: a bill_changelog answer that set insufficient_information=true
+# while also returning real sections_added/removed/modified content used to
+# be discarded wholesale (AGENTS-79). It's now published instead, but
+# flagged -- the model's own policy_implications text in that shape is
+# reliably its refusal rationale, not real analysis, so a reader needs to
+# know to weigh the structural sections over the summary. Same
+# validation_notes mechanism as source_support=inferred above (empty on
+# every existing row, human-editable, not caller-writable elsewhere), and
+# queryable the same way:
+#
+#     BillArtifact.objects.filter(
+#         bill_version__session_code="2026E",
+#         validation_notes__startswith="flagged_but_populated",
+#     )
+#
+# Deliberately not combined with the source_support note when both could
+# apply (AGENTS-80's source_support is populated even on a refusal) -- this
+# marker is the more operationally significant one for a row that would
+# otherwise have been silently discarded, and combining two independently-
+# evolving note formats into one queryable string is bigger scope than this
+# ticket's own acceptance criteria ask for.
+_INSUFFICIENT_BUT_POPULATED_NOTE = (
+    "flagged_but_populated: LegBot set insufficient_information=true but also "
+    "returned real added/removed/modified content (SYNC-47). The policy-"
+    "implications summary above may only restate the refusal -- read the "
+    "structural sections directly before treating this as fully grounded."
+)
+
 
 def _validation_notes_for(source_support: str | None, *, artifact_type: str) -> str:
     """Map LegBot's source_support onto the note stored with the artifact.
@@ -145,6 +173,7 @@ async def write_bill_artifact(
     compare_version_date: str | None = None,
     compare_version_note: str | None = None,
     source_support: str | None = None,
+    insufficient_but_populated: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -241,7 +270,12 @@ async def write_bill_artifact(
     # "direct", so an artifact can stay flagged after it stops being weakly
     # grounded. That is the safe direction: over-flagging costs a human a
     # second look, while the alternative destroys review notes irreversibly.
-    _notes = _validation_notes_for(source_support, artifact_type=artifact_type)
+    # SYNC-47: takes priority over source_support's own note when both could
+    # apply -- see that constant's own comment for why they aren't combined.
+    if insufficient_but_populated:
+        _notes = _INSUFFICIENT_BUT_POPULATED_NOTE
+    else:
+        _notes = _validation_notes_for(source_support, artifact_type=artifact_type)
     if _notes:
         payload["validation_notes"] = _notes
     headers = {"Authorization": f"Bearer {resolved_api_token}"}

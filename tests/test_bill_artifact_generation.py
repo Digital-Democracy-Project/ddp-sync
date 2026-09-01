@@ -721,6 +721,83 @@ async def test_changelog_insufficient_information_writes_failed_row_with_compare
 
 
 @pytest.mark.asyncio
+async def test_changelog_insufficient_but_populated_is_published_with_review_marker():
+    """SYNC-47: matches one of the 3 live 2026-08-31 examples -- flagged
+    insufficient, but sections_removed has real content and
+    policy_implications is just the model's own refusal rationale. Published
+    as complete with the review marker, not discarded."""
+    dispatch_result = {
+        "answer": {
+            "insufficient_information": True,
+            "sections_added": [],
+            "sections_removed": ["The entire original text of Senate Bill No. 351."],
+            "sections_modified": [],
+            "policy_implications": (
+                "The provided diff does not contain the actual text of the "
+                "new proposed bill; the practical impact cannot be determined."
+            ),
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 4, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 4, "created": True, "status": "complete"}
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "complete"
+    assert write_kwargs["insufficient_but_populated"] is True
+    assert "failure_reason" not in write_kwargs
+    assert "The entire original text of Senate Bill No. 351." in write_kwargs["content"]
+    assert write_kwargs["compare_version_date"] == "2026-01-01"
+    assert write_kwargs["compare_version_note"] == "Introduced"
+
+
+@pytest.mark.asyncio
+async def test_changelog_insufficient_and_genuinely_empty_still_discards():
+    """The common, correct-refusal case must not regress: every structural
+    field empty means the row is still recorded failed, exactly as before
+    SYNC-47."""
+    dispatch_result = {
+        "answer": {
+            "insufficient_information": True,
+            "reason": "diff_too_ambiguous",
+            "sections_added": [],
+            "sections_removed": [],
+            "sections_modified": [],
+            "policy_implications": "",
+        },
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 5, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert result == {"id": 5, "created": True, "status": "failed"}
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["failure_reason"] == "diff_too_ambiguous"
+    assert write_kwargs["content"] == ""
+    assert "insufficient_but_populated" not in write_kwargs
+
+
+@pytest.mark.asyncio
 async def test_changelog_local_status_overrides_a_conflicting_broker_response_status():
     """Same merge-order guarantee as generate_and_store_bill_artifact's own
     equivalent test -- this function's own known status always wins over
