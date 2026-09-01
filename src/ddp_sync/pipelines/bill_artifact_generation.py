@@ -165,6 +165,31 @@ def _bill_changelog_content_from_answer(
 {answer.get("policy_implications") or "None noted."}"""
 
 
+# SYNC-47: fields bill_changelog's own answer shape declares for what
+# actually changed -- deliberately excludes policy_implications, which the
+# model reliably fills with its own refusal rationale ("the diff does not
+# contain the actual text of the new version...") even when it also sets
+# insufficient_information=true, rather than with real analysis. Counting
+# that field here would treat a refusal's own explanation as evidence the
+# answer is usable -- the same shape of trap AGENTS-79's own detector had to
+# guard against for source_support.
+_CHANGELOG_STRUCTURAL_FIELDS = ("sections_added", "sections_removed", "sections_modified")
+
+
+def _bill_changelog_has_structural_content(answer: dict) -> bool:
+    """True when bill_changelog's answer has real added/removed/modified
+    content, regardless of what insufficient_information says (SYNC-47).
+
+    Confirmed live 2026-08-31: 3 of 73 real bill_changelog calls set
+    insufficient_information=true while sections_added/sections_removed
+    were genuinely populated (Committee-substitute/Governor's-recommendation
+    transitions) -- CAMS's own legbot_insufficient_but_populated detector
+    fired on all 3. Before this existed, that content was discarded
+    wholesale (AGENTS-79); this is what makes it publishable instead.
+    """
+    return any(answer.get(field) for field in _CHANGELOG_STRUCTURAL_FIELDS)
+
+
 def _canonicalize_bill_topic(raw_topic: str) -> str | None:
     """Match a raw topic string (trimmed, case-insensitive) to its canonical
     _BILL_TOPICS_TAXONOMY name, or None if it isn't a member.
@@ -485,6 +510,44 @@ async def _dispatch_and_write_changelog(
     model_name = dispatch_result.get("backend")
 
     if answer.get("insufficient_information"):
+        # SYNC-47: a flagged answer that still carries real structural
+        # content is published, not discarded -- see
+        # _bill_changelog_has_structural_content's own docstring for the
+        # live evidence this is responding to.
+        if _bill_changelog_has_structural_content(answer):
+            populated_fields = [
+                field for field in _CHANGELOG_STRUCTURAL_FIELDS if answer.get(field)
+            ]
+            logger.warning(
+                "AUDIT sync_bill_changelog_insufficient_but_populated -- "
+                "publishing with a review marker instead of discarding (SYNC-47)",
+                bill_openstates_id=bill_openstates_id,
+                version_note=version_note,
+                populated_fields=populated_fields,
+            )
+            content = _bill_changelog_content_from_answer(
+                answer,
+                old_version_note=old_version_note,
+                new_version_note=version_note,
+            )
+            broker_result = await write_bill_artifact(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                artifact_type="bill_changelog",
+                content=content,
+                status="complete",
+                model_name=model_name,
+                insufficient_but_populated=True,
+                compare_version_date=old_version_date,
+                compare_version_note=old_version_note,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+            return {**broker_result, "status": "complete"}
+
         logger.info(
             "LegBot reported insufficient_information for bill_changelog -- "
             "recording a failed artifact",

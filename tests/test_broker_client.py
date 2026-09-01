@@ -1310,3 +1310,47 @@ def test_the_marker_prefix_is_the_queryable_contract():
     from ddp_sync.services.broker_client import _SOURCE_SUPPORT_INFERRED_NOTE
 
     assert _SOURCE_SUPPORT_INFERRED_NOTE.startswith("source_support=inferred")
+
+
+# ---------------------------------------------------------------------------
+# SYNC-47: insufficient_but_populated -- a second, independent
+# validation_notes marker for bill_changelog answers published despite
+# insufficient_information=true. Same mechanism as source_support above, own
+# queryable prefix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insufficient_but_populated_is_recorded_in_validation_notes():
+    payload = await _write_and_capture(insufficient_but_populated=True)
+
+    assert payload["validation_notes"].startswith("flagged_but_populated")
+    assert "review_status" not in payload
+
+
+@pytest.mark.asyncio
+async def test_insufficient_but_populated_takes_priority_over_source_support():
+    """The two markers could both apply in principle -- AGENTS-80's
+    source_support is populated even on a refusal -- but only one note is
+    sent per SYNC-47's own scope decision. See _INSUFFICIENT_BUT_POPULATED_NOTE's
+    own comment for why they aren't combined."""
+    payload = await _write_and_capture(insufficient_but_populated=True, source_support="inferred")
+
+    assert payload["validation_notes"].startswith("flagged_but_populated")
+    assert "source_support=inferred" not in payload["validation_notes"]
+
+
+@pytest.mark.asyncio
+async def test_absent_insufficient_but_populated_writes_no_marker():
+    """Byte-identical to a row written before this existed -- the default is
+    False, not sent as a marker."""
+    payload = await _write_and_capture()
+    assert "validation_notes" not in payload
+
+
+def test_the_insufficient_but_populated_prefix_is_the_queryable_contract():
+    """SYNC-47's own AC3: validation_notes__startswith="flagged_but_populated"
+    is the query this prefix has to keep supporting."""
+    from ddp_sync.services.broker_client import _INSUFFICIENT_BUT_POPULATED_NOTE
+
+    assert _INSUFFICIENT_BUT_POPULATED_NOTE.startswith("flagged_but_populated")
