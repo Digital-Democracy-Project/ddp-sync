@@ -420,12 +420,14 @@ openstates_scrape:
   # example, which turned out to be stale; the real names Ramon settled on (2026-08-28, per
   # that repo's `variables.tf`) drop the `-prototype`/singular suffix entirely.
   #
-  # `subnets` stays blank -- genuinely unresolved, not just unfilled: the original request said
-  # "private subnets", but `infra/fargate-spike/variables.tf`'s own comment says the rehearsal
-  # deliberately used PUBLIC subnets with auto-assigned public IPs (Option A, to avoid every
-  # task sharing one NAT gateway's egress IP) -- and `ecs:ListTasks` isn't granted from the
-  # verification host, so there's no way to check which one the real historical rehearsal task
-  # actually used. Confirm this before filling it in, not by guessing from either source alone.
+  # `subnets` -- resolved 2026-09-02 (notes/ops-handoff): the original request said "private
+  # subnets", but `ec2:DescribeSubnets` against all three candidates (found in
+  # ddp-open-states-dev's own .env, same block as the already-verified security group/role
+  # ARNs) confirmed MapPublicIpOnLaunch: true on all three -- matching
+  # `infra/fargate-spike/variables.tf`'s documented "Option A" decision (public IP per task,
+  # deliberately avoiding a shared NAT gateway egress IP), not the original request's phrasing.
+  # No NAT gateway or VPC endpoint needed as a result. All three sit in the same VPC
+  # (vpc-094e2b729f120ef62) as everything else already confirmed.
   cloud_path:
     enabled: false
     jurisdictions: []
@@ -433,7 +435,10 @@ openstates_scrape:
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
-      subnets: []               # unresolved -- public vs private, see note above
+      subnets:
+        - "subnet-0fdc71c33a5cb60bc"  # us-east-1c
+        - "subnet-0dbb01bb8fd1cd1e8"  # us-east-1a
+        - "subnet-087136704d428e5f2"  # us-east-1f
       security_groups: ["sg-09346518873d48a08"]  # ddp-scraper-task
       container_name: "scraper" # matches the task definition's container name
       memory_bucket: "ddp-openstates-scraper-memory"
