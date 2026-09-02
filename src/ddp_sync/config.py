@@ -329,6 +329,40 @@ class SyncSettings:
     # leaves real headroom above that without being unboundable.
     session_pipeline_scraper_trigger_lock_ttl_seconds: int = 14400
 
+    # SYNC-50: what a real scraper-completion trigger dispatches once it has
+    # resolved which session(s) a scrape run touched. Deliberately its own
+    # setting, not a reuse of config/sync_schedule.yaml's session_pipeline_batch
+    # job config -- that job hand-picks one fixed (jurisdiction, session) pair on
+    # a schedule; this fires for whichever jurisdiction/session a real scrape
+    # just resolved, so its defaults have to be jurisdiction-agnostic. Defaults
+    # to every recognized artifact type (session_pipeline_runner.ALL_ARTIFACT_TYPES)
+    # -- a real 24/7 pipeline has no principled reason to leave one out by default.
+    session_pipeline_scraper_trigger_artifact_types: list = field(default_factory=list)
+
+    # SYNC-50: per-trigger bill limit, same "no real ceiling needed" reasoning
+    # SYNC-9's own limit field already documents (run_legbot_pipeline dispatches
+    # sequentially, and MLX concurrency protection already lives one layer down)
+    # -- sized generously above any single tracked jurisdiction's real session
+    # size (Virginia's own 2026 regular session: 3,637 bills).
+    session_pipeline_scraper_trigger_limit: int = 10000
+
+    # SYNC-50: concept_statements is already part of the standard automated flow
+    # elsewhere (session_pipeline_batch's own include_concept_statements) --
+    # true by default here for the same reason. include_org_research has no
+    # equivalent setting: ddp-infra PLAN-legbot.md §32 Gate 1 item 4 (2026-09-01)
+    # decided that explicitly out of scope for automated dispatch, not a knob to
+    # reintroduce here -- see _maybe_trigger_legbot_for_scrape's own call site.
+    session_pipeline_scraper_trigger_include_concept_statements: bool = True
+
+    # SYNC-50: safety bound on how many bills resolve_touched_sessions() will
+    # scan (paginating the local api-v3 instance) before giving up on finding
+    # every touched session for one scrape run. Not a limit on what LegBot
+    # dispatches -- purely how far this one resolution step looks before
+    # settling for whatever sessions it has already found, so a jurisdiction
+    # with an unexpectedly enormous single-run diff can't turn session
+    # resolution itself into an unbounded scan.
+    session_pipeline_scraper_trigger_resolution_max_bills: int = 500
+
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
     openai_model: str = ""
@@ -442,6 +476,32 @@ def _load_from_env() -> dict:
         ),
         "session_pipeline_scraper_trigger_lock_ttl_seconds": int(
             os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_LOCK_TTL_SECONDS", "14400")
+        ),
+        # SYNC-50. Default mirrors session_pipeline_runner.ALL_ARTIFACT_TYPES exactly --
+        # not imported from there to avoid a pipelines-importing-into-config cycle; that
+        # module's own assertion (ARTIFACT_DISPATCH_ORDER == ALL_ARTIFACT_TYPES) is what
+        # keeps this literal from silently drifting unnoticed if a type is ever added.
+        "session_pipeline_scraper_trigger_artifact_types": [
+            t.strip()
+            for t in os.getenv(
+                "SESSION_PIPELINE_SCRAPER_TRIGGER_ARTIFACT_TYPES",
+                "bill_summary,bill_pros_cons,bill_vote_yes_frame,bill_vote_no_frame,"
+                "bill_supporting_orgs,bill_opposing_orgs,bill_impact_analysis,"
+                "bill_topics,bill_changelog",
+            ).split(",")
+            if t.strip()
+        ],
+        "session_pipeline_scraper_trigger_limit": int(
+            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_LIMIT", "10000")
+        ),
+        "session_pipeline_scraper_trigger_include_concept_statements": (
+            os.getenv(
+                "SESSION_PIPELINE_SCRAPER_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "true"
+            ).lower()
+            == "true"
+        ),
+        "session_pipeline_scraper_trigger_resolution_max_bills": int(
+            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_RESOLUTION_MAX_BILLS", "500")
         ),
     }
 

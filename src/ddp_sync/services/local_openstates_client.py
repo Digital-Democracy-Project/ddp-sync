@@ -54,6 +54,8 @@ raw_text, on the same single-bill detail endpoint.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 import structlog
 
@@ -740,3 +742,110 @@ async def list_current_session_bill_candidates(
         )
 
     return candidates[:limit]
+
+
+async def resolve_touched_sessions(
+    jurisdiction_iso2: str,
+    *,
+    since: datetime,
+    max_bills_scanned: int,
+) -> list[str]:
+    """SYNC-50: resolve which session_code(s) actually had a bill touched
+    (created or updated) in this jurisdiction since `since`, from the local
+    api-v3 instance's own `updated_since` filter -- real ground truth for
+    "what did this scrape run touch", not a guess at "the jurisdiction's
+    current session" (which cannot represent more than one session
+    simultaneously active -- confirmed real for Virginia and Utah, both of
+    which have had two active sessions at once).
+
+    Args:
+        jurisdiction_iso2: two-letter state code (e.g. "VA"; normalized to
+            uppercase here regardless of what the caller passes, matching
+            list_current_session_bill_candidates' own real fix for api-v3's
+            case-sensitive jurisdiction filter above).
+        since: a real wall-clock floor -- typically the timestamp captured
+            immediately before the scrape that just finished was started.
+            Passed straight through as `updated_since`; being a few seconds
+            early or late is harmless (it only widens or narrows the window
+            slightly, never produces a wrong session).
+        max_bills_scanned: stop paginating once this many bills have been
+            looked at, even if more pages remain -- a safety bound on this
+            scan specifically (see SyncSettings.
+            session_pipeline_scraper_trigger_resolution_max_bills's own
+            docstring), not a limit on anything a caller goes on to dispatch.
+
+    Returns:
+        Distinct session_code strings, in first-seen order (the order
+        carries no meaning -- callers dispatch per session independently).
+        Empty when nothing changed, api-v3 is unreachable or rejects the
+        request, or the response isn't valid JSON -- never raises, same
+        never-abort posture as list_current_session_bill_candidates above:
+        a resolution failure should skip triggering for this scrape, not
+        crash the scrape job that already succeeded.
+    """
+    settings = get_settings()
+    if not settings.local_openstates_api_base or max_bills_scanned <= 0:
+        return []
+
+    url = f"{settings.local_openstates_api_base}/bills"
+    base_params: dict[str, str] = {
+        "jurisdiction": jurisdiction_iso2.upper(),
+        "updated_since": since.isoformat(),
+    }
+    if settings.local_openstates_api_key:
+        base_params["apikey"] = settings.local_openstates_api_key
+
+    session_codes: list[str] = []
+    seen_sessions: set[str] = set()
+    bills_scanned = 0
+    page = 1
+    per_page = str(_API_V3_MAX_PER_PAGE)
+
+    while bills_scanned < max_bills_scanned:
+        params = dict(base_params)
+        params["per_page"] = per_page
+        params["page"] = str(page)
+
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+                resp = await client.get(url, params=params)
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Local api-v3 unreachable -- cannot resolve touched sessions",
+                jurisdiction_iso2=jurisdiction_iso2,
+                error=str(exc),
+            )
+            return session_codes
+
+        if resp.status_code >= 400:
+            logger.warning(
+                "Local api-v3 rejected the touched-sessions read",
+                jurisdiction_iso2=jurisdiction_iso2,
+                status_code=resp.status_code,
+            )
+            return session_codes
+
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning(
+                "Local api-v3 returned a non-JSON touched-sessions response",
+                jurisdiction_iso2=jurisdiction_iso2,
+            )
+            return session_codes
+
+        results = data.get("results", []) or []
+        bills_scanned += len(results)
+        for bill in results:
+            session = (bill.get("session") or "").strip()
+            if session and session not in seen_sessions:
+                seen_sessions.add(session)
+                session_codes.append(session)
+
+        pagination = data.get("pagination") or {}
+        max_page = pagination.get("max_page", page)
+        if page >= max_page or not results:
+            break
+        page += 1
+
+    return session_codes

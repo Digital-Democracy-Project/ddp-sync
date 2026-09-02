@@ -28,6 +28,7 @@ from typing import Any, NamedTuple
 import requests
 import structlog
 
+from ddp_sync.config import get_settings
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
 
@@ -1027,7 +1028,115 @@ def _run_with_group_kill(
             watchdog.join(timeout=_STALL_POLL_SECONDS + 5)
 
 
+async def _maybe_trigger_legbot_for_scrape(
+    jurisdiction: str,
+    scrape_started_at: datetime,
+) -> None:
+    """SYNC-50: the real scraper-completion hook SYNC-48 deliberately did not build.
+
+    Called only after a scrape has already succeeded (see `_run_scrape` below) --
+    a failure here must never affect the scrape job's own reported outcome, so
+    every exception is caught and logged, not raised.
+
+    The real blocker SYNC-48 left open: a completed scrape tells you a
+    jurisdiction, not a session -- and a jurisdiction can have more than one
+    session simultaneously active (VA and UT both have). Guessing "the
+    jurisdiction's current session" would silently miss the other one, or
+    trigger the wrong one, undermining the full-session-re-evaluation safety
+    property `trigger_scraper_session_pipeline`'s own overlap lock depends on.
+
+    Resolved here the way the ticket's own scope describes: read back which
+    session(s) actually had bills touched by *this* scrape run, from the local
+    api-v3 instance's own `updated_since` filter -- real ground truth (what
+    changed), not a guess (what's "current").
+    """
+    settings = get_settings()
+    if not settings.session_pipeline_scraper_trigger_enabled:
+        return
+
+    from ddp_sync.services.local_openstates_client import resolve_touched_sessions
+
+    try:
+        session_codes = await resolve_touched_sessions(
+            jurisdiction.upper(),
+            since=scrape_started_at,
+            max_bills_scanned=settings.session_pipeline_scraper_trigger_resolution_max_bills,
+        )
+    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+        logger.error(
+            "scraper_triggered_legbot_session_resolution_failed",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
+        return
+
+    if not session_codes:
+        logger.info(
+            "scraper_triggered_legbot_no_sessions_touched",
+            jurisdiction=jurisdiction,
+            since=scrape_started_at.isoformat(),
+        )
+        return
+
+    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
+
+    for session_code in session_codes:
+        try:
+            result = await trigger_scraper_session_pipeline(
+                jurisdiction.upper(),
+                session_code,
+                settings.session_pipeline_scraper_trigger_artifact_types,
+                # Gate 1 item 4 (ddp-infra PLAN-legbot.md §32, 2026-09-01): org research is a
+                # deliberate operator decision, not a tunable default -- burst-week cost
+                # exposure (Virginia's own filing-deadline week alone: ~$670 in 7 days) has no
+                # spend visibility yet (AGENTS-89, still open). Revisit there, not here.
+                False,
+                settings.session_pipeline_scraper_trigger_limit,
+                include_concept_statements=(
+                    settings.session_pipeline_scraper_trigger_include_concept_statements
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "scraper_triggered_legbot_trigger_failed",
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                error=str(e),
+            )
+            continue
+        logger.info(
+            "scraper_triggered_legbot_result",
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            result=result,
+        )
+
+
 async def _run_scrape(
+    jurisdiction: str,
+    session_arg: str | None,
+    openstates_root: str,
+    timeout_s: int | None = None,
+    config: dict | None = None,
+) -> dict[str, Any]:
+    """Thin wrapper around `_run_scrape_impl` (the real scrape) that adds SYNC-50's
+    scraper-completion hook on top, uniformly for both of `_run_scrape_impl`'s own
+    success paths (the local run-scrape.sh branch and OPEN-193's cloud-owned
+    branch) -- neither needs its own copy of this logic.
+
+    `scrape_started_at` is captured here, before the scrape itself runs, rather
+    than read back from `_run_scrape_impl`'s own internal timing -- it only
+    needs to be a real wall-clock floor for "what changed because of this run",
+    a few seconds of slack on either side is harmless.
+    """
+    scrape_started_at = datetime.now(timezone.utc)
+    result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
+    if result.get("success"):
+        await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
+    return result
+
+
+async def _run_scrape_impl(
     jurisdiction: str,
     session_arg: str | None,
     openstates_root: str,
