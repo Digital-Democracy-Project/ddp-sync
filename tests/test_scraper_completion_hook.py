@@ -44,11 +44,11 @@ from ddp_sync.pipelines.openstates_scrape import (
 
 def _enabled_settings(**overrides) -> SyncSettings:
     defaults = dict(
-        session_pipeline_scraper_trigger_enabled=True,
-        session_pipeline_scraper_trigger_artifact_types=["bill_summary", "bill_changelog"],
-        session_pipeline_scraper_trigger_limit=10000,
-        session_pipeline_scraper_trigger_include_concept_statements=True,
-        session_pipeline_scraper_trigger_resolution_max_bills=500,
+        legbot_scrape_completion_trigger_enabled=True,
+        legbot_scrape_completion_trigger_artifact_types=["bill_summary", "bill_changelog"],
+        legbot_scrape_completion_trigger_limit=10000,
+        legbot_scrape_completion_trigger_include_concept_statements=True,
+        legbot_scrape_completion_trigger_resolution_max_bills=500,
     )
     defaults.update(overrides)
     return SyncSettings(**defaults)
@@ -63,7 +63,7 @@ async def test_disabled_flag_skips_session_resolution_entirely(monkeypatch):
 
     monkeypatch.setattr(
         "ddp_sync.pipelines.openstates_scrape.get_settings",
-        lambda: _enabled_settings(session_pipeline_scraper_trigger_enabled=False),
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_enabled=False),
     )
     with patch(
         "ddp_sync.services.local_openstates_client.resolve_touched_sessions",

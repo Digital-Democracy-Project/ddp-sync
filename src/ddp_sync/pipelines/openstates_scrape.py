@@ -1051,7 +1051,7 @@ async def _maybe_trigger_legbot_for_scrape(
     changed), not a guess (what's "current").
     """
     settings = get_settings()
-    if not settings.session_pipeline_scraper_trigger_enabled:
+    if not settings.legbot_scrape_completion_trigger_enabled:
         return
 
     from ddp_sync.services.local_openstates_client import resolve_touched_sessions
@@ -1060,7 +1060,7 @@ async def _maybe_trigger_legbot_for_scrape(
         session_codes = await resolve_touched_sessions(
             jurisdiction.upper(),
             since=scrape_started_at,
-            max_bills_scanned=settings.session_pipeline_scraper_trigger_resolution_max_bills,
+            max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
         )
     except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
         logger.error(
@@ -1085,15 +1085,15 @@ async def _maybe_trigger_legbot_for_scrape(
             result = await trigger_scraper_session_pipeline(
                 jurisdiction.upper(),
                 session_code,
-                settings.session_pipeline_scraper_trigger_artifact_types,
+                settings.legbot_scrape_completion_trigger_artifact_types,
                 # Gate 1 item 4 (ddp-infra PLAN-legbot.md §32, 2026-09-01): org research is a
                 # deliberate operator decision, not a tunable default -- burst-week cost
                 # exposure (Virginia's own filing-deadline week alone: ~$670 in 7 days) has no
                 # spend visibility yet (AGENTS-89, still open). Revisit there, not here.
                 False,
-                settings.session_pipeline_scraper_trigger_limit,
+                settings.legbot_scrape_completion_trigger_limit,
                 include_concept_statements=(
-                    settings.session_pipeline_scraper_trigger_include_concept_statements
+                    settings.legbot_scrape_completion_trigger_include_concept_statements
                 ),
             )
         except Exception as e:  # noqa: BLE001

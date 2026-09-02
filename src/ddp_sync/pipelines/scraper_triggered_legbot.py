@@ -35,7 +35,7 @@ questions -- see the ticket for the full rationale):
 3. A trigger-specific enable flag, independent of CAMS's own LEGBOT_ENABLED.
    LEGBOT_ENABLED (on the ddp-agents/CAMS side) is the last-resort "stop
    everything, including Agent Smith's manual dispatches" switch. This
-   module's own SESSION_PIPELINE_SCRAPER_TRIGGER_ENABLED flag (SyncSettings)
+   module's own LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED flag (SyncSettings)
    is a routine, ddp-sync-local control: flip it off to pause only the
    automated path while manual dispatches (this endpoint's own sibling,
    /trigger/bill-artifact-generation) keep working.
@@ -106,7 +106,7 @@ async def trigger_scraper_session_pipeline(
         {"success": True, "run_id": str, **run_legbot_pipeline's own result}
     """
     settings = get_settings()
-    if not settings.session_pipeline_scraper_trigger_enabled:
+    if not settings.legbot_scrape_completion_trigger_enabled:
         logger.info(
             "scraper_triggered_legbot_disabled",
             jurisdiction_iso2=jurisdiction_iso2,
@@ -127,7 +127,7 @@ async def trigger_scraper_session_pipeline(
 
     run_id = uuid.uuid4().hex
     lock_key = _lock_key(jurisdiction_iso2, session_code)
-    lock_ttl = settings.session_pipeline_scraper_trigger_lock_ttl_seconds
+    lock_ttl = settings.legbot_scrape_completion_trigger_lock_ttl_seconds
 
     # PM review (SYNC-48): acquisition itself must not raise either -- a
     # Redis timeout/connection drop here previously would have propagated

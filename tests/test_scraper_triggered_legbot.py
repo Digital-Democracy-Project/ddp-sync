@@ -52,8 +52,8 @@ def fake_redis_store():
 
 def _enabled_settings(**overrides) -> SyncSettings:
     defaults = dict(
-        session_pipeline_scraper_trigger_enabled=True,
-        session_pipeline_scraper_trigger_lock_ttl_seconds=14400,
+        legbot_scrape_completion_trigger_enabled=True,
+        legbot_scrape_completion_trigger_lock_ttl_seconds=14400,
     )
     defaults.update(overrides)
     return SyncSettings(**defaults)
@@ -65,7 +65,7 @@ async def test_disabled_flag_returns_trigger_disabled_without_touching_redis(
 ):
     monkeypatch.setattr(
         "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
-        lambda: _enabled_settings(session_pipeline_scraper_trigger_enabled=False),
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_enabled=False),
     )
     monkeypatch.setattr(
         "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
@@ -266,7 +266,7 @@ async def test_lock_ttl_uses_the_configured_setting_not_a_hardcoded_value(
     actually used is the configured setting, not a hardcoded fallback."""
     monkeypatch.setattr(
         "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
-        lambda: _enabled_settings(session_pipeline_scraper_trigger_lock_ttl_seconds=999),
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_lock_ttl_seconds=999),
     )
     monkeypatch.setattr(
         "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
@@ -318,8 +318,8 @@ async def test_success_result_merges_run_id_with_the_pipeline_result(
 def test_default_enable_flag_is_off():
     """SYNC-48: disabled by default -- no automated caller exists yet, so
     there is nothing today to opt into."""
-    assert SyncSettings().session_pipeline_scraper_trigger_enabled is False
+    assert SyncSettings().legbot_scrape_completion_trigger_enabled is False
 
 
 def test_default_lock_ttl_is_a_finite_positive_number():
-    assert SyncSettings().session_pipeline_scraper_trigger_lock_ttl_seconds > 0
+    assert SyncSettings().legbot_scrape_completion_trigger_lock_ttl_seconds > 0
