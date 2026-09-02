@@ -921,9 +921,15 @@ async def run_legbot_pipeline(
                     "concept_statements_dispatched": bool,
                     "concept_statements_skipped_reason": str | None,
                     "concept_statements_duration_seconds": float | None,
-                    "concept_statements_failed": bool,  # SYNC-52: True only for a genuine
-                                                         # status-check/dispatch exception, not
-                                                         # a benign skip (already_published,
+                    "concept_statements_failed": bool,  # SYNC-52: "an isolated
+                                                         # concept-statements failure was
+                                                         # observed," not "an attempt was made" --
+                                                         # False when include_concept_statements
+                                                         # is False too, same as every other
+                                                         # concept_statements_* field. True only
+                                                         # for a genuine status-check/dispatch
+                                                         # exception, never a benign skip
+                                                         # (already_published,
                                                          # nothing_to_publish) -- lets a caller
                                                          # tell the two apart without parsing
                                                          # concept_statements_skipped_reason.

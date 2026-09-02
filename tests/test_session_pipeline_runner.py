@@ -820,6 +820,10 @@ async def test_concept_statements_not_requested_is_never_checked():
     bill_result = result["results"][0]
     assert bill_result["concept_statements_dispatched"] is False
     assert bill_result["concept_statements_skipped_reason"] is None
+    # SYNC-52 (pm-review): concept_statements_failed means "an isolated concept-statements
+    # failure was observed," not "an attempt was made" -- when nothing was even checked, it
+    # must still default False rather than implying a failure happened.
+    assert bill_result["concept_statements_failed"] is False
 
 
 @pytest.mark.asyncio
