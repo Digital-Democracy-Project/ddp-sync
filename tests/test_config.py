@@ -27,3 +27,41 @@ def test_load_from_env_honors_explicit_session_pipeline_concurrency_override(mon
     safe. This is not a removal of configurability."""
     monkeypatch.setenv("SESSION_PIPELINE_CONCURRENCY", "4")
     assert _load_from_env()["session_pipeline_concurrency"] == 4
+
+
+def test_load_from_env_defaults_every_sync51_task_flag_to_true(monkeypatch):
+    """SYNC-51: every per-task flag must default True -- merging this change alone must
+    change nothing on any existing host (Mac, EC2-civic), since none of them will have
+    these vars set in their .env yet."""
+    flag_env_vars = [
+        "BILL_SYNC_ENABLED",
+        "LEGISLATOR_SYNC_ENABLED",
+        "LEGISLATOR_BIO_SYNC_ENABLED",
+        "ORGANIZATION_SYNC_ENABLED",
+        "VOATZ_SYNC_ENABLED",
+        "WEBFLOW_BATCH_ENABLED",
+        "VOTEBOT_EVAL_ENABLED",
+        "API_HEALTH_CHECK_ENABLED",
+        "OPENSTATES_SCRAPE_ENABLED",
+        "OPENSTATES_ARCHIVE_ENABLED",
+        "MI_COOKIE_PUBLISH_ENABLED",
+    ]
+    for var in flag_env_vars:
+        monkeypatch.delenv(var, raising=False)
+
+    loaded = _load_from_env()
+    for var in flag_env_vars:
+        key = var.lower()
+        assert loaded[key] is True, f"{key} must default True"
+
+
+def test_load_from_env_honors_explicit_task_flag_opt_out(monkeypatch):
+    """The actual SYNC-51 use case: a host's own .env opts a specific task out."""
+    monkeypatch.setenv("VOATZ_SYNC_ENABLED", "false")
+    monkeypatch.setenv("WEBFLOW_BATCH_ENABLED", "false")
+    monkeypatch.delenv("OPENSTATES_SCRAPE_ENABLED", raising=False)
+
+    loaded = _load_from_env()
+    assert loaded["voatz_sync_enabled"] is False
+    assert loaded["webflow_batch_enabled"] is False
+    assert loaded["openstates_scrape_enabled"] is True

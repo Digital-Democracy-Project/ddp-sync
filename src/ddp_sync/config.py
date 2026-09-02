@@ -120,6 +120,34 @@ class SyncSettings:
     debug: bool = False
     log_level: str = "INFO"
 
+    # SYNC-51 (found building OPEN-193): scheduler.py's start() registers every job it knows
+    # about unconditionally the moment a process starts, with zero coordination against any
+    # other host also running this same image -- true when ddp-sync ran on exactly one host,
+    # not true the moment a second host (the EC2 instance running ddp-broker/api-v3) runs it
+    # too. A single blanket on/off switch for the whole scheduler was tried first and rejected:
+    # it can only ever be all-or-nothing per host, and the Mac's own start-ddp-sync.sh already
+    # needs the scheduler running for real, so a blanket default-off would have required every
+    # existing host's startup script to opt back in correctly -- fragile, and the wrong shape
+    # regardless once a host needs SOME jobs but not others (this EC2 instance wants
+    # openstates_scrape_enabled but not voatz_sync_enabled/webflow_batch_enabled/etc).
+    #
+    # Every flag below defaults to True -- preserving current behavior exactly, on every
+    # existing host, with zero .env changes required there. A host opts a specific task OUT
+    # by setting its flag to false in its own .env; sync_schedule.yaml's own per-job `enabled`
+    # keys (checked-in, identical across every deployment) are untouched by this and still
+    # apply underneath -- both must be true for tasks that have both.
+    bill_sync_enabled: bool = True
+    legislator_sync_enabled: bool = True
+    legislator_bio_sync_enabled: bool = True
+    organization_sync_enabled: bool = True
+    voatz_sync_enabled: bool = True
+    webflow_batch_enabled: bool = True
+    votebot_eval_enabled: bool = True
+    api_health_check_enabled: bool = True
+    openstates_scrape_enabled: bool = True
+    openstates_archive_enabled: bool = True
+    mi_cookie_publish_enabled: bool = True
+
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
     # from ddp-sync's local instance, not EC2 production — same-box call,
@@ -442,6 +470,17 @@ def _load_from_env() -> dict:
         "environment": os.getenv("ENVIRONMENT", "production"),
         "debug": os.getenv("DEBUG", "false").lower() == "true",
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
+        "bill_sync_enabled": os.getenv("BILL_SYNC_ENABLED", "true").lower() == "true",
+        "legislator_sync_enabled": os.getenv("LEGISLATOR_SYNC_ENABLED", "true").lower() == "true",
+        "legislator_bio_sync_enabled": os.getenv("LEGISLATOR_BIO_SYNC_ENABLED", "true").lower() == "true",
+        "organization_sync_enabled": os.getenv("ORGANIZATION_SYNC_ENABLED", "true").lower() == "true",
+        "voatz_sync_enabled": os.getenv("VOATZ_SYNC_ENABLED", "true").lower() == "true",
+        "webflow_batch_enabled": os.getenv("WEBFLOW_BATCH_ENABLED", "true").lower() == "true",
+        "votebot_eval_enabled": os.getenv("VOTEBOT_EVAL_ENABLED", "true").lower() == "true",
+        "api_health_check_enabled": os.getenv("API_HEALTH_CHECK_ENABLED", "true").lower() == "true",
+        "openstates_scrape_enabled": os.getenv("OPENSTATES_SCRAPE_ENABLED", "true").lower() == "true",
+        "openstates_archive_enabled": os.getenv("OPENSTATES_ARCHIVE_ENABLED", "true").lower() == "true",
+        "mi_cookie_publish_enabled": os.getenv("MI_COOKIE_PUBLISH_ENABLED", "true").lower() == "true",
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
         "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
