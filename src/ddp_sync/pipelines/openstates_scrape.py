@@ -1128,11 +1128,40 @@ async def _run_scrape(
     than read back from `_run_scrape_impl`'s own internal timing -- it only
     needs to be a real wall-clock floor for "what changed because of this run",
     a few seconds of slack on either side is harmless.
+
+    OPEN-193's cloud-owned branch loads into RDS (`RDS_DATABASE_URL`), a separate
+    database from the local Postgres `resolve_touched_sessions()` reads through
+    `local_openstates_api_base` (`localhost:8002` by default) -- so for a
+    cloud-owned jurisdiction, resolution would always find nothing, not because
+    nothing changed but because it's looking at the wrong database. Skipped here
+    explicitly (with its own log line) rather than silently returning zero
+    sessions forever. `cloud_path.jurisdictions` is empty in production today, so
+    this has no live effect yet -- real cloud-owned resolution is a separate,
+    unscoped piece of work for whenever that changes.
+
+    The hook call itself is wrapped in a catch-all: pm-review (round 1) found
+    `_maybe_trigger_legbot_for_scrape`'s own internal try/excepts don't cover its
+    `get_settings()` call or its lazy imports, so an exception there would have
+    escaped a wrapper that must never turn an already-successful scrape into a
+    failure.
     """
     scrape_started_at = datetime.now(timezone.utc)
     result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
     if result.get("success"):
-        await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
+        if _cloud_path_owns(jurisdiction, config):
+            logger.info(
+                "scraper_triggered_legbot_skipped_cloud_owned",
+                jurisdiction=jurisdiction,
+            )
+        else:
+            try:
+                await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
+            except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+                logger.error(
+                    "scraper_triggered_legbot_hook_failed",
+                    jurisdiction=jurisdiction,
+                    error=str(e),
+                )
     return result
 
 

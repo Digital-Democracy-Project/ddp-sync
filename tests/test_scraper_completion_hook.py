@@ -18,9 +18,15 @@ Covers:
   * a session-resolution exception is swallowed, never propagates to the scrape job
   * a per-session trigger exception doesn't stop the remaining sessions
   * the `_run_scrape` / `_run_scrape_impl` wrapper split: success invokes the hook,
-    failure does not, and both of `_run_scrape_impl`'s own success paths (local
-    subprocess vs. OPEN-193's cloud-owned branch) reach it uniformly through the one
-    wrapper -- no per-path duplication.
+    failure does not
+  * a cloud-owned jurisdiction's success is skipped explicitly (pm-review round 1: its
+    scraped data lands in RDS, not the local Postgres `resolve_touched_sessions()`
+    reads -- resolution would otherwise silently find nothing there forever)
+  * a hook-body exception (including one from `get_settings()` or a lazy import, not
+    just the two call sites `_maybe_trigger_legbot_for_scrape` already wraps in its own
+    try/except) can never propagate out of `_run_scrape` and replace a successful
+    scrape's own result (pm-review round 1: the original wrapper's try/except coverage
+    had a real gap here)
 """
 
 from __future__ import annotations
@@ -237,10 +243,14 @@ async def test_run_scrape_skips_hook_after_a_failed_scrape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_scrape_invokes_hook_for_a_cloud_owned_success_too(monkeypatch):
-    """The wrapper sits above `_run_scrape_impl` entirely, so OPEN-193's cloud-owned
-    branch (inside `_run_scrape_impl`) reaches the hook the same way the local
-    run-scrape.sh branch does -- no separate wiring needed at that branch point."""
+async def test_run_scrape_skips_hook_for_a_cloud_owned_jurisdiction_even_on_success(monkeypatch):
+    """pm-review round 1: OPEN-193's cloud-owned branch loads into RDS, a separate
+    database from the local Postgres resolve_touched_sessions() reads -- resolving
+    against local api-v3 for a cloud-owned jurisdiction would silently find nothing,
+    forever, not because nothing changed but because it's the wrong database. The
+    wrapper must skip the hook entirely for a cloud-owned jurisdiction rather than
+    let that play out as a permanent silent no-op."""
+    config = {"cloud_path": {"enabled": True, "jurisdictions": ["mi"]}}
     monkeypatch.setattr(
         "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
         AsyncMock(
@@ -256,7 +266,48 @@ async def test_run_scrape_invokes_hook_for_a_cloud_owned_success_too(monkeypatch
         "ddp_sync.pipelines.openstates_scrape._maybe_trigger_legbot_for_scrape",
         new=AsyncMock(),
     ) as mock_hook:
-        result = await _run_scrape("mi", None, "/fake/root")
+        result = await _run_scrape("mi", None, "/fake/root", config=config)
 
     assert result["cloud_run_id"] == "mi-abc123"
+    mock_hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_still_invokes_hook_for_a_non_cloud_owned_jurisdiction(monkeypatch):
+    """Same config object, but the jurisdiction isn't in the cloud_path list -- the
+    hook must still fire normally. Guards against the cloud-owned check accidentally
+    gating on "config was passed" instead of real per-jurisdiction ownership."""
+    config = {"cloud_path": {"enabled": True, "jurisdictions": ["mi"]}}
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
+        AsyncMock(return_value={"success": True, "jurisdiction": "va", "duration_seconds": 1.0}),
+    )
+    with patch(
+        "ddp_sync.pipelines.openstates_scrape._maybe_trigger_legbot_for_scrape",
+        new=AsyncMock(),
+    ) as mock_hook:
+        result = await _run_scrape("va", None, "/fake/root", config=config)
+
+    assert result["success"] is True
     mock_hook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_isolates_a_hook_exception_from_the_scrape_result(monkeypatch):
+    """pm-review round 1: the original wrapper only relied on
+    _maybe_trigger_legbot_for_scrape's own internal try/excepts, which don't cover
+    its get_settings() call or its lazy imports -- an exception there would have
+    escaped _run_scrape entirely and turned an already-successful scrape into a
+    raised exception. The wrapper's own try/except must catch anything, not just
+    the cases the hook function already anticipated."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
+        AsyncMock(return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0}),
+    )
+    with patch(
+        "ddp_sync.pipelines.openstates_scrape._maybe_trigger_legbot_for_scrape",
+        new=AsyncMock(side_effect=RuntimeError("settings blew up")),
+    ):
+        result = await _run_scrape("mi", None, "/fake/root")  # must not raise
+
+    assert result["success"] is True

@@ -799,6 +799,7 @@ async def resolve_touched_sessions(
     seen_sessions: set[str] = set()
     bills_scanned = 0
     page = 1
+    max_page_seen = 1
     per_page = str(_API_V3_MAX_PER_PAGE)
 
     while bills_scanned < max_bills_scanned:
@@ -844,8 +845,26 @@ async def resolve_touched_sessions(
 
         pagination = data.get("pagination") or {}
         max_page = pagination.get("max_page", page)
+        max_page_seen = max_page
         if page >= max_page or not results:
             break
         page += 1
+    else:
+        # The `while` condition (not a `break`) ended the loop -- the cap was hit while
+        # pages potentially still remained. Real gap pm-review round 1 found: a scrape
+        # touching more bills than the cap could silently omit a genuinely distinct
+        # session sitting on a later page. Not fixed by raising the cap (any fixed cap
+        # has the same failure mode at some size) -- surfaced instead, so an operator
+        # can tell "resolution completed" from "resolution gave up partway".
+        if page <= max_page_seen:
+            logger.warning(
+                "resolve_touched_sessions hit its bill-scan cap with pages still remaining "
+                "-- a distinct session on a later page may have been missed",
+                jurisdiction_iso2=jurisdiction_iso2,
+                bills_scanned=bills_scanned,
+                max_bills_scanned=max_bills_scanned,
+                next_page_not_scanned=page,
+                max_page_seen=max_page_seen,
+            )
 
     return session_codes

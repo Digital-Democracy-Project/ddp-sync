@@ -1185,6 +1185,63 @@ async def test_resolve_touched_sessions_stops_at_max_bills_scanned():
 
 
 @pytest.mark.asyncio
+async def test_resolve_touched_sessions_warns_when_cap_truncates_a_real_remaining_page():
+    """pm-review round 1: the cap silently stopping mid-scan could omit a genuinely
+    distinct session sitting on a later page -- a real gap, not fixable by raising the
+    cap (any fixed cap has the same failure mode at some size). Surfaced instead via a
+    warning naming exactly what was and wasn't scanned, so it's observable rather than
+    a silent miss."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}, {"session": "2026"}],
+        "pagination": {"max_page": 2},
+    }))
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch("ddp_sync.services.local_openstates_client.logger") as mock_logger,
+        _patch_async_client(mock_client),
+    ):
+        await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=2
+        )
+
+    assert mock_logger.warning.call_count == 1
+    call = mock_logger.warning.call_args
+    assert "cap" in call.args[0]
+    assert call.kwargs["max_page_seen"] == 2
+    assert call.kwargs["next_page_not_scanned"] == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_does_not_warn_when_scan_completes_naturally():
+    """The same warning must not fire when every page was actually scanned --
+    only when the cap cut the scan off with real pages still unread."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch("ddp_sync.services.local_openstates_client.logger") as mock_logger,
+        _patch_async_client(mock_client),
+    ):
+        await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    mock_logger.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_resolve_touched_sessions_zero_max_bills_scanned_makes_no_request():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock()
