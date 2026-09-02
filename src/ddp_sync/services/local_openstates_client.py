@@ -771,7 +771,7 @@ async def resolve_touched_sessions(
         max_bills_scanned: stop paginating once this many bills have been
             looked at, even if more pages remain -- a safety bound on this
             scan specifically (see SyncSettings.
-            session_pipeline_scraper_trigger_resolution_max_bills's own
+            legbot_scrape_completion_trigger_resolution_max_bills's own
             docstring), not a limit on anything a caller goes on to dispatch.
 
     Returns:

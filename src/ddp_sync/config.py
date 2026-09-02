@@ -314,7 +314,7 @@ class SyncSettings:
     # Defaults to disabled: no automated caller exists yet (see that
     # module's own docstring for what's still a named follow-up), so there
     # is nothing for an operator to opt into today.
-    session_pipeline_scraper_trigger_enabled: bool = False
+    legbot_scrape_completion_trigger_enabled: bool = False
 
     # SYNC-48: TTL for the overlap-rejection lock in
     # scraper_triggered_legbot.py, keyed per (jurisdiction, session). A
@@ -327,7 +327,7 @@ class SyncSettings:
     # so a few hundred-bill session is on the order of an hour or two at
     # session_pipeline_concurrency's default of 1 (sequential) -- 4 hours
     # leaves real headroom above that without being unboundable.
-    session_pipeline_scraper_trigger_lock_ttl_seconds: int = 14400
+    legbot_scrape_completion_trigger_lock_ttl_seconds: int = 14400
 
     # SYNC-50: what a real scraper-completion trigger dispatches once it has
     # resolved which session(s) a scrape run touched. Deliberately its own
@@ -337,14 +337,14 @@ class SyncSettings:
     # just resolved, so its defaults have to be jurisdiction-agnostic. Defaults
     # to every recognized artifact type (session_pipeline_runner.ALL_ARTIFACT_TYPES)
     # -- a real 24/7 pipeline has no principled reason to leave one out by default.
-    session_pipeline_scraper_trigger_artifact_types: list = field(default_factory=list)
+    legbot_scrape_completion_trigger_artifact_types: list = field(default_factory=list)
 
     # SYNC-50: per-trigger bill limit, same "no real ceiling needed" reasoning
     # SYNC-9's own limit field already documents (run_legbot_pipeline dispatches
     # sequentially, and MLX concurrency protection already lives one layer down)
     # -- sized generously above any single tracked jurisdiction's real session
     # size (Virginia's own 2026 regular session: 3,637 bills).
-    session_pipeline_scraper_trigger_limit: int = 10000
+    legbot_scrape_completion_trigger_limit: int = 10000
 
     # SYNC-50: concept_statements is already part of the standard automated flow
     # elsewhere (session_pipeline_batch's own include_concept_statements) --
@@ -352,7 +352,7 @@ class SyncSettings:
     # equivalent setting: ddp-infra PLAN-legbot.md §32 Gate 1 item 4 (2026-09-01)
     # decided that explicitly out of scope for automated dispatch, not a knob to
     # reintroduce here -- see _maybe_trigger_legbot_for_scrape's own call site.
-    session_pipeline_scraper_trigger_include_concept_statements: bool = True
+    legbot_scrape_completion_trigger_include_concept_statements: bool = True
 
     # SYNC-50: safety bound on how many bills resolve_touched_sessions() will
     # scan (paginating the local api-v3 instance) before giving up on finding
@@ -361,7 +361,7 @@ class SyncSettings:
     # settling for whatever sessions it has already found, so a jurisdiction
     # with an unexpectedly enormous single-run diff can't turn session
     # resolution itself into an unbounded scan.
-    session_pipeline_scraper_trigger_resolution_max_bills: int = 500
+    legbot_scrape_completion_trigger_resolution_max_bills: int = 500
 
     # Fields that VoteBot code references but are not relevant to sync
     # Included as no-ops to avoid AttributeError during migration
@@ -471,37 +471,37 @@ def _load_from_env() -> dict:
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
-        "session_pipeline_scraper_trigger_enabled": (
-            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_ENABLED", "false").lower() == "true"
+        "legbot_scrape_completion_trigger_enabled": (
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "false").lower() == "true"
         ),
-        "session_pipeline_scraper_trigger_lock_ttl_seconds": int(
-            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_LOCK_TTL_SECONDS", "14400")
+        "legbot_scrape_completion_trigger_lock_ttl_seconds": int(
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_TTL_SECONDS", "14400")
         ),
         # SYNC-50. Default mirrors session_pipeline_runner.ALL_ARTIFACT_TYPES exactly --
         # not imported from there to avoid a pipelines-importing-into-config cycle; that
         # module's own assertion (ARTIFACT_DISPATCH_ORDER == ALL_ARTIFACT_TYPES) is what
         # keeps this literal from silently drifting unnoticed if a type is ever added.
-        "session_pipeline_scraper_trigger_artifact_types": [
+        "legbot_scrape_completion_trigger_artifact_types": [
             t.strip()
             for t in os.getenv(
-                "SESSION_PIPELINE_SCRAPER_TRIGGER_ARTIFACT_TYPES",
+                "LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES",
                 "bill_summary,bill_pros_cons,bill_vote_yes_frame,bill_vote_no_frame,"
                 "bill_supporting_orgs,bill_opposing_orgs,bill_impact_analysis,"
                 "bill_topics,bill_changelog",
             ).split(",")
             if t.strip()
         ],
-        "session_pipeline_scraper_trigger_limit": int(
-            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_LIMIT", "10000")
+        "legbot_scrape_completion_trigger_limit": int(
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT", "10000")
         ),
-        "session_pipeline_scraper_trigger_include_concept_statements": (
+        "legbot_scrape_completion_trigger_include_concept_statements": (
             os.getenv(
-                "SESSION_PIPELINE_SCRAPER_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "true"
+                "LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "true"
             ).lower()
             == "true"
         ),
-        "session_pipeline_scraper_trigger_resolution_max_bills": int(
-            os.getenv("SESSION_PIPELINE_SCRAPER_TRIGGER_RESOLUTION_MAX_BILLS", "500")
+        "legbot_scrape_completion_trigger_resolution_max_bills": int(
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_RESOLUTION_MAX_BILLS", "500")
         ),
     }
 
