@@ -1159,8 +1159,14 @@ class UpdateScheduler:
 
         config = self._sync_config.get("session_pipeline_batch", {})
 
-        if not config.get("enabled", False):
-            logger.info("session_pipeline_batch: disabled in config — skipping")
+        # SYNC-51 (independent review, round 1): this job has no cross-host overlap lock of
+        # its own -- run_scheduled_session_pipeline() calls run_legbot_pipeline() directly,
+        # not through SYNC-48's overlap-safe trigger_scraper_session_pipeline() wrapper -- so
+        # a per-host env opt-out is the only lever available to stop it firing on two colocated
+        # hosts at once. Env flag ANDs with the existing (shared, checked-in) YAML gate, same
+        # pattern as openstates_scrape_enabled/openstates_archive_enabled/mi_cookie_publish_enabled.
+        if not (self.settings.session_pipeline_batch_enabled and config.get("enabled", False)):
+            logger.info("session_pipeline_batch: disabled — skipping")
             return
 
         missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]

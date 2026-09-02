@@ -45,6 +45,7 @@ def test_load_from_env_defaults_every_sync51_task_flag_to_true(monkeypatch):
         "OPENSTATES_SCRAPE_ENABLED",
         "OPENSTATES_ARCHIVE_ENABLED",
         "MI_COOKIE_PUBLISH_ENABLED",
+        "SESSION_PIPELINE_BATCH_ENABLED",
     ]
     for var in flag_env_vars:
         monkeypatch.delenv(var, raising=False)

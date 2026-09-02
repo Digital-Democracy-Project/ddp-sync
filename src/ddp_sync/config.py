@@ -147,6 +147,7 @@ class SyncSettings:
     openstates_scrape_enabled: bool = True
     openstates_archive_enabled: bool = True
     mi_cookie_publish_enabled: bool = True
+    session_pipeline_batch_enabled: bool = True
 
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
@@ -481,6 +482,7 @@ def _load_from_env() -> dict:
         "openstates_scrape_enabled": os.getenv("OPENSTATES_SCRAPE_ENABLED", "true").lower() == "true",
         "openstates_archive_enabled": os.getenv("OPENSTATES_ARCHIVE_ENABLED", "true").lower() == "true",
         "mi_cookie_publish_enabled": os.getenv("MI_COOKIE_PUBLISH_ENABLED", "true").lower() == "true",
+        "session_pipeline_batch_enabled": os.getenv("SESSION_PIPELINE_BATCH_ENABLED", "true").lower() == "true",
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
         "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
