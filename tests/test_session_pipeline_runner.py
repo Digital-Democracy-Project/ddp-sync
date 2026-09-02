@@ -842,6 +842,8 @@ async def test_concept_statements_skipped_when_already_published():
     bill_result = result["results"][0]
     assert bill_result["concept_statements_dispatched"] is False
     assert bill_result["concept_statements_skipped_reason"] == "already_published"
+    # SYNC-52: already-published is a benign skip, not a failure.
+    assert bill_result["concept_statements_failed"] is False
 
 
 @pytest.mark.asyncio
@@ -868,6 +870,8 @@ async def test_concept_statements_dispatched_when_not_yet_published():
     bill_result = result["results"][0]
     assert bill_result["concept_statements_dispatched"] is True
     assert bill_result["concept_statements_skipped_reason"] is None
+    # SYNC-52: a successful dispatch is obviously not a failure.
+    assert bill_result["concept_statements_failed"] is False
 
 
 _ALREADY_COVERED = {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
@@ -895,6 +899,9 @@ async def test_concept_statements_no_row_created_is_not_a_failure():
     assert bill_result["concept_statements_dispatched"] is False
     assert bill_result["concept_statements_skipped_reason"] == "nothing_to_publish"
     assert bill_result["artifacts_failed"] == []
+    # SYNC-52: a benign business-logic skip is not a failure -- concept_statements_failed
+    # must stay False here even though nothing was dispatched.
+    assert bill_result["concept_statements_failed"] is False
 
 
 @pytest.mark.asyncio
@@ -914,6 +921,10 @@ async def test_concept_statements_dispatch_failure_is_isolated():
     assert bill_result["concept_statements_dispatched"] is False
     assert "dispatch_failed" in bill_result["concept_statements_skipped_reason"]
     assert bill_result["error"] is None
+    # SYNC-52: a real dispatch exception must be distinguishable from a benign skip
+    # (test_concept_statements_no_row_created_is_not_a_failure, above) without parsing
+    # concept_statements_skipped_reason's contents.
+    assert bill_result["concept_statements_failed"] is True
 
 
 @pytest.mark.asyncio
@@ -929,6 +940,8 @@ async def test_concept_statements_status_check_failure_is_isolated():
     bill_result = result["results"][0]
     assert bill_result["concept_statements_dispatched"] is False
     assert "status_check_failed" in bill_result["concept_statements_skipped_reason"]
+    # SYNC-52: same distinguishing signal for the status-check exception path.
+    assert bill_result["concept_statements_failed"] is True
 
 
 @pytest.mark.asyncio

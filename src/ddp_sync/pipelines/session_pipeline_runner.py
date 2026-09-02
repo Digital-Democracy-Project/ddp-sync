@@ -438,6 +438,7 @@ async def _process_bill_inner(
         "concept_statements_dispatched": False,
         "concept_statements_skipped_reason": None,
         "concept_statements_duration_seconds": None,
+        "concept_statements_failed": False,
         "duration_seconds": None,
         "error": None,
     }
@@ -713,6 +714,17 @@ async def _process_bill_inner(
     # means dispatch_and_store_concept_statements wrote nothing, recorded
     # here as concept_statements_skipped_reason="nothing_to_publish", not as
     # a member of artifacts_failed (which is BillArtifact-status-shaped).
+    #
+    # SYNC-52: concept_statements_failed added as a narrow, standalone fix -- distinct from
+    # this ticket's own blocked full scope (folding concept_statements into ALL_ARTIFACT_TYPES
+    # and the shared _dispatch_artifact path, which needs BROKER-133's schema change first).
+    # Before this field existed, both branches below only wrote a description into
+    # concept_statements_skipped_reason, so a real BrokerClientError/exception and a benign
+    # business-logic skip (already_published, nothing_to_publish) were both just "not
+    # dispatched" to any caller checking booleans rather than parsing the reason string.
+    # concept_statements_failed is set only on the two genuine-exception paths below, so a
+    # caller can tell "this needs attention" from "this bill legitimately has nothing to
+    # publish" without string-matching concept_statements_skipped_reason's contents.
     if include_concept_statements:
         try:
             existing_concept_set = await get_concept_statement_set(
@@ -724,6 +736,7 @@ async def _process_bill_inner(
             )
         except BrokerClientError as exc:
             result["concept_statements_skipped_reason"] = f"status_check_failed: {exc}"
+            result["concept_statements_failed"] = True
         else:
             if existing_concept_set is not None:
                 result["concept_statements_skipped_reason"] = "already_published"
@@ -747,6 +760,7 @@ async def _process_bill_inner(
                         run_id=run_id, gov_id=gov_id, error=str(exc),
                     )
                     result["concept_statements_skipped_reason"] = f"dispatch_failed: {exc}"
+                    result["concept_statements_failed"] = True
                 else:
                     if concept_result is None:
                         result["concept_statements_skipped_reason"] = "nothing_to_publish"
@@ -907,6 +921,12 @@ async def run_legbot_pipeline(
                     "concept_statements_dispatched": bool,
                     "concept_statements_skipped_reason": str | None,
                     "concept_statements_duration_seconds": float | None,
+                    "concept_statements_failed": bool,  # SYNC-52: True only for a genuine
+                                                         # status-check/dispatch exception, not
+                                                         # a benign skip (already_published,
+                                                         # nothing_to_publish) -- lets a caller
+                                                         # tell the two apart without parsing
+                                                         # concept_statements_skipped_reason.
                     "duration_seconds": float,  # this bill's total processing time
                     "error": str | None,
                 },
