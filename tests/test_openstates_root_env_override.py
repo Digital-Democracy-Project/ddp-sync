@@ -30,3 +30,11 @@ def test_get_root_env_var_wins_even_when_config_sets_a_different_path(monkeypatc
     assert _get_root({"openstates_root": "/Users/agentsmith/Developer/repos/ddp-open-states"}) == (
         "/opt/ddp-open-states"
     )
+
+
+def test_get_root_empty_env_value_falls_back_rather_than_returning_empty(monkeypatch):
+    """pm-review: an empty string is a falsy env value, not a real override -- a host with
+    OPENSTATES_ROOT="" in its .env (e.g. an unset template variable) must still fall back to
+    config/default rather than handing an empty path to cloud_loader.py."""
+    monkeypatch.setenv("OPENSTATES_ROOT", "")
+    assert _get_root({"openstates_root": "/opt/ddp-open-states"}) == "/opt/ddp-open-states"
