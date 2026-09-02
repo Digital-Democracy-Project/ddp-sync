@@ -7,6 +7,7 @@ itself is already exercised indirectly via test_bill_artifact_generation.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -18,6 +19,7 @@ from ddp_sync.services.local_openstates_client import (
     get_archived_version_transitions,
     get_current_version_identity,
     list_current_session_bill_candidates,
+    resolve_touched_sessions,
 )
 
 
@@ -1068,3 +1070,269 @@ async def test_current_version_identity_none_on_unreachable_api():
         result = await get_current_version_identity("some-uuid")
 
     assert result is None
+
+
+# --- SYNC-50: resolve_touched_sessions() -------------------------------------------------
+
+
+def _response(status_code=200, json_value=None, raises_on_json=False):
+    response = MagicMock()
+    response.status_code = status_code
+    if raises_on_json:
+        response.json.side_effect = ValueError("not json")
+    else:
+        response.json.return_value = json_value or {}
+    return response
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_happy_path_dedupes_one_session():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [
+            {"session": "2026"},
+            {"session": "2026"},
+        ],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["2026"]
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8002/bills"
+    # Same real case-sensitivity fix list_current_session_bill_candidates already needed.
+    assert call.kwargs["params"]["jurisdiction"] == "VA"
+    assert call.kwargs["params"]["updated_since"] == "2026-01-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_finds_multiple_sessions_same_jurisdiction():
+    """The whole reason this function exists: VA/UT can have two sessions
+    simultaneously active, and a real scrape run can touch bills in both."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [
+            {"session": "2026"},
+            {"session": "2027"},
+            {"session": "2026"},
+        ],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["2026", "2027"]  # first-seen order, deduped
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_paginates_across_pages():
+    mock_client = AsyncMock()
+    page1 = _response(json_value={
+        "results": [{"session": "2026"}],
+        "pagination": {"max_page": 2},
+    })
+    page2 = _response(json_value={
+        "results": [{"session": "2027"}],
+        "pagination": {"max_page": 2},
+    })
+    mock_client.get = AsyncMock(side_effect=[page1, page2])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["2026", "2027"]
+    assert mock_client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_stops_at_max_bills_scanned():
+    """Confirms the safety bound actually bounds the scan -- a second page
+    exists (max_page=2) but must never be fetched once the cap is hit."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}, {"session": "2026"}],
+        "pagination": {"max_page": 2},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=2
+        )
+
+    assert result == ["2026"]
+    assert mock_client.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_warns_when_cap_truncates_a_real_remaining_page():
+    """pm-review round 1: the cap silently stopping mid-scan could omit a genuinely
+    distinct session sitting on a later page -- a real gap, not fixable by raising the
+    cap (any fixed cap has the same failure mode at some size). Surfaced instead via a
+    warning naming exactly what was and wasn't scanned, so it's observable rather than
+    a silent miss."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}, {"session": "2026"}],
+        "pagination": {"max_page": 2},
+    }))
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch("ddp_sync.services.local_openstates_client.logger") as mock_logger,
+        _patch_async_client(mock_client),
+    ):
+        await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=2
+        )
+
+    assert mock_logger.warning.call_count == 1
+    call = mock_logger.warning.call_args
+    assert "cap" in call.args[0]
+    assert call.kwargs["max_page_seen"] == 2
+    assert call.kwargs["next_page_not_scanned"] == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_does_not_warn_when_scan_completes_naturally():
+    """The same warning must not fire when every page was actually scanned --
+    only when the cap cut the scan off with real pages still unread."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch("ddp_sync.services.local_openstates_client.logger") as mock_logger,
+        _patch_async_client(mock_client),
+    ):
+        await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    mock_logger.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_zero_max_bills_scanned_makes_no_request():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock()
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=0
+        )
+
+    assert result == []
+    mock_client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_empty_on_unreachable_api():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_empty_on_error_status():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(status_code=500))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_empty_on_non_json_response():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(raises_on_json=True))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_empty_when_no_local_api_base_configured():
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(local_openstates_api_base=""),
+    ):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_ignores_bills_with_no_session_field():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": ""}, {}, {"session": "2026"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["2026"]
