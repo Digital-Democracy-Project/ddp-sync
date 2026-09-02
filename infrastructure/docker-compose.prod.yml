@@ -8,11 +8,32 @@ networks:
   ddp-broker-py_default:
     external: true
 
+# pm-review: the Dockerfile's openstates-builder stage reads a BuildKit secret
+# (`--mount=type=secret,id=github_token`), but a bare `additional_contexts` entry doesn't
+# supply it -- `docker compose build` needs its own explicit wiring, or the build fails at
+# the git-clone step with "No such file or directory: /run/secrets/github_token". Sourced
+# from an environment variable (GITHUB_PERSONAL_ACCESS_TOKEN, already required in ../.env
+# for the same PAT the root ddp-open-states Dockerfile's own build already uses), not a file
+# on disk -- consistent with every other secret this host already keeps in .env rather than
+# a separate credential file.
+secrets:
+  github_token:
+    environment: GITHUB_PERSONAL_ACCESS_TOKEN
+
 services:
   ddp-sync:
     build:
       context: ..
       dockerfile: infrastructure/Dockerfile
+      # OPEN-248: the Dockerfile's openstates-builder stage needs requirements-openstates.txt
+      # from the SEPARATE ddp-open-states repo, reached this way rather than duplicated into
+      # this repo -- both checkouts already sit as siblings on this exact host (same absolute
+      # path OPENSTATES_ROOT below already points at), so referencing the real file directly
+      # avoids a second copy of a ~150-line pinned-dependency file that would only drift.
+      additional_contexts:
+        - openstates=/opt/ddp-open-states
+      secrets:
+        - github_token
     image: ddp-sync:prod
     env_file:
       - ../.env
@@ -70,7 +91,11 @@ services:
       # the env var alone doesn't make the HOST's /opt/ddp-open-states visible inside this
       # container's own filesystem -- found live 2026-09-02: cloud_loader.py resolved the
       # correct path but still got ENOENT, since nothing had actually bind-mounted it in yet.
-      # Read-write, not :ro -- cloud_loader.py os.makedirs()'s data/cache dirs under here.
+      # Still needed after OPEN-248 bundled the os-update TOOLCHAIN into the image -- this
+      # mount is for cloud_loader.py/cloud_collector.py's own SCRIPT FILES (the Dockerfile
+      # never COPYs them; only their compiled dependencies), which _run_load() invokes as a
+      # separate subprocess by path. Read-write, not :ro -- cloud_loader.py os.makedirs()'s
+      # data/cache dirs under here.
       - /opt/ddp-open-states:/opt/ddp-open-states
     ports:
       - "8001:8001"
