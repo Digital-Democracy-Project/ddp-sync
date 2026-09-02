@@ -1,0 +1,84 @@
+# OPEN-193: ddp-sync prod stack. No Redis service of its own -- joins ddp-broker-py's existing
+# network and points at its Redis container directly, on a separate logical DB (see REDIS_URL
+# below) rather than standing up a second Redis instance. Requires ddp-broker-py's own stack to
+# already be up (specifically its `redis` service / `ddp-broker-py_default` network).
+version: "3.5"
+
+networks:
+  ddp-broker-py_default:
+    external: true
+
+services:
+  ddp-sync:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile
+    image: ddp-sync:prod
+    env_file:
+      - ../.env
+    environment:
+      # DB 3: ddp-broker-py's Celery broker/result backend use DB 0, its Django cache DB 1, its
+      # celery_once lock backend DB 2 (apps/ddp-broker/ddpbroker/settings/base.py) -- confirmed
+      # 2026-09-02 (notes/ops-handoff) before picking this one, not assumed.
+      - REDIS_URL=redis://redis:6379/3
+      - ENVIRONMENT=production
+      - AWS_DEFAULT_REGION=us-east-1
+      # OPEN-243: openstates_root is inherently per-host but sync_schedule.yaml is a single
+      # file every ddp-sync host pulls identically (its own openstates_root value is the Mac
+      # Studio's path). This env var wins over that shared config value -- see
+      # openstates_scrape.py's _get_root(). Real path on THIS host, matching the checkout
+      # cloud_scrape_trigger.py's _run_load() actually finds cloud_loader.py in.
+      - OPENSTATES_ROOT=/opt/ddp-open-states
+      # SYNC-51 per-task flags (notes/ops-handoff, 2026-09-02): this host owns ONLY the
+      # OpenStates scrape trigger for OPEN-193's canary -- every other scheduled task ddp-sync
+      # can run is explicitly disabled here so this doesn't become a second, uncoordinated
+      # scheduler duplicating whatever else already runs these jobs elsewhere (no shared Redis
+      # with any other ddp-sync instance -- see SYNC-11, there is no single canonical one).
+      - BILL_SYNC_ENABLED=false
+      - LEGISLATOR_SYNC_ENABLED=false
+      - LEGISLATOR_BIO_SYNC_ENABLED=false
+      - ORGANIZATION_SYNC_ENABLED=false
+      - VOATZ_SYNC_ENABLED=false
+      - WEBFLOW_BATCH_ENABLED=false
+      - VOTEBOT_EVAL_ENABLED=false
+      - API_HEALTH_CHECK_ENABLED=false
+      - SESSION_PIPELINE_BATCH_ENABLED=false
+      # OPENSTATES_SCRAPE_ENABLED=false (NOT left unset): unset/default-true turned out to mean
+      # something much bigger than "the one job this host owns" -- it registers SIX recurring
+      # scheduled jobs (FL, WA, USA, secondary states including MI, people refresh, patch
+      # apply), independently of whatever already runs those same jurisdictions elsewhere, with
+      # zero cross-host coordination. Found live 2026-09-02 (notes/ops-handoff) before any of
+      # them could actually fire. POST /trigger/openstates-scrape/{target}
+      # (api/routes/triggers.py:825) never checks this flag at all -- it's a separate, always-on
+      # code path -- so disabling the scheduled jobs here does not affect OPEN-193's actual
+      # need (the manual FL trigger).
+      - OPENSTATES_SCRAPE_ENABLED=false
+      # OPENSTATES_ARCHIVE_ENABLED/MI_COOKIE_PUBLISH_ENABLED: the handoff note left these as
+      # "your call" (OpenStates-domain, not Voatz/Webflow/LegBot, so plausible either way) --
+      # defaulted to false here too, since this host's mandate is specifically the OPEN-193
+      # canary, not general OpenStates archive/MI-cookie maintenance. Flagged back on
+      # notes/ops-handoff in case that call should go the other way.
+      - OPENSTATES_ARCHIVE_ENABLED=false
+      - MI_COOKIE_PUBLISH_ENABLED=false
+    volumes:
+      # config/sync_schedule.yaml is never baked into the image (Dockerfile only COPYs
+      # pyproject.toml + src/) -- mounted read-only instead so an ordinary git pull on the host
+      # (no rebuild) is enough to pick up a config change, matching how this file has always
+      # been edited so far (PRs, not image rebuilds).
+      - ../config:/app/config:ro
+      # OPENSTATES_ROOT points _run_load() at this path (see the env var above), but setting
+      # the env var alone doesn't make the HOST's /opt/ddp-open-states visible inside this
+      # container's own filesystem -- found live 2026-09-02: cloud_loader.py resolved the
+      # correct path but still got ENOENT, since nothing had actually bind-mounted it in yet.
+      # Read-write, not :ro -- cloud_loader.py os.makedirs()'s data/cache dirs under here.
+      - /opt/ddp-open-states:/opt/ddp-open-states
+    ports:
+      - "8001:8001"
+    networks:
+      - ddp-broker-py_default
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/ddp-sync/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
