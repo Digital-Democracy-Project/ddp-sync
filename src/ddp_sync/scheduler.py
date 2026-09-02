@@ -101,14 +101,19 @@ class UpdateScheduler:
         sync_time_str = bill_sync_config.get("sync_time_utc") or self._sync_config.get("sync_time_utc", "04:00")
         hour, minute = map(int, sync_time_str.split(":"))
 
-        # Add daily bill sync job (shared fetch, independent write paths)
-        self.scheduler.add_job(
-            self._run_daily_bill_sync,
-            trigger=CronTrigger(hour=hour, minute=minute),
-            id="daily_bill_sync",
-            name="Daily Bill Sync",
-            replace_existing=True,
-        )
+        # Add daily bill sync job (shared fetch, independent write paths). SYNC-51: this had
+        # no gate of any kind before -- bill_sync_enabled is a per-host .env opt-out, default
+        # True (preserves every existing host's current behavior with no config change).
+        if self.settings.bill_sync_enabled:
+            self.scheduler.add_job(
+                self._run_daily_bill_sync,
+                trigger=CronTrigger(hour=hour, minute=minute),
+                id="daily_bill_sync",
+                name="Daily Bill Sync",
+                replace_existing=True,
+            )
+        else:
+            logger.info("bill_sync_enabled=false — skipping daily bill sync job")
 
         # Add legislator sync job (daily or weekly based on config)
         # Prefer new legislator_sync config, fall back to legacy legislator_bills
@@ -116,7 +121,9 @@ class UpdateScheduler:
         if not leg_config:
             leg_config = self._sync_config.get("legislator_bills", {})
 
-        if leg_config.get("enabled", False):
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate -- a host
+        # can opt out even while sync_schedule.yaml says enabled: true for every deployment.
+        if self.settings.legislator_sync_enabled and leg_config.get("enabled", False):
             leg_sync_time = leg_config.get("sync_time_utc", "06:00")
             leg_hour, leg_minute = map(int, leg_sync_time.split(":"))
             frequency = leg_config.get("frequency", "weekly")
@@ -176,7 +183,8 @@ class UpdateScheduler:
             except Exception:  # noqa: BLE001 — JobLookupError variant
                 pass
 
-        if bio_config.get("enabled", False):
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if self.settings.legislator_bio_sync_enabled and bio_config.get("enabled", False):
             # Phase-4 startup-time scope validation. If upload_photos is
             # set true in YAML but webflow_assets_read_write_key isn't
             # configured, the orchestrator's per-run fail-fast would
@@ -241,7 +249,8 @@ class UpdateScheduler:
 
         # Add organization sync job (monthly based on config)
         org_config = self._sync_config.get("organization_sync", {})
-        if org_config.get("enabled", False):
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if self.settings.organization_sync_enabled and org_config.get("enabled", False):
             org_sync_time = org_config.get("sync_time_utc", "08:00")
             org_hour, org_minute = map(int, org_sync_time.split(":"))
             org_day_of_month = org_config.get("day_of_month", 1)
@@ -299,60 +308,73 @@ class UpdateScheduler:
         )
 
     def _register_ddp_api_jobs(self) -> None:
-        """Register jobs moved from DDP-API (Voatz/Brevo sync + Webflow CMS batch)."""
-        from ddp_sync.pipelines.voatz_brevo import run_sync_job, run_full_sync_job
-        from ddp_sync.pipelines.webflow_batch import (
-            run_webflow_fill_session_code,
-            run_webflow_fill_map_url,
-            run_webflow_bill_org_sync,
-            run_webflow_org_about_parse,
-            run_webflow_check_org_missing,
-            run_webflow_find_duplicates,
-            run_webflow_merge_duplicate_orgs,
-        )
+        """Register jobs moved from DDP-API (Voatz/Brevo sync + Webflow CMS batch).
 
-        # Voatz -> Brevo user sync — every N minutes (default 30)
-        interval = self.settings.sync_interval_minutes
-        self.scheduler.add_job(
-            run_sync_job,
-            trigger=IntervalTrigger(minutes=interval),
-            id="voatz_user_sync",
-            name="Voatz -> Brevo user sync",
-            replace_existing=True,
-        )
-        logger.info("Voatz user sync scheduled", interval_minutes=interval)
+        SYNC-51: neither half had any gate at all before -- voatz_sync_enabled and
+        webflow_batch_enabled are independent per-host .env opt-outs (default True,
+        preserving every existing host's current behavior with no config change), gated
+        separately since a host may need one without the other.
+        """
+        if self.settings.voatz_sync_enabled:
+            from ddp_sync.pipelines.voatz_brevo import run_sync_job, run_full_sync_job
 
-        # Voatz -> Brevo full-attribute sync — monthly 1st at 02:00 UTC
-        self.scheduler.add_job(
-            run_full_sync_job,
-            trigger=CronTrigger(day=1, hour=2),
-            id="voatz_full_sync",
-            name="Voatz -> Brevo full-attribute sync",
-            replace_existing=True,
-        )
-        logger.info("Voatz full-attribute sync scheduled (monthly, 1st at 02:00 UTC)")
-
-        # Webflow CMS batch jobs — weekly Monday at 03:00 UTC
-        webflow_trigger = CronTrigger(day_of_week="mon", hour=3)
-        webflow_jobs = [
-            ("webflow_fill_session_code", "Webflow: fill session-code", run_webflow_fill_session_code),
-            ("webflow_fill_map_url", "Webflow: fill map-url", run_webflow_fill_map_url),
-            ("webflow_bill_org_sync", "Webflow: bill-org reference sync", run_webflow_bill_org_sync),
-            ("webflow_org_about_parse", "Webflow: org about-field parse", run_webflow_org_about_parse),
-            ("webflow_check_org_missing", "Webflow: check org missing fields", run_webflow_check_org_missing),
-            ("webflow_find_duplicates", "Webflow: find duplicate bills", run_webflow_find_duplicates),
-            ("webflow_merge_duplicate_orgs", "Webflow: merge duplicate orgs", run_webflow_merge_duplicate_orgs),
-        ]
-
-        for job_id, name, func in webflow_jobs:
+            # Voatz -> Brevo user sync — every N minutes (default 30)
+            interval = self.settings.sync_interval_minutes
             self.scheduler.add_job(
-                func,
-                trigger=webflow_trigger,
-                id=job_id,
-                name=name,
+                run_sync_job,
+                trigger=IntervalTrigger(minutes=interval),
+                id="voatz_user_sync",
+                name="Voatz -> Brevo user sync",
                 replace_existing=True,
             )
-        logger.info("Webflow CMS batch jobs scheduled (weekly, Mon 03:00 UTC)", count=len(webflow_jobs))
+            logger.info("Voatz user sync scheduled", interval_minutes=interval)
+
+            # Voatz -> Brevo full-attribute sync — monthly 1st at 02:00 UTC
+            self.scheduler.add_job(
+                run_full_sync_job,
+                trigger=CronTrigger(day=1, hour=2),
+                id="voatz_full_sync",
+                name="Voatz -> Brevo full-attribute sync",
+                replace_existing=True,
+            )
+            logger.info("Voatz full-attribute sync scheduled (monthly, 1st at 02:00 UTC)")
+        else:
+            logger.info("voatz_sync_enabled=false — skipping Voatz -> Brevo sync jobs")
+
+        if self.settings.webflow_batch_enabled:
+            from ddp_sync.pipelines.webflow_batch import (
+                run_webflow_bill_org_sync,
+                run_webflow_check_org_missing,
+                run_webflow_fill_map_url,
+                run_webflow_fill_session_code,
+                run_webflow_find_duplicates,
+                run_webflow_merge_duplicate_orgs,
+                run_webflow_org_about_parse,
+            )
+
+            # Webflow CMS batch jobs — weekly Monday at 03:00 UTC
+            webflow_trigger = CronTrigger(day_of_week="mon", hour=3)
+            webflow_jobs = [
+                ("webflow_fill_session_code", "Webflow: fill session-code", run_webflow_fill_session_code),
+                ("webflow_fill_map_url", "Webflow: fill map-url", run_webflow_fill_map_url),
+                ("webflow_bill_org_sync", "Webflow: bill-org reference sync", run_webflow_bill_org_sync),
+                ("webflow_org_about_parse", "Webflow: org about-field parse", run_webflow_org_about_parse),
+                ("webflow_check_org_missing", "Webflow: check org missing fields", run_webflow_check_org_missing),
+                ("webflow_find_duplicates", "Webflow: find duplicate bills", run_webflow_find_duplicates),
+                ("webflow_merge_duplicate_orgs", "Webflow: merge duplicate orgs", run_webflow_merge_duplicate_orgs),
+            ]
+
+            for job_id, name, func in webflow_jobs:
+                self.scheduler.add_job(
+                    func,
+                    trigger=webflow_trigger,
+                    id=job_id,
+                    name=name,
+                    replace_existing=True,
+                )
+            logger.info("Webflow CMS batch jobs scheduled (weekly, Mon 03:00 UTC)", count=len(webflow_jobs))
+        else:
+            logger.info("webflow_batch_enabled=false — skipping Webflow CMS batch jobs")
 
     def _register_votebot_eval_job(self) -> None:
         """Register the weekly votebot eval cron (plan §3.3).
@@ -363,7 +385,15 @@ class UpdateScheduler:
         - Skips registration on any validation failure (no silent no-op).
         - Job parameters: ``max_instances=1`` + ``coalesce=True`` +
           ``misfire_grace_time=3600`` for concurrency safety.
+
+        SYNC-51: votebot_eval_enabled is a per-host .env opt-out, ANDed with the existing
+        (shared, checked-in) YAML gate below -- default True, preserves every existing host's
+        current behavior with no config change.
         """
+        if not self.settings.votebot_eval_enabled:
+            logger.info("votebot_eval_enabled=false — skipping")
+            return
+
         from ddp_sync.pipelines.votebot_eval import (
             resolve_votebot_path,
             validate_votebot_path,
@@ -487,8 +517,10 @@ class UpdateScheduler:
         )
 
         config = self._sync_config.get("openstates_scrape", {})
-        if not config.get("enabled", False):
-            logger.info("openstates_scrape: disabled in config — skipping")
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate -- applies
+        # to every caller of this method (startup and cadence-review re-registration alike).
+        if not (self.settings.openstates_scrape_enabled and config.get("enabled", False)):
+            logger.info("openstates_scrape: disabled — skipping")
             return
 
         # An excluded jurisdiction can never be escalated here, whatever the caller
@@ -1026,8 +1058,9 @@ class UpdateScheduler:
         except Exception:  # noqa: BLE001 — JobLookupError variant
             pass
 
-        if not config.get("enabled", False):
-            logger.info("openstates_archive: disabled in config — skipping")
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if not (self.settings.openstates_archive_enabled and config.get("enabled", False)):
+            logger.info("openstates_archive: disabled — skipping")
             return
 
         day_map = {
@@ -1077,8 +1110,9 @@ class UpdateScheduler:
 
         config = self._sync_config.get("openstates_scrape", {})
         publish_cfg = config.get("mi_cookie_publish", {})
-        if not publish_cfg.get("enabled", False):
-            logger.info("mi_cookie_publish: disabled in config — skipping")
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if not (self.settings.mi_cookie_publish_enabled and publish_cfg.get("enabled", False)):
+            logger.info("mi_cookie_publish: disabled — skipping")
             return
 
         interval_hours = publish_cfg.get("interval_hours", 6)
@@ -1125,8 +1159,14 @@ class UpdateScheduler:
 
         config = self._sync_config.get("session_pipeline_batch", {})
 
-        if not config.get("enabled", False):
-            logger.info("session_pipeline_batch: disabled in config — skipping")
+        # SYNC-51 (independent review, round 1): this job has no cross-host overlap lock of
+        # its own -- run_scheduled_session_pipeline() calls run_legbot_pipeline() directly,
+        # not through SYNC-48's overlap-safe trigger_scraper_session_pipeline() wrapper -- so
+        # a per-host env opt-out is the only lever available to stop it firing on two colocated
+        # hosts at once. Env flag ANDs with the existing (shared, checked-in) YAML gate, same
+        # pattern as openstates_scrape_enabled/openstates_archive_enabled/mi_cookie_publish_enabled.
+        if not (self.settings.session_pipeline_batch_enabled and config.get("enabled", False)):
+            logger.info("session_pipeline_batch: disabled — skipping")
             return
 
         missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]
@@ -1918,8 +1958,9 @@ class UpdateScheduler:
         from ddp_sync.pipelines.api_health_check import run_api_health_check_job
 
         config = self._sync_config.get("api_health_check", {})
-        if not config.get("enabled", False):
-            logger.info("api_health_check: disabled in config — skipping")
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if not (self.settings.api_health_check_enabled and config.get("enabled", False)):
+            logger.info("api_health_check: disabled — skipping")
             return
 
         sync_time_str = config.get("sync_time_utc", "09:00")
