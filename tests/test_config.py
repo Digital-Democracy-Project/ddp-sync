@@ -98,3 +98,26 @@ def test_task_flags_still_apply_when_secrets_manager_supplies_the_base_config(mo
         assert settings.webflow_batch_enabled is True
     finally:
         get_settings.cache_clear()
+
+
+def test_redis_url_still_applies_when_secrets_manager_supplies_the_base_config(monkeypatch):
+    """OPEN-193, found verifying PR #110 live on the EC2-broker host: same bug, different
+    field. redis_url is host-specific the same way the 12 SYNC-51 flags are, but wasn't in
+    that override list, so a real REDIS_URL set in the container's environment silently lost
+    to the ddp-sync/credentials secret's own stored redis_url whenever Secrets Manager
+    supplied the base config."""
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/3")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        # the real secret's shape: its own stale redis_url, distinct from the real env value
+        return_value={"api_key": "from-secrets-manager", "redis_url": "redis://localhost:6379/0"},
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"  # confirms Secrets Manager path was taken
+        assert settings.redis_url == "redis://redis:6379/3"
+    finally:
+        get_settings.cache_clear()
