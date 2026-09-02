@@ -174,6 +174,44 @@ def test_collection_polls_until_stopped_then_loads():
     assert captured["env"]["DATABASE_URL"] == "postgresql://rds/openstates"
 
 
+def test_assign_public_ip_defaults_to_enabled_for_no_nat_public_subnets():
+    """OPEN-241: every subnet this project has stood up so far is public-by-design with no
+    NAT gateway. DISABLED (the old hardcoded value) left a task's ENI with no route to the
+    internet at all, so it could never reach ECR to pull its own image -- confirmed live
+    during OPEN-193's canary run, where every attempt failed with a
+    ResourceInitializationError timing out trying to reach ECR."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+        cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
+            subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
+        )
+
+    network_cfg = ecs.run_task_calls[0]["networkConfiguration"]["awsvpcConfiguration"]
+    assert network_cfg["assignPublicIp"] == "ENABLED"
+
+
+def test_assign_public_ip_honors_explicit_fargate_config_override():
+    """A future task definition that does run in a NAT-backed private subnet must still be
+    able to opt back into DISABLED -- this isn't a removal of configurability, just a
+    correct default for what's actually deployed today."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+        cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(assign_public_ip="DISABLED"),
+            ecs_client=ecs, subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
+        )
+
+    network_cfg = ecs.run_task_calls[0]["networkConfiguration"]["awsvpcConfiguration"]
+    assert network_cfg["assignPublicIp"] == "DISABLED"
+
+
 def test_session_arg_reaches_both_collection_command_and_loader_command():
     ecs = FakeEcsClient(
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},

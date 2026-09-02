@@ -186,7 +186,15 @@ def _run_fargate_collection(
                 "awsvpcConfiguration": {
                     "subnets": fargate_cfg["subnets"],
                     "securityGroups": fargate_cfg["security_groups"],
-                    "assignPublicIp": "DISABLED",
+                    # OPEN-241: every subnet this project has stood up so far (OPEN-200's
+                    # spike, and OPEN-193's own canary subnets) is public-by-design with no
+                    # NAT gateway -- that's the whole point of assigning a public IP per task
+                    # instead. Hardcoding DISABLED here left every task's ENI with no route to
+                    # the internet at all, so it could never even reach ECR to pull its own
+                    # image. Configurable per fargate_cfg for a future task definition that
+                    # does run in a NAT-backed private subnet, but ENABLED is the correct
+                    # default given what's actually deployed today.
+                    "assignPublicIp": fargate_cfg.get("assign_public_ip", "ENABLED"),
                 }
             },
             overrides={
