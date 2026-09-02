@@ -8,7 +8,9 @@ test_session_pipeline_runner.py.
 
 from __future__ import annotations
 
-from ddp_sync.config import _load_from_env
+from unittest.mock import patch
+
+from ddp_sync.config import _load_from_env, get_settings
 
 
 def test_load_from_env_defaults_session_pipeline_concurrency_to_one(monkeypatch):
@@ -66,3 +68,33 @@ def test_load_from_env_honors_explicit_task_flag_opt_out(monkeypatch):
     assert loaded["voatz_sync_enabled"] is False
     assert loaded["webflow_batch_enabled"] is False
     assert loaded["openstates_scrape_enabled"] is True
+
+
+def test_task_flags_still_apply_when_secrets_manager_supplies_the_base_config(monkeypatch):
+    """SYNC-51, found live on the EC2-broker host: get_settings() picks EITHER Secrets Manager
+    OR .env for the whole config, never both -- so on any host where Secrets Manager succeeds
+    (every EC2 host with an instance role that can reach it), _load_from_env() -- and every
+    os.getenv() call inside it -- never ran, making the 12 per-task flags permanently inert
+    exactly where they're needed most. Setting the env vars in the container's real
+    environment had zero effect. This reproduces that exact scenario: a Secrets Manager
+    payload that predates SYNC-51 (no flag keys in it at all, matching the real
+    ddp-sync/credentials secret today) combined with real env vars set in the process."""
+    monkeypatch.setenv("VOATZ_SYNC_ENABLED", "false")
+    monkeypatch.setenv("OPENSTATES_SCRAPE_ENABLED", "true")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={"api_key": "from-secrets-manager"},  # no flag keys -- the real secret's shape
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"  # confirms Secrets Manager path was taken
+        assert settings.voatz_sync_enabled is False
+        assert settings.openstates_scrape_enabled is True
+        # A flag with no env var set at all still falls back to the dataclass default (True),
+        # not to whatever Secrets Manager omitted -- there's no flag key in that payload either.
+        assert settings.webflow_batch_enabled is True
+    finally:
+        get_settings.cache_clear()
