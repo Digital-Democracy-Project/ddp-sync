@@ -407,10 +407,30 @@ openstates_scrape:
   # Rollback is therefore two separate edits with two separate effects: remove from
   # `jurisdictions` to stop cloud collecting it (mac resumes); `memory_backend_jurisdictions`
   # stays as it is, permanently, once a jurisdiction has ever appeared there.
+  #
+  # OPEN-193: once `enabled: true` and a jurisdiction is listed, `_run_scrape()` no longer just
+  # skips it -- it triggers a real Fargate collection and loads the result into RDS (see
+  # `pipelines/cloud_scrape_trigger.py`). `fargate` below is that trigger's own config, values
+  # deliberately left blank here: `cluster`/`task_definition`/`subnets`/`security_groups` name
+  # real AWS resources (`infra/fargate-spike` in `ddp-open-states`, same account this Mac's own
+  # `ddp-scraper` IAM user cannot fully see into) that only whoever holds production AWS access
+  # can fill in correctly -- see `notes/ops-handoff` for the real values and the RDS credential
+  # this also needs (`RDS_DATABASE_URL`, an environment variable, never YAML).
   cloud_path:
     enabled: false
     jurisdictions: []
     memory_backend_jurisdictions: []
+    fargate:
+      cluster: ""              # e.g. "ddp-scrapers-prototype"
+      task_definition: ""      # e.g. "ddp-scraper-prototype" (family name or family:revision)
+      subnets: []               # private subnet IDs the task's ENI attaches to
+      security_groups: []       # security group IDs allowing egress to source sites + RDS
+      container_name: "scraper" # matches the task definition's container name
+      memory_bucket: ""         # S3 bucket cloud_collector.py/cloud_loader.py share memory in
+      memory_prefix: "prod"     # matches cloud_collector.py's own MEMORY_PREFIX convention
+      max_wait_seconds: 43200   # 12h backstop; MA's cold-start rehearsal run took ~9.5h
+      load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
+                                  # loads were minutes even for multi-thousand-row jurisdictions
 
   # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
   #
