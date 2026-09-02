@@ -172,7 +172,13 @@ def _run_fargate_collection(
     itself -- OOM, spot interruption -- or this function's own wait gave up first, in which
     case it also asked ECS to stop the task -- see `_stop_orphaned_task()`).
     """
-    command = ["python3", "cloud_collector.py", jurisdiction]
+    # OPEN-242: docker-entrypoint.sh already runs `exec python3 /app/cloud_collector.py "$@"`,
+    # and an ECS `command` override replaces CMD/ARGS, not ENTRYPOINT -- so this list becomes
+    # that entrypoint's own "$@". Prepending "python3"/"cloud_collector.py" here double-ran the
+    # interpreter and script name as if they were the jurisdiction/session args themselves
+    # (`python3 cloud_collector.py python3 cloud_collector.py fl session=2026`), which
+    # cloud_collector.py then choked on trying to parse as key=value arguments.
+    command = [jurisdiction]
     if session_arg:
         command.append(session_arg)
 

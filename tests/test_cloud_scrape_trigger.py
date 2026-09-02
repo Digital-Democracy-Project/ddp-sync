@@ -229,8 +229,10 @@ def test_session_arg_reaches_both_collection_command_and_loader_command():
             ecs_client=ecs, subprocess_runner=fake_subprocess,
         )
 
+    # OPEN-242: docker-entrypoint.sh already runs `python3 /app/cloud_collector.py "$@"`, so
+    # the override must be just the entrypoint's own args, not another python3/script prefix.
     collect_cmd = ecs.run_task_calls[0]["overrides"]["containerOverrides"][0]["command"]
-    assert collect_cmd == ["python3", "cloud_collector.py", "va", "session=2027"]
+    assert collect_cmd == ["va", "session=2027"]
     assert captured["cmd"][-1] == "session=2027"
 
 
