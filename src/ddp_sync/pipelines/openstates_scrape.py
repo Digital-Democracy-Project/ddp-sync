@@ -88,6 +88,16 @@ SCRAPE_TIMEOUT_S: dict[str, int] = {
 
 
 def _get_root(config: dict | None) -> str:
+    """OPEN-243: openstates_root is inherently per-host (each ddp-sync host has its own
+    checkout path), but sync_schedule.yaml is a single, checked-in file every host pulls via
+    git identically -- so a value set there (as openstates_root is, under both
+    openstates_scrape: and openstates_archive:) can only ever be one host's path at a time.
+    Found live on the EC2-broker host: the checked-in value was the Mac Studio's path,
+    breaking cloud_loader.py's invocation on every other host. An env var lets a host override
+    its real path without touching the shared YAML -- same shape as REDIS_URL in config.py."""
+    env_root = os.getenv("OPENSTATES_ROOT")
+    if env_root:
+        return env_root
     return (config or {}).get("openstates_root", DEFAULT_OPENSTATES_ROOT)
 
 
