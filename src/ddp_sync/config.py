@@ -426,6 +426,28 @@ def _load_from_secrets_manager() -> dict | None:
         return None
 
 
+# SYNC-51: these 12 per-task scheduling flags are deliberately per-HOST -- the whole point is
+# that different ddp-sync hosts enable different tasks. They are NOT part of the shared
+# `ddp-sync/credentials` Secrets Manager blob every host reads identically (putting one host's
+# flag values there would silently override every other host's flags too, since it's the same
+# secret). A single source of truth for the env-var name per field, used both by
+# _load_from_env() below and by get_settings()'s override pass, so the two can never drift.
+_TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
+    "bill_sync_enabled": "BILL_SYNC_ENABLED",
+    "legislator_sync_enabled": "LEGISLATOR_SYNC_ENABLED",
+    "legislator_bio_sync_enabled": "LEGISLATOR_BIO_SYNC_ENABLED",
+    "organization_sync_enabled": "ORGANIZATION_SYNC_ENABLED",
+    "voatz_sync_enabled": "VOATZ_SYNC_ENABLED",
+    "webflow_batch_enabled": "WEBFLOW_BATCH_ENABLED",
+    "votebot_eval_enabled": "VOTEBOT_EVAL_ENABLED",
+    "api_health_check_enabled": "API_HEALTH_CHECK_ENABLED",
+    "openstates_scrape_enabled": "OPENSTATES_SCRAPE_ENABLED",
+    "openstates_archive_enabled": "OPENSTATES_ARCHIVE_ENABLED",
+    "mi_cookie_publish_enabled": "MI_COOKIE_PUBLISH_ENABLED",
+    "session_pipeline_batch_enabled": "SESSION_PIPELINE_BATCH_ENABLED",
+}
+
+
 def _load_from_env() -> dict:
     """Fallback: build config dict from environment variables."""
     global _config_source
@@ -471,18 +493,10 @@ def _load_from_env() -> dict:
         "environment": os.getenv("ENVIRONMENT", "production"),
         "debug": os.getenv("DEBUG", "false").lower() == "true",
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
-        "bill_sync_enabled": os.getenv("BILL_SYNC_ENABLED", "true").lower() == "true",
-        "legislator_sync_enabled": os.getenv("LEGISLATOR_SYNC_ENABLED", "true").lower() == "true",
-        "legislator_bio_sync_enabled": os.getenv("LEGISLATOR_BIO_SYNC_ENABLED", "true").lower() == "true",
-        "organization_sync_enabled": os.getenv("ORGANIZATION_SYNC_ENABLED", "true").lower() == "true",
-        "voatz_sync_enabled": os.getenv("VOATZ_SYNC_ENABLED", "true").lower() == "true",
-        "webflow_batch_enabled": os.getenv("WEBFLOW_BATCH_ENABLED", "true").lower() == "true",
-        "votebot_eval_enabled": os.getenv("VOTEBOT_EVAL_ENABLED", "true").lower() == "true",
-        "api_health_check_enabled": os.getenv("API_HEALTH_CHECK_ENABLED", "true").lower() == "true",
-        "openstates_scrape_enabled": os.getenv("OPENSTATES_SCRAPE_ENABLED", "true").lower() == "true",
-        "openstates_archive_enabled": os.getenv("OPENSTATES_ARCHIVE_ENABLED", "true").lower() == "true",
-        "mi_cookie_publish_enabled": os.getenv("MI_COOKIE_PUBLISH_ENABLED", "true").lower() == "true",
-        "session_pipeline_batch_enabled": os.getenv("SESSION_PIPELINE_BATCH_ENABLED", "true").lower() == "true",
+        **{
+            field: os.getenv(env_var, "true").lower() == "true"
+            for field, env_var in _TASK_ENABLE_FLAG_ENV_VARS.items()
+        },
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
         "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
@@ -561,6 +575,22 @@ def get_settings() -> SyncSettings:
     # Build SyncSettings from dict, ignoring unknown keys
     known_fields = {f for f in SyncSettings.__dataclass_fields__}
     filtered = {k: v for k, v in raw.items() if k in known_fields}
+
+    # SYNC-51 (found live on the EC2-broker host, 2026-09-02): the branch above is all-or-
+    # nothing between Secrets Manager and .env -- on any host where Secrets Manager succeeds
+    # (every EC2 host with an instance role that can reach it, which is most of them),
+    # _load_from_env() -- and every os.getenv() call inside it -- never runs at all. That made
+    # the 12 per-task flags above permanently inert wherever they're actually needed: setting
+    # them in a container's real environment had zero effect, because the code that would read
+    # them was never reached. These flags are deliberately per-HOST (the whole point of
+    # SYNC-51) and are never part of the shared `ddp-sync/credentials` secret every host reads
+    # identically, so unlike every other setting here, they always come from THIS process's own
+    # environment when explicitly set, regardless of which branch supplied everything else.
+    for field_name, env_var in _TASK_ENABLE_FLAG_ENV_VARS.items():
+        env_value = os.getenv(env_var)
+        if env_value is not None:
+            filtered[field_name] = env_value.lower() == "true"
+
     return SyncSettings(**filtered)
 
 
