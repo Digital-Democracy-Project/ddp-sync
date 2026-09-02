@@ -8,6 +8,18 @@ networks:
   ddp-broker-py_default:
     external: true
 
+# pm-review: the Dockerfile's openstates-builder stage reads a BuildKit secret
+# (`--mount=type=secret,id=github_token`), but a bare `additional_contexts` entry doesn't
+# supply it -- `docker compose build` needs its own explicit wiring, or the build fails at
+# the git-clone step with "No such file or directory: /run/secrets/github_token". Sourced
+# from an environment variable (GITHUB_PERSONAL_ACCESS_TOKEN, already required in ../.env
+# for the same PAT the root ddp-open-states Dockerfile's own build already uses), not a file
+# on disk -- consistent with every other secret this host already keeps in .env rather than
+# a separate credential file.
+secrets:
+  github_token:
+    environment: GITHUB_PERSONAL_ACCESS_TOKEN
+
 services:
   ddp-sync:
     build:
@@ -20,6 +32,8 @@ services:
       # avoids a second copy of a ~150-line pinned-dependency file that would only drift.
       additional_contexts:
         - openstates=/opt/ddp-open-states
+      secrets:
+        - github_token
     image: ddp-sync:prod
     env_file:
       - ../.env

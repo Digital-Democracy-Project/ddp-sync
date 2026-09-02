@@ -126,15 +126,25 @@ COPY --from=openstates-builder /opt/venv-openstates /opt/venv-openstates
 COPY --from=openstates-builder /opt/openstates-core /opt/openstates-core
 COPY --from=openstates-builder /opt/openstates-scrapers /opt/openstates-scrapers
 
+# pm-review: PYTHONPATH pointing at openstates-scrapers must not leak into ddp-sync's OWN
+# Python 3.11 app -- a bare `ENV PYTHONPATH=...` here would apply to every process in this
+# image, this one included. Checked live that nothing in ddp-sync's own source or the
+# openstates-scrapers top-level package names (two-letter state codes, "utils", "config",
+# "usa") actually collides today, but "checked safe today" isn't the same guarantee as
+# "structurally can't leak" -- a thin wrapper scopes it correctly by construction: exported
+# only inside this script's own exec, never touching ddp-sync's own already-running
+# environment. openstates-scrapers is deliberately NOT pip-installed (its pyproject.toml's
+# pre-poetry-core backend has no PEP 660 editable-install support, per the root Dockerfile's
+# own note), so its scrapers/ subdirectory is pointed at this way instead of an install.
+RUN printf '#!/bin/sh\nexport PYTHONPATH=/opt/openstates-scrapers/scrapers\nexec /opt/venv-openstates/bin/os-update "$@"\n' \
+        > /opt/venv-openstates/bin/os-update-wrapper \
+    && chmod +x /opt/venv-openstates/bin/os-update-wrapper
+
 # cloud_loader.py's _run_import() does `os.environ.get("OS_UPDATE", "os-update")` with no
 # explicit `env=` override on its own subprocess.Popen call, so it inherits this container's
-# full environment -- these two vars are what actually make that inherited environment point
-# at the bundled toolchain rather than a bare, unresolvable "os-update" PATH lookup.
-# PYTHONPATH matches the root Dockerfile's own note: openstates-scrapers is deliberately NOT
-# pip-installed (its pyproject.toml's pre-poetry-core backend has no PEP 660 editable-install
-# support), so its scrapers/ subdirectory is pointed at directly instead.
-ENV OS_UPDATE=/opt/venv-openstates/bin/os-update
-ENV PYTHONPATH=/opt/openstates-scrapers/scrapers
+# full environment -- this is what actually makes that inherited environment point at the
+# bundled toolchain rather than a bare, unresolvable "os-update" PATH lookup.
+ENV OS_UPDATE=/opt/venv-openstates/bin/os-update-wrapper
 
 USER python
 WORKDIR /app
