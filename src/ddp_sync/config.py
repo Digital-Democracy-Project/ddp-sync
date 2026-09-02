@@ -591,6 +591,16 @@ def get_settings() -> SyncSettings:
         if env_value is not None:
             filtered[field_name] = env_value.lower() == "true"
 
+    # OPEN-193 (found live on the same EC2-broker host, 2026-09-02, verifying the flag fix
+    # above): identical bug, different field. redis_url is host-specific in the same way the
+    # 12 flags are -- different hosts point at different Redis instances/DBs -- but it isn't
+    # one of them, so REDIS_URL set in the container's real environment was silently losing to
+    # the `ddp-sync/credentials` secret's own stored redis_url whenever Secrets Manager
+    # supplied the base config.
+    env_redis_url = os.getenv("REDIS_URL")
+    if env_redis_url is not None:
+        filtered["redis_url"] = env_redis_url
+
     return SyncSettings(**filtered)
 
 
