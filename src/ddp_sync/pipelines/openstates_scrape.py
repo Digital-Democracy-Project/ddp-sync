@@ -1139,29 +1139,32 @@ async def _run_scrape(
     this has no live effect yet -- real cloud-owned resolution is a separate,
     unscoped piece of work for whenever that changes.
 
-    The hook call itself is wrapped in a catch-all: pm-review (round 1) found
-    `_maybe_trigger_legbot_for_scrape`'s own internal try/excepts don't cover its
-    `get_settings()` call or its lazy imports, so an exception there would have
-    escaped a wrapper that must never turn an already-successful scrape into a
-    failure.
+    The whole post-success block -- the cloud-ownership check AND the hook call --
+    is wrapped in one catch-all: pm-review (round 1) found the original version
+    only wrapped the hook call itself, leaving `_cloud_path_owns()` free to escape
+    and turn an already-successful scrape into a raised exception if it ever
+    raised. `_cloud_path_owns()` is a pure config read and not expected to raise
+    in practice, but this wrapper's own contract is "nothing after a successful
+    scrape may change that scrape's result," not "nothing we currently believe
+    can raise" -- so it's inside the same try, not exempted on that assumption.
     """
     scrape_started_at = datetime.now(timezone.utc)
     result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
     if result.get("success"):
-        if _cloud_path_owns(jurisdiction, config):
-            logger.info(
-                "scraper_triggered_legbot_skipped_cloud_owned",
-                jurisdiction=jurisdiction,
-            )
-        else:
-            try:
-                await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
-            except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
-                logger.error(
-                    "scraper_triggered_legbot_hook_failed",
+        try:
+            if _cloud_path_owns(jurisdiction, config):
+                logger.info(
+                    "scraper_triggered_legbot_skipped_cloud_owned",
                     jurisdiction=jurisdiction,
-                    error=str(e),
                 )
+            else:
+                await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
+        except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+            logger.error(
+                "scraper_triggered_legbot_hook_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
     return result
 
 

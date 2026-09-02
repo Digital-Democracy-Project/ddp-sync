@@ -311,3 +311,29 @@ async def test_run_scrape_isolates_a_hook_exception_from_the_scrape_result(monke
         result = await _run_scrape("mi", None, "/fake/root")  # must not raise
 
     assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_isolates_a_cloud_ownership_check_exception_too(monkeypatch):
+    """pm-review round 2: round 1's fix wrapped the hook call but left
+    _cloud_path_owns() itself outside the try/except -- exercised here directly,
+    since the wrapper's contract is "nothing after a successful scrape may change
+    that scrape's result," not "nothing we currently believe can raise"."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
+        AsyncMock(return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0}),
+    )
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._cloud_path_owns",
+            side_effect=RuntimeError("config blew up"),
+        ),
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._maybe_trigger_legbot_for_scrape",
+            new=AsyncMock(),
+        ) as mock_hook,
+    ):
+        result = await _run_scrape("mi", None, "/fake/root")  # must not raise
+
+    assert result["success"] is True
+    mock_hook.assert_not_awaited()

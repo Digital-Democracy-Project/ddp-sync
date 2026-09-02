@@ -782,6 +782,21 @@ async def resolve_touched_sessions(
         never-abort posture as list_current_session_bill_candidates above:
         a resolution failure should skip triggering for this scrape, not
         crash the scrape job that already succeeded.
+
+        A failure partway through pagination (a later page's request fails,
+        or the cap is hit -- see the truncation warning below) returns
+        whatever sessions the earlier pages already found, rather than
+        discarding them: for pm-review's "does a later scrape recover a
+        session missed this way" question -- yes for the common case, no in
+        the worst case. An active legislative session gets scraped
+        repeatedly for as long as it stays active, so a session missed on
+        one run's truncated resolution is very likely to be found again (and
+        triggered then) on the next run that touches it. The genuine gap is
+        a session that goes dormant for the rest of this scrape cycle
+        immediately after being missed -- accepted here rather than solved,
+        since solving it needs either raising the cap (same failure mode
+        recurs at a larger size) or a reconciliation mechanism, which is
+        more machinery than this ticket's scope calls for.
     """
     settings = get_settings()
     if not settings.local_openstates_api_base or max_bills_scanned <= 0:
