@@ -449,29 +449,47 @@ def _finish_after_launch(
 
 
 def resume_inflight_fargate_job(
-    record: dict[str, Any], *, ecs_client=None, subprocess_runner=None
+    run_id: str, record: dict[str, Any], *, ecs_client=None, subprocess_runner=None
 ) -> dict[str, Any]:
     """Finish a Fargate job a previous ddp-sync process left in-flight (OPEN-251).
 
-    `record` is exactly what `run_cloud_scrape()` persisted via `inflight_fargate_jobs.
-    record_started()` at launch time: jurisdiction, session_arg, run_id, task_arn, fargate_cfg,
-    openstates_root. Resuming replays the same decisions the original launch already made, not
-    whatever sync_schedule.yaml says right now -- there is no re-read of live config here.
+    `run_id` is the Redis Hash field itself (from `inflight_fargate_jobs.list_inflight()`'s own
+    keys), passed separately from `record` rather than trusted to also be correct *inside* the
+    JSON payload (pm-review, round 1) -- a record can still be identified and cleared by its
+    real key even if its payload is partially malformed. `record` is otherwise exactly what
+    `run_cloud_scrape()` persisted via `record_started()` at launch time: jurisdiction,
+    session_arg, task_arn, fargate_cfg, openstates_root. Resuming replays the same decisions
+    the original launch already made, not whatever sync_schedule.yaml says right now -- there
+    is no re-read of live config here.
 
-    Always clears the record when done, success or failure alike, exactly like
-    `run_cloud_scrape()` does for a fresh run -- this call is itself the reconciliation, so once
-    it returns there is nothing left to resume a second time.
+    Runs unobserved on its own background thread (`asyncio.to_thread`, see
+    `reconcile_inflight_fargate_jobs()`), so -- exactly like `run_cloud_scrape()`'s own outer
+    guarantee for a fresh run (pm-review, round 1) -- nothing may escape this function
+    uncaught: a malformed record, an ECS client construction failure, anything. The whole
+    point of this function existing is to stop a job from disappearing without a trace: an
+    uncaught exception here, on a background task nothing is awaiting, would do exactly that
+    silently, which is worse than the restart this is meant to recover from.
+
+    Always clears the record when done -- success, a normal reported failure, or this
+    function's own unexpected-exception path alike -- exactly like `run_cloud_scrape()` does
+    for a fresh run. Safe to do unconditionally because every one of those paths also alerts
+    first: a cleared-but-still-broken run is never silent, only ever loudly reported.
     """
-    jurisdiction = record["jurisdiction"]
-    session_arg = record.get("session_arg")
-    run_id = record["run_id"]
-    task_arn = record["task_arn"]
-    fargate_cfg = record["fargate_cfg"]
-    openstates_root = record["openstates_root"]
-    label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
+    from ddp_sync.pipelines.openstates_scrape import (
+        _alert_scrape_failure,
+        classify_failure_reason,
+    )
 
-    client = ecs_client or boto3.client("ecs")
+    start = time.monotonic()
     try:
+        jurisdiction = record["jurisdiction"]
+        session_arg = record.get("session_arg")
+        task_arn = record["task_arn"]
+        fargate_cfg = record["fargate_cfg"]
+        openstates_root = record["openstates_root"]
+        label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
+
+        client = ecs_client or boto3.client("ecs")
         return _finish_after_launch(
             jurisdiction,
             session_arg,
@@ -483,8 +501,46 @@ def resume_inflight_fargate_job(
             subprocess_runner,
             label,
         )
+    except Exception as e:  # noqa: BLE001 -- see docstring: nothing may escape uncaught here
+        duration = round(time.monotonic() - start, 1)
+        logger.error(
+            "cloud_scrape: resuming an in-flight job failed unexpectedly",
+            run_id=run_id,
+            error=str(e),
+        )
+        _alert_scrape_failure(f"resume:{run_id}", str(e), duration)
+        return {
+            "success": False,
+            "error": str(e),
+            "failure_reason": classify_failure_reason("exit_code_unexpected", str(e)),
+            "cloud_run_id": run_id,
+            "duration_seconds": duration,
+        }
     finally:
         inflight_fargate_jobs.clear(run_id)
+
+
+# Reconciliation tasks are otherwise unreferenced once reconcile_inflight_fargate_jobs()
+# returns (pm-review, round 1): asyncio only holds a WEAK reference to a task created via
+# create_task, so with nothing else keeping it alive it can be garbage-collected mid-run,
+# silently abandoning the very job this whole mechanism exists to not lose track of. Kept
+# here for the process lifetime, and each one's own outcome logged via a done-callback --
+# resume_inflight_fargate_job() should already guarantee it never raises (see its own
+# docstring), so this callback firing with an exception is itself a bug worth knowing about,
+# not the primary safety net.
+_reconciliation_tasks: set[asyncio.Task] = set()
+
+
+def _log_reconciliation_outcome(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "cloud_scrape: a resumed job's background task raised despite its own "
+            "guarantee not to -- this is a bug in resume_inflight_fargate_job() itself",
+            error=str(exc),
+        )
 
 
 def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
@@ -499,6 +555,13 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
     Each resumed job runs on its own background thread via `asyncio.to_thread`, exactly like a
     fresh `run_cloud_scrape()` call is already run from `openstates_scrape.py` -- this function
     itself never blocks, so it never delays app startup.
+
+    A resumed wait starts its own fresh `max_wait_seconds` budget (`_wait_for_task_stop()` has
+    no memory of how long a previous process already waited) -- deliberately not fixed, same
+    reasoning as `_finish_after_launch()`'s own `duration_seconds` note: only a restart-heavy
+    jurisdiction would ever stack enough resumed waits to matter, and persisting/reconciling
+    the original wall-clock launch time across processes just to tighten a safety-net timeout
+    is not proportionate to how rarely ddp-sync actually restarts mid-run.
     """
     records = inflight_fargate_jobs.list_inflight()
     tasks = []
@@ -509,7 +572,13 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
             jurisdiction=record.get("jurisdiction"),
             task_arn=record.get("task_arn"),
         )
-        tasks.append(asyncio.create_task(asyncio.to_thread(resume_inflight_fargate_job, record)))
+        task = asyncio.create_task(
+            asyncio.to_thread(resume_inflight_fargate_job, run_id, record)
+        )
+        _reconciliation_tasks.add(task)
+        task.add_done_callback(_reconciliation_tasks.discard)
+        task.add_done_callback(_log_reconciliation_outcome)
+        tasks.append(task)
     return tasks
 
 
