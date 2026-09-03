@@ -178,9 +178,23 @@ def _run_fargate_collection(
     # interpreter and script name as if they were the jurisdiction/session args themselves
     # (`python3 cloud_collector.py python3 cloud_collector.py fl session=2026`), which
     # cloud_collector.py then choked on trying to parse as key=value arguments.
+    # SYNC-54: session_arg can itself carry more than one key=value pair space-separated
+    # (USA's own config is literally "119 chamber=lower" -- one combined string, not separate
+    # session/chamber values). The Mac-side path tolerates this by accident: run-scrape.sh
+    # interpolates this same value UNQUOTED when building its own os-update invocation, so
+    # bash's own word-splitting silently re-splits it into two real argv tokens before
+    # os-update ever sees it. There is no shell anywhere in this path -- ECS's
+    # containerOverrides.command is a literal JSON array -- so nothing re-splits it here.
+    # Found live: USA's cloud-path canary got "session=119 chamber=lower" as ONE argv token,
+    # cloud_collector.py's parse_kv_args() (split on the first "=" only) parsed it as a single
+    # garbage key=value pair, and USBillScraper's sitemap filter then matched nothing at all
+    # -- a real crawl silently returning zero bills, not the ambiguous no-op case OPEN-244
+    # exists for. .split() reproduces the same effective argv bash's word-splitting has always
+    # produced for the Mac path; for the common case (no spaces) this is a one-element list,
+    # identical to appending the string directly.
     command = [jurisdiction]
     if session_arg:
-        command.append(session_arg)
+        command.extend(session_arg.split())
 
     container_name = fargate_cfg.get("container_name", "scraper")
     try:
@@ -286,7 +300,11 @@ def _run_load(
     script = os.path.join(openstates_root, "cloud_loader.py")
     cmd = ["python3", script, jurisdiction, run_id]
     if session_arg:
-        cmd.append(session_arg)
+        # SYNC-54: same fix as _run_fargate_collection() -- session_arg can carry more than
+        # one key=value pair space-separated (USA's own config), and this subprocess call has
+        # no shell to word-split it the way the Mac path's bash invocation of run-scrape.sh
+        # does by accident. .split() is a no-op for the common single-pair case.
+        cmd.extend(session_arg.split())
 
     env = {
         **os.environ,
