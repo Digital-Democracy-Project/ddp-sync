@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import botocore.exceptions
 import pytest
+from boto3.exceptions import S3UploadFailedError
 
 from ddp_sync.pipelines.mi_cookie_publish import (
     DEFAULT_SCRAPER_MEMORY_S3_BUCKET,
@@ -129,13 +130,17 @@ async def test_never_raises_when_mint_fails(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_never_raises_when_publish_fails_with_a_client_error(monkeypatch):
-    """The AccessDenied/NoSuchBucket-shaped failure -- boto3's real exception for an S3 API
-    error, the equivalent of the old wrapper's nonzero exit."""
+    """The AccessDenied/NoSuchBucket-shaped failure -- the equivalent of the old wrapper's
+    nonzero exit. boto3's real upload_file() never lets a raw botocore.exceptions.ClientError
+    escape: S3Transfer.upload_file catches it internally and re-raises
+    boto3.exceptions.S3UploadFailedError instead (confirmed by reading that method's source),
+    so that's the exception this test -- and the real code -- has to handle."""
     monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
     mock_client = _fake_s3_client(
         upload_file_mock=MagicMock(
-            side_effect=botocore.exceptions.ClientError(
-                {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "PutObject"
+            side_effect=S3UploadFailedError(
+                "Failed to upload x to y/z: An error occurred (AccessDenied) when calling "
+                "the PutObject operation: denied"
             )
         )
     )

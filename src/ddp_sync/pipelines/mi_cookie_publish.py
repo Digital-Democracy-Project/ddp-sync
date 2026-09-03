@@ -43,8 +43,8 @@ import os
 import tempfile
 
 import boto3
-import botocore.exceptions
 import structlog
+from boto3.exceptions import S3UploadFailedError
 
 from ddp_sync.services import scrapebot_client
 
@@ -100,9 +100,15 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
     # An earlier pm-review already established the "never raises past this point" contract
     # this try/except exists to keep (a malformed mint_result or a write_cookie_cache failure
     # must not crash the scheduler); SYNC-53 extends the same contract to the S3 upload itself
-    # (bad/missing credentials, AccessDenied, a network blip). boto3's own default connect/read
-    # timeouts (60s each) already bound a hang the same way the old subprocess `timeout=60` did
-    # -- no extra timeout plumbing needed to keep that same ceiling.
+    # (bad/missing credentials, AccessDenied, a network blip). A second pm-review pass caught
+    # that upload_file() itself never lets a raw botocore.exceptions.ClientError escape --
+    # boto3's own S3Transfer.upload_file wraps any ClientError it hits in
+    # boto3.exceptions.S3UploadFailedError (confirmed by reading that method's source), a plain
+    # Exception subclass, not a ClientError subclass -- so catching ClientError here would never
+    # actually fire, and every real upload failure would fall through to the generic
+    # "unexpected_error" branch below instead of "publish_failed". boto3's own default
+    # connect/read timeouts (60s each) still bound a hang the same way the old subprocess
+    # `timeout=60` did -- no extra timeout plumbing needed to keep that same ceiling.
     key = _publish_key(prefix)
     try:
         with tempfile.TemporaryDirectory(prefix="mi-cookie-publish-") as tmp:
@@ -111,10 +117,11 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
                 local_path, cookies=mint_result["cookies"], user_agent=mint_result["user_agent"]
             )
             boto3.client("s3").upload_file(local_path, bucket, key)
-    except botocore.exceptions.ClientError as e:
+    except S3UploadFailedError as e:
         logger.error(
             "mi_cookie_publish: publish to S3 failed -- the previously published "
             "cookie (if any) is unchanged",
+            bucket=bucket,
             error=str(e),
         )
         return {"success": False, "reason": "publish_failed", "error": str(e)}
@@ -126,5 +133,5 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
         )
         return {"success": False, "reason": "unexpected_error", "error": str(e)}
 
-    logger.info("mi_cookie_publish: published fresh Michigan WAF cookies", key=key)
+    logger.info("mi_cookie_publish: published fresh Michigan WAF cookies", bucket=bucket, key=key)
     return {"success": True, "key": key}
