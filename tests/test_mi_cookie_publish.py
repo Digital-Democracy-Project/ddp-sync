@@ -1,4 +1,4 @@
-"""Tests for mi_cookie_publish.py (OPEN-188).
+"""Tests for mi_cookie_publish.py (OPEN-188, SYNC-53).
 
 Mirrors test_openstates_archive_scrapebot_preseed.py's mocking style. The acceptance
 question is not "does it call ScrapeBot" -- it is:
@@ -11,26 +11,34 @@ question is not "does it call ScrapeBot" -- it is:
   * the S3 key this job publishes to matches scraper_memory_cache_key's own formula
     exactly, since cloud_collector.py's S3Memory.cache_key() and scraper-memory.sh's
     scraper_memory_cache_key() both have to agree on it independently.
+  * SYNC-53: the publish actually lands in the real scraper-memory bucket
+    (ddp-openstates-scraper-memory by default), not just that "some S3 call" happened --
+    the whole bug this ticket fixes was a publish that "succeeded" while silently
+    targeting the wrong bucket.
 """
 
 from __future__ import annotations
 
-import subprocess
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+import botocore.exceptions
 import pytest
+from boto3.exceptions import S3UploadFailedError
 
-from ddp_sync.pipelines.mi_cookie_publish import _publish_key, run_mi_cookie_publish_job
+from ddp_sync.pipelines.mi_cookie_publish import (
+    DEFAULT_SCRAPER_MEMORY_S3_BUCKET,
+    _publish_key,
+    run_mi_cookie_publish_job,
+)
 from ddp_sync.services.scrapebot_client import ScrapeBotDispatchError
 
 _MINT_RESULT = {"cookies": [{"name": "x", "value": "y", "expires": 0}], "user_agent": "ua"}
 
 
-def _completed_process(returncode=0, stderr=""):
-    proc = MagicMock(spec=subprocess.CompletedProcess)
-    proc.returncode = returncode
-    proc.stderr = stderr
-    return proc
+def _fake_s3_client(upload_file_mock=None):
+    client = MagicMock()
+    client.upload_file = upload_file_mock or MagicMock()
+    return client
 
 
 def test_publish_key_matches_scraper_memory_cache_key_shape():
@@ -51,14 +59,15 @@ async def test_refuses_when_scraper_memory_prefix_is_not_set(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_publishes_on_a_successful_mint(monkeypatch):
+async def test_publishes_to_the_real_scraper_memory_bucket_by_default(monkeypatch):
+    """SYNC-53's own regression case: the whole bug was a publish that reported success
+    while silently landing in the deprecated ddp-openstates-backups bucket instead of
+    ddp-openstates-scraper-memory (the one cloud_collector.py's S3Memory actually reads
+    MI's cookie from). Asserts the real default bucket name, not just that upload_file
+    was called with *some* arguments."""
     monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
-    monkeypatch.setenv("SCRAPER_MEMORY_S3_CMD", "fake-s3-wrapper")
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return _completed_process(returncode=0)
+    monkeypatch.delenv("SCRAPER_MEMORY_S3_BUCKET", raising=False)
+    mock_client = _fake_s3_client()
 
     with patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
@@ -67,16 +76,40 @@ async def test_publishes_on_a_successful_mint(monkeypatch):
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
     ) as mock_write, patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run", side_effect=fake_run
-    ):
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client", return_value=mock_client
+    ) as mock_boto_client:
         result = await run_mi_cookie_publish_job()
 
     mock_dispatch.assert_awaited_once_with("mi")
     mock_write.assert_called_once()
-    assert captured["cmd"][0] == "fake-s3-wrapper"
-    assert captured["cmd"][1] == "put"
-    assert captured["cmd"][3] == "prod/mi/_cache/mi_waf_cookies.json"
+    mock_boto_client.assert_called_once_with("s3", config=ANY)
+    assert mock_boto_client.call_args.kwargs["config"].retries == {"max_attempts": 1}
+    mock_client.upload_file.assert_called_once()
+    call_args = mock_client.upload_file.call_args.args
+    assert call_args[1] == DEFAULT_SCRAPER_MEMORY_S3_BUCKET == "ddp-openstates-scraper-memory"
+    assert call_args[2] == "prod/mi/_cache/mi_waf_cookies.json"
     assert result == {"success": True, "key": "prod/mi/_cache/mi_waf_cookies.json"}
+
+
+@pytest.mark.asyncio
+async def test_honors_an_explicit_scraper_memory_s3_bucket_override(monkeypatch):
+    monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
+    monkeypatch.setenv("SCRAPER_MEMORY_S3_BUCKET", "some-other-bucket")
+    mock_client = _fake_s3_client()
+
+    with patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
+        new_callable=AsyncMock,
+        return_value=_MINT_RESULT,
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
+    ), patch(
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client", return_value=mock_client
+    ):
+        result = await run_mi_cookie_publish_job()
+
+    assert mock_client.upload_file.call_args.args[1] == "some-other-bucket"
+    assert result["success"] is True
 
 
 @pytest.mark.asyncio
@@ -87,18 +120,31 @@ async def test_never_raises_when_mint_fails(monkeypatch):
         new_callable=AsyncMock,
         side_effect=ScrapeBotDispatchError("mint failed"),
     ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run"
-    ) as mock_run:
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client"
+    ) as mock_boto_client:
         result = await run_mi_cookie_publish_job()
 
-    mock_run.assert_not_called()
+    mock_boto_client.assert_not_called()
     assert result["success"] is False
     assert result["reason"] == "mint_failed"
 
 
 @pytest.mark.asyncio
-async def test_never_raises_when_publish_fails(monkeypatch):
+async def test_never_raises_when_publish_fails_with_a_client_error(monkeypatch):
+    """The AccessDenied/NoSuchBucket-shaped failure -- the equivalent of the old wrapper's
+    nonzero exit. boto3's real upload_file() never lets a raw botocore.exceptions.ClientError
+    escape: S3Transfer.upload_file catches it internally and re-raises
+    boto3.exceptions.S3UploadFailedError instead (confirmed by reading that method's source),
+    so that's the exception this test -- and the real code -- has to handle."""
     monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
+    mock_client = _fake_s3_client(
+        upload_file_mock=MagicMock(
+            side_effect=S3UploadFailedError(
+                "Failed to upload x to y/z: An error occurred (AccessDenied) when calling "
+                "the PutObject operation: denied"
+            )
+        )
+    )
     with patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
         new_callable=AsyncMock,
@@ -106,8 +152,7 @@ async def test_never_raises_when_publish_fails(monkeypatch):
     ), patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
     ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run",
-        return_value=_completed_process(returncode=1, stderr="AccessDenied"),
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client", return_value=mock_client
     ):
         result = await run_mi_cookie_publish_job()
 
@@ -116,7 +161,9 @@ async def test_never_raises_when_publish_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_never_raises_when_publish_times_out(monkeypatch):
+async def test_never_raises_when_boto3_client_construction_itself_fails(monkeypatch):
+    """No credentials configured at all (NoCredentialsError, a BotoCoreError subclass, not
+    a ClientError) must still come back structured, not crash the scheduler."""
     monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
     with patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
@@ -125,12 +172,13 @@ async def test_never_raises_when_publish_times_out(monkeypatch):
     ), patch(
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
     ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd="fake-s3-wrapper", timeout=60),
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client",
+        side_effect=botocore.exceptions.NoCredentialsError(),
     ):
         result = await run_mi_cookie_publish_job()
 
-    assert result == {"success": False, "reason": "publish_timed_out"}
+    assert result["success"] is False
+    assert result["reason"] == "unexpected_error"
 
 
 @pytest.mark.asyncio
@@ -147,31 +195,10 @@ async def test_never_raises_when_write_cookie_cache_raises(monkeypatch):
         "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache",
         side_effect=OSError("disk full"),
     ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run"
-    ) as mock_run:
+        "ddp_sync.pipelines.mi_cookie_publish.boto3.client"
+    ) as mock_boto_client:
         result = await run_mi_cookie_publish_job()
 
-    mock_run.assert_not_called()
-    assert result["success"] is False
-    assert result["reason"] == "unexpected_error"
-
-
-@pytest.mark.asyncio
-async def test_never_raises_when_the_s3_wrapper_is_not_executable(monkeypatch):
-    """A missing/non-executable SCRAPER_MEMORY_S3_CMD raises FileNotFoundError from
-    subprocess.run itself -- must come back structured, not crash the scheduler."""
-    monkeypatch.setenv("SCRAPER_MEMORY_PREFIX", "prod")
-    with patch(
-        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.dispatch_mint_cookies",
-        new_callable=AsyncMock,
-        return_value=_MINT_RESULT,
-    ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.scrapebot_client.write_cookie_cache"
-    ), patch(
-        "ddp_sync.pipelines.mi_cookie_publish.subprocess.run",
-        side_effect=FileNotFoundError("no such file: fake-s3-wrapper"),
-    ):
-        result = await run_mi_cookie_publish_job()
-
+    mock_boto_client.assert_not_called()
     assert result["success"] is False
     assert result["reason"] == "unexpected_error"

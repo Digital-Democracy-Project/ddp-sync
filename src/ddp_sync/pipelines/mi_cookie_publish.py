@@ -15,8 +15,22 @@ mac's own local cache before a scheduled Michigan scrape. This job does the same
 own independent schedule, and additionally publishes the result to S3 so a cloud run (which has
 no local cache to warm) can read it too.
 
-Publishing goes through the same sudo-gated wrapper scraper-memory.sh already uses for every
-other mac-side write to the memory store (SCRAPER_MEMORY_S3_CMD), at the identical cache key
+SYNC-53: publishing used to go through the same sudo-gated wrapper scraper-memory.sh uses for
+mac-side writes (SCRAPER_MEMORY_S3_CMD, default a wrapper around
+`/usr/local/ddp-db-proxy/s3-openstates-backups.sh`) -- but that wrapper still targets the OLD
+`ddp-openstates-backups` bucket, never repointed at `ddp-openstates-scraper-memory` (created
+2026-08-29 specifically for scraper memory/working-tier data, precisely so it would NOT be
+subject to the backups bucket's own 30-day deletion lifecycle rule). Confirmed live: every
+scheduled publish "succeeded" (the wrapper exited 0) while silently writing to a bucket
+cloud_collector.py's S3Memory never reads, leaving the real target's copy frozen since the
+migration -- ~4 days stale before this was noticed.
+
+Now writes directly via boto3 straight to SCRAPER_MEMORY_S3_BUCKET, the same shape
+cloud_collector.py's own S3Memory.store() already uses for this exact bucket (a plain
+`upload_file`, no sudo, no intermediate wrapper script to fall out of sync with a bucket
+migration again) -- rather than pointing SCRAPER_MEMORY_S3_CMD at a second wrapper script that
+would need its own deploy to every host and would reproduce the same "shared indirection can
+silently drift" shape this bug already demonstrated once. At the identical cache key
 scraper_memory_cache_key("mi", "mi_waf_cookies.json") computes
 (`${SCRAPER_MEMORY_PREFIX}/mi/_cache/mi_waf_cookies.json`) -- the same key
 cloud_collector.py's own S3Memory.cache_key() and _MI_WAF_COOKIE_GLOB already read from,
@@ -26,10 +40,12 @@ so nothing on the reading side needs to change to find what this job writes.
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 
+import boto3
 import structlog
+from boto3.exceptions import S3UploadFailedError
+from botocore.config import Config
 
 from ddp_sync.services import scrapebot_client
 
@@ -37,6 +53,18 @@ logger = structlog.get_logger()
 
 JURISDICTION = "mi"
 CACHE_FILENAME = "mi_waf_cookies.json"
+
+# SYNC-53: the bucket cloud_collector.py's own S3Memory already reads MI's published cookie
+# from -- see this module's own docstring for why the old sudo-gated wrapper's default no
+# longer belongs here.
+DEFAULT_SCRAPER_MEMORY_S3_BUCKET = "ddp-openstates-scraper-memory"
+
+# SYNC-53 pm-review: botocore's default retry mode ("legacy") retries a failed upload up to
+# 5 times, each attempt with its own 60s connect + 60s read timeout -- a worst-case wall time
+# in the multiple-minutes range, not the single subprocess.run(timeout=60) ceiling this job had
+# before. A single attempt (no retries) keeps that same rough ceiling: at most one 60s connect
+# + 60s read, matching what the old wrapper call actually bounded.
+_S3_CLIENT_CONFIG = Config(retries={"max_attempts": 1})
 
 
 def _publish_key(prefix: str) -> str:
@@ -55,7 +83,7 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
     cloud_collector.py's own staleness check at read time (OPEN-188's other, gated half),
     not by this job succeeding on every single tick.
     """
-    bucket_cmd = os.environ.get("SCRAPER_MEMORY_S3_CMD", "ddp-prod-s3-openstates-backups")
+    bucket = os.environ.get("SCRAPER_MEMORY_S3_BUCKET", DEFAULT_SCRAPER_MEMORY_S3_BUCKET)
     prefix = os.environ.get("SCRAPER_MEMORY_PREFIX")
     if not prefix:
         # Matches SourceLock/S3Memory's own refusal (cloud_collector.py) and
@@ -77,11 +105,18 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
         )
         return {"success": False, "reason": "mint_failed", "error": str(e)}
 
-    # pm-review: the docstring's "never raises" claim wasn't actually true past this point --
-    # a malformed mint_result, a write_cookie_cache failure, a missing/non-executable
-    # bucket_cmd (FileNotFoundError), or subprocess.run hanging indefinitely (no timeout) could
-    # all have raised out of this best-effort job and crashed the scheduler. Caught broadly and
-    # explicitly, with a timeout, rather than letting any of them propagate.
+    # An earlier pm-review already established the "never raises past this point" contract
+    # this try/except exists to keep (a malformed mint_result or a write_cookie_cache failure
+    # must not crash the scheduler); SYNC-53 extends the same contract to the S3 upload itself
+    # (bad/missing credentials, AccessDenied, a network blip). A second pm-review pass caught
+    # that upload_file() itself never lets a raw botocore.exceptions.ClientError escape --
+    # boto3's own S3Transfer.upload_file wraps any ClientError it hits in
+    # boto3.exceptions.S3UploadFailedError (confirmed by reading that method's source), a plain
+    # Exception subclass, not a ClientError subclass -- so catching ClientError here would never
+    # actually fire, and every real upload failure would fall through to the generic
+    # "unexpected_error" branch below instead of "publish_failed". See _S3_CLIENT_CONFIG's own
+    # comment for why retries are disabled to keep this call's worst-case wall time close to
+    # the old subprocess `timeout=60` ceiling.
     key = _publish_key(prefix)
     try:
         with tempfile.TemporaryDirectory(prefix="mi-cookie-publish-") as tmp:
@@ -89,31 +124,23 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
             scrapebot_client.write_cookie_cache(
                 local_path, cookies=mint_result["cookies"], user_agent=mint_result["user_agent"]
             )
-            proc = subprocess.run(
-                [bucket_cmd, "put", local_path, key],
-                capture_output=True, text=True, timeout=60, check=False,
-            )
-    except subprocess.TimeoutExpired:
+            boto3.client("s3", config=_S3_CLIENT_CONFIG).upload_file(local_path, bucket, key)
+    except S3UploadFailedError as e:
         logger.error(
-            "mi_cookie_publish: publish to S3 timed out -- the previously published cookie "
-            "(if any) is unchanged"
+            "mi_cookie_publish: publish to S3 failed -- the previously published "
+            "cookie (if any) is unchanged",
+            bucket=bucket,
+            error=str(e),
         )
-        return {"success": False, "reason": "publish_timed_out"}
+        return {"success": False, "reason": "publish_failed", "error": str(e)}
     except Exception as e:  # noqa: BLE001 -- a bad tick must never crash the scheduler
         logger.error(
             "mi_cookie_publish: unexpected error while writing/publishing the cookie -- the "
             "previously published cookie (if any) is unchanged",
+            bucket=bucket,
             error=str(e),
         )
         return {"success": False, "reason": "unexpected_error", "error": str(e)}
 
-    if proc.returncode != 0:
-        logger.error(
-            "mi_cookie_publish: publish to S3 failed -- the previously published "
-            "cookie (if any) is unchanged",
-            stderr=proc.stderr,
-        )
-        return {"success": False, "reason": "publish_failed", "error": proc.stderr}
-
-    logger.info("mi_cookie_publish: published fresh Michigan WAF cookies", key=key)
+    logger.info("mi_cookie_publish: published fresh Michigan WAF cookies", bucket=bucket, key=key)
     return {"success": True, "key": key}
