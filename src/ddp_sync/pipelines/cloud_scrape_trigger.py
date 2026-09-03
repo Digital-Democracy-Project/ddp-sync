@@ -64,10 +64,22 @@ measured freshness -- not full local-path parity):
     Fargate task definition's own environment, not something set from here) -- there is no
     mac-side fallback path for a run that already executes in the cloud, so the floor that
     function exists to enforce does not apply on this side.
+
+OPEN-251: the wait between "task launched" and "task stopped" (`_wait_for_task_stop()`, up to
+`max_wait_seconds`, hours in practice) happens entirely in this process's own memory. A ddp-sync
+restart mid-wait does not touch the ECS task itself -- Fargate keeps it running regardless of
+who launched it -- but it does lose the only thing watching for it to finish, which is exactly
+what let a completed collection's output sit unloaded until the OPEN-193 canary's 123-object
+manual recovery. `inflight_fargate_jobs.py` persists each launched task_arn to Redis the moment
+it's known and clears it once the job reaches a terminal outcome; `reconcile_inflight_fargate_
+jobs()` (called once from app.py's startup) resumes anything still on record, meaning the record
+survived an unclean restart. `_finish_after_launch()` is the shared tail both a fresh launch and
+a resumed one run through, so the two paths can't drift apart from here on.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import time
@@ -76,6 +88,8 @@ from typing import Any
 
 import boto3
 import structlog
+
+from ddp_sync.pipelines import inflight_fargate_jobs
 
 logger = structlog.get_logger(__name__)
 
@@ -157,20 +171,17 @@ def _stop_orphaned_task(ecs_client, cluster: str, task_arn: str) -> str:
         return f"stop_task also failed: {e}"
 
 
-def _run_fargate_collection(
+def _launch_fargate_task(
     jurisdiction: str,
     session_arg: str | None,
     run_id: str,
     fargate_cfg: dict,
     ecs_client,
-) -> tuple[bool, int | None, str]:
-    """Launch the collection task and block until it stops.
+) -> tuple[bool, str | None, str]:
+    """Just the run_task call and its immediate failure handling.
 
-    Returns (started, exit_code, detail). `started=False` means run_task itself failed
-    (capacity, config, IAM -- the task never actually ran); `exit_code=None` with
-    `started=True` covers a task that stopped without ever reporting one (killed by ECS
-    itself -- OOM, spot interruption -- or this function's own wait gave up first, in which
-    case it also asked ECS to stop the task -- see `_stop_orphaned_task()`).
+    Returns (started, task_arn, detail). `started=False` means run_task itself failed
+    (capacity, config, IAM -- the task never actually ran), and `task_arn` is None.
     """
     # OPEN-242: docker-entrypoint.sh already runs `exec python3 /app/cloud_collector.py "$@"`,
     # and an ECS `command` override replaces CMD/ARGS, not ENTRYPOINT -- so this list becomes
@@ -236,7 +247,20 @@ def _run_fargate_collection(
         detail = "; ".join(f.get("reason", "unknown") for f in failures) or "no task returned"
         return False, None, detail
 
-    task_arn = tasks[0]["taskArn"]
+    return True, tasks[0]["taskArn"], ""
+
+
+def _wait_for_task_stop(task_arn: str, fargate_cfg: dict, ecs_client) -> tuple[int | None, str]:
+    """Poll DescribeTasks until `task_arn` stops, or `max_wait_seconds` runs out.
+
+    Extracted from the old `_run_fargate_collection` (OPEN-251) so it can run against a
+    task_arn this process just launched OR one a previous process launched and persisted --
+    DescribeTasks doesn't care which. Returns (exit_code, detail); `exit_code=None` covers a
+    task that stopped without ever reporting one (killed by ECS itself -- OOM, spot
+    interruption -- or this function's own wait gave up first, in which case it also asked ECS
+    to stop the task -- see `_stop_orphaned_task()`).
+    """
+    container_name = fargate_cfg.get("container_name", "scraper")
     max_wait = fargate_cfg.get("max_wait_seconds", _DEFAULT_MAX_WAIT_S)
     deadline = time.monotonic() + max_wait
 
@@ -255,10 +279,10 @@ def _run_fargate_collection(
             # 1: the original version only ever read the container-level field, which could be
             # empty for exactly the failures worth diagnosing most.
             reason = (match or {}).get("reason") or task.get("stoppedReason", "")
-            return True, exit_code, reason
+            return exit_code, reason
         if time.monotonic() >= deadline:
             stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
-            return True, None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
+            return None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
         time.sleep(_POLL_INTERVAL_S)
 
 
@@ -327,6 +351,166 @@ def _run_load(
         tail = stderr.decode(errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
         return False, f"cloud_loader.py exited {result.returncode}: {tail[-500:]}"
     return True, ""
+
+
+def _finish_after_launch(
+    jurisdiction: str,
+    session_arg: str | None,
+    run_id: str,
+    openstates_root: str,
+    fargate_cfg: dict,
+    task_arn: str,
+    ecs_client,
+    subprocess_runner,
+    label: str,
+) -> dict[str, Any]:
+    """Wait for an already-launched ECS task to stop, then load into RDS on success.
+
+    Shared by `run_cloud_scrape()` (task_arn just came back from `_launch_fargate_task()`) and
+    `resume_inflight_fargate_job()` (task_arn was persisted by a previous process -- OPEN-251):
+    from here on the two paths are identical, since DescribeTasks doesn't care which process is
+    asking and cloud_loader.py doesn't care whether this is the first attempt to run it. Keeping
+    one shared tail means those two callers can't quietly drift apart over time.
+
+    `duration_seconds` in the returned dict is measured from this call, not from the task's
+    original launch -- for a resumed job that understates true end-to-end time by however long
+    the previous process had already been waiting. Deliberately not fixed: reconstructing exact
+    original duration would mean persisting and reconciling two different process's clocks for a
+    number that is informational only, not used by any retry/escalation logic downstream.
+    """
+    from ddp_sync.pipelines.openstates_scrape import (
+        _alert_scrape_failure,
+        classify_failure_reason,
+    )
+
+    start = time.monotonic()
+    exit_code, detail = _wait_for_task_stop(task_arn, fargate_cfg, ecs_client)
+
+    if exit_code != 0:
+        duration = round(time.monotonic() - start, 1)
+        error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
+        logger.error(
+            "cloud_scrape: collection failed",
+            jurisdiction=jurisdiction,
+            run_id=run_id,
+            exit_code=exit_code,
+            detail=detail,
+        )
+        _alert_scrape_failure(label, f"collection {error}: {detail}", duration)
+        return {
+            "success": False,
+            "error": error,
+            "failure_reason": classify_failure_reason(error, detail),
+            "jurisdiction": label,
+            "duration_seconds": duration,
+            "cloud_run_id": run_id,
+        }
+
+    logger.info(
+        "cloud_scrape: collection done, loading into RDS",
+        jurisdiction=jurisdiction,
+        run_id=run_id,
+    )
+    load_ok, load_detail = _run_load(
+        jurisdiction, session_arg, run_id, openstates_root, fargate_cfg, subprocess_runner
+    )
+    duration = round(time.monotonic() - start, 1)
+
+    if not load_ok:
+        logger.error(
+            "cloud_scrape: load failed",
+            jurisdiction=jurisdiction,
+            run_id=run_id,
+            detail=load_detail,
+        )
+        error = f"load_failed: {load_detail}"
+        _alert_scrape_failure(label, error, duration)
+        return {
+            "success": False,
+            "error": error,
+            "failure_reason": classify_failure_reason("exit_code_load", load_detail),
+            "jurisdiction": label,
+            "duration_seconds": duration,
+            "cloud_run_id": run_id,
+        }
+
+    logger.info(
+        "cloud_scrape: done",
+        jurisdiction=jurisdiction,
+        run_id=run_id,
+        duration_seconds=duration,
+    )
+    return {
+        "success": True,
+        "jurisdiction": label,
+        "duration_seconds": duration,
+        "cloud_run_id": run_id,
+    }
+
+
+def resume_inflight_fargate_job(
+    record: dict[str, Any], *, ecs_client=None, subprocess_runner=None
+) -> dict[str, Any]:
+    """Finish a Fargate job a previous ddp-sync process left in-flight (OPEN-251).
+
+    `record` is exactly what `run_cloud_scrape()` persisted via `inflight_fargate_jobs.
+    record_started()` at launch time: jurisdiction, session_arg, run_id, task_arn, fargate_cfg,
+    openstates_root. Resuming replays the same decisions the original launch already made, not
+    whatever sync_schedule.yaml says right now -- there is no re-read of live config here.
+
+    Always clears the record when done, success or failure alike, exactly like
+    `run_cloud_scrape()` does for a fresh run -- this call is itself the reconciliation, so once
+    it returns there is nothing left to resume a second time.
+    """
+    jurisdiction = record["jurisdiction"]
+    session_arg = record.get("session_arg")
+    run_id = record["run_id"]
+    task_arn = record["task_arn"]
+    fargate_cfg = record["fargate_cfg"]
+    openstates_root = record["openstates_root"]
+    label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
+
+    client = ecs_client or boto3.client("ecs")
+    try:
+        return _finish_after_launch(
+            jurisdiction,
+            session_arg,
+            run_id,
+            openstates_root,
+            fargate_cfg,
+            task_arn,
+            client,
+            subprocess_runner,
+            label,
+        )
+    finally:
+        inflight_fargate_jobs.clear(run_id)
+
+
+def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
+    """Resume any Fargate jobs a previous ddp-sync process left in-flight (OPEN-251).
+
+    Meant to be called once from `app.py`'s startup. Every fresh `run_cloud_scrape()` call
+    records its own task_arn the moment the ECS task launches and clears that record itself once
+    the job reaches a terminal outcome (collection failure, load failure, or success) -- so
+    anything still present here when a NEW process starts was orphaned by the previous process
+    dying (crash, deploy restart) mid-wait or mid-load, not a job someone else is still watching.
+
+    Each resumed job runs on its own background thread via `asyncio.to_thread`, exactly like a
+    fresh `run_cloud_scrape()` call is already run from `openstates_scrape.py` -- this function
+    itself never blocks, so it never delays app startup.
+    """
+    records = inflight_fargate_jobs.list_inflight()
+    tasks = []
+    for run_id, record in records.items():
+        logger.warning(
+            "cloud_scrape: resuming a Fargate job orphaned by a previous restart",
+            run_id=run_id,
+            jurisdiction=record.get("jurisdiction"),
+            task_arn=record.get("task_arn"),
+        )
+        tasks.append(asyncio.create_task(asyncio.to_thread(resume_inflight_fargate_job, record)))
+    return tasks
 
 
 def run_cloud_scrape(
@@ -413,7 +597,7 @@ def run_cloud_scrape(
             jurisdiction=jurisdiction,
             run_id=run_id,
         )
-        started, exit_code, detail = _run_fargate_collection(
+        started, task_arn, detail = _launch_fargate_task(
             jurisdiction, session_arg, run_id, fargate_cfg, client
         )
         if not started:
@@ -434,66 +618,26 @@ def run_cloud_scrape(
                 "cloud_run_id": run_id,
             }
 
-        if exit_code != 0:
-            duration = round(time.monotonic() - start, 1)
-            error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
-            logger.error(
-                "cloud_scrape: collection failed",
-                jurisdiction=jurisdiction,
-                run_id=run_id,
-                exit_code=exit_code,
-                detail=detail,
+        # OPEN-251: persist this task_arn now, before the -- possibly hours-long -- wait, so a
+        # ddp-sync restart mid-wait can find and resume this job instead of losing track of it.
+        # See inflight_fargate_jobs.py and reconcile_inflight_fargate_jobs().
+        inflight_fargate_jobs.record_started(
+            run_id, jurisdiction, session_arg, task_arn, fargate_cfg, openstates_root
+        )
+        try:
+            return _finish_after_launch(
+                jurisdiction,
+                session_arg,
+                run_id,
+                openstates_root,
+                fargate_cfg,
+                task_arn,
+                client,
+                subprocess_runner,
+                label,
             )
-            _alert_scrape_failure(label, f"collection {error}: {detail}", duration)
-            return {
-                "success": False,
-                "error": error,
-                "failure_reason": classify_failure_reason(error, detail),
-                "jurisdiction": label,
-                "duration_seconds": duration,
-                "cloud_run_id": run_id,
-            }
-
-        logger.info(
-            "cloud_scrape: collection done, loading into RDS",
-            jurisdiction=jurisdiction,
-            run_id=run_id,
-        )
-        load_ok, load_detail = _run_load(
-            jurisdiction, session_arg, run_id, openstates_root, fargate_cfg, subprocess_runner
-        )
-        duration = round(time.monotonic() - start, 1)
-
-        if not load_ok:
-            logger.error(
-                "cloud_scrape: load failed",
-                jurisdiction=jurisdiction,
-                run_id=run_id,
-                detail=load_detail,
-            )
-            error = f"load_failed: {load_detail}"
-            _alert_scrape_failure(label, error, duration)
-            return {
-                "success": False,
-                "error": error,
-                "failure_reason": classify_failure_reason("exit_code_load", load_detail),
-                "jurisdiction": label,
-                "duration_seconds": duration,
-                "cloud_run_id": run_id,
-            }
-
-        logger.info(
-            "cloud_scrape: done",
-            jurisdiction=jurisdiction,
-            run_id=run_id,
-            duration_seconds=duration,
-        )
-        return {
-            "success": True,
-            "jurisdiction": label,
-            "duration_seconds": duration,
-            "cloud_run_id": run_id,
-        }
+        finally:
+            inflight_fargate_jobs.clear(run_id)
     except Exception as e:  # noqa: BLE001 -- the guarantee this whole function makes to its
         # caller (pm-review, round 1): NOTHING escapes uncaught. boto3 client construction,
         # a describe_tasks throttling error mid-poll, anything -- all come back as this same
