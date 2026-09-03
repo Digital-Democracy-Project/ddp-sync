@@ -19,7 +19,7 @@ question is not "does it call ScrapeBot" -- it is:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import botocore.exceptions
 import pytest
@@ -82,7 +82,8 @@ async def test_publishes_to_the_real_scraper_memory_bucket_by_default(monkeypatc
 
     mock_dispatch.assert_awaited_once_with("mi")
     mock_write.assert_called_once()
-    mock_boto_client.assert_called_once_with("s3")
+    mock_boto_client.assert_called_once_with("s3", config=ANY)
+    assert mock_boto_client.call_args.kwargs["config"].retries == {"max_attempts": 1}
     mock_client.upload_file.assert_called_once()
     call_args = mock_client.upload_file.call_args.args
     assert call_args[1] == DEFAULT_SCRAPER_MEMORY_S3_BUCKET == "ddp-openstates-scraper-memory"

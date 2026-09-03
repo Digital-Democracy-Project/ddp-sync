@@ -45,6 +45,7 @@ import tempfile
 import boto3
 import structlog
 from boto3.exceptions import S3UploadFailedError
+from botocore.config import Config
 
 from ddp_sync.services import scrapebot_client
 
@@ -57,6 +58,13 @@ CACHE_FILENAME = "mi_waf_cookies.json"
 # from -- see this module's own docstring for why the old sudo-gated wrapper's default no
 # longer belongs here.
 DEFAULT_SCRAPER_MEMORY_S3_BUCKET = "ddp-openstates-scraper-memory"
+
+# SYNC-53 pm-review: botocore's default retry mode ("legacy") retries a failed upload up to
+# 5 times, each attempt with its own 60s connect + 60s read timeout -- a worst-case wall time
+# in the multiple-minutes range, not the single subprocess.run(timeout=60) ceiling this job had
+# before. A single attempt (no retries) keeps that same rough ceiling: at most one 60s connect
+# + 60s read, matching what the old wrapper call actually bounded.
+_S3_CLIENT_CONFIG = Config(retries={"max_attempts": 1})
 
 
 def _publish_key(prefix: str) -> str:
@@ -106,9 +114,9 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
     # boto3.exceptions.S3UploadFailedError (confirmed by reading that method's source), a plain
     # Exception subclass, not a ClientError subclass -- so catching ClientError here would never
     # actually fire, and every real upload failure would fall through to the generic
-    # "unexpected_error" branch below instead of "publish_failed". boto3's own default
-    # connect/read timeouts (60s each) still bound a hang the same way the old subprocess
-    # `timeout=60` did -- no extra timeout plumbing needed to keep that same ceiling.
+    # "unexpected_error" branch below instead of "publish_failed". See _S3_CLIENT_CONFIG's own
+    # comment for why retries are disabled to keep this call's worst-case wall time close to
+    # the old subprocess `timeout=60` ceiling.
     key = _publish_key(prefix)
     try:
         with tempfile.TemporaryDirectory(prefix="mi-cookie-publish-") as tmp:
@@ -116,7 +124,7 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
             scrapebot_client.write_cookie_cache(
                 local_path, cookies=mint_result["cookies"], user_agent=mint_result["user_agent"]
             )
-            boto3.client("s3").upload_file(local_path, bucket, key)
+            boto3.client("s3", config=_S3_CLIENT_CONFIG).upload_file(local_path, bucket, key)
     except S3UploadFailedError as e:
         logger.error(
             "mi_cookie_publish: publish to S3 failed -- the previously published "
@@ -129,6 +137,7 @@ async def run_mi_cookie_publish_job(config: dict | None = None) -> dict:
         logger.error(
             "mi_cookie_publish: unexpected error while writing/publishing the cookie -- the "
             "previously published cookie (if any) is unchanged",
+            bucket=bucket,
             error=str(e),
         )
         return {"success": False, "reason": "unexpected_error", "error": str(e)}
