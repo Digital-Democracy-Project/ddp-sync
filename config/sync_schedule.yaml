@@ -818,8 +818,12 @@ votebot_eval:
 # turning this true on a scheduled weekly job over a full session is a
 # recurring five-to-high-two-figure bill per run, not a one-off. If a cadence
 # decision ever turns it on, decide `limit` and this flag together.
+# Enabled for testing the pipeline via ddp-sync's own scheduled dispatch (as opposed to
+# the scraper-completion trigger, SYNC-48/50, which stays off separately). This is a
+# shared, checked-in flag -- every ddp-sync host picks it up on next pull/restart unless
+# it has its own SESSION_PIPELINE_BATCH_ENABLED=false in .env (SYNC-51).
 session_pipeline_batch:
-  enabled: false
+  enabled: true
   frequency: weekly
   sync_day: sunday
   sync_time_utc: "13:00"       # after votebot_eval (12:00)
