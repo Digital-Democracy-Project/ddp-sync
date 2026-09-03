@@ -236,6 +236,36 @@ def test_session_arg_reaches_both_collection_command_and_loader_command():
     assert captured["cmd"][-1] == "session=2027"
 
 
+def test_multi_part_session_arg_is_split_into_separate_argv_tokens():
+    """SYNC-54: USA's own config passes session_arg as ONE combined string ("119
+    chamber=lower"), not separate session/chamber values. The Mac path tolerates this by
+    accident (bash word-splits an unquoted variable when run-scrape.sh builds its own
+    os-update invocation); nothing here has a shell to do that, so this function must split
+    it itself -- found live when USA's cloud-path canary got "session=119 chamber=lower" as
+    ONE argv token, which cloud_collector.py's parse_kv_args() then parsed as a single garbage
+    key=value pair, and USBillScraper's sitemap filter matched nothing at all."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    captured = {}
+
+    def fake_subprocess(cmd, env):
+        captured["cmd"] = cmd
+        return FakeSubprocessResult(returncode=0)
+
+    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+        cst.run_cloud_scrape(
+            "usa", "session=119 chamber=lower", "/fake/root", _fargate_config(),
+            ecs_client=ecs, subprocess_runner=fake_subprocess,
+        )
+
+    collect_cmd = ecs.run_task_calls[0]["overrides"]["containerOverrides"][0]["command"]
+    assert collect_cmd == ["usa", "session=119", "chamber=lower"]
+    load_cmd = captured["cmd"]
+    assert load_cmd[-2:] == ["session=119", "chamber=lower"]
+
+
 def test_nonzero_exit_code_skips_the_load_entirely():
     ecs = FakeEcsClient(
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
