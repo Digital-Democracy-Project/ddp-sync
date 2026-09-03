@@ -58,6 +58,15 @@ async def lifespan(app: FastAPI):
     # Start zombie watchdog (simplified — no leader gating)
     watchdog_task = asyncio.create_task(_zombie_sync_watchdog(redis_store))
 
+    # OPEN-251: resume any Fargate scrape+load jobs a previous ddp-sync process left
+    # in-flight when it was restarted or crashed mid-wait/mid-load. A normal run always
+    # clears its own record when it finishes (success or failure) — see
+    # cloud_scrape_trigger.py's inflight_fargate_jobs usage — so anything still present
+    # here was orphaned, not a job still being watched by anyone else. Fire-and-forget:
+    # each resumed job runs on its own background thread and this never blocks startup.
+    from ddp_sync.pipelines.cloud_scrape_trigger import reconcile_inflight_fargate_jobs
+    reconcile_inflight_fargate_jobs()
+
     yield
 
     # Shutdown

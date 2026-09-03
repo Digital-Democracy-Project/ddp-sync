@@ -10,11 +10,33 @@ re-verifying botocore's request/response validation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from unittest.mock import patch
 
+import pytest
+
 from ddp_sync.pipelines import cloud_scrape_trigger as cst
+
+
+class FakeRedisClient:
+    """In-memory stand-in for redis.Redis, just the Hash ops inflight_fargate_jobs.py uses."""
+
+    def __init__(self):
+        self._hashes: dict[str, dict[str, str]] = {}
+
+    def ping(self):
+        return True
+
+    def hset(self, key, field, value):
+        self._hashes.setdefault(key, {})[field] = value
+
+    def hdel(self, key, field):
+        self._hashes.get(key, {}).pop(field, None)
+
+    def hgetall(self, key):
+        return dict(self._hashes.get(key, {}))
 
 
 def _fargate_config(**overrides):
@@ -524,3 +546,173 @@ def test_non_dict_cloud_path_returns_clean_failure_instead_of_attributeerror():
     assert result["failure_reason"] == "config_error"
     assert "must be a mapping" in result["error"]
     mock_alert.assert_called_once()
+
+
+# ── OPEN-251: in-flight tracking survives a restart ────────────────────────────────────────
+
+
+def test_task_arn_recorded_before_the_wait_begins_and_cleared_on_success():
+    """The whole point: the record must exist while the (possibly hours-long) wait is still
+    running, not only after -- a restart during the wait is exactly the case OPEN-251 exists
+    for. Cleared again once the run reaches a terminal outcome, since a restart after that
+    point has nothing left to reconcile."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/inflight"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    seen_while_waiting = {}
+
+    def fake_wait(task_arn, fargate_cfg, ecs_client):
+        seen_while_waiting["record"] = dict(cst.inflight_fargate_jobs.list_inflight())
+        return 0, ""
+
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger._wait_for_task_stop", fake_wait),
+        patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
+    ):
+        result = cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
+            subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
+        )
+
+    assert result["success"] is True
+    recorded = seen_while_waiting["record"]
+    assert len(recorded) == 1
+    run_id, record = next(iter(recorded.items()))
+    assert record["task_arn"] == "arn:task/inflight"
+    assert record["jurisdiction"] == "mi"
+    assert run_id == result["cloud_run_id"]
+    # And cleared again once the run is done.
+    assert cst.inflight_fargate_jobs.list_inflight() == {}
+
+
+def test_inflight_record_cleared_even_when_the_load_step_fails():
+    """A failed load is still a terminal outcome -- nothing left this side to reconcile."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/2"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+        patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
+    ):
+        result = cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
+            subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=1, stderr=b"boom"),
+        )
+
+    assert result["success"] is False
+    assert cst.inflight_fargate_jobs.list_inflight() == {}
+
+
+def test_resume_inflight_fargate_job_finishes_a_persisted_task_arn_without_relaunching():
+    """The resumed path must never call run_task again -- the ECS task from before the restart
+    is still the one and only task for this run_id; resuming only ever waits and loads."""
+    ecs = FakeEcsClient(describe_responses=[_stopped_response(exit_code=0)])
+    record = {
+        "jurisdiction": "mi",
+        "session_arg": None,
+        "task_arn": "arn:task/resumed",
+        "fargate_cfg": _fargate_config()["cloud_path"]["fargate"],
+        "openstates_root": "/fake/root",
+    }
+    captured = {}
+
+    def fake_subprocess(cmd, env):
+        captured["cmd"] = cmd
+        return FakeSubprocessResult(returncode=0)
+
+    with (
+        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
+    ):
+        result = cst.resume_inflight_fargate_job(
+            "mi-deadbeef0000", record, ecs_client=ecs, subprocess_runner=fake_subprocess
+        )
+
+    assert result["success"] is True
+    assert result["cloud_run_id"] == "mi-deadbeef0000"
+    assert ecs.run_task_calls == []
+    assert ecs.describe_calls[0]["tasks"] == ["arn:task/resumed"]
+    assert captured["cmd"] == ["python3", "/fake/root/cloud_loader.py", "mi", "mi-deadbeef0000"]
+
+
+def test_resume_inflight_fargate_job_never_raises_on_a_malformed_record():
+    """A record missing a required field must not escape uncaught into the caller -- this runs
+    unobserved on a background thread (reconcile_inflight_fargate_jobs's asyncio.to_thread), so
+    an uncaught exception here would silently abandon the job all over again. The record is
+    still cleared (by run_id, passed in separately -- not read back out of the broken payload)
+    and the failure is still alerted, so nothing about this is silent."""
+    with (
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+        patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
+    ):
+        cst.inflight_fargate_jobs.record_started(
+            "mi-broken", "mi", None, "arn:task/x", {}, "/fake/root"
+        )
+        result = cst.resume_inflight_fargate_job("mi-broken", {"jurisdiction": "mi"})
+
+    assert result["success"] is False
+    assert result["cloud_run_id"] == "mi-broken"
+    mock_alert.assert_called_once()
+    assert cst.inflight_fargate_jobs.list_inflight() == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_inflight_fargate_jobs_resumes_every_persisted_record_concurrently():
+    """Each persisted record gets its own background thread -- reconciliation itself must
+    never block app startup waiting on one job before starting the next."""
+    records = {
+        "mi-aaa": {"jurisdiction": "mi", "task_arn": "arn:task/a"},
+        "fl-bbb": {"jurisdiction": "fl", "task_arn": "arn:task/b"},
+    }
+    resumed_with = []
+
+    def fake_resume(run_id, record, **kwargs):
+        resumed_with.append((run_id, record))
+        return {"success": True}
+
+    with (
+        patch.object(cst.inflight_fargate_jobs, "list_inflight", return_value=records),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resume_inflight_fargate_job", fake_resume),
+    ):
+        tasks = cst.reconcile_inflight_fargate_jobs()
+        assert len(tasks) == 2
+        await asyncio.gather(*tasks)
+
+    assert {run_id for run_id, _ in resumed_with} == {"mi-aaa", "fl-bbb"}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_tasks_are_retained_and_survive_without_external_references():
+    """pm-review, round 1: a fire-and-forget asyncio.create_task with nothing else referencing
+    it can be garbage-collected mid-run. reconcile_inflight_fargate_jobs() must keep its own
+    strong reference so a caller that (like app.py's real lifespan) doesn't hold onto the
+    returned list still sees every job through to completion."""
+    records = {"mi-aaa": {"jurisdiction": "mi", "task_arn": "arn:task/a"}}
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow_resume(run_id, record, **kwargs):
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+        return {"success": True}
+
+    def fake_resume(run_id, record, **kwargs):
+        # asyncio.to_thread runs this in a worker thread; drive the async fixture from there.
+        asyncio.run(slow_resume(run_id, record, **kwargs))
+
+    with (
+        patch.object(cst.inflight_fargate_jobs, "list_inflight", return_value=records),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resume_inflight_fargate_job", fake_resume),
+    ):
+        cst.reconcile_inflight_fargate_jobs()  # returned list deliberately discarded
+        import gc
+
+        gc.collect()
+        await asyncio.sleep(0.2)
+
+    assert finished.is_set()
