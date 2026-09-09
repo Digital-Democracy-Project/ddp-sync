@@ -55,10 +55,13 @@ def resolve_rds_database_url(secretsmanager_client=None) -> tuple[str | None, st
     if not RDS_CREDENTIALS_SECRET_ARN:
         return None, "RDS_CREDENTIALS_SECRET_ARN not set -- refusing to guess which secret to read"
 
-    client = secretsmanager_client or boto3.client("secretsmanager", region_name=AWS_REGION)
     try:
+        client = secretsmanager_client or boto3.client("secretsmanager", region_name=AWS_REGION)
         response = client.get_secret_value(SecretId=RDS_CREDENTIALS_SECRET_ARN)
     except Exception as e:  # noqa: BLE001 -- any boto3/network failure is equally "can't proceed"
+        # pm-review: boto3.client() itself can raise (region/credential-provider/botocore
+        # config problems), not just get_secret_value() -- both must land in this same tuple
+        # contract, not let a client-construction failure escape uncaught past this function.
         logger.error("rds_credentials: fetch failed", error=str(e))
         return None, f"could not fetch RDS credential from Secrets Manager: {e}"
 
@@ -69,12 +72,16 @@ def resolve_rds_database_url(secretsmanager_client=None) -> tuple[str | None, st
         host = secret["host"]
         port = secret["port"]
         dbname = secret["dbname"]
+        # pm-review: a JSON null for any of these would otherwise stringify to the literal
+        # text "None" and silently produce a garbage-but-well-formed DSN instead of an error.
+        if not all([username, password, host, port, dbname]):
+            raise ValueError("one or more required fields is null or empty")
     except (KeyError, ValueError, TypeError) as e:
         logger.error("rds_credentials: unexpected secret shape", error=str(e))
         return None, f"RDS credential secret has an unexpected shape: {e}"
 
     url = (
         f"postgresql://{quote(str(username), safe='')}:{quote(str(password), safe='')}"
-        f"@{host}:{port}/{dbname}"
+        f"@{host}:{port}/{quote(str(dbname), safe='')}"
     )
     return url, ""

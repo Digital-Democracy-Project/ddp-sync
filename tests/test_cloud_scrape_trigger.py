@@ -196,6 +196,46 @@ def test_collection_polls_until_stopped_then_loads():
     assert captured["env"]["DATABASE_URL"] == "postgresql://rds/openstates"
 
 
+def test_preflight_and_load_resolve_the_credential_independently_not_once_and_reused():
+    """pm-review: the design's central claim is that a rotation mid-collection is picked up at
+    load time rather than carrying forward whatever the preflight check resolved. A test using
+    one constant mocked URL for both calls can't distinguish "resolved twice" from "resolved
+    once and cached" -- this uses two DISTINCT URLs (simulating a rotation between the
+    preflight check and the load step) and asserts the loader actually receives the second
+    one, not the first."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_stopped_response(exit_code=0)],
+    )
+    captured = {}
+
+    def fake_subprocess(cmd, env):
+        captured["env"] = env
+        return FakeSubprocessResult(returncode=0)
+
+    resolve_calls = []
+
+    def fake_resolve():
+        resolve_calls.append(len(resolve_calls))
+        # First call (preflight) gets the pre-rotation URL; second call (the actual load)
+        # gets the post-rotation URL -- simulating a rotation that happened in between.
+        if len(resolve_calls) == 1:
+            return "postgresql://pre-rotation/openstates", ""
+        return "postgresql://post-rotation/openstates", ""
+
+    with patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", side_effect=fake_resolve
+    ):
+        result = cst.run_cloud_scrape(
+            "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
+            subprocess_runner=fake_subprocess,
+        )
+
+    assert result["success"] is True
+    assert len(resolve_calls) == 2
+    assert captured["env"]["DATABASE_URL"] == "postgresql://post-rotation/openstates"
+
+
 def test_assign_public_ip_defaults_to_enabled_for_no_nat_public_subnets():
     """OPEN-241: every subnet this project has stood up so far is public-by-design with no
     NAT gateway. DISABLED (the old hardcoded value) left a task's ENI with no route to the

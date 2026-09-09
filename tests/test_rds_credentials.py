@@ -124,3 +124,44 @@ def test_no_injected_client_constructs_a_real_boto3_client():
     mock_boto_client.assert_called_once_with("secretsmanager", region_name="us-east-1")
     assert error == ""
     assert url is not None
+
+
+def test_boto3_client_construction_failure_fails_cleanly_instead_of_raising():
+    """pm-review: boto3.client() itself can raise (region/credential-provider/botocore config
+    problems), not just get_secret_value() -- both must land in the same (None, error) tuple
+    contract, not let a client-construction failure escape uncaught."""
+    with (
+        patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"),
+        patch("boto3.client", side_effect=RuntimeError("no region configured")),
+    ):
+        url, error = rc.resolve_rds_database_url()
+
+    assert url is None
+    assert "no region configured" in error
+
+
+def test_dbname_with_url_special_characters_is_percent_encoded():
+    """The same class of bug the password test covers, for the DSN's path component instead
+    of its userinfo component -- an unescaped '/' or '?' in dbname would otherwise corrupt or
+    misparse the URL just as badly as an unescaped password character would."""
+    client = FakeSecretsManagerClient(secret_string=_real_shaped_secret(dbname="weird/db?name"))
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+        url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
+
+    assert error == ""
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    assert unquote(parsed.path.lstrip("/")) == "weird/db?name"
+
+
+def test_null_field_in_secret_fails_cleanly_instead_of_producing_a_garbage_dsn():
+    """pm-review: without this check, a JSON `null` password would stringify to the literal
+    text "None" via str(None) and silently produce a well-formed-looking but wrong DSN,
+    instead of a clear error."""
+    client = FakeSecretsManagerClient(secret_string=_real_shaped_secret(password=None))
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+        url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
+
+    assert url is None
+    assert "unexpected shape" in error
