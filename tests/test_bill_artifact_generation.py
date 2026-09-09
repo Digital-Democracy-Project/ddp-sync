@@ -612,6 +612,12 @@ async def test_changelog_generates_ready_transitions_when_true_latest_has_no_dif
     # AC4: nothing is written against "Enrolled" itself -- the one write
     # that happens targets "Engrossed" (the ready transition's own target).
     assert mock_write.await_args.kwargs["version_note"] == "Engrossed"
+    # SYNC-56: status="complete" here is entirely about the "Engrossed"
+    # transition -- the caller asked for "Enrolled" and nothing was ever
+    # written under that version, which this flag must surface so
+    # dispatch_and_record_bill_artifact doesn't mistake this for "Enrolled"
+    # having been resolved.
+    assert result["requested_version_written"] is False
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1481,58 @@ async def test_bill_changelog_not_applicable_resolves_the_pending_row_to_failed(
     resolved_kwargs = mock_write.await_args_list[1].kwargs
     assert resolved_kwargs["status"] == "failed"
     assert resolved_kwargs["failure_reason"] == "no_version_transition_available"
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_requested_version_not_written_resolves_the_pending_row_to_failed():
+    """SYNC-56: a bill whose true latest version has no diff of its own
+    (SYNC-46) makes generate_and_store_bill_changelog dispatch an OLDER
+    transition instead and report the aggregate call "complete" -- that
+    status describes the older transition, not the version this endpoint's
+    own pending placeholder was written under. Confirmed live on VA HB1070
+    and UT SB194: both left a `pending` row 40+ seconds after dispatch,
+    sitting beside the older transition's real, complete row. This must
+    resolve the placeholder the same way the "not_applicable" case already
+    does, even though `status` here reads "complete", not "failed"."""
+    mock_write = AsyncMock(side_effect=[{"id": 1, "created": True}, {"id": 1, "created": False}])
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(
+            return_value={
+                "id": 5, "created": True, "status": "complete",
+                "requested_version_written": False,
+            }
+        ),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    assert mock_write.await_count == 2
+    resolved_kwargs = mock_write.await_args_list[1].kwargs
+    assert resolved_kwargs["status"] == "failed"
+    assert resolved_kwargs["failure_reason"] == "no_version_transition_available"
+
+
+@pytest.mark.asyncio
+async def test_bill_changelog_requested_version_written_leaves_pending_row_alone():
+    """Sanity check for the SYNC-56 flag's default: a normal happy-path
+    changelog result (requested_version_written unset, same as every
+    pre-existing mock in this file) must NOT trigger the reconciliation
+    write -- only the pending row and the real generation write happen."""
+    mock_write = AsyncMock(return_value={"id": 1, "created": True})
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=mock_write,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 5, "created": True, "status": "complete"}),
+    ):
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    mock_write.assert_awaited_once()
+    assert mock_write.await_args.kwargs["status"] == "pending"
 
 
 @pytest.mark.asyncio
