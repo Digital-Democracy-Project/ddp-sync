@@ -28,30 +28,60 @@ class FakeSecretsManagerClient:
 
 
 def _real_shaped_secret(**overrides):
+    # 2026-09-09 (found live): the real RDS-managed secret only ever carries these two keys --
+    # confirmed directly against the real secret's own keys on the ddp-sync host. host/port/
+    # dbname are NOT in it; those come from their own env vars (RDS_HOST/RDS_PORT/RDS_DBNAME),
+    # patched separately below, matching render-env.sh's existing precedent for the same values.
     secret = {
         "username": "openstates_admin",
         "password": "correct horse battery staple",
-        "engine": "postgres",
-        "host": "ddp-openstates.cvxdhm1ogxug.us-east-1.rds.amazonaws.com",
-        "port": 5432,
-        "dbname": "openstates",
-        "dbInstanceIdentifier": "ddp-openstates",
     }
     secret.update(overrides)
     return json.dumps(secret)
 
 
+def _patch_connection_details(**overrides):
+    """Context manager patching RDS_HOST/RDS_PORT/RDS_DBNAME to real-shaped test values,
+    with overrides for the one test that needs to vary one of them."""
+    values = {
+        "RDS_HOST": "ddp-openstates.cvxdhm1ogxug.us-east-1.rds.amazonaws.com",
+        "RDS_PORT": "5432",
+        "RDS_DBNAME": "openstates",
+    }
+    values.update(overrides)
+    return patch.multiple(rc, **values)
+
+
 def test_missing_secret_arn_refuses_without_calling_secrets_manager():
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", None):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", None), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=FakeSecretsManagerClient())
 
     assert url is None
     assert "RDS_CREDENTIALS_SECRET_ARN not set" in error
 
 
+def test_missing_connection_details_refuses_without_calling_secrets_manager():
+    """The secret alone was never enough (it only has username/password) -- RDS_HOST/RDS_PORT/
+    RDS_DBNAME must all be set too, checked up front rather than discovered as a KeyError deep
+    inside DSN assembly."""
+    client = FakeSecretsManagerClient(secret_string=_real_shaped_secret())
+    with (
+        patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"),
+        _patch_connection_details(RDS_HOST=None),
+    ):
+        url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
+
+    assert url is None
+    assert "RDS_HOST/RDS_PORT/RDS_DBNAME" in error
+    assert client.get_secret_value_calls == []  # fails before ever touching Secrets Manager
+
+
 def test_successful_fetch_assembles_a_valid_postgres_url():
     client = FakeSecretsManagerClient(secret_string=_real_shaped_secret())
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:1:secret:rds!x"):
+    with (
+        patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:1:secret:rds!x"),
+        _patch_connection_details(),
+    ):
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert error == ""
@@ -66,7 +96,7 @@ def test_password_with_url_special_characters_is_percent_encoded():
     """The exact class of bug a raw-string DATABASE_URL would risk: a password containing
     characters that are valid JSON but would corrupt or misparse an unescaped URL."""
     client = FakeSecretsManagerClient(secret_string=_real_shaped_secret(password="p@ss:w/rd%25"))
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert error == ""
@@ -83,7 +113,7 @@ def test_password_with_url_special_characters_is_percent_encoded():
 
 def test_secrets_manager_api_error_fails_loudly_not_silently():
     client = FakeSecretsManagerClient(error=RuntimeError("AccessDeniedException"))
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert url is None
@@ -91,10 +121,10 @@ def test_secrets_manager_api_error_fails_loudly_not_silently():
 
 
 def test_malformed_secret_shape_fails_cleanly_instead_of_raising():
-    """A secret that isn't RDS's expected shape (missing a required field) must come back as
-    the normal (None, error) result, not an uncaught KeyError escaping into the caller."""
+    """A secret missing username/password must come back as the normal (None, error) result,
+    not an uncaught KeyError escaping into the caller."""
     client = FakeSecretsManagerClient(secret_string=json.dumps({"username": "x"}))
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert url is None
@@ -103,7 +133,7 @@ def test_malformed_secret_shape_fails_cleanly_instead_of_raising():
 
 def test_non_json_secret_string_fails_cleanly_instead_of_raising():
     client = FakeSecretsManagerClient(secret_string="not-json-at-all")
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert url is None
@@ -116,6 +146,7 @@ def test_no_injected_client_constructs_a_real_boto3_client():
     with (
         patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"),
         patch.object(rc, "AWS_REGION", "us-east-1"),
+        _patch_connection_details(),
         patch("boto3.client") as mock_boto_client,
     ):
         mock_boto_client.return_value = FakeSecretsManagerClient(secret_string=_real_shaped_secret())
@@ -132,6 +163,7 @@ def test_boto3_client_construction_failure_fails_cleanly_instead_of_raising():
     contract, not let a client-construction failure escape uncaught."""
     with (
         patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"),
+        _patch_connection_details(),
         patch("boto3.client", side_effect=RuntimeError("no region configured")),
     ):
         url, error = rc.resolve_rds_database_url()
@@ -142,10 +174,13 @@ def test_boto3_client_construction_failure_fails_cleanly_instead_of_raising():
 
 def test_dbname_with_url_special_characters_is_percent_encoded():
     """The same class of bug the password test covers, for the DSN's path component instead
-    of its userinfo component -- an unescaped '/' or '?' in dbname would otherwise corrupt or
-    misparse the URL just as badly as an unescaped password character would."""
-    client = FakeSecretsManagerClient(secret_string=_real_shaped_secret(dbname="weird/db?name"))
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    of its userinfo component -- an unescaped '/' or '?' in RDS_DBNAME would otherwise corrupt
+    or misparse the URL just as badly as an unescaped password character would."""
+    client = FakeSecretsManagerClient(secret_string=_real_shaped_secret())
+    with (
+        patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"),
+        _patch_connection_details(RDS_DBNAME="weird/db?name"),
+    ):
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert error == ""
@@ -160,7 +195,7 @@ def test_null_field_in_secret_fails_cleanly_instead_of_producing_a_garbage_dsn()
     text "None" via str(None) and silently produce a well-formed-looking but wrong DSN,
     instead of a clear error."""
     client = FakeSecretsManagerClient(secret_string=_real_shaped_secret(password=None))
-    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"):
+    with patch.object(rc, "RDS_CREDENTIALS_SECRET_ARN", "arn:secret"), _patch_connection_details():
         url, error = rc.resolve_rds_database_url(secretsmanager_client=client)
 
     assert url is None
