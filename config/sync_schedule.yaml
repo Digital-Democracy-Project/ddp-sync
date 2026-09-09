@@ -703,6 +703,35 @@ openstates_scrape:
 # day since both pairs are already ~fully archived and do almost no work once caught up.
 openstates_archive:
   enabled: true
+  use_fargate: false  # OPEN-192 (reopened): cloud_archiver.py runs as a real Fargate task
+                      # when true, instead of run-archive.sh locally. Off by default -- this
+                      # is a live cutover decision (moves archiving's data source from the
+                      # Mac's local Postgres to RDS), not something this ticket's own PR
+                      # should flip on its own. pm-review: do NOT flip this before the
+                      # deployed "ddp-scrapers" ECS task definition's image actually contains
+                      # cloud_archiver.py and docker-entrypoint.sh's RUNNER_SCRIPT dispatch
+                      # (ddp-open-states#225) -- an older image has neither, so the first
+                      # task launched this way would fail at container startup, not cleanly.
+  cloud_path:
+    fargate:
+      # Same real values as openstates_scrape.cloud_path.fargate above (same cluster, same
+      # task definition -- docker-entrypoint.sh's RUNNER_SCRIPT picks cloud_archiver.py over
+      # cloud_collector.py within the one image/family, so nothing here needs its own
+      # cluster/task-def/network). Duplicated rather than referenced because this config has
+      # no include/anchor mechanism wired up for cross-block reuse yet -- flagging here rather
+      # than silently accepting drift risk: if the scrape block's subnets/security-groups/
+      # cluster ever change, this block needs the same edit.
+      cluster: "ddp-scrapers"
+      task_definition: "ddp-scrapers"
+      subnets:
+        - "subnet-0fdc71c33a5cb60bc"  # us-east-1c
+        - "subnet-0dbb01bb8fd1cd1e8"  # us-east-1a
+        - "subnet-087136704d428e5f2"  # us-east-1f
+      security_groups: ["sg-09346518873d48a08"]  # ddp-scraper-task
+      container_name: "scraper" # matches the task definition's container name
+      memory_bucket: "ddp-openstates-scraper-memory"
+      memory_prefix: "prod"
+      max_wait_seconds: 43200   # 12h backstop, same reasoning as the scrape block's
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
                            # 01:00-03:00 scrape-job start times, though overlap with a live

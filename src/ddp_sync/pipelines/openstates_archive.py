@@ -25,9 +25,11 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import boto3
 import requests
 import structlog
 
@@ -309,6 +311,171 @@ async def _run_archive(
         }
 
 
+def _launch_archive_fargate_task(
+    jurisdiction: str,
+    run_id: str,
+    rds_url: str,
+    fargate_cfg: dict,
+    ecs_client,
+) -> tuple[bool, str | None, str]:
+    """Launch cloud_archiver.py for one jurisdiction as a Fargate task.
+
+    Deliberately its own function rather than reusing cloud_scrape_trigger._launch_fargate_task
+    -- that function's `environment` override is fixed to just RUN_ID, which is correct for
+    cloud_collector.py (it reads its S3/DB config from the task definition itself) but not
+    enough here: this container also needs RUNNER_SCRIPT (selects cloud_archiver.py over the
+    image's default cloud_collector.py -- see docker-entrypoint.sh) and DATABASE_URL (RDS,
+    cloud_archiver.py reads bill rows from Django/Postgres directly, unlike the scrape path).
+    Changing the shared helper to carry archive-only environment keys risked the live scrape
+    path picking up something it doesn't need; a second small function with its own environment
+    list keeps the two genuinely independent.
+    """
+    container_name = fargate_cfg.get("container_name", "scraper")
+    try:
+        resp = ecs_client.run_task(
+            cluster=fargate_cfg["cluster"],
+            taskDefinition=fargate_cfg["task_definition"],
+            launchType="FARGATE",
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": fargate_cfg["subnets"],
+                    "securityGroups": fargate_cfg["security_groups"],
+                    "assignPublicIp": fargate_cfg.get("assign_public_ip", "ENABLED"),
+                }
+            },
+            overrides={
+                "containerOverrides": [
+                    {
+                        "name": container_name,
+                        "command": [jurisdiction],
+                        "environment": [
+                            {"name": "RUN_ID", "value": run_id},
+                            {"name": "RUNNER_SCRIPT", "value": "cloud_archiver.py"},
+                            {"name": "DATABASE_URL", "value": rds_url},
+                            {
+                                "name": "MEMORY_BUCKET",
+                                "value": fargate_cfg.get(
+                                    "memory_bucket", os.environ.get("MEMORY_BUCKET", "")
+                                ),
+                            },
+                            {
+                                "name": "MEMORY_PREFIX",
+                                "value": fargate_cfg.get("memory_prefix", "prod"),
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+    except Exception as e:  # noqa: BLE001 -- ClientError and friends, all "never started" alike
+        return False, None, str(e)
+
+    failures = resp.get("failures", [])
+    tasks = resp.get("tasks", [])
+    if failures or not tasks:
+        detail = "; ".join(f.get("reason", "unknown") for f in failures) or "no task returned"
+        return False, None, detail
+    return True, tasks[0]["taskArn"], ""
+
+
+async def _run_archive_fargate(
+    jurisdiction: str,
+    config: dict | None = None,
+    ecs_client=None,
+) -> dict[str, Any]:
+    """OPEN-192 (reopened): run cloud_archiver.py for one jurisdiction as a real Fargate task,
+    instead of run-archive.sh locally. Selected by run_archive_jobs()/run_single_archive_job()
+    when openstates_archive.use_fargate is true; default is false, so enabling this file's own
+    import changes no behavior until that flag is flipped.
+
+    Deliberately skips _maybe_preseed_scrapebot_cookies -- that writes a WAF cookie to a LOCAL
+    cache file path this process can reach, which a disposable Fargate task's own filesystem
+    never sees. cloud_archiver.py already hydrates Michigan's WAF cookie itself, from the
+    shared S3 memory store (see its own docstring) -- the two paths reach a fresh cookie by two
+    different means, not one silently losing a capability the other has.
+
+    Reuses cloud_scrape_trigger's config validation and task-completion wait -- both are
+    generic over what the task actually runs, not scrape-specific -- rather than a second
+    implementation of the same run_task-and-poll mechanics.
+    """
+    from ddp_sync.pipelines.cloud_scrape_trigger import _fargate_config, _wait_for_task_stop
+
+    rds_url = os.environ.get("RDS_DATABASE_URL")
+    if not rds_url:
+        error = "RDS_DATABASE_URL not set -- refusing to launch without a target database"
+        logger.error(
+            "openstates_archive: fargate launch refused", jurisdiction=jurisdiction, error=error
+        )
+        return {
+            "success": False,
+            "error": error,
+            "jurisdiction": jurisdiction,
+            "duration_seconds": 0.0,
+        }
+
+    try:
+        fargate_cfg = _fargate_config(config)
+    except ValueError as e:
+        logger.error(
+            "openstates_archive: fargate config error", jurisdiction=jurisdiction, error=str(e)
+        )
+        return {
+            "success": False,
+            "error": f"config_error: {e}",
+            "jurisdiction": jurisdiction,
+            "duration_seconds": 0.0,
+        }
+
+    client = ecs_client or boto3.client("ecs")
+    run_id = f"{jurisdiction}-archive-{uuid.uuid4().hex[:12]}"
+
+    start = time.monotonic()
+    started, task_arn, detail = _launch_archive_fargate_task(
+        jurisdiction, run_id, rds_url, fargate_cfg, client
+    )
+    if not started:
+        duration = round(time.monotonic() - start, 1)
+        logger.error(
+            "openstates_archive: fargate launch failed", jurisdiction=jurisdiction, detail=detail
+        )
+        _alert_archive_failure(jurisdiction, f"fargate run_task failed: {detail}", duration)
+        return {
+            "success": False,
+            "error": f"run_task_failed: {detail}",
+            "jurisdiction": jurisdiction,
+            "duration_seconds": duration,
+        }
+
+    exit_code, wait_detail = await asyncio.to_thread(
+        _wait_for_task_stop, task_arn, fargate_cfg, client
+    )
+    duration = round(time.monotonic() - start, 1)
+
+    if exit_code != 0:
+        error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
+        logger.error(
+            "openstates_archive: fargate task failed",
+            jurisdiction=jurisdiction,
+            exit_code=exit_code,
+            detail=wait_detail,
+            duration_seconds=duration,
+        )
+        _alert_archive_failure(jurisdiction, f"{error}: {wait_detail}", duration)
+        return {
+            "success": False,
+            "error": error,
+            "jurisdiction": jurisdiction,
+            "duration_seconds": duration,
+        }
+
+    logger.info(
+        "openstates_archive: fargate task done",
+        jurisdiction=jurisdiction,
+        duration_seconds=duration,
+    )
+    return {"success": True, "jurisdiction": jurisdiction, "duration_seconds": duration}
+
+
 async def _write_flow_status(flow_key: str, status: dict) -> None:
     """Best-effort Redis flow_status write. Never raises."""
     try:
@@ -326,8 +493,12 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     natural-key skip check makes this safe to run at any cadence, on any
     subset of jurisdictions, without coordinating with when that
     jurisdiction's own scrape last ran.
+
+    OPEN-192 (reopened): `use_fargate: true` in config switches the whole batch to
+    _run_archive_fargate instead of the local run-archive.sh wrapper -- one flag for the
+    entire batch, not per-jurisdiction, since a mixed batch would need its own reasoning
+    about which jurisdictions are safe to run where, and nothing here needs that yet.
     """
-    openstates_root = _get_root(config)
     jurisdictions: list[str] = (config or {}).get(
         "jurisdictions", DEFAULT_ARCHIVE_JURISDICTIONS
     )
@@ -336,9 +507,15 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
 
     logger.info("openstates_archive: starting batch", jurisdictions=jurisdictions)
 
-    results: list[dict[str, Any]] = await asyncio.gather(
-        *[_run_archive(j, openstates_root, config=config) for j in jurisdictions]
-    )
+    if (config or {}).get("use_fargate", False):
+        results: list[dict[str, Any]] = await asyncio.gather(
+            *[_run_archive_fargate(j, config=config) for j in jurisdictions]
+        )
+    else:
+        openstates_root = _get_root(config)
+        results = await asyncio.gather(
+            *[_run_archive(j, openstates_root, config=config) for j in jurisdictions]
+        )
 
     duration = round(time.monotonic() - t, 1)
     failed = [r for r in results if not r["success"]]
@@ -376,6 +553,11 @@ async def run_single_archive_job(
     jurisdiction: str,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Archive a single arbitrary jurisdiction. Used by the manual trigger endpoint."""
+    """Archive a single arbitrary jurisdiction. Used by the manual trigger endpoint.
+
+    Same `use_fargate` dispatch as run_archive_jobs() -- see that function's docstring.
+    """
+    if (config or {}).get("use_fargate", False):
+        return await _run_archive_fargate(jurisdiction, config=config)
     openstates_root = _get_root(config)
     return await _run_archive(jurisdiction, openstates_root, config=config)
