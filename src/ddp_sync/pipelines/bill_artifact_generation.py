@@ -1029,6 +1029,15 @@ async def generate_and_store_bill_changelog(
             transition["new_version_date"] == version_date
             and transition["new_version_note"] == version_note
         ):
+            # Named "written", not just "targeted": _dispatch_and_write_
+            # changelog above either returns after a real write_bill_artifact
+            # call (complete, or failed via insufficient_information) or
+            # raises (BrokerClientError/LegBotDispatchError) -- there is no
+            # path where it returns without one. A raise here propagates out
+            # of this whole function uncaught, and dispatch_and_record_bill_
+            # artifact's own outer except block already resolves the
+            # placeholder in that case -- so by the time this line runs at
+            # all, a real terminal row exists for this transition.
             requested_version_written = True
         if first_failure is None and last_result.get("status") != "complete":
             first_failure = last_result

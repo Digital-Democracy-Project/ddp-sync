@@ -511,6 +511,31 @@ async def test_bill_changelog_normally_returned_complete_status_is_still_counted
 
 
 @pytest.mark.asyncio
+async def test_bill_changelog_requested_version_written_flag_does_not_affect_batch_counting():
+    """SYNC-56: generate_and_store_bill_changelog now also carries
+    requested_version_written -- a signal dispatch_and_record_bill_artifact's
+    on-demand endpoint uses to resolve its own pending placeholder. This
+    batch caller writes no such placeholder and must keep counting purely off
+    `status`, ignoring the new key entirely -- confirmed here by including it
+    (False) on a result that otherwise reports "complete"."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={
+            "id": 1, "status": "complete", "requested_version_written": False,
+        }),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_changelog"]
+    assert bill_result["artifacts_failed"] == []
+
+
+@pytest.mark.asyncio
 async def test_a_raised_exception_and_a_normal_failed_status_are_both_captured_independently():
     """A thrown exception (a real dispatch outage) and a normally-returned
     status="failed" (a legitimate decline) both end up in artifacts_failed,

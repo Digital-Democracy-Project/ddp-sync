@@ -1037,6 +1037,48 @@ async def test_changelog_reports_the_first_failed_transition_not_the_last():
     assert [w["status"] for w in write_calls] == ["failed", "complete"]
     # ...but the overall call reports the failure, not the later success.
     assert result["status"] == "failed"
+    # SYNC-56: "Engrossed" -- _CHANGELOG_KWARGS' own requested version -- IS
+    # among the dispatched transitions here (just not the one whose failure
+    # got reported), so the placeholder-reconciliation flag must NOT fire:
+    # requested_version_written stays True/omitted despite the older failure.
+    assert "requested_version_written" not in result
+
+
+@pytest.mark.asyncio
+async def test_changelog_requested_version_not_targeted_and_an_older_transition_fails():
+    """SYNC-56 combined case: the true latest version has no diff of its own
+    (so it is never a transition's target, same fixture as
+    test_changelog_generates_ready_transitions_when_true_latest_has_no_diff)
+    AND the one transition that IS ready fails. requested_version_written
+    must still come back False regardless of what the aggregate status ends
+    up reporting for that older, failed transition."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_LATEST_HAS_NO_DIFF),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value={
+            "answer": {"insufficient_information": True, "reason": "diff_too_ambiguous"},
+            "backend": "mlx",
+        }),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 6, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(
+            bill_openstates_id=_CHANGELOG_KWARGS["bill_openstates_id"],
+            jurisdiction=_CHANGELOG_KWARGS["jurisdiction"],
+            session_code=_CHANGELOG_KWARGS["session_code"],
+            version_date="2026-03-01",
+            version_note="Enrolled",
+        )
+
+    assert result["status"] == "failed"
+    assert result["requested_version_written"] is False
+    assert mock_write.await_args.kwargs["version_note"] == "Engrossed"
 
 
 # ---------------------------------------------------------------------------
