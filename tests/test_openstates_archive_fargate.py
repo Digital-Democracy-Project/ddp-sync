@@ -72,9 +72,13 @@ _FARGATE_CFG = {
 
 
 @pytest.mark.asyncio
-async def test_use_fargate_false_still_calls_the_local_wrapper_path(monkeypatch):
-    """Default behavior (use_fargate absent/false) must be unchanged -- adding this file's own
-    import must not flip any live archive job onto the new path by accident."""
+async def test_use_fargate_key_entirely_absent_still_calls_the_local_wrapper_path(monkeypatch):
+    """pm-review: the safety property that matters isn't "use_fargate: false" being read
+    correctly -- every existing/deployed config predates this key and won't have it at all.
+    This config dict deliberately has no `use_fargate` key whatsoever (not even set to false),
+    proving `.get("use_fargate", False)` defaults an absent key the same way a real, currently-
+    deployed sync_schedule.yaml would -- adding this file's own import must not flip any live
+    archive job onto the new path by accident."""
     with patch.object(oa, "_run_archive", new=AsyncMock(return_value={"success": True})) as mock_local, \
          patch.object(oa, "_run_archive_fargate", new=AsyncMock()) as mock_fargate:
         result = await oa.run_single_archive_job("fl", config={"openstates_root": "/x"})
@@ -158,6 +162,48 @@ async def test_run_task_exception_fails_cleanly_and_alerts(monkeypatch):
     assert result["success"] is False
     assert "no capacity" in result["error"]
     mock_alert.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_task_response_with_failures_list_fails_cleanly_without_raising(monkeypatch):
+    """pm-review: a real ECS failure mode distinct from an SDK exception -- run_task can return
+    HTTP 200 with a non-empty `failures` list and an empty `tasks` list (capacity, placement,
+    or config problems ECS itself rejects before ever starting the task). Confirms
+    _launch_archive_fargate_task's failures-list check actually fires -- this was already
+    implemented, but had no test proving it before this one."""
+    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    ecs = FakeEcsClient(
+        run_task_response={"failures": [{"reason": "RESOURCE:FARGATE"}], "tasks": []}
+    )
+
+    with patch.object(oa, "_alert_archive_failure") as mock_alert:
+        result = await oa._run_archive_fargate(
+            "mi", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
+        )
+
+    assert result["success"] is False
+    assert "RESOURCE:FARGATE" in result["error"]
+    mock_alert.assert_called_once()
+    assert ecs.describe_calls == []  # never got as far as waiting on a task that never started
+
+
+@pytest.mark.asyncio
+async def test_run_task_response_with_no_tasks_and_no_failures_fails_cleanly(monkeypatch):
+    """The other half of the same real ECS shape: an empty tasks list with no failures entries
+    either (no `reason` given at all) must still be treated as "never started", not as a
+    successful launch with a None task_arn that then blows up waiting on it."""
+    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    ecs = FakeEcsClient(run_task_response={"failures": [], "tasks": []})
+
+    with patch.object(oa, "_alert_archive_failure") as mock_alert:
+        result = await oa._run_archive_fargate(
+            "mi", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
+        )
+
+    assert result["success"] is False
+    assert "no task returned" in result["error"]
+    mock_alert.assert_called_once()
+    assert ecs.describe_calls == []
 
 
 @pytest.mark.asyncio

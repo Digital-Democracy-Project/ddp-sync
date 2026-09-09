@@ -707,7 +707,11 @@ openstates_archive:
                       # when true, instead of run-archive.sh locally. Off by default -- this
                       # is a live cutover decision (moves archiving's data source from the
                       # Mac's local Postgres to RDS), not something this ticket's own PR
-                      # should flip on its own.
+                      # should flip on its own. pm-review: do NOT flip this before the
+                      # deployed "ddp-scrapers" ECS task definition's image actually contains
+                      # cloud_archiver.py and docker-entrypoint.sh's RUNNER_SCRIPT dispatch
+                      # (ddp-open-states#225) -- an older image has neither, so the first
+                      # task launched this way would fail at container startup, not cleanly.
   cloud_path:
     fargate:
       # Same real values as openstates_scrape.cloud_path.fargate above (same cluster, same
