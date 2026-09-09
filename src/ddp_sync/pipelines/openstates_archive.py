@@ -35,6 +35,7 @@ import structlog
 
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
+from ddp_sync.services.rds_credentials import resolve_rds_database_url
 
 logger = structlog.get_logger()
 
@@ -400,9 +401,13 @@ async def _run_archive_fargate(
     """
     from ddp_sync.pipelines.cloud_scrape_trigger import _fargate_config, _wait_for_task_stop
 
-    rds_url = os.environ.get("RDS_DATABASE_URL")
-    if not rds_url:
-        error = "RDS_DATABASE_URL not set -- refusing to launch without a target database"
+    # OPEN-260: resolved live from Secrets Manager on every launch, not read from a cached env
+    # var -- RDS's own automatic 7-day credential rotation goes stale under a cached value
+    # regardless of how recently this process started (see rds_credentials.py's docstring for
+    # the full incident this fixes, 2026-09-09).
+    rds_url, rds_error = resolve_rds_database_url()
+    if rds_error:
+        error = f"cannot resolve an RDS target: {rds_error}"
         logger.error(
             "openstates_archive: fargate launch refused", jurisdiction=jurisdiction, error=error
         )

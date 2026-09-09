@@ -90,6 +90,7 @@ import boto3
 import structlog
 
 from ddp_sync.pipelines import inflight_fargate_jobs
+from ddp_sync.services.rds_credentials import resolve_rds_database_url
 
 logger = structlog.get_logger(__name__)
 
@@ -305,21 +306,24 @@ def _run_load(
 ) -> tuple[bool, str]:
     """Run cloud_loader.py locally against RDS. Returns (success, detail).
 
-    Reads the target database from `RDS_DATABASE_URL`, deliberately not `DATABASE_URL`:
-    `_run_scrape()`'s own mac-side branch (this same ddp-sync process) uses that name for the
-    LOCAL Postgres run-scrape.sh writes to. Reusing it here would make one config mistake
-    silently point the mac's own local scrapes at RDS, or this load at the mac's local
-    database -- two very different failure modes from one typo. A dedicated name makes that
-    class of mistake impossible rather than merely documented against.
+    Resolves the target database live from Secrets Manager (OPEN-260), deliberately not from
+    a cached `DATABASE_URL`-style env var: `_run_scrape()`'s own mac-side branch (this same
+    ddp-sync process) uses that name for the LOCAL Postgres run-scrape.sh writes to, and a
+    static env var goes stale the moment RDS's own 7-day automatic credential rotation fires,
+    regardless of how recently this container restarted. Resolving here, right before use,
+    rather than reusing whatever `run_cloud_scrape()`'s own preflight check resolved earlier,
+    is deliberate: a rotation that happens during the collection step (which can run for
+    hours) is picked up here instead of carrying forward a value that was current when the
+    preflight ran but may not be by the time the load actually happens.
 
-    `run_cloud_scrape()` already refuses before spending hours on a Fargate collection if
-    `RDS_DATABASE_URL` is unset (pm-review, round 1: the original version only discovered this
-    here, after the collection had already run). This function keeps its own check too, so a
+    `run_cloud_scrape()` already refuses before spending hours on a Fargate collection if this
+    can't be resolved (pm-review, round 1: the original version only discovered this here,
+    after the collection had already run). This function keeps its own check too, so a
     caller that invokes it directly -- tests included -- gets the same guarantee.
     """
-    rds_url = os.environ.get("RDS_DATABASE_URL")
-    if not rds_url:
-        return False, "RDS_DATABASE_URL not set -- refusing to load without a target database"
+    rds_url, error = resolve_rds_database_url()
+    if error:
+        return False, f"cannot resolve an RDS target: {error}"
 
     script = os.path.join(openstates_root, "cloud_loader.py")
     cmd = ["python3", script, jurisdiction, run_id]
@@ -645,10 +649,16 @@ def run_cloud_scrape(
         # pm-review, round 1: check this BEFORE triggering an hours-long Fargate collection,
         # not only inside _run_load() after the fact -- a missing RDS target is knowable up
         # front and shouldn't cost real AWS spend to discover.
-        if not os.environ.get("RDS_DATABASE_URL"):
+        #
+        # OPEN-260: only checking resolvability here, not keeping the resolved URL for later --
+        # _run_load() below resolves it again live, deliberately, so a Secrets Manager rotation
+        # that happens during this collection's hours-long run is picked up at load time rather
+        # than carrying forward whatever was current when this preflight check ran.
+        _, preflight_error = resolve_rds_database_url()
+        if preflight_error:
             duration = round(time.monotonic() - start, 1)
-            error = "RDS_DATABASE_URL not set -- refusing to load without a target database"
-            logger.error("cloud_scrape: missing load prerequisite", jurisdiction=jurisdiction)
+            error = f"cannot resolve an RDS target: {preflight_error}"
+            logger.error("cloud_scrape: missing load prerequisite", jurisdiction=jurisdiction, error=preflight_error)
             _alert_scrape_failure(label, error, duration)
             return {
                 "success": False,

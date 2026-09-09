@@ -133,7 +133,7 @@ def test_missing_fargate_config_fails_without_touching_ecs():
 def test_run_task_exception_fails_cleanly():
     ecs = FakeEcsClient(run_task_error=RuntimeError("no capacity"))
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
@@ -148,7 +148,7 @@ def test_run_task_failures_list_fails_cleanly():
         run_task_response={"failures": [{"reason": "RESOURCE:FARGATE"}], "tasks": []}
     )
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
@@ -173,7 +173,7 @@ def test_collection_polls_until_stopped_then_loads():
         return FakeSubprocessResult(returncode=0)
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}, clear=False),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("time.sleep"),  # the RUNNING->STOPPED poll would otherwise really sleep
     ):
         result = cst.run_cloud_scrape(
@@ -206,7 +206,7 @@ def test_assign_public_ip_defaults_to_enabled_for_no_nat_public_subnets():
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
         describe_responses=[_stopped_response(exit_code=0)],
     )
-    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+    with patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")):
         cst.run_cloud_scrape(
             "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
             subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
@@ -224,7 +224,7 @@ def test_assign_public_ip_honors_explicit_fargate_config_override():
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
         describe_responses=[_stopped_response(exit_code=0)],
     )
-    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+    with patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")):
         cst.run_cloud_scrape(
             "mi", None, "/fake/root", _fargate_config(assign_public_ip="DISABLED"),
             ecs_client=ecs, subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
@@ -245,7 +245,7 @@ def test_session_arg_reaches_both_collection_command_and_loader_command():
         captured["cmd"] = cmd
         return FakeSubprocessResult(returncode=0)
 
-    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+    with patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")):
         cst.run_cloud_scrape(
             "va", "session=2027", "/fake/root", _fargate_config(),
             ecs_client=ecs, subprocess_runner=fake_subprocess,
@@ -276,7 +276,7 @@ def test_multi_part_session_arg_is_split_into_separate_argv_tokens():
         captured["cmd"] = cmd
         return FakeSubprocessResult(returncode=0)
 
-    with patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}):
+    with patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")):
         cst.run_cloud_scrape(
             "usa", "session=119 chamber=lower", "/fake/root", _fargate_config(),
             ecs_client=ecs, subprocess_runner=fake_subprocess,
@@ -300,7 +300,7 @@ def test_nonzero_exit_code_skips_the_load_entirely():
         return FakeSubprocessResult(returncode=0)
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
         result = cst.run_cloud_scrape(
@@ -320,7 +320,7 @@ def test_task_stopped_with_no_matching_container_reports_exit_code_none():
         describe_responses=[_stopped_response(container_name="not-the-scraper")],
     )
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
@@ -335,7 +335,7 @@ def test_max_wait_exceeded_gives_up_without_looping_forever():
         describe_responses=[_running_response()],
     )
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
     ):
         result = cst.run_cloud_scrape(
@@ -359,7 +359,7 @@ def test_describe_tasks_exception_mid_poll_is_caught_and_reported():
         describe_error=RuntimeError("ThrottlingException: Rate exceeded"),
     )
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
         result = cst.run_cloud_scrape("mi", None, "/fake/root", _fargate_config(), ecs_client=ecs)
@@ -373,7 +373,7 @@ def test_ecs_client_construction_failure_is_caught_and_reported():
     """Same guarantee, for the other place an unexpected exception could originate:
     boto3.client("ecs") itself, when no ecs_client is injected."""
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("boto3.client", side_effect=RuntimeError("no region configured")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -387,10 +387,11 @@ def test_ecs_client_construction_failure_is_caught_and_reported():
 # ── load step ────────────────────────────────────────────────────────────────────────────────
 
 
-def test_missing_rds_database_url_refuses_before_touching_ecs_at_all():
+def test_unresolvable_rds_credential_refuses_before_touching_ecs_at_all():
     """pm-review, round 1: the original version only discovered a missing RDS target after an
     hours-long collection had already run. Now it's the very first thing checked -- neither
-    ECS nor the loader subprocess is ever touched."""
+    ECS nor the loader subprocess is ever touched. OPEN-260: "missing" now means Secrets
+    Manager couldn't resolve a credential, not an unset env var."""
     ecs = FakeEcsClient()
     subprocess_calls = []
 
@@ -398,9 +399,11 @@ def test_missing_rds_database_url_refuses_before_touching_ecs_at_all():
         subprocess_calls.append(cmd)
         return FakeSubprocessResult(returncode=0)
 
-    env_without_rds_url = {k: v for k, v in os.environ.items() if k != "RDS_DATABASE_URL"}
     with (
-        patch.dict(os.environ, env_without_rds_url, clear=True),
+        patch(
+            "ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url",
+            return_value=(None, "RDS_CREDENTIALS_SECRET_ARN not set -- refusing to guess which secret to read"),
+        ),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
         result = cst.run_cloud_scrape(
@@ -409,22 +412,24 @@ def test_missing_rds_database_url_refuses_before_touching_ecs_at_all():
         )
 
     assert result["success"] is False
-    assert "RDS_DATABASE_URL" in result["error"]
+    assert "cannot resolve an RDS target" in result["error"]
     assert ecs.run_task_calls == []
     assert subprocess_calls == []
     mock_alert.assert_called_once()
 
 
-def test_run_load_directly_also_refuses_without_rds_database_url():
+def test_run_load_directly_also_refuses_when_credential_unresolvable():
     """_run_load() keeps its own check too (not just run_cloud_scrape()'s earlier one), so a
     caller that invokes it directly -- including a future retry/resume path -- still gets the
     same guarantee."""
-    env_without_rds_url = {k: v for k, v in os.environ.items() if k != "RDS_DATABASE_URL"}
-    with patch.dict(os.environ, env_without_rds_url, clear=True):
+    with patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url",
+        return_value=(None, "could not fetch RDS credential from Secrets Manager: boom"),
+    ):
         ok, detail = cst._run_load("mi", None, "run-1", "/fake/root", _fargate_config()["cloud_path"]["fargate"], None)
 
     assert ok is False
-    assert "RDS_DATABASE_URL" in detail
+    assert "cannot resolve an RDS target" in detail
 
 
 def test_loader_nonzero_returncode_fails():
@@ -437,7 +442,7 @@ def test_loader_nonzero_returncode_fails():
         return FakeSubprocessResult(returncode=1, stderr=b"could not connect to server")
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
         result = cst.run_cloud_scrape(
@@ -452,9 +457,10 @@ def test_loader_nonzero_returncode_fails():
 
 
 def test_loader_never_reuses_the_ambient_database_url():
-    """The whole reason RDS_DATABASE_URL is a separate variable: a pre-set DATABASE_URL in
+    """The whole reason the loader builds its own env from scratch: a pre-set DATABASE_URL in
     this process's own environment (the mac-side local Postgres URL, in production) must
-    never leak into the loader's subprocess in place of the RDS one."""
+    never leak into the loader's subprocess in place of the live-resolved RDS credential
+    (OPEN-260: resolved from Secrets Manager at call time, not read from an env var either)."""
     ecs = FakeEcsClient(
         run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
         describe_responses=[_stopped_response(exit_code=0)],
@@ -465,12 +471,12 @@ def test_loader_never_reuses_the_ambient_database_url():
         captured["env"] = env
         return FakeSubprocessResult(returncode=0)
 
-    with patch.dict(
-        os.environ,
-        {
-            "DATABASE_URL": "postgresql://local/openstates",
-            "RDS_DATABASE_URL": "postgresql://rds/openstates",
-        },
+    with (
+        patch.dict(os.environ, {"DATABASE_URL": "postgresql://local/openstates"}),
+        patch(
+            "ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url",
+            return_value=("postgresql://rds/openstates", ""),
+        ),
     ):
         cst.run_cloud_scrape(
             "mi", None, "/fake/root", _fargate_config(), ecs_client=ecs,
@@ -493,7 +499,7 @@ def test_loader_timeout_fails_instead_of_hanging_forever():
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=7200)
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
         result = cst.run_cloud_scrape(
@@ -567,7 +573,7 @@ def test_task_arn_recorded_before_the_wait_begins_and_cleared_on_success():
         return 0, ""
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.cloud_scrape_trigger._wait_for_task_stop", fake_wait),
         patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
     ):
@@ -594,7 +600,7 @@ def test_inflight_record_cleared_even_when_the_load_step_fails():
         describe_responses=[_stopped_response(exit_code=0)],
     )
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
         patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
     ):
@@ -625,7 +631,7 @@ def test_resume_inflight_fargate_job_finishes_a_persisted_task_arn_without_relau
         return FakeSubprocessResult(returncode=0)
 
     with (
-        patch.dict(os.environ, {"RDS_DATABASE_URL": "postgresql://rds/openstates"}),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
         patch.object(cst.inflight_fargate_jobs, "_client", FakeRedisClient()),
     ):
         result = cst.resume_inflight_fargate_job(
