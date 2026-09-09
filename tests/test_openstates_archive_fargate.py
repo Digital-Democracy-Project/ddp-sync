@@ -10,7 +10,6 @@ own Fargate tests, so the two suites read the same way.
 
 from __future__ import annotations
 
-import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -105,20 +104,24 @@ async def test_use_fargate_true_calls_the_fargate_path_not_the_local_wrapper():
 
 
 @pytest.mark.asyncio
-async def test_missing_rds_database_url_refuses_without_touching_ecs(monkeypatch):
-    monkeypatch.delenv("RDS_DATABASE_URL", raising=False)
+async def test_unresolvable_rds_credential_refuses_without_touching_ecs(monkeypatch):
+    monkeypatch.setattr(
+        oa,
+        "resolve_rds_database_url",
+        lambda: (None, "RDS_CREDENTIALS_SECRET_ARN not set -- refusing to guess which secret to read"),
+    )
     ecs = FakeEcsClient()
 
     result = await oa._run_archive_fargate("mi", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs)
 
     assert result["success"] is False
-    assert "RDS_DATABASE_URL" in result["error"]
+    assert "cannot resolve an RDS target" in result["error"]
     assert ecs.run_task_calls == []
 
 
 @pytest.mark.asyncio
 async def test_missing_fargate_config_fails_without_touching_ecs(monkeypatch):
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient()
 
     result = await oa._run_archive_fargate("mi", config={}, ecs_client=ecs)
@@ -133,7 +136,7 @@ async def test_missing_fargate_config_fails_without_touching_ecs(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_successful_run_passes_runner_script_and_database_url_overrides(monkeypatch):
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
 
     result = await oa._run_archive_fargate(
@@ -151,7 +154,7 @@ async def test_successful_run_passes_runner_script_and_database_url_overrides(mo
 
 @pytest.mark.asyncio
 async def test_run_task_exception_fails_cleanly_and_alerts(monkeypatch):
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(run_task_error=RuntimeError("no capacity"))
 
     with patch.object(oa, "_alert_archive_failure") as mock_alert:
@@ -171,7 +174,7 @@ async def test_run_task_response_with_failures_list_fails_cleanly_without_raisin
     or config problems ECS itself rejects before ever starting the task). Confirms
     _launch_archive_fargate_task's failures-list check actually fires -- this was already
     implemented, but had no test proving it before this one."""
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(
         run_task_response={"failures": [{"reason": "RESOURCE:FARGATE"}], "tasks": []}
     )
@@ -192,7 +195,7 @@ async def test_run_task_response_with_no_tasks_and_no_failures_fails_cleanly(mon
     """The other half of the same real ECS shape: an empty tasks list with no failures entries
     either (no `reason` given at all) must still be treated as "never started", not as a
     successful launch with a None task_arn that then blows up waiting on it."""
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(run_task_response={"failures": [], "tasks": []})
 
     with patch.object(oa, "_alert_archive_failure") as mock_alert:
@@ -208,7 +211,7 @@ async def test_run_task_response_with_no_tasks_and_no_failures_fails_cleanly(mon
 
 @pytest.mark.asyncio
 async def test_nonzero_exit_code_fails_cleanly_and_alerts(monkeypatch):
-    monkeypatch.setenv("RDS_DATABASE_URL", "postgresql://rds/openstates")
+    monkeypatch.setattr(oa, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=1)])
 
     with patch.object(oa, "_alert_archive_failure") as mock_alert:
