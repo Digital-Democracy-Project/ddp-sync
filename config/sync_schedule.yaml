@@ -428,10 +428,26 @@ openstates_scrape:
   # deliberately avoiding a shared NAT gateway egress IP), not the original request's phrasing.
   # No NAT gateway or VPC endpoint needed as a result. All three sit in the same VPC
   # (vpc-094e2b729f120ef62) as everything else already confirmed.
+  # Reconciled 2026-09-09 (OPEN-231): this block had drifted from what's actually running --
+  # the live host has been hand-edited to enabled: true with 8 real jurisdictions since at
+  # least 2026-09-02 (notes/ops-handoff, "confirmed by actually launching and stopping two real
+  # Fargate tasks"), but nobody had committed that back to git (`ddp-sync.service`'s restart
+  # path only runs `render-env.sh` + `docker compose up`, never a git sync -- confirmed directly
+  # against the live host, not assumed). Bringing this file in line with the real, already-live
+  # values rather than treating git as the source of truth it wasn't. Same "committed != running"
+  # gap OPEN-247 exists to fix generally; not re-solving that here, just not compounding it with
+  # a PR that would silently roll back 8 production jurisdictions if it were ever deployed by
+  # overwriting the live file.
+  #
+  # nc added alongside the reconciliation: OPEN-231 Stage 6 found NC has never actually run
+  # through this path (zero watermark objects in ddp-openstates-scraper-memory for nc, versus
+  # every other cloud jurisdiction having them) -- it was only ever added to `secondary.
+  # jurisdictions` above, which schedules it but doesn't route it through Fargate/RDS. This is
+  # what actually starts NC's recurring cloud cycles so Stage 6's soak period can begin for real.
   cloud_path:
-    enabled: false
-    jurisdictions: []
-    memory_backend_jurisdictions: []
+    enabled: true
+    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc"]
+    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc"]
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
@@ -746,6 +762,11 @@ openstates_archive:
     - ma
     - al
     - us
+    # OPEN-231 Stage 6: NC's one-time catch-up run (6192/6192 archived, Stage 4's gate) already
+    # cleared its backlog, so its weekly runs going forward should be as light as fl/ut's --
+    # paired with mi on thursday rather than given a dedicated day. Arbitrary choice of day
+    # beyond "pick an already-light one" -- change freely if a different day fits ops better.
+    - nc
   schedule:
     fl: monday
     ut: monday
@@ -756,6 +777,7 @@ openstates_archive:
     ma: friday
     al: saturday
     us: sunday
+    nc: thursday
   # Same ScrapeBot cookie pre-seed the scrape jobs get (secondary.scrapebot_fallback above),
   # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
   # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed
