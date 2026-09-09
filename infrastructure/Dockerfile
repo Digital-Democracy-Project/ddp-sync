@@ -93,8 +93,19 @@ LABEL description="ddp-sync"
 # Found missing by actually running a real --import here (2026-09-02): "Could not find the
 # GDAL library ... Is GDAL installed?" -- runtime-only (ctypes.util.find_library(), not a
 # build-time link), so the bare runtime package is enough; no -dev headers or CLI tools needed.
+#
+# poppler-utils: provides `pdftotext`, invoked as a subprocess at RUNTIME -- the root
+# ddp-open-states Dockerfile's own final stage added this 2026-08-29 for spatula (fl/bills.py's
+# SubjectPDF page, openstates-scrapers), after a real FL scrape hit FileNotFoundError:
+# 'pdftotext'. This file's own header comment claims to mirror that Dockerfile "exactly," but
+# never actually carried this package over -- found live 2026-09-09 running refresh-extraction
+# (openstates-core's general PDF text-extraction path, a different caller of the same missing
+# binary) against RDS from a container built off this file: every PDF-sourced document refused
+# unconditionally, `[Errno 2] No such file or directory: 'pdftotext'`, indistinguishable from a
+# real extractor regression until traced back to this missing binary. Not a build-time
+# dependency either, so it belongs here, not the builder stage above.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgdal32 \
+        libgdal32 poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
