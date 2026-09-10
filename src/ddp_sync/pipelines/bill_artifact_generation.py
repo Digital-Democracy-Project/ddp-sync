@@ -335,6 +335,7 @@ async def generate_and_store_bill_artifact(
     version_date: str,
     version_note: str,
     artifact_type: str,
+    target_artifact_id: int | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -346,6 +347,13 @@ async def generate_and_store_bill_artifact(
     quality-verified; if nothing is archived, it records a failed row
     without ever dispatching, rather than accepting a caller-supplied URL
     it would otherwise fall back to.
+
+    target_artifact_id (SYNC-62): passed straight through to every
+    write_bill_artifact call below -- see that function's own artifact_id
+    docstring. Every write in this function targets the same
+    (version_date, version_note) the caller supplied, so there is exactly
+    one row any of them could mean to update; None (the default) preserves
+    every existing caller's natural-key-only behavior unchanged.
 
     Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
     docstring. A LegBot answer flagged insufficient_information is recorded
@@ -396,6 +404,7 @@ async def generate_and_store_bill_artifact(
             status="failed",
             failure_stage="generation",
             failure_reason="no_archived_bill_text",
+            artifact_id=target_artifact_id,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
@@ -423,6 +432,7 @@ async def generate_and_store_bill_artifact(
             failure_stage="generation",
             failure_reason="insufficient_information",
             model_name=model_name,
+            artifact_id=target_artifact_id,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
@@ -447,6 +457,7 @@ async def generate_and_store_bill_artifact(
                 failure_stage="generation",
                 failure_reason="no_valid_topics",
                 model_name=model_name,
+                artifact_id=target_artifact_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
@@ -469,6 +480,7 @@ async def generate_and_store_bill_artifact(
         # SYNC-43: AGENTS-80's source_support, recorded rather than dropped.
         # Only "inferred" marks anything -- see _validation_notes_for.
         source_support=answer.get("source_support"),
+        artifact_id=target_artifact_id,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
@@ -486,6 +498,7 @@ async def _dispatch_and_write_changelog(
     diff_source: str,
     old_version_date: str,
     old_version_note: str,
+    target_artifact_id: int | None = None,
     broker_api_base: str | None,
     broker_api_token: str | None,
 ) -> dict:
@@ -501,6 +514,13 @@ async def _dispatch_and_write_changelog(
     caller wraps this in a try/except for LegBotDispatchError or
     BrokerClientError -- both propagate uncaught, same convention as
     generate_and_store_bill_artifact.
+
+    target_artifact_id (SYNC-62): passed straight through to every
+    write_bill_artifact call below -- see that function's own artifact_id
+    docstring. Only ever non-None when THIS transition is the one targeting
+    the caller's own on-demand placeholder version -- generate_and_store_
+    bill_changelog's own docstring explains why every other transition in
+    its walk always passes None here.
     """
     dispatch_result = await dispatch_bill_changelog(
         old_bill_source=old_bill_source,
@@ -543,6 +563,7 @@ async def _dispatch_and_write_changelog(
                 insufficient_but_populated=True,
                 compare_version_date=old_version_date,
                 compare_version_note=old_version_note,
+                artifact_id=target_artifact_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
@@ -568,6 +589,7 @@ async def _dispatch_and_write_changelog(
             model_name=model_name,
             compare_version_date=old_version_date,
             compare_version_note=old_version_note,
+            artifact_id=target_artifact_id,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
@@ -593,6 +615,7 @@ async def _dispatch_and_write_changelog(
             source_support=answer.get("source_support"),  # SYNC-43
             compare_version_date=old_version_date,
             compare_version_note=old_version_note,
+            artifact_id=target_artifact_id,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
@@ -620,6 +643,7 @@ async def generate_and_store_bill_changelog(
     version_date: str,
     version_note: str,
     gov_id: str | None = None,
+    target_artifact_id: int | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -627,6 +651,17 @@ async def generate_and_store_bill_changelog(
     ddp-broker-py -- the 8th BillArtifact type, not part of
     generate_and_store_bill_artifact above because it needs a prior
     version's text plus a precomputed diff, not a single bill_source.
+
+    target_artifact_id (SYNC-62): dispatch_and_record_bill_artifact's
+    on-demand placeholder id, passed through to write_bill_artifact -- see
+    that function's own artifact_id docstring. This function's own walk
+    dispatches whichever transitions are ready, each targeting its own
+    (possibly different) BillVersion, so the placeholder's id is only ever
+    the right target for the ONE transition whose new_version_date/
+    new_version_note matches this call's own version_date/version_note --
+    the same match requested_version_written already tracks below. Every
+    other transition passes None, since none of them share the
+    placeholder's row.
 
     Does not touch Pinecone -- decoupled 2026-08-10, see this module's own
     docstring.
@@ -1012,6 +1047,15 @@ async def generate_and_store_bill_changelog(
     # beside the older transition's real, complete row.
     requested_version_written = False
     for transition in transitions:
+        # SYNC-62: computed before dispatching, not after -- target_artifact_id
+        # must only ever reach the one transition targeting the caller's own
+        # placeholder version. Passing it to any other transition would tell
+        # ddp-broker-py to overwrite an unrelated row that happens to share no
+        # relationship with this id at all beyond coincidence.
+        is_requested_version = (
+            transition["new_version_date"] == version_date
+            and transition["new_version_note"] == version_note
+        )
         last_result = await _dispatch_and_write_changelog(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
@@ -1022,13 +1066,11 @@ async def generate_and_store_bill_changelog(
             diff_source=transition["diff_source"],
             old_version_date=transition["old_version_date"],
             old_version_note=transition["old_version_note"],
+            target_artifact_id=target_artifact_id if is_requested_version else None,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
-        if (
-            transition["new_version_date"] == version_date
-            and transition["new_version_note"] == version_note
-        ):
+        if is_requested_version:
             # Named "written", not just "targeted": _dispatch_and_write_
             # changelog above either returns after a real write_bill_artifact
             # call (complete, or failed via insufficient_information) or
@@ -1077,14 +1119,24 @@ async def dispatch_and_record_bill_artifact(
 
     Writes an initial `pending` BillArtifact row before dispatching to
     LegBot, then lets generate_and_store_bill_artifact/
-    generate_and_store_bill_changelog update the *same* row (via
-    write_bill_artifact's existing upsert-by-natural-key semantics) once a
-    real answer comes back -- so ddp-next can poll ddp-broker-py and
-    observe a real pending -> complete/failed transition, per this ticket's
-    AC #3. The pending write and the eventual complete/failed write always
-    target the same broker_api_base/broker_api_token pair passed in here,
-    so the upsert resolves against one broker's own database throughout --
-    never split across the dev/prod pair.
+    generate_and_store_bill_changelog update the *same* row once a real
+    answer comes back -- so ddp-next can poll ddp-broker-py and observe a
+    real pending -> complete/failed transition, per this ticket's AC #3.
+    The pending write and the eventual complete/failed write always target
+    the same broker_api_base/broker_api_token pair passed in here, so the
+    upsert resolves against one broker's own database throughout -- never
+    split across the dev/prod pair.
+
+    SYNC-62: "the same row" above used to mean "the same natural key," which
+    ddp-broker-py cannot actually guarantee once the bill_version already has
+    prior coverage for this artifact_type -- its BROKER-105 revision logic
+    resolves a write's target via review_status, not an identity this client
+    holds, and the placeholder/final writes could permanently diverge into
+    two rows (confirmed live: 44 of 49 stuck-pending rows in one 50-bill
+    backfill batch). Fixed by capturing the placeholder's own row id from its
+    write response and passing it back on every later write for this same
+    dispatch -- including the failure-reconciliation writes below, which had
+    exactly the same natural-key gap.
 
     Never raises: this runs as a fire-and-forget FastAPI BackgroundTasks
     callback with no caller left to propagate an exception to by the time
@@ -1099,7 +1151,7 @@ async def dispatch_and_record_bill_artifact(
     forever with nothing left to update it.
     """
     try:
-        await write_bill_artifact(
+        pending_result = await write_bill_artifact(
             bill_openstates_id=bill_openstates_id,
             jurisdiction=jurisdiction,
             session_code=session_code,
@@ -1111,6 +1163,11 @@ async def dispatch_and_record_bill_artifact(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        # SYNC-62: every later write for this dispatch targets this exact row
+        # by id -- see this function's own docstring for why the natural key
+        # alone can't be trusted to reunite them once the bill_version already
+        # has prior coverage for this artifact_type.
+        placeholder_id = pending_result.get("id")
     except BrokerClientError as exc:
         # Nothing to update later -- the caller's poll will simply never
         # see a row for this bill+artifact_type, same as if this call had
@@ -1131,6 +1188,7 @@ async def dispatch_and_record_bill_artifact(
                 session_code=session_code,
                 version_date=version_date,
                 version_note=version_note,
+                target_artifact_id=placeholder_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
@@ -1175,6 +1233,7 @@ async def dispatch_and_record_bill_artifact(
                     status="failed",
                     failure_stage="generation",
                     failure_reason="no_version_transition_available",
+                    artifact_id=placeholder_id,
                     broker_api_base=broker_api_base,
                     broker_api_token=broker_api_token,
                 )
@@ -1186,6 +1245,7 @@ async def dispatch_and_record_bill_artifact(
                 version_date=version_date,
                 version_note=version_note,
                 artifact_type=artifact_type,
+                target_artifact_id=placeholder_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
@@ -1208,6 +1268,7 @@ async def dispatch_and_record_bill_artifact(
                 status="failed",
                 failure_stage="dispatch_error",
                 failure_reason=str(exc),
+                artifact_id=placeholder_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )

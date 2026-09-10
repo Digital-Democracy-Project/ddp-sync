@@ -119,6 +119,72 @@ async def test_compare_version_fields_pass_through_the_payload():
 
 
 # ---------------------------------------------------------------------------
+# SYNC-62: artifact_id lets a caller resolve directly to a specific row,
+# bypassing ddp-broker-py's natural-key/revision resolution -- see that
+# parameter's own docstring for why the natural key alone can't be trusted
+# once a bill_version already has prior coverage for this artifact_type.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_id_is_included_in_the_payload_when_given():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"id": 198773, "created": False}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="A summary.",
+            artifact_id=198773,
+        )
+
+    assert result == {"id": 198773, "created": False}
+    call = mock_client.post.await_args
+    assert call.kwargs["json"]["id"] == 198773
+
+
+@pytest.mark.asyncio
+async def test_artifact_id_omitted_from_the_payload_when_not_given():
+    """Every existing caller must be unaffected -- the key should not even be
+    present, not sent as null, since ddp-broker-py's own serializer treats
+    "not provided" and "provided as null" as the same thing here, but keeping
+    the payload identical to before this field existed is the safer bar."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 201
+    response.json.return_value = {"id": 7, "created": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await write_bill_artifact(
+            bill_openstates_id="abc",
+            jurisdiction="FL",
+            session_code="2026",
+            version_date="2026-01-05",
+            version_note="Introduced",
+            artifact_type="bill_summary",
+            content="A summary.",
+        )
+
+    call = mock_client.post.await_args
+    assert "id" not in call.kwargs["json"]
+
+
+# ---------------------------------------------------------------------------
 # SYNC-29: failure_reason truncation -- a verbose failure_reason (e.g. a
 # backend-error repr) must never cause ddp-broker-py to reject the whole
 # write and lose the BillArtifact row entirely.

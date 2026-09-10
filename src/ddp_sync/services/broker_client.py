@@ -174,6 +174,7 @@ async def write_bill_artifact(
     compare_version_note: str | None = None,
     source_support: str | None = None,
     insufficient_but_populated: bool = False,
+    artifact_id: int | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -185,6 +186,19 @@ async def write_bill_artifact(
     same (bill_version, artifact_type, model_version, prompt_version)
     combination upserts rather than duplicates, matching BillArtifact's own
     uniqueness constraint (Phase 6) — safe to retry after a network failure.
+
+    artifact_id (SYNC-62): when the caller already knows the exact row it
+    means to update -- dispatch_and_record_bill_artifact's on-demand
+    placeholder-then-final-result pattern -- pass the placeholder's own id
+    here to resolve directly to that row, bypassing the natural-key lookup
+    above entirely. That lookup can't be trusted to reunite the two writes on
+    its own once a bill_version already has prior coverage for this
+    artifact_type: ddp-broker-py's BROKER-105 revision logic sends both
+    writes through a path keyed on review_status rather than any identity
+    this client can rely on, so they can permanently diverge into two rows
+    (SYNC-62). None (the default) omits the field entirely rather than
+    sending it as null, leaving every other caller's payload byte-for-byte
+    unchanged.
 
     compare_version_date/compare_version_note are only ever set by
     generate_and_store_bill_changelog (artifact_type=bill_changelog) — the
@@ -278,6 +292,11 @@ async def write_bill_artifact(
         _notes = _validation_notes_for(source_support, artifact_type=artifact_type)
     if _notes:
         payload["validation_notes"] = _notes
+    # SYNC-62: only sent when a caller actually has a row to target -- see
+    # artifact_id's own docstring. Omitted rather than sent as null so every
+    # existing caller's payload is unaffected.
+    if artifact_id is not None:
+        payload["id"] = artifact_id
     headers = {"Authorization": f"Bearer {resolved_api_token}"}
 
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
