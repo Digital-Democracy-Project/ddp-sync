@@ -777,6 +777,16 @@ async def generate_and_store_bill_changelog(
         even though a real failed row was left behind with nothing left to
         revisit it (the outer coverage gate only ever looks at the bill's
         current latest version).
+
+        SYNC-56: also carries `requested_version_written: False` -- omitted
+        entirely otherwise -- when none of the dispatched transitions
+        targeted THIS call's own version_date/version_note (the true latest
+        version had no diff of its own, SYNC-46). `status` alone can read
+        "complete" here purely because an OLDER transition succeeded;
+        dispatch_and_record_bill_artifact checks this flag alongside `status`
+        for exactly that reason. session_pipeline_runner.py's batch caller
+        ignores it -- it never writes a placeholder tied to one specific
+        version the way the on-demand endpoint does.
     """
     resolved = await get_archived_version_transitions(bill_openstates_id)
 
@@ -987,6 +997,20 @@ async def generate_and_store_bill_changelog(
     # what status is REPORTED back to the caller when one of them failed.
     first_failure: dict | None = None
     last_result: dict = {"status": "not_applicable"}
+    # SYNC-56: whether one of the dispatched transitions actually targets
+    # THIS call's own version_date/version_note -- distinct from whatever
+    # status ends up reported below. A bill whose true latest version has no
+    # diff of its own (SYNC-46) still dispatches whatever earlier transition
+    # IS ready, and that transition's own "complete"/"failed" result is not
+    # evidence that anything was written under the caller's requested
+    # version. dispatch_and_record_bill_artifact's on-demand caller already
+    # wrote a `pending` placeholder under that exact version before calling
+    # this function -- without this flag, a "complete" result here (from an
+    # older transition) satisfies its not_applicable check and leaves that
+    # placeholder stuck forever. Observed live: VA HB1070 and UT SB194 each
+    # kept a `pending` bill_changelog row 40+ seconds after dispatch, sitting
+    # beside the older transition's real, complete row.
+    requested_version_written = False
     for transition in transitions:
         last_result = await _dispatch_and_write_changelog(
             bill_openstates_id=bill_openstates_id,
@@ -1001,9 +1025,32 @@ async def generate_and_store_bill_changelog(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        if (
+            transition["new_version_date"] == version_date
+            and transition["new_version_note"] == version_note
+        ):
+            # Named "written", not just "targeted": _dispatch_and_write_
+            # changelog above either returns after a real write_bill_artifact
+            # call (complete, or failed via insufficient_information) or
+            # raises (BrokerClientError/LegBotDispatchError) -- there is no
+            # path where it returns without one. A raise here propagates out
+            # of this whole function uncaught, and dispatch_and_record_bill_
+            # artifact's own outer except block already resolves the
+            # placeholder in that case -- so by the time this line runs at
+            # all, a real terminal row exists for this transition.
+            requested_version_written = True
         if first_failure is None and last_result.get("status") != "complete":
             first_failure = last_result
-    return first_failure if first_failure is not None else last_result
+    result = first_failure if first_failure is not None else last_result
+    if requested_version_written:
+        return result
+    # Signal the gap to callers that care (today, only
+    # dispatch_and_record_bill_artifact) without changing this function's
+    # existing return shape for the normal case -- omitted entirely (not set
+    # to True) whenever a transition did target the requested version, so
+    # every pre-existing caller/test asserting an exact result dict is
+    # unaffected.
+    return {**result, "requested_version_written": False}
 
 
 async def dispatch_and_record_bill_artifact(
@@ -1087,7 +1134,10 @@ async def dispatch_and_record_bill_artifact(
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
             )
-            if changelog_result.get("status") == "not_applicable":
+            if (
+                changelog_result.get("status") == "not_applicable"
+                or changelog_result.get("requested_version_written") is False
+            ):
                 # SYNC-44: unlike session_pipeline_runner.py's batch caller
                 # (which never writes a placeholder row and is happy to
                 # leave nothing behind for a not-yet-applicable bill), this
@@ -1100,6 +1150,20 @@ async def dispatch_and_record_bill_artifact(
                 # no scheduled retry sweep against this on-demand endpoint,
                 # so unlike the batch path's own AC4 concern, there's no
                 # retry_failed loop for this to get stuck in.
+                #
+                # SYNC-56: a "complete"/"failed" status alone is not enough
+                # to know this placeholder got resolved -- generate_and_
+                # store_bill_changelog dispatches whichever archived
+                # transitions are ready, and the bill's true latest version
+                # (this placeholder's own version_date/version_note) does not
+                # always have one of its own (SYNC-46: no diff of its own
+                # yet). When that happens, every real write in this call
+                # landed on an OLDER version, requested_version_written comes
+                # back False, and this placeholder would otherwise be left
+                # `pending` forever even though the overall call "succeeded".
+                # failure_reason is left the same either way -- from a
+                # ddp-next poller's perspective both mean the same thing: no
+                # changelog is coming for the version it asked about.
                 await write_bill_artifact(
                     bill_openstates_id=bill_openstates_id,
                     jurisdiction=jurisdiction,
