@@ -90,6 +90,70 @@ async def test_happy_path_writes_broker():
 
 
 @pytest.mark.asyncio
+async def test_target_artifact_id_reaches_the_write_on_success():
+    """SYNC-62: dispatch_and_record_bill_artifact's placeholder id must reach
+    the real write, so ddp-broker-py updates that exact row instead of
+    resolving a new one via natural key/revision matching."""
+    dispatch_result = {
+        "answer": {"text": "A plain-language summary.", "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 42, "created": False}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary", target_artifact_id=42
+        )
+
+    assert mock_write.await_args.kwargs["artifact_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_target_artifact_id_reaches_the_write_on_failure():
+    """The same id must reach a failed-row write too -- a failed generation
+    is still meant to resolve onto the placeholder, not orphan it."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_bill_text",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 42, "created": False}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary", target_artifact_id=42
+        )
+
+    assert mock_write.await_args.kwargs["artifact_id"] == 42
+    assert mock_write.await_args.kwargs["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_target_artifact_id_defaults_to_none():
+    """Every pre-existing caller (the batch pipeline) never has a placeholder
+    id to pass -- the write must omit it exactly as before this ticket."""
+    dispatch_result = {
+        "answer": {"text": "A plain-language summary.", "insufficient_information": False},
+        "backend": "mlx",
+    }
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        await generate_and_store_bill_artifact(
+            **_COMMON_KWARGS, artifact_type="bill_summary"
+        )
+
+    assert mock_write.await_args.kwargs["artifact_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_pros_cons_content_is_json():
     dispatch_result = {
         "answer": {
@@ -934,6 +998,38 @@ async def test_changelog_generates_every_transition_oldest_first():
 
 
 @pytest.mark.asyncio
+async def test_target_artifact_id_only_reaches_the_transition_matching_the_requested_version():
+    """SYNC-62: target_artifact_id is dispatch_and_record_bill_artifact's
+    placeholder id, written under _CHANGELOG_KWARGS' own version ("Engrossed",
+    the LAST transition's target here). Only that write may carry the id --
+    the older "Introduced" transition never had a placeholder and must not be
+    told to overwrite an unrelated row."""
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": len(write_calls), "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS, target_artifact_id=99)
+
+    by_version = {w["version_note"]: w["artifact_id"] for w in write_calls}
+    assert by_version == {"Introduced": None, "Engrossed": 99}
+
+
+@pytest.mark.asyncio
 async def test_changelog_processes_every_transition_uncapped():
     """/pm-review caught a real bug in an earlier version of this function: a
     hardcoded cap kept only the most recent N transitions, but since this
@@ -1478,6 +1574,24 @@ async def test_happy_path_delegates_to_generate_and_store_bill_artifact_with_bro
 
 
 @pytest.mark.asyncio
+async def test_placeholder_id_reaches_generate_and_store_bill_artifact():
+    """SYNC-62: the pending write's own returned id must be threaded through
+    as target_artifact_id, so the eventual real write resolves onto that
+    exact row rather than a natural-key/revision lookup that can't be trusted
+    to find it once the bill_version already has prior coverage."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_generate:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_pros_cons")
+
+    assert mock_generate.await_args.kwargs["target_artifact_id"] == 198773
+
+
+@pytest.mark.asyncio
 async def test_bill_changelog_routes_to_changelog_function_not_artifact_one():
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
@@ -1497,6 +1611,22 @@ async def test_bill_changelog_routes_to_changelog_function_not_artifact_one():
     assert "bill_source" not in call_kwargs
     assert call_kwargs["broker_api_base"] == "http://localhost:8080"
     assert call_kwargs["broker_api_token"] == "dev-token"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_id_reaches_generate_and_store_bill_changelog():
+    """SYNC-62: same threading as the non-changelog path above, just to the
+    changelog function's own target_artifact_id parameter."""
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"id": 198773, "created": False, "status": "complete"}),
+    ) as mock_changelog:
+        await dispatch_and_record_bill_artifact(**_ONDEMAND_KWARGS, artifact_type="bill_changelog")
+
+    assert mock_changelog.await_args.kwargs["target_artifact_id"] == 198773
 
 
 @pytest.mark.asyncio
@@ -1523,6 +1653,11 @@ async def test_bill_changelog_not_applicable_resolves_the_pending_row_to_failed(
     resolved_kwargs = mock_write.await_args_list[1].kwargs
     assert resolved_kwargs["status"] == "failed"
     assert resolved_kwargs["failure_reason"] == "no_version_transition_available"
+    # SYNC-62: this reconciliation write must target the same placeholder row
+    # (id=1, from the pending write's own return value above) rather than
+    # relying on the natural key, which has exactly the same revision-
+    # matching gap the real generation write does.
+    assert resolved_kwargs["artifact_id"] == 1
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1690,7 @@ async def test_bill_changelog_requested_version_not_written_resolves_the_pending
     resolved_kwargs = mock_write.await_args_list[1].kwargs
     assert resolved_kwargs["status"] == "failed"
     assert resolved_kwargs["failure_reason"] == "no_version_transition_available"
+    assert resolved_kwargs["artifact_id"] == 1
 
 
 @pytest.mark.asyncio
@@ -1609,6 +1745,7 @@ async def test_legbot_dispatch_error_writes_a_failed_row():
     assert failed_kwargs["failure_stage"] == "dispatch_error"
     assert "LegBot task timed out" in failed_kwargs["failure_reason"]
     assert failed_kwargs["broker_api_base"] == "http://localhost:8080"
+    assert failed_kwargs["artifact_id"] == 1
 
 
 @pytest.mark.asyncio
