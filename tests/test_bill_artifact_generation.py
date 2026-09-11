@@ -15,6 +15,7 @@ import pytest
 
 from ddp_sync.pipelines.bill_artifact_generation import (
     ArchivedVersionMismatchError,
+    _broker_api_token_for_base,
     dispatch_and_record_bill_artifact,
     generate_and_store_bill_artifact,
     generate_and_store_bill_changelog,
@@ -1607,10 +1608,75 @@ async def test_dispatch_records_the_task_before_polling_and_deletes_it_on_succes
 
 
 @pytest.mark.asyncio
-async def test_dispatch_deletes_the_record_even_when_the_write_fails():
-    """The finally block's whole point -- an exception path is still this
-    process handling the outcome, not a crash, so the record must not be
-    left behind for the recovery sweep to needlessly re-check."""
+async def test_dispatch_never_persists_the_broker_api_token_in_redis():
+    """SYNC-61 /pm-review: broker_api_token can be a real secret (session_
+    pipeline_runner.py's batch caller resolves a real dev/prod token) -- it
+    must never sit in Redis for LEGBOT_TASK_TTL (7 days). Only
+    broker_api_base (a URL, not a secret) is recorded; the token is
+    re-resolved from it at recovery time instead."""
+    store = _FakeLegbotTaskStore()
+    seen_during_dispatch = {}
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        await on_task_created("task-secret")
+        seen_during_dispatch["record"] = await store.get_legbot_task("task-secret")
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ):
+        await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS,
+            broker_api_base="http://prod-broker.example",
+            broker_api_token="super-secret-prod-token",
+        )
+
+    record = seen_during_dispatch["record"]
+    assert record["broker_api_base"] == "http://prod-broker.example"
+    assert "broker_api_token" not in record
+    assert "super-secret-prod-token" not in json.dumps(record)
+
+
+def test_broker_api_token_for_base_resolves_known_targets_and_defaults_to_none():
+    from ddp_sync.config import get_settings
+
+    settings = get_settings()
+    with patch.object(settings, "ondemand_broker_api_base_dev", "http://dev-broker.example"), \
+         patch.object(settings, "ondemand_broker_api_token_dev", "dev-token"), \
+         patch.object(settings, "ondemand_broker_api_base_prod", "http://prod-broker.example"), \
+         patch.object(settings, "ondemand_broker_api_token_prod", "prod-token"), \
+         patch.object(settings, "ddp_broker_api_base", "http://localhost:8080"), \
+         patch.object(settings, "ddp_broker_api_token", "default-token"), \
+         patch(
+             "ddp_sync.pipelines.bill_artifact_generation.get_settings",
+             return_value=settings,
+         ):
+        assert _broker_api_token_for_base("http://dev-broker.example") == "dev-token"
+        assert _broker_api_token_for_base("http://prod-broker.example") == "prod-token"
+        assert _broker_api_token_for_base("http://localhost:8080") == "default-token"
+        assert _broker_api_token_for_base("http://some-unknown-broker.example") is None
+        assert _broker_api_token_for_base(None) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_keeps_the_record_when_only_the_broker_write_fails():
+    """SYNC-61 /pm-review: CAMS genuinely finished here -- only persisting
+    the result failed. Deleting the record in this case (the original
+    behavior) would discard the one thing that lets a later recovery sweep
+    retry the write, forcing a needless fresh LegBot dispatch instead."""
     store = _FakeLegbotTaskStore()
 
     async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
@@ -1636,7 +1702,7 @@ async def test_dispatch_deletes_the_record_even_when_the_write_fails():
         with pytest.raises(BrokerClientError):
             await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
-    assert await store.get_legbot_task("task-fails") is None
+    assert await store.get_legbot_task("task-fails") is not None
 
 
 @pytest.mark.asyncio
@@ -1931,6 +1997,35 @@ async def test_a_recently_dispatched_task_is_left_alone():
     mock_status.assert_not_awaited()
     assert counts == {"checked": 0, "recovered": 0, "marked_failed": 0}
     assert await store.get_legbot_task("task-fresh") is not None
+
+
+@pytest.mark.asyncio
+async def test_still_queued_or_running_is_left_alone_not_marked_failed():
+    """SYNC-61 /pm-review: a stale-by-age record whose CAMS status is
+    genuinely still active (or any status this code doesn't recognize) must
+    NOT be treated as a terminal failure -- only reachable if a live,
+    non-crashed dispatcher's own cleanup hasn't happened yet (e.g. a Redis
+    delete that itself failed), and marking it failed there would be wrong
+    while the real dispatch is still in progress or already resolved."""
+    for still_active_status in ("queued", "running", "some_future_status"):
+        store = _FakeLegbotTaskStore()
+        await store.set_legbot_task("task-active", _stale_record())
+
+        with patch(
+            "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+            return_value=store,
+        ), patch(
+            "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+            new=AsyncMock(return_value={"status": still_active_status}),
+        ), patch(
+            "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+            new=AsyncMock(),
+        ) as mock_write:
+            counts = await recover_stale_legbot_dispatches()
+
+        mock_write.assert_not_awaited()
+        assert counts == {"checked": 1, "recovered": 0, "marked_failed": 0}, still_active_status
+        assert await store.get_legbot_task("task-active") is not None
 
 
 @pytest.mark.asyncio

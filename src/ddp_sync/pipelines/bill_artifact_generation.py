@@ -70,6 +70,7 @@ from ddp_sync.services.broker_client import (
     write_bill_artifact,
 )
 from ddp_sync.services.legbot_client import (
+    TERMINAL_STATUSES,
     LegBotDispatchError,
     check_task_status,
     dispatch_bill_changelog,
@@ -635,6 +636,29 @@ async def _write_changelog_answer(
 _LEGBOT_TASK_STALE_BUFFER_SECONDS = 300
 
 
+def _broker_api_token_for_base(broker_api_base: str | None) -> str | None:
+    """Resolve the right broker_api_token for a given broker_api_base without
+    ever persisting the token itself in Redis (SYNC-61 /pm-review: tracking
+    records live for up to LEGBOT_TASK_TTL, and a real secret has no business
+    sitting in Redis for days when it doesn't need to). There are only ever a
+    handful of distinct (base, token) pairs in play -- see
+    triggers.py's _resolve_batch_broker_target -- so this just matches the
+    recorded base against each configured pair and falls through to the
+    process-wide default (None, which write_bill_artifact/etc. already
+    resolve to settings.ddp_broker_api_token) if none match.
+    """
+    if broker_api_base is None:
+        return None
+    settings = get_settings()
+    if broker_api_base == settings.ondemand_broker_api_base_dev:
+        return settings.ondemand_broker_api_token_dev
+    if broker_api_base == settings.ondemand_broker_api_base_prod:
+        return settings.ondemand_broker_api_token_prod
+    if broker_api_base == settings.ddp_broker_api_base:
+        return settings.ddp_broker_api_token
+    return None
+
+
 async def _dispatch_and_write_changelog(
     *,
     bill_openstates_id: str,
@@ -682,6 +706,14 @@ async def _dispatch_and_write_changelog(
     (recover_stale_legbot_dispatches, below) exists to find later.
     """
     dispatched_task_id: str | None = None
+    # SYNC-61 /pm-review: only skipped (left False) when the recovery sweep
+    # would still have something real to do with the record -- today that's
+    # exactly the BrokerClientError case below, where CAMS genuinely
+    # finished but persisting the result failed. Every other outcome this
+    # process itself reaches (success, or dispatch_bill_changelog raising
+    # LegBotDispatchError -- no completed CAMS answer exists to recover)
+    # cleans up its own record as before.
+    skip_cleanup = False
 
     async def _track(task_id: str) -> None:
         nonlocal dispatched_task_id
@@ -698,8 +730,13 @@ async def _dispatch_and_write_changelog(
                 "old_version_date": old_version_date,
                 "old_version_note": old_version_note,
                 "target_artifact_id": target_artifact_id,
+                # SYNC-61 /pm-review: broker_api_base is just a URL, but
+                # broker_api_token can be a real secret (session_pipeline_
+                # runner.py's batch caller resolves one per dev/prod target)
+                # -- never persisted here, re-resolved from broker_api_base
+                # at recovery time instead (_broker_api_token_for_base), so
+                # a secret never has to sit in Redis for LEGBOT_TASK_TTL.
                 "broker_api_base": broker_api_base,
-                "broker_api_token": broker_api_token,
                 "dispatched_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -710,22 +747,32 @@ async def _dispatch_and_write_changelog(
             diff_source=diff_source,
             on_task_created=_track,
         )
-        return await _write_changelog_answer(
-            answer=dispatch_result["answer"],
-            model_name=dispatch_result.get("backend"),
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            version_date=version_date,
-            version_note=version_note,
-            old_version_date=old_version_date,
-            old_version_note=old_version_note,
-            target_artifact_id=target_artifact_id,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
+        try:
+            return await _write_changelog_answer(
+                answer=dispatch_result["answer"],
+                model_name=dispatch_result.get("backend"),
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                old_version_date=old_version_date,
+                old_version_note=old_version_note,
+                target_artifact_id=target_artifact_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        except BrokerClientError:
+            # SYNC-61 /pm-review: CAMS already finished this task for real --
+            # only persisting the result failed. Deleting the tracking
+            # record here (the pre-fix behavior) would discard the one
+            # thing that lets the recovery sweep retry the write later
+            # without paying for an entirely fresh LegBot dispatch. Still
+            # propagates uncaught, same convention as before this ticket.
+            skip_cleanup = True
+            raise
     finally:
-        if dispatched_task_id is not None:
+        if dispatched_task_id is not None and not skip_cleanup:
             await get_redis_store().delete_legbot_task(dispatched_task_id)
 
 
@@ -744,9 +791,13 @@ async def recover_stale_legbot_dispatches(
     recovery, not a new parallel mechanism -- see that watchdog's own
     docstring).
 
-    For each tracked task old enough that its own dispatcher must have
-    already given up on it one way or another (see
-    _LEGBOT_TASK_STALE_BUFFER_SECONDS):
+    For each tracked task old enough that its own dispatcher would almost
+    certainly have already given up on it one way or another (see
+    _LEGBOT_TASK_STALE_BUFFER_SECONDS -- a live, non-crashed dispatcher
+    deletes its own record on every outcome including its own timeout, so a
+    record surviving this long is normally a crash; not guaranteed, since a
+    Redis delete can itself silently fail, so this age check is eligibility
+    to inspect CAMS, not proof of a crash on its own):
 
     * CAMS reports it completed -> read task_result.json (the same file
       the normal path reads) and write the real content via
@@ -758,6 +809,10 @@ async def recover_stale_legbot_dispatches(
       `failed` BillArtifact row instead (same id-targeted resolution), so
       the existing retry_failed mechanism (SYNC-42) picks it up on its own
       terms -- this function never re-dispatches itself.
+    * CAMS reports it's still queued/running (or any other non-terminal
+      status this code doesn't recognize) -> genuinely still active, or a
+      live dispatcher's own cleanup just hasn't happened yet -- leave the
+      record in place rather than guessing it's failed.
     * CAMS itself is unreachable, or returns some other error status, or
       reading a completed task's result fails -> leave the record in
       place and try again on the next sweep; logged, never raised, so one
@@ -866,7 +921,7 @@ async def recover_stale_legbot_dispatches(
                         old_version_note=record["old_version_note"],
                         target_artifact_id=record.get("target_artifact_id"),
                         broker_api_base=record.get("broker_api_base"),
-                        broker_api_token=record.get("broker_api_token"),
+                        broker_api_token=_broker_api_token_for_base(record.get("broker_api_base")),
                     )
                 except BrokerClientError as exc:
                     # Same posture as _mark_stale_legbot_task_failed below --
@@ -884,7 +939,10 @@ async def recover_stale_legbot_dispatches(
                     )
                     continue
                 recovered += 1
-        else:
+        elif status in TERMINAL_STATUSES or status == "not_found":
+            # A real terminal outcome other than completed (failed/
+            # cancelled, or our own synthetic "not_found" for a 404 above)
+            # -- genuinely nothing left to wait for.
             logger.warning(
                 "recover_stale_legbot_dispatches: CAMS reports this task did "
                 "not complete -- marking failed so retry_failed can pick it "
@@ -900,6 +958,22 @@ async def recover_stale_legbot_dispatches(
                 # rather than losing track of this task entirely.
                 continue
             marked_failed += 1
+        else:
+            # SYNC-61 /pm-review: "queued"/"running", or any future CAMS
+            # status this code doesn't recognize yet -- not a terminal
+            # outcome, so must NOT be marked failed. Only reachable at all
+            # if a live, non-crashed dispatcher's own record survived past
+            # its own timeout (its finally block deletes its record on
+            # give-up, same as on success) -- e.g. a Redis delete that
+            # itself failed, or CAMS genuinely still working past this
+            # sweep's stale threshold. Either way, leave it tracked; a
+            # future sweep re-checks rather than this one guessing.
+            logger.info(
+                "recover_stale_legbot_dispatches: CAMS reports this task is "
+                "still active -- leaving it tracked for a future sweep",
+                task_id=task_id, cams_status=status,
+            )
+            continue
 
         await redis_store.delete_legbot_task(task_id)
 
@@ -936,7 +1010,7 @@ async def _mark_stale_legbot_task_failed(record: dict, *, reason: str) -> bool:
             compare_version_note=record.get("old_version_note"),
             artifact_id=record.get("target_artifact_id"),
             broker_api_base=record.get("broker_api_base"),
-            broker_api_token=record.get("broker_api_token"),
+            broker_api_token=_broker_api_token_for_base(record.get("broker_api_base")),
         )
     except BrokerClientError as exc:
         logger.error(

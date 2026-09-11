@@ -37,7 +37,10 @@ logger = structlog.get_logger()
 # SYNC-39: the poll interval used to be a module constant of 5 here. It now
 # lives on SyncSettings (legbot_poll_interval_seconds), which carries the
 # measurements explaining why that number was costing real time.
-_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+# Not underscore-prefixed -- SYNC-61's recovery sweep (bill_artifact_
+# generation.py) imports this directly, so both places agree on exactly
+# which CAMS statuses are terminal rather than maintaining two separate lists.
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
 class LegBotDispatchError(Exception):
@@ -319,7 +322,7 @@ async def _dispatch_and_await(
             status_resp.raise_for_status()
             body = status_resp.json()
             status = body["status"]
-            if status in _TERMINAL_STATUSES:
+            if status in TERMINAL_STATUSES:
                 break
             if "mlx_generation_started_at" not in body:
                 if not legacy_no_marker_field:
