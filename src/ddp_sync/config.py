@@ -38,6 +38,33 @@ def _positive_float(raw: str | None, *, default: float, name: str) -> float:
         return default
     return value
 
+
+def _positive_int(raw: str | None, *, default: int, name: str) -> int:
+    """Parse an operator-supplied int that must be >= 1.
+
+    Same fallback posture as _positive_float above, for the same reason: a
+    typo in a .env should not stop the service starting. SYNC-60 -- the
+    value this guards is a retry attempt count, where 0 would mean "give up
+    without ever calling the retried operation" (surprising -- see the
+    caller's own docstring) and a negative is nonsensical; an accidentally
+    huge value also has real cost here, since each attempt is a real HTTP
+    call plus a backoff sleep, so this logs loudly enough to be noticed
+    rather than silently accepting whatever an operator typed.
+    """
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "%s=%r is not an integer; using %s", name, raw, default)
+        return default
+    if value < 1:
+        logging.getLogger(__name__).warning(
+            "%s=%r must be an integer >= 1; using %s", name, raw, default)
+        return default
+    return value
+
 logger = logging.getLogger(__name__)
 
 AWS_SECRET_NAME = os.getenv("AWS_SECRET_NAME", "ddp-sync/credentials")
@@ -540,8 +567,9 @@ def _load_from_env() -> dict:
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),
-        "legbot_poll_retry_max_attempts": int(
-            os.getenv("LEGBOT_POLL_RETRY_MAX_ATTEMPTS", "5")
+        "legbot_poll_retry_max_attempts": _positive_int(
+            os.getenv("LEGBOT_POLL_RETRY_MAX_ATTEMPTS"), default=5,
+            name="LEGBOT_POLL_RETRY_MAX_ATTEMPTS",
         ),
         # Same hazard _positive_float already guards legbot_poll_interval_
         # seconds against: 0 or negative would busy-loop retries against an

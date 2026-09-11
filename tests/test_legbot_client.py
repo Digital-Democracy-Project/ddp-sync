@@ -724,6 +724,45 @@ async def test_poll_retry_budget_exhausted_cancels_and_raises_dispatch_error(tmp
     )
 
 
+@pytest.mark.asyncio
+async def test_poll_retry_budget_exhausted_on_sustained_5xx_cancels_and_raises(tmp_path):
+    """Same as the sustained-ConnectError case above, but for a sustained
+    5xx -- CAMS answering every time, just always with a server error
+    (/pm-review: the earlier test only proved this for a connection
+    failure, not for the 5xx failure kind this ticket also names)."""
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": "task-500-down"}
+    post_response.raise_for_status.return_value = None
+
+    call_count = {"n": 0}
+
+    async def _get(*args, **kwargs):
+        call_count["n"] += 1
+        return _http_status_error_response(500)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_get)
+    delete_response = MagicMock()
+    delete_response.raise_for_status.return_value = None
+    mock_client.delete = AsyncMock(return_value=delete_response)
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(
+            cams_artifacts_dir=str(tmp_path), legbot_poll_retry_max_attempts=3,
+        ),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(LegBotDispatchError, match="status poll failed after 3 attempts"):
+            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert call_count["n"] == 3
+    mock_client.delete.assert_awaited_once_with(
+        "http://localhost:8000/api/v1/tasks/task-500-down",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+
 class TestAgents42TwoPhaseTimeout:
     """AGENTS-42: legbot_client.py's poll loop no longer conflates "queued
     behind LegBot's single-instance MLX pool" with "actively generating" --
