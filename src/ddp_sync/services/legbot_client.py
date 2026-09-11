@@ -532,7 +532,13 @@ def read_task_result(task_id: str) -> dict:
 
     Raises:
         LegBotDispatchError: the file is missing/unreadable/not valid JSON,
-        or has no "answer" key.
+        has no "answer" key, or "answer" is present but not a dict (seen in
+        practice: a truncated/corrupted string where CAMS should have
+        written a real object) -- every caller downstream (the live poll
+        path in _dispatch_and_await below, generate_and_store_bill_
+        changelog's own dispatch/recovery calls) treats a returned answer
+        as a dict without checking again, so this is the one place that
+        needs to guarantee it actually is one.
     """
     settings = get_settings()
     result_path = Path(settings.cams_artifacts_dir) / task_id / "task_result.json"
@@ -547,6 +553,11 @@ def read_task_result(task_id: str) -> dict:
     if answer is None:
         raise LegBotDispatchError(
             f"task_result.json for {task_id} has no 'answer' key: {snapshot}"
+        )
+    if not isinstance(answer, dict):
+        raise LegBotDispatchError(
+            f"task_result.json for {task_id} has a non-dict 'answer' "
+            f"(got {type(answer).__name__}): {answer!r}"
         )
     return {"answer": answer, "backend": snapshot.get("backend")}
 
