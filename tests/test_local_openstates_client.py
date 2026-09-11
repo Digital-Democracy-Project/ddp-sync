@@ -1336,3 +1336,72 @@ async def test_resolve_touched_sessions_ignores_bills_with_no_session_field():
         )
 
     assert result == ["2026"]
+
+
+# --- SYNC-59: api_base/api_key overrides (OPEN-193's cloud-owned scrape path) ------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_api_base_override_reaches_that_url_not_local():
+    """SYNC-59: the cloud-owned scrape path's data lands in RDS, not the Mac's
+    local Postgres -- an explicit api_base override must be the URL this actually
+    reads from, not settings.local_openstates_api_base."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026S1"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500,
+            api_base="http://rds-api-v3.internal:8002", api_key="rds-key",
+        )
+
+    assert result == ["2026S1"]
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://rds-api-v3.internal:8002/bills"
+    assert call.kwargs["params"]["apikey"] == "rds-key"
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_no_override_still_uses_local_settings():
+    """Omitting api_base/api_key (SYNC-50's original callers, unchanged) must
+    preserve the exact original behavior -- settings.local_openstates_api_base."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8002/bills"
+    assert call.kwargs["params"]["apikey"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_empty_when_override_api_base_is_empty_string():
+    """An explicitly empty override (settings.rds_openstates_api_base's own
+    unconfigured default) must behave exactly like no local api-v3 configured --
+    a safe no-op, not a fall-through to the local settings value."""
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500,
+            api_base="",
+        )
+
+    assert result == []

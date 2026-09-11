@@ -1129,7 +1129,7 @@ async def _run_scrape(
     timeout_s: int | None = None,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Thin wrapper around `_run_scrape_impl` (the real scrape) that adds SYNC-50's
+    """Thin wrapper around `_run_scrape_impl` (the real scrape) that adds a
     scraper-completion hook on top, uniformly for both of `_run_scrape_impl`'s own
     success paths (the local run-scrape.sh branch and OPEN-193's cloud-owned
     branch) -- neither needs its own copy of this logic.
@@ -1139,18 +1139,20 @@ async def _run_scrape(
     needs to be a real wall-clock floor for "what changed because of this run",
     a few seconds of slack on either side is harmless.
 
-    OPEN-193's cloud-owned branch loads into RDS (`RDS_DATABASE_URL`), a separate
-    database from the local Postgres `resolve_touched_sessions()` reads through
-    `local_openstates_api_base` (`localhost:8002` by default) -- so for a
-    cloud-owned jurisdiction, resolution would always find nothing, not because
-    nothing changed but because it's looking at the wrong database. Skipped here
-    explicitly (with its own log line) rather than silently returning zero
-    sessions forever. `cloud_path.jurisdictions` is empty in production today, so
-    this has no live effect yet -- real cloud-owned resolution is a separate,
-    unscoped piece of work for whenever that changes.
+    Two separate hooks, by which branch actually ran: SYNC-50's
+    `_maybe_trigger_legbot_for_scrape` for the local run-scrape.sh branch (reads
+    ground truth from the Mac's own local Postgres via `resolve_touched_sessions`),
+    and SYNC-59's `_maybe_trigger_legbot_for_cloud_scrape` for OPEN-193's
+    cloud-owned branch, which loads into RDS -- a separate database the local
+    Postgres read would never see data in, so it needs its own resolution path
+    (an explicit session named by `session_arg` when the caller already supplied
+    one, or `resolve_touched_sessions` pointed at `settings.rds_openstates_api_base`
+    otherwise) and reaches the Mac Studio's ddp-sync over WireGuard instead of
+    calling anything in-process, since this process has no CAMS/LegBot access of
+    its own once a jurisdiction is cloud-owned.
 
-    The whole post-success block -- the cloud-ownership check AND the hook call --
-    is wrapped in one catch-all: pm-review (round 1) found the original version
+    The whole post-success block -- the cloud-ownership check AND whichever hook
+    it calls -- is wrapped in one catch-all: pm-review (round 1) found the original version
     only wrapped the hook call itself, leaving `_cloud_path_owns()` free to escape
     and turn an already-successful scrape into a raised exception if it ever
     raised. `_cloud_path_owns()` is a pure config read and not expected to raise
@@ -1163,9 +1165,19 @@ async def _run_scrape(
     if result.get("success"):
         try:
             if _cloud_path_owns(jurisdiction, config):
-                logger.info(
-                    "scraper_triggered_legbot_skipped_cloud_owned",
-                    jurisdiction=jurisdiction,
+                # SYNC-59: this used to be a bare skip -- nothing on the Mac ever runs
+                # this function for a cloud-owned jurisdiction again once OPEN-193 takes
+                # it over, so SYNC-50's hook below (which assumes scraping and LegBot-
+                # triggering happen in the same process) simply never fired for it. The
+                # cloud-owned counterpart reaches the Mac Studio's ddp-sync over
+                # WireGuard instead of calling anything in-process -- see
+                # cloud_scrape_trigger.py's own docstring for the full rationale.
+                from ddp_sync.pipelines.cloud_scrape_trigger import (
+                    _maybe_trigger_legbot_for_cloud_scrape,
+                )
+
+                await _maybe_trigger_legbot_for_cloud_scrape(
+                    jurisdiction, session_arg, scrape_started_at
                 )
             else:
                 await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)

@@ -327,6 +327,78 @@ async def trigger_bill_artifact_generation(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ScraperSessionLegbotTriggerRequest(BaseModel):
+    """Request body for POST /trigger/scraper-session-legbot (SYNC-59)."""
+
+    jurisdiction_iso2: str = Field(..., description="Two-letter state code, e.g. 'VA'.")
+    session_code: str = Field(
+        ..., description="The specific session_code that just had bills touched, e.g. '2026S1'."
+    )
+
+
+@router.post("/trigger/scraper-session-legbot")
+async def trigger_scraper_session_legbot(
+    body: ScraperSessionLegbotTriggerRequest,
+    x_ddp_environment: str | None = Header(default=None),
+    token: str = Depends(api_key_auth),
+):
+    """Remote entry point for `pipelines.scraper_triggered_legbot.
+    trigger_scraper_session_pipeline` (SYNC-48's overlap-safe, independently-
+    gated automated-caller wrapper) -- SYNC-59.
+
+    Distinct from /trigger/bill-artifact-generation above, which calls
+    run_legbot_pipeline directly for a manual/human-reviewed dispatch.
+    trigger_scraper_session_pipeline's own Redis overlap lock and
+    LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED gate exist specifically for an
+    automated caller firing with no human reviewing each call first -- this
+    endpoint IS that caller's entry point, just reached over HTTP/WireGuard
+    instead of an in-process call, for OPEN-193's EC2-broker ddp-sync
+    instance (which runs the Fargate/RDS-load path and therefore has no
+    CAMS/LegBot of its own to dispatch to -- it has to reach the Mac
+    Studio's ddp-sync, the one instance that does, same live pattern
+    ddp-api's proxy already uses to reach the Mac's local api-v3, API-6).
+
+    Every cost-relevant dispatch parameter (artifact_types, limit,
+    include_concept_statements) is resolved from THIS instance's own
+    settings -- the same settings.legbot_scrape_completion_trigger_* values
+    the existing in-process scraper-completion hook
+    (_maybe_trigger_legbot_for_scrape, openstates_scrape.py) already reads
+    -- not accepted from the caller. A remote automated caller supplying its
+    own artifact_types/limit would bypass the same "no silent defaults for
+    an automated trigger" review this settings-based approach already
+    passed for the in-process case; this endpoint's whole job is dispatching
+    a known jurisdiction/session through that same, already-decided policy,
+    not accepting a new one per call.
+
+    x_ddp_environment: same optional 'dev'/'prod' switch
+    /trigger/bill-artifact-generation already exposes -- SYNC-59's own
+    caller sends `X-DDP-Environment: prod` so this writes to the real
+    production broker, not silently defaulting to dev.
+
+    Returns trigger_scraper_session_pipeline's own result dict verbatim,
+    always as a 200 -- that function never raises, and none of its
+    "success": False outcomes (trigger_disabled, redis_unavailable,
+    already_running, pipeline_error) are this endpoint's own error to
+    report; the caller inspects the body's own success/error fields.
+    """
+    broker_api_base, broker_api_token = _resolve_batch_broker_target(x_ddp_environment)
+    settings = get_settings()
+
+    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
+
+    return await trigger_scraper_session_pipeline(
+        body.jurisdiction_iso2,
+        body.session_code,
+        settings.legbot_scrape_completion_trigger_artifact_types,
+        False,  # include_org_research -- Gate 1 item 4, PLAN-legbot.md §32: a deliberate
+        # operator decision, not a tunable default, same as the in-process hook.
+        settings.legbot_scrape_completion_trigger_limit,
+        include_concept_statements=settings.legbot_scrape_completion_trigger_include_concept_statements,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
 # Which of the two configured ddp-broker-py instances (dev vs. prod) an
 # on-demand single-bill dispatch writes its BillArtifact to (SYNC-10) --
 # keyed by the trusted X-DDP-Environment header ddp-api's /trigger/* proxy

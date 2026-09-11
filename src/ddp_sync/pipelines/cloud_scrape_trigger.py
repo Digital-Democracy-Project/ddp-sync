@@ -84,11 +84,14 @@ import os
 import subprocess
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
 import boto3
+import httpx
 import structlog
 
+from ddp_sync.config import get_settings
 from ddp_sync.pipelines import inflight_fargate_jobs
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
 
@@ -734,3 +737,160 @@ def run_cloud_scrape(
             "jurisdiction": label,
             "duration_seconds": duration,
         }
+
+
+# SYNC-59: how long to wait for the Mac Studio's own /trigger/scraper-session-legbot
+# to respond. That endpoint itself only fires the actual LegBot pipeline in the
+# background of its OWN process's request/response cycle the same way /trigger/
+# bill-artifact-generation already does today -- synchronous, not fire-and-forget --
+# so this has to be generous enough to cover a real dispatch, not just a network
+# round trip. Matches the same order of magnitude as this module's own
+# _DEFAULT_LOAD_TIMEOUT_S reasoning: a real, bounded ceiling rather than an
+# indefinite wait, sized for "a real call can take a while," not "this should be
+# instant."
+_MAC_TRIGGER_TIMEOUT_SECONDS = 3600.0
+
+
+def _explicit_session_code_from_arg(session_arg: str | None) -> str | None:
+    """SYNC-59: extract an explicit session_code from `session_arg`, when the
+    caller already named one specific session for this run.
+
+    `run_fl_scrapes_job`/`run_usa_scrapes_job` (openstates_scrape.py) build
+    `session_arg` as `"session=<value>"`, optionally followed by more
+    space-separated key=value pairs (USA's own config is literally
+    `"session=119 chamber=lower"` -- one combined string, see SYNC-54).
+    Returns the value after `"session="` up to the next space, or None when
+    `session_arg` carries no `"session="` token at all -- the secondary-
+    jurisdiction case (VA/UT-shaped; `run_secondary_scrapes_job` passes
+    `session_arg=None` deliberately, since `do_scrape()` picks up every
+    currently-active session on its own when none is given, and this
+    process has no way to know in advance which one(s) that will be).
+    """
+    if not session_arg:
+        return None
+    for token in session_arg.split():
+        if token.startswith("session="):
+            value = token[len("session="):]
+            return value or None
+    return None
+
+
+async def _maybe_trigger_legbot_for_cloud_scrape(
+    jurisdiction: str,
+    session_arg: str | None,
+    scrape_started_at: datetime,
+) -> None:
+    """SYNC-59: the cloud-owned counterpart to openstates_scrape.py's
+    `_maybe_trigger_legbot_for_scrape` (SYNC-50).
+
+    Called only after `run_cloud_scrape` has already succeeded (see
+    `_run_scrape`'s own caller in openstates_scrape.py) -- a failure here
+    must never affect the scrape job's own reported outcome, so every
+    exception is caught and logged, not raised, the same posture SYNC-50's
+    own hook already has.
+
+    Root cause this exists to fix: SYNC-50 wired its hook to fire from
+    inside the Mac Studio's own scraper job functions, on the assumption
+    that scraping and LegBot-triggering happen in the same process. Once a
+    jurisdiction's scraping moves to OPEN-193's Fargate/RDS path (this
+    module), that assumption breaks -- nothing on the Mac ever runs the
+    mac-side scrape function for that jurisdiction again, so SYNC-50's hook
+    simply never fires for it. This process (the EC2-broker ddp-sync
+    instance) has no CAMS/LegBot access of its own, so it reaches the Mac
+    Studio's ddp-sync over the existing WireGuard mesh instead of calling
+    anything in-process -- the same live pattern ddp-api's proxy already
+    uses to reach the Mac's local api-v3 (API-6).
+
+    Session resolution deliberately does NOT always reuse
+    `resolve_touched_sessions()`'s ground-truth read -- this process
+    already knows exactly which session it just told `cloud_loader.py` to
+    load, whenever the caller named one explicitly (fl/usa-shaped
+    `sessions:` config -- see `_explicit_session_code_from_arg`). Ground-
+    truth resolution is used only when `session_arg` is `None` (VA/UT-
+    shaped `secondary` jurisdictions, where `do_scrape()` picks up every
+    currently-active session on its own) -- and even then, only against
+    `settings.rds_openstates_api_base`, never the Mac's own
+    `local_openstates_api_base`, which never sees RDS-loaded data at all
+    (a cloud-owned jurisdiction's local-Postgres read would always find
+    nothing, not because nothing changed but because it's looking at the
+    wrong database). Until that setting is actually configured (empty by
+    default), this case safely resolves zero sessions and no-ops -- the
+    same graceful-empty contract `resolve_touched_sessions` already
+    documents -- rather than guessing at infrastructure that isn't deployed
+    yet.
+    """
+    settings = get_settings()
+    if not settings.legbot_scrape_completion_trigger_enabled:
+        return
+    if not settings.mac_ddp_sync_base_url:
+        logger.info(
+            "scraper_triggered_legbot_cloud_no_mac_target_configured",
+            jurisdiction=jurisdiction,
+        )
+        return
+
+    explicit_session_code = _explicit_session_code_from_arg(session_arg)
+    if explicit_session_code is not None:
+        session_codes = [explicit_session_code]
+    else:
+        from ddp_sync.services.local_openstates_client import resolve_touched_sessions
+
+        try:
+            session_codes = await resolve_touched_sessions(
+                jurisdiction.upper(),
+                since=scrape_started_at,
+                max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
+                api_base=settings.rds_openstates_api_base,
+                api_key=settings.rds_openstates_api_key,
+            )
+        except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+            logger.error(
+                "scraper_triggered_legbot_cloud_session_resolution_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+            return
+
+        if not session_codes:
+            logger.info(
+                "scraper_triggered_legbot_cloud_no_sessions_touched",
+                jurisdiction=jurisdiction,
+                since=scrape_started_at.isoformat(),
+            )
+            return
+
+    headers = {
+        "Authorization": f"Bearer {settings.mac_ddp_sync_api_key}",
+        # SYNC-59: writes to the real production broker, not the Mac ddp-sync's own
+        # dev default -- same header /trigger/bill-artifact-generation already
+        # honors for a manual dispatch (_resolve_batch_broker_target).
+        "X-DDP-Environment": "prod",
+    }
+    url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/scraper-session-legbot"
+
+    for session_code in session_codes:
+        try:
+            async with httpx.AsyncClient(timeout=_MAC_TRIGGER_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    url,
+                    headers=headers,
+                    json={"jurisdiction_iso2": jurisdiction.upper(), "session_code": session_code},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+        except Exception as e:  # noqa: BLE001 -- a trigger-call failure must never affect
+            # the scrape job's own already-successful result, same posture as every other
+            # exception this function catches.
+            logger.error(
+                "scraper_triggered_legbot_cloud_trigger_failed",
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                error=str(e),
+            )
+            continue
+        logger.info(
+            "scraper_triggered_legbot_cloud_result",
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            result=result,
+        )

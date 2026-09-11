@@ -236,6 +236,31 @@ class SyncSettings:
     local_openstates_api_base: str = "http://localhost:8002"
     local_openstates_api_key: str = ""
 
+    # SYNC-59: resolve_touched_sessions' read path for OPEN-193's cloud-owned scrape
+    # path, which loads scraped bills into RDS -- a completely separate database from
+    # the Mac Studio's local Postgres local_openstates_api_base above points at, which
+    # never sees RDS-loaded data. Empty by default: until an RDS-facing api-v3 read
+    # replica actually exists and is configured here, a cloud-owned jurisdiction with
+    # an ambiguous (unspecified) session_arg -- VA/UT-shaped, both have had two
+    # sessions simultaneously active -- safely resolves zero touched sessions (same
+    # graceful-empty contract resolve_touched_sessions already documents) rather than
+    # this code guessing at a mechanism that isn't deployed yet.
+    rds_openstates_api_base: str = ""
+    rds_openstates_api_key: str = ""
+
+    # SYNC-59: where the EC2-broker ddp-sync instance (OPEN-193's Fargate/RDS-load
+    # path) reaches the Mac Studio's own ddp-sync over the existing WireGuard mesh, to
+    # trigger LegBot for a jurisdiction/session a cloud-owned scrape+RDS-load just
+    # finished -- the same live pattern ddp-api's proxy already uses to reach the Mac's
+    # local api-v3 (API-6, 10.0.0.8:8002). Empty by default (no target configured) --
+    # the calling side treats that the same as the feature being off, not an error.
+    mac_ddp_sync_base_url: str = ""
+    # The Bearer token this process presents when calling the Mac's ddp-sync -- the
+    # MAC's own configured DDP_SYNC_API_KEY, not this (EC2) process's own api_key
+    # above (that one authenticates INCOMING calls to this instance, a different
+    # value in general since these are two independent deployments).
+    mac_ddp_sync_api_key: str = ""
+
     # How long legbot_client.py's _dispatch_and_await polls before giving up on a
     # LegBot task. Generous by design, not a tight deadline -- MLX/local-model
     # compute has no per-call cost the way cloud API tokens do, so there's no
@@ -561,6 +586,10 @@ def _load_from_env() -> dict:
         "ondemand_broker_api_token_prod": os.getenv("ONDEMAND_BROKER_API_TOKEN_PROD", ""),
         "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
         "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
+        "rds_openstates_api_base": os.getenv("RDS_OPENSTATES_API_BASE", ""),
+        "rds_openstates_api_key": os.getenv("RDS_OPENSTATES_API_KEY", ""),
+        "mac_ddp_sync_base_url": os.getenv("MAC_DDP_SYNC_BASE_URL", ""),
+        "mac_ddp_sync_api_key": os.getenv("MAC_DDP_SYNC_API_KEY", ""),
         "legbot_dispatch_timeout_seconds": float(
             os.getenv("LEGBOT_DISPATCH_TIMEOUT_SECONDS", "1200")
         ),
