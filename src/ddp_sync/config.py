@@ -38,6 +38,33 @@ def _positive_float(raw: str | None, *, default: float, name: str) -> float:
         return default
     return value
 
+
+def _positive_int(raw: str | None, *, default: int, name: str) -> int:
+    """Parse an operator-supplied int that must be >= 1.
+
+    Same fallback posture as _positive_float above, for the same reason: a
+    typo in a .env should not stop the service starting. SYNC-60 -- the
+    value this guards is a retry attempt count, where 0 would mean "give up
+    without ever calling the retried operation" (surprising -- see the
+    caller's own docstring) and a negative is nonsensical; an accidentally
+    huge value also has real cost here, since each attempt is a real HTTP
+    call plus a backoff sleep, so this logs loudly enough to be noticed
+    rather than silently accepting whatever an operator typed.
+    """
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "%s=%r is not an integer; using %s", name, raw, default)
+        return default
+    if value < 1:
+        logging.getLogger(__name__).warning(
+            "%s=%r must be an integer >= 1; using %s", name, raw, default)
+        return default
+    return value
+
 logger = logging.getLogger(__name__)
 
 AWS_SECRET_NAME = os.getenv("AWS_SECRET_NAME", "ddp-sync/credentials")
@@ -278,6 +305,32 @@ class SyncSettings:
     # still given up on and cancelled, not waited on forever.
     legbot_queue_wait_timeout_seconds: float = 3600.0
 
+    # SYNC-60: _dispatch_and_await's status poll (GET /api/v1/tasks/{task_id})
+    # retries a TRANSIENT failure -- CAMS unreachable at all (a brief window
+    # during a `cams reload`), or CAMS answering with a 5xx (confirmed live
+    # 2026-09-11: a 947-bill backfill fired near-simultaneous polls and CAMS
+    # returned real 500s 618 times over ~6 minutes; two of the affected bills'
+    # answers were later confirmed to have completed successfully on CAMS's
+    # side, but ddp-sync had already given up and never came back to collect
+    # them) -- against the SAME task_id, rather than treating either as a real
+    # task failure. This does NOT retry a genuine task-level failure (CAMS
+    # reachable and answering 2xx, task itself failed/timed out) or a non-5xx
+    # HTTP error (e.g. a 404 -- no point retrying a task_id CAMS has no
+    # record of); see legbot_client.py's _poll_task_status_for_retry.
+    #
+    # Bounded (not an independent timeout of its own) so a real, sustained
+    # outage still falls through to the existing queue-wait/dispatch
+    # deadline and its cancel-on-give-up behavior, unchanged -- it just no
+    # longer takes a single unlucky poll to get there.
+    legbot_poll_retry_max_attempts: int = 5
+
+    # Fixed backoff between retries above, deliberately separate from
+    # legbot_poll_interval_seconds (that cadence is tuned for throughput
+    # against a healthy CAMS, per this file's own SYNC-39 comment; retrying
+    # a transient failure calls for a little more breathing room, not the
+    # same brisk interval that could pile onto an already-overloaded CAMS).
+    legbot_poll_retry_backoff_seconds: float = 2.0
+
     # Cap on how many organizations bill_organization_position_research.py's
     # generate_and_store_bill_organization_positions will verify/write per
     # invocation -- a safety valve against a malformed or hallucinated
@@ -513,6 +566,17 @@ def _load_from_env() -> dict:
         ),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
+        ),
+        "legbot_poll_retry_max_attempts": _positive_int(
+            os.getenv("LEGBOT_POLL_RETRY_MAX_ATTEMPTS"), default=5,
+            name="LEGBOT_POLL_RETRY_MAX_ATTEMPTS",
+        ),
+        # Same hazard _positive_float already guards legbot_poll_interval_
+        # seconds against: 0 or negative would busy-loop retries against an
+        # already-struggling CAMS instead of backing off.
+        "legbot_poll_retry_backoff_seconds": _positive_float(
+            os.getenv("LEGBOT_POLL_RETRY_BACKOFF_SECONDS"), default=2.0,
+            name="LEGBOT_POLL_RETRY_BACKOFF_SECONDS",
         ),
         # Guarded because this is operator-editable and 0 or a negative would
         # turn the poll loop into a hot loop against CAMS rather than merely

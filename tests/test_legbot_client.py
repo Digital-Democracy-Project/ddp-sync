@@ -37,6 +37,13 @@ class _FakeSettings:
     # The one test that cares about the interval itself sets it explicitly.
     legbot_poll_interval_seconds: float = 0.0
 
+    # SYNC-60: real production defaults are 5/2.0. Small attempt count and
+    # zero backoff here for the same reason as legbot_poll_interval_seconds
+    # above -- tests exercising the retry path care about attempt counts and
+    # which errors are retried, not real wall-clock backoff.
+    legbot_poll_retry_max_attempts: int = 3
+    legbot_poll_retry_backoff_seconds: float = 0.0
+
 
 def _mock_client(
     *, statuses, task_id="abc123", delete_should_fail=False,
@@ -98,6 +105,23 @@ def _patch_async_client(mock_client):
     cm.__aenter__ = AsyncMock(return_value=mock_client)
     cm.__aexit__ = AsyncMock(return_value=False)
     return patch("ddp_sync.services.legbot_client.httpx.AsyncClient", return_value=cm)
+
+
+def _http_status_error_response(status_code: int):
+    """A MagicMock httpx.Response whose raise_for_status() raises a real
+    httpx.HTTPStatusError carrying that status code -- SYNC-60's retry
+    logic branches on exc.response.status_code, so a bare MagicMock
+    HTTPError (as elsewhere in this file, where the status code never
+    matters) isn't enough here."""
+    request = httpx.Request("GET", "http://localhost:8000/api/v1/tasks/x")
+    real_response = httpx.Response(status_code, request=request)
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            f"{status_code}", request=request, response=real_response,
+        )
+    )
+    return resp
 
 
 @pytest.mark.asyncio
@@ -529,6 +553,214 @@ async def test_cancel_failure_does_not_mask_the_original_timeout_error(tmp_path)
             )
 
     mock_client.delete.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# SYNC-60: the status poll retries a transient failure (connection-level, or
+# a 5xx HTTP response) against the same task_id, instead of treating either
+# as an immediate, permanent failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_connect_error_then_succeeds(tmp_path):
+    """A brief connection-level failure (e.g. CAMS's port not yet accepting
+    connections mid-`cams reload`) during polling must not fail the
+    dispatch -- retrying the same task_id picks up its real status once
+    CAMS answers again."""
+    task_id = "task-flaky-conn"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"text": "ok", "insufficient_information": False}
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "mlx"})
+    )
+
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": task_id}
+    post_response.raise_for_status.return_value = None
+
+    call_count = {"n": 0}
+
+    async def _flaky_get(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            raise httpx.ConnectError("connection refused")
+        resp = MagicMock()
+        resp.json.return_value = {"status": "completed", "mlx_generation_started_at": ""}
+        resp.raise_for_status.return_value = None
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_flaky_get)
+    mock_client.delete = AsyncMock()
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client):
+        result = await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert result == {"answer": answer, "backend": "mlx"}
+    assert call_count["n"] == 3  # 2 failures + 1 success
+    mock_client.delete.assert_not_awaited()  # never gave up -- no orphan to cancel
+
+
+@pytest.mark.asyncio
+async def test_poll_retries_5xx_then_succeeds(tmp_path):
+    """Confirmed live 2026-09-11: a burst of near-simultaneous polls from a
+    947-bill backfill hit CAMS's status endpoint with real 500s 618 times
+    over ~6 minutes; some of the affected tasks had already finished
+    successfully on CAMS's side. A transient 500 must not fail the
+    dispatch either."""
+    task_id = "task-flaky-500"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"text": "ok", "insufficient_information": False}
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "mlx"})
+    )
+
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": task_id}
+    post_response.raise_for_status.return_value = None
+
+    call_count = {"n": 0}
+
+    async def _flaky_get(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return _http_status_error_response(500)
+        resp = MagicMock()
+        resp.json.return_value = {"status": "completed", "mlx_generation_started_at": ""}
+        resp.raise_for_status.return_value = None
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_flaky_get)
+    mock_client.delete = AsyncMock()
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client):
+        result = await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert result == {"answer": answer, "backend": "mlx"}
+    assert call_count["n"] == 3
+    mock_client.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_does_not_retry_a_non_5xx_error_and_it_propagates_unwrapped(tmp_path):
+    """A 404 (or any non-5xx) is not a transient condition worth retrying,
+    and this ticket must not change what happens to it: no retry attempt,
+    no cancel-on-give-up wrapping, propagates exactly as before SYNC-60."""
+    call_count = {"n": 0}
+
+    async def _get(*args, **kwargs):
+        call_count["n"] += 1
+        return _http_status_error_response(404)
+
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": "task-404"}
+    post_response.raise_for_status.return_value = None
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_get)
+    mock_client.delete = AsyncMock()
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(tmp_path)),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(httpx.HTTPStatusError):
+            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert call_count["n"] == 1
+    mock_client.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_retry_budget_exhausted_cancels_and_raises_dispatch_error(tmp_path):
+    """A SUSTAINED transient failure (CAMS down for good, or a real,
+    ongoing outage) must still give up -- bounded by
+    legbot_poll_retry_max_attempts -- through the same cancel-on-give-up +
+    LegBotDispatchError path a client-side deadline uses, not hang forever
+    or raise a raw httpx exception."""
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": "task-down"}
+    post_response.raise_for_status.return_value = None
+
+    call_count = {"n": 0}
+
+    async def _get(*args, **kwargs):
+        call_count["n"] += 1
+        raise httpx.ConnectError("connection refused")
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_get)
+    delete_response = MagicMock()
+    delete_response.raise_for_status.return_value = None
+    mock_client.delete = AsyncMock(return_value=delete_response)
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(
+            cams_artifacts_dir=str(tmp_path), legbot_poll_retry_max_attempts=3,
+        ),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(LegBotDispatchError, match="status poll failed after 3 attempts"):
+            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert call_count["n"] == 3
+    mock_client.delete.assert_awaited_once_with(
+        "http://localhost:8000/api/v1/tasks/task-down",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_retry_budget_exhausted_on_sustained_5xx_cancels_and_raises(tmp_path):
+    """Same as the sustained-ConnectError case above, but for a sustained
+    5xx -- CAMS answering every time, just always with a server error
+    (/pm-review: the earlier test only proved this for a connection
+    failure, not for the 5xx failure kind this ticket also names)."""
+    post_response = MagicMock()
+    post_response.json.return_value = {"task_id": "task-500-down"}
+    post_response.raise_for_status.return_value = None
+
+    call_count = {"n": 0}
+
+    async def _get(*args, **kwargs):
+        call_count["n"] += 1
+        return _http_status_error_response(500)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=post_response)
+    mock_client.get = AsyncMock(side_effect=_get)
+    delete_response = MagicMock()
+    delete_response.raise_for_status.return_value = None
+    mock_client.delete = AsyncMock(return_value=delete_response)
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(
+            cams_artifacts_dir=str(tmp_path), legbot_poll_retry_max_attempts=3,
+        ),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(LegBotDispatchError, match="status poll failed after 3 attempts"):
+            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+    assert call_count["n"] == 3
+    mock_client.delete.assert_awaited_once_with(
+        "http://localhost:8000/api/v1/tasks/task-500-down",
+        headers={"Authorization": "Bearer test-token"},
+    )
 
 
 class TestAgents42TwoPhaseTimeout:

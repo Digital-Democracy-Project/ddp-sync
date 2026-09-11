@@ -43,6 +43,108 @@ logger = structlog.get_logger()
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
 
+class _TransientPollFailure(Exception):
+    """Internal signal (SYNC-60): _poll_task_status_with_retry exhausted its
+    retry budget on a transient failure (5xx or a connection-level error).
+    Caught by _dispatch_and_await's poll loop and converted into the same
+    cancel-on-give-up + LegBotDispatchError path already used for a
+    client-side deadline. Deliberately NOT used for a non-retryable error
+    (e.g. a 404) -- that propagates directly and unwrapped, exactly as
+    before this ticket (its own AC: no behavior change outside the
+    connection-failure/5xx cases).
+    """
+
+
+async def _poll_task_status_with_retry(
+    client: httpx.AsyncClient, url: str, headers: dict, *, task_id: str,
+) -> dict:
+    """GET .../tasks/{task_id} once, retrying a TRANSIENT failure against
+    the same task_id (SYNC-60).
+
+    Two failure kinds are retried, both self-resolving conditions that
+    don't mean the task itself failed:
+
+    * httpx.RequestError -- the request never got a response at all (e.g.
+      CAMS's port briefly not accepting connections during a `cams
+      reload`).
+    * httpx.HTTPStatusError with a 5xx status -- CAMS answered, but with a
+      server error (confirmed live 2026-09-11: a burst of near-simultaneous
+      polls from a 947-bill backfill hit CAMS's status endpoint with real
+      500s 618 times over ~6 minutes; two of the affected bills had
+      genuinely finished successfully on CAMS's side, but ddp-sync had
+      already given up on the first 500 and never came back to collect
+      them).
+
+    A non-5xx HTTPStatusError (e.g. a 404 -- CAMS has no record of this
+    task_id) is NOT retried; there's no reason to expect a different answer
+    later, and the caller's own existing handling for that should see it
+    immediately, same as before this ticket.
+
+    Bounded by legbot_poll_retry_max_attempts short retries at
+    legbot_poll_retry_backoff_seconds apart -- exhausting the budget
+    re-raises the last error, so a real, sustained outage still falls
+    through to _dispatch_and_await's own existing queue-wait/dispatch
+    deadline and cancel-on-give-up behavior unchanged, just no longer
+    triggered by a single unlucky poll.
+    """
+    settings = get_settings()
+    attempt = 0
+    while True:
+        try:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise
+            transient_error: Exception = exc
+        except httpx.RequestError as exc:
+            transient_error = exc
+
+        attempt += 1
+        if attempt >= settings.legbot_poll_retry_max_attempts:
+            raise _TransientPollFailure(str(transient_error)) from transient_error
+        logger.warning(
+            "LegBot status poll hit a transient failure -- retrying same "
+            "task_id after a short backoff",
+            task_id=task_id, attempt=attempt,
+            max_attempts=settings.legbot_poll_retry_max_attempts,
+            error=str(transient_error),
+        )
+        await asyncio.sleep(settings.legbot_poll_retry_backoff_seconds)
+
+
+async def _cancel_task_best_effort(
+    client: httpx.AsyncClient, cams_base_url: str, headers: dict, *,
+    task_id: str, question_type: str, reason: str,
+) -> None:
+    """Best-effort DELETE /api/v1/tasks/{task_id} (SYNC-20) -- shared by
+    both ways _dispatch_and_await's poll loop can give up on a task: the
+    client-side deadline expiring, and (SYNC-60) a transient status-poll
+    failure exhausting its own retry budget. Either way, walking away
+    without this leaves the CAMS task running as an orphan no one is
+    watching, indefinitely occupying a worker (and, for LegBot, the shared
+    MLX slot). A cancel-call failure is logged but never masks or replaces
+    the real error the caller is about to raise.
+    """
+    try:
+        cancel_resp = await client.delete(
+            f"{cams_base_url}/api/v1/tasks/{task_id}", headers=headers
+        )
+        cancel_resp.raise_for_status()
+        logger.warning(
+            f"LegBot task give-up ({reason}) -- cancelled on CAMS",
+            task_id=task_id, question_type=question_type,
+        )
+    except httpx.HTTPError as cancel_exc:
+        logger.warning(
+            f"LegBot task give-up ({reason}) -- cancel request itself "
+            "failed, task may still be running orphaned",
+            task_id=task_id, question_type=question_type,
+            error=str(cancel_exc),
+        )
+
+
 class LegBotDispatchError(Exception):
     """Raised when a LegBot dispatch fails to produce a usable answer.
 
@@ -316,11 +418,35 @@ async def _dispatch_and_await(
         dispatch_time = time.monotonic()
         deadline = dispatch_time + queue_wait_timeout_seconds
         while time.monotonic() < deadline:
-            status_resp = await client.get(
-                f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
-            )
-            status_resp.raise_for_status()
-            body = status_resp.json()
+            # SYNC-60: retries a transient connection failure or 5xx against
+            # this same task_id -- see _poll_task_status_with_retry's own
+            # docstring. A genuine task-level outcome (CAMS reachable,
+            # answering 2xx) is completely unaffected by this change.
+            try:
+                body = await _poll_task_status_with_retry(
+                    client,
+                    f"{settings.cams_base_url}/api/v1/tasks/{task_id}",
+                    headers,
+                    task_id=task_id,
+                )
+            except _TransientPollFailure as exc:
+                # Retry budget exhausted -- this is a real, sustained
+                # problem (CAMS down for good, or a genuine outage), not a
+                # one-off blip. Give up exactly like the client-side
+                # deadline below: cancel the orphaned CAMS task and raise
+                # LegBotDispatchError, never a raw httpx exception. A non-
+                # retryable error (e.g. a 404) is NOT this exception type --
+                # it propagates directly out of this function, unwrapped,
+                # exactly as before this ticket.
+                await _cancel_task_best_effort(
+                    client, settings.cams_base_url, headers,
+                    task_id=task_id, question_type=question_type,
+                    reason="status poll retries exhausted",
+                )
+                raise LegBotDispatchError(
+                    f"LegBot task {task_id} status poll failed after "
+                    f"{settings.legbot_poll_retry_max_attempts} attempts: {exc}"
+                ) from exc
             status = body["status"]
             if status in TERMINAL_STATUSES:
                 break
@@ -352,24 +478,13 @@ async def _dispatch_and_await(
             # decided to treat it as failed. Confirmed live 2026-08-15/16:
             # 4 abandoned tasks sat RUNNING for 45+ minutes and starved a
             # later, correctly-dispatched run's own tasks of worker
-            # capacity. Best-effort: a cancel-call failure must never mask
-            # or replace the real error this function is about to raise.
-            try:
-                cancel_resp = await client.delete(
-                    f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
-                )
-                cancel_resp.raise_for_status()
-                logger.warning(
-                    "LegBot task timed out client-side -- cancelled on CAMS",
-                    task_id=task_id, question_type=question_type,
-                )
-            except httpx.HTTPError as cancel_exc:
-                logger.warning(
-                    "LegBot task timed out client-side -- cancel request "
-                    "itself failed, task may still be running orphaned",
-                    task_id=task_id, question_type=question_type,
-                    error=str(cancel_exc),
-                )
+            # capacity. Shared with the SYNC-60 retry-exhausted case above
+            # -- see _cancel_task_best_effort's own docstring.
+            await _cancel_task_best_effort(
+                client, settings.cams_base_url, headers,
+                task_id=task_id, question_type=question_type,
+                reason="timed out client-side",
+            )
             if legacy_no_marker_field:
                 timeout_desc = (
                     f"legacy dispatch timeout {timeout_seconds}s "
