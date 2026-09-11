@@ -817,8 +817,58 @@ async def run_legbot_pipeline(
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    bill_candidates: list[dict] | None = None,
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
+
+    bill_candidates (SYNC-63): optional explicit list of bills to process,
+    as an alternative to scanning the whole jurisdiction/session for
+    candidates via list_current_session_bill_candidates. Each entry is a
+    dict with the same shape that scan already returns: {"gov_id",
+    "bill_openstates_id"} required, "live_url_fallback" optional (defaults
+    to "" -- the same default _process_bill_inner's own candidate.get
+    already falls back to). None (the default) preserves this function's
+    original session-wide-scan behavior for every existing caller
+    unchanged.
+
+    Root cause this exists to fix: the SYNC-56/60/61/62 incident chain
+    (2026-09-10/11) traced back to a 947-bill bill_changelog backfill run by
+    calling /trigger/legbot-analyze-bill (the on-demand, single-bill
+    endpoint) once per bill from an external script, with no concurrency
+    awareness at all -- send-side pacing controls nothing about how many
+    dispatches are actually in flight at once, since each call's own poll
+    loop runs for potentially minutes. Hundreds ended up genuinely
+    concurrent regardless of the delay between sends, which is what
+    overloaded CAMS's status-check endpoint. The session-wide scan this
+    function already does was not a fit either -- it has no way to target
+    "just these specific bills" (SYNC-56's own investigation hit this same
+    limitation first; see feedback_ddp_sync_batch_endpoint_limit_scope).
+    Every existing safety property this function already has -- bounded
+    concurrency via session_pipeline_concurrency, coverage-aware skip
+    logic, retry_failed, dry_run -- applies identically here, since
+    bill_candidates only changes where the candidate list comes from, not
+    anything about how each one is processed (same _process_bill_bounded
+    loop below, unmodified).
+
+    When provided, `limit` is NOT used to select or truncate which bills
+    are considered -- every entry in bill_candidates is processed. (limit
+    is still validated as > 0 below regardless, the same as always, so
+    this function's existing "no parameter here has a silent default"
+    posture doesn't grow a special case; callers in this mode can pass
+    len(bill_candidates) or any other positive value.) `truncated` in the
+    return value is always False in this mode -- there is no "more exist
+    beyond what was considered" to report when the caller supplied the
+    complete list themselves.
+
+    Raises:
+        ValueError: any bill_candidates entry is missing "gov_id" or
+            "bill_openstates_id" -- checked up front, before any dispatch,
+            so a malformed caller-supplied list fails loudly and early
+            rather than as a confusing per-bill KeyError deep inside
+            _process_bill_inner. (Also raised, unchanged, for the
+            pre-existing jurisdiction_iso2/session_code/limit/artifact_types
+            validation below, regardless of which candidate-sourcing mode
+            is in play.)
 
     artifact_types, include_org_research, include_concept_statements,
     retry_failed, and limit all have NO default -- the caller must decide
@@ -951,6 +1001,20 @@ async def run_legbot_pipeline(
     unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
+    if bill_candidates is not None:
+        # SYNC-63: fail loudly and early on a malformed caller-supplied list,
+        # before any dispatch -- the alternative is a confusing KeyError deep
+        # inside _process_bill_inner for whichever entry happens to be
+        # missing a key, on whichever bill the semaphore gets to first.
+        missing_keys = [
+            i for i, entry in enumerate(bill_candidates)
+            if "gov_id" not in entry or "bill_openstates_id" not in entry
+        ]
+        if missing_keys:
+            raise ValueError(
+                "bill_candidates entries missing 'gov_id' or "
+                f"'bill_openstates_id' at index/indices: {missing_keys}"
+            )
 
     run_id = str(uuid.uuid4())
     run_started = time.monotonic()
@@ -964,18 +1028,28 @@ async def run_legbot_pipeline(
         include_concept_statements=include_concept_statements,
         limit=limit,
         dry_run=dry_run,
+        bill_candidates_count=(len(bill_candidates) if bill_candidates is not None else None),
         peak_memory_mb=round(_peak_memory_mb(), 1),
     )
 
-    # Request limit + 1 so truncated is actually computable: if more than
-    # `limit` candidates come back, we know more exist beyond what's
-    # considered, without misreporting a specific further count (a
-    # limit + 1 probe only proves "more than limit exist").
-    candidates = await list_current_session_bill_candidates(
-        jurisdiction_iso2, session_code=session_code, limit=limit + 1
-    )
-    truncated = len(candidates) > limit
-    candidates = candidates[:limit]
+    if bill_candidates is not None:
+        # SYNC-63: an explicit, caller-supplied list replaces the session-wide
+        # scan entirely -- limit does not select or truncate here (every
+        # supplied entry is processed), and there's no "more exist beyond
+        # what was considered" for truncated to report, since the caller
+        # already supplied their own complete list.
+        candidates = list(bill_candidates)
+        truncated = False
+    else:
+        # Request limit + 1 so truncated is actually computable: if more than
+        # `limit` candidates come back, we know more exist beyond what's
+        # considered, without misreporting a specific further count (a
+        # limit + 1 probe only proves "more than limit exist").
+        candidates = await list_current_session_bill_candidates(
+            jurisdiction_iso2, session_code=session_code, limit=limit + 1
+        )
+        truncated = len(candidates) > limit
+        candidates = candidates[:limit]
     bills_considered = len(candidates)
 
     # Bounded concurrency (2026-08-18): several bills' own _process_bill

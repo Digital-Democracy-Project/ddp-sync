@@ -217,6 +217,161 @@ async def test_lister_called_with_limit_plus_one():
     mock_lister.assert_awaited_once_with("fl", session_code="2026F", limit=6)
 
 
+# --- bill_candidates (SYNC-63): explicit caller-supplied list, as an -------
+# alternative to the session-wide scan -------------------------------------
+
+@pytest.mark.asyncio
+async def test_bill_candidates_bypasses_the_session_wide_scan():
+    """The whole point -- when a caller supplies their own list, this must
+    not also scan the session (that's the "not a session-wide scan"
+    requirement, and calling the lister at all would waste a real
+    request against the local api-v3 instance for no reason)."""
+    candidates = _make_candidates(3)
+    with _patch_lister([]) as mock_lister, _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=1,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+
+    mock_lister.assert_not_awaited()
+    assert result["bills_considered"] == 3
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_processes_every_entry_limit_does_not_truncate():
+    """limit must not select/truncate bill_candidates -- every supplied
+    entry is processed regardless of limit's value, and truncated is
+    always False (there's no "more exist" to report for a caller-supplied,
+    already-complete list)."""
+    candidates = _make_candidates(5)
+    with _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=1,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+
+    assert result["bills_considered"] == 5
+    assert result["bills_processed"] == 5
+    assert result["truncated"] is False
+    assert {r["gov_id"] for r in result["results"]} == {f"HB {i}" for i in range(5)}
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_still_validates_limit():
+    """limit isn't used to select bill_candidates, but it's still a
+    required, validated positional argument -- no new special case in this
+    function's existing "every parameter is a conscious choice" posture."""
+    with pytest.raises(ValueError, match="limit"):
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=0,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=_make_candidates(2),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_missing_required_key_raises_before_any_dispatch():
+    """A malformed caller-supplied list must fail loudly and early, not as
+    a confusing KeyError deep inside _process_bill_inner for whichever
+    entry the semaphore happens to reach first."""
+    bad_candidates = [
+        {"gov_id": "HB 1", "bill_openstates_id": "id-1"},
+        {"gov_id": "HB 2"},  # missing bill_openstates_id
+    ]
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        with pytest.raises(ValueError, match="bill_openstates_id"):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10,
+                include_concept_statements=False, retry_failed=False,
+                bill_candidates=bad_candidates,
+            )
+
+    mock_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_coverage_aware_skip_still_applies():
+    """A caller shouldn't have to pre-filter "already done" entries
+    themselves -- the same coverage check every session-wide candidate
+    goes through applies identically here."""
+    candidates = _make_candidates(2)
+    with _patch_coverage({"artifacts": {"bill_summary": {"status": "complete"}}}), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+
+    mock_artifact.assert_not_awaited()
+    for bill_result in result["results"]:
+        assert bill_result["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_retry_failed_and_dry_run_work_the_same_way():
+    candidates = _make_candidates(1)
+    with _patch_coverage({"artifacts": {"bill_summary": {"status": "failed"}}}), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=False, retry_failed=True, dry_run=True,
+            bill_candidates=candidates,
+        )
+
+    mock_artifact.assert_not_awaited()  # dry_run: nothing actually dispatched
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]  # retry_failed honored
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_concurrency_stays_bounded_regardless_of_list_size():
+    """SYNC-63's own explicit AC: a large supplied list must not create
+    that-many concurrent dispatches -- same semaphore-bounded loop as the
+    session-wide scan, just fed a caller-supplied list instead. Uses the
+    same tracking-coverage-check technique as this file's own pre-existing
+    session-wide concurrency tests above, scaled to a 60-bill list against
+    a bound of 4 (the ticket's own "50-100 bill identifiers" scale)."""
+    candidates = _make_candidates(60)
+    in_flight = {"count": 0}
+    max_seen = {"value": 0}
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        in_flight["count"] += 1
+        max_seen["value"] = max(max_seen["value"], in_flight["count"])
+        await asyncio.sleep(0.01)
+        in_flight["count"] -= 1
+        return None
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(4):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+
+    assert max_seen["value"] == 4
+    assert result["bills_considered"] == 60
+    assert len(result["results"]) == 60
+
+
 # --- dry_run ---------------------------------------------------------------
 
 @pytest.mark.asyncio
