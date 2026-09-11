@@ -1979,6 +1979,38 @@ async def test_completed_but_unreadable_result_falls_through_to_failed():
 
 
 @pytest.mark.asyncio
+async def test_completed_but_stored_answer_is_malformed_falls_through_to_failed():
+    """Distinct from the unreadable-file case above: read_task_result
+    succeeds (the file parses as JSON), but the `answer` field inside it is
+    itself corrupted -- a string instead of the expected dict, as seen on a
+    real stale task_result.json in production. Must be caught and resolved
+    the same way, not left to crash the sweep with a bare AttributeError."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-4b", _stale_record())
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "completed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.read_task_result",
+        return_value={"answer": "not a dict, truncated json...", "backend": "opus"},
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert "completed_but_malformed_answer" in write_kwargs["failure_reason"]
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 1}
+    assert await store.get_legbot_task("task-4b") is None
+
+
+@pytest.mark.asyncio
 async def test_a_recently_dispatched_task_is_left_alone():
     """Still plausibly in-flight -- its own dispatcher owns it, and touching
     it here would race a live poller that is about to resolve it itself."""

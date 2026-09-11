@@ -516,7 +516,24 @@ async def _write_changelog_answer(
     dispatched. Nothing in this function knows or cares which of those two
     ways the answer arrived; see _dispatch_and_write_changelog's own
     docstring for the split rationale.
+
+    SYNC-61 follow-up: the normal dispatch path's `answer` always comes
+    straight from a freshly-parsed CAMS response, but the recovery sweep's
+    `answer` comes from a task_result.json written at some earlier time --
+    which can itself be corrupted (seen in practice: a truncated/invalid
+    JSON string stored where a dict was expected). A malformed answer is
+    treated the same way as an unreadable one -- raising the same
+    LegBotDispatchError read_task_result itself raises for that case --
+    so every caller has exactly one exception type to handle for "this
+    stored answer can't be used," rather than this function crashing with
+    a bare AttributeError partway through and leaving the caller's own
+    try/except (scoped to BrokerClientError) unable to catch it.
     """
+    if not isinstance(answer, dict):
+        raise LegBotDispatchError(
+            f"bill_changelog answer is not a dict (got {type(answer).__name__}) -- "
+            "cannot be processed, likely a corrupted stored task_result.json"
+        )
     if answer.get("insufficient_information"):
         # SYNC-47: a flagged answer that still carries real structural
         # content is published, not discarded -- see
@@ -923,6 +940,33 @@ async def recover_stale_legbot_dispatches(
                         broker_api_base=record.get("broker_api_base"),
                         broker_api_token=_broker_api_token_for_base(record.get("broker_api_base")),
                     )
+                except LegBotDispatchError as exc:
+                    # The stored answer itself is unusable (e.g. a
+                    # corrupted/malformed task_result.json) -- same shape
+                    # and same resolution as "completed but unreadable"
+                    # above, just caught one step later since read_task_
+                    # result succeeded but what it returned didn't parse
+                    # as a valid answer. Nothing will fix itself on a
+                    # future sweep, so mark failed now rather than retry
+                    # forever.
+                    logger.warning(
+                        "recover_stale_legbot_dispatches: CAMS reports completed "
+                        "but the stored answer is malformed -- marking failed so "
+                        "retry_failed can pick it up",
+                        task_id=task_id, error=str(exc),
+                    )
+                    marked = await _mark_stale_legbot_task_failed(
+                        record, reason=f"completed_but_malformed_answer: {exc}"
+                    )
+                    if not marked:
+                        continue
+                    marked_failed += 1
+                    # Resolved (as failed) one level deeper than the
+                    # unreadable-file case above, so falling through would
+                    # hit `recovered += 1` below -- delete here and move on
+                    # to the next task instead.
+                    await redis_store.delete_legbot_task(task_id)
+                    continue
                 except BrokerClientError as exc:
                     # Same posture as _mark_stale_legbot_task_failed below --
                     # a write failure here must not crash the rest of the
