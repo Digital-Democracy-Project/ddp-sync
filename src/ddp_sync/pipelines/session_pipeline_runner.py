@@ -825,11 +825,20 @@ async def run_legbot_pipeline(
     as an alternative to scanning the whole jurisdiction/session for
     candidates via list_current_session_bill_candidates. Each entry is a
     dict with the same shape that scan already returns: {"gov_id",
-    "bill_openstates_id"} required, "live_url_fallback" optional (defaults
-    to "" -- the same default _process_bill_inner's own candidate.get
-    already falls back to). None (the default) preserves this function's
-    original session-wide-scan behavior for every existing caller
-    unchanged.
+    "bill_openstates_id"} required and non-empty, "live_url_fallback"
+    optional (defaults to "" -- the same default _process_bill_inner's own
+    candidate.get already falls back to). None (the default) preserves
+    this function's original session-wide-scan behavior for every existing
+    caller unchanged. Deduped by bill_openstates_id (keeping the first
+    occurrence of each), the same precedent list_current_session_bill_
+    candidates' own SYNC-23 dedup already set for the session-scan path --
+    a caller-supplied list has no equivalent protection otherwise, and two
+    entries for the same bill would each run their own concurrent coverage
+    check/dispatch. Every entry is trusted to actually belong to this
+    call's own jurisdiction_iso2/session_code -- not independently
+    re-verified per entry, the same trust model the session-scan path
+    already has (nothing downstream of candidate resolution re-checks a
+    candidate's jurisdiction membership either way).
 
     Root cause this exists to fix: the SYNC-56/60/61/62 incident chain
     (2026-09-10/11) traced back to a 947-bill bill_changelog backfill run by
@@ -861,10 +870,13 @@ async def run_legbot_pipeline(
     complete list themselves.
 
     Raises:
-        ValueError: any bill_candidates entry is missing "gov_id" or
-            "bill_openstates_id" -- checked up front, before any dispatch,
-            so a malformed caller-supplied list fails loudly and early
-            rather than as a confusing per-bill KeyError deep inside
+        ValueError: any bill_candidates entry is not a dict, or is missing
+            a non-empty "gov_id" or "bill_openstates_id" -- checked up
+            front, before any dispatch, so a malformed caller-supplied
+            list fails loudly and early (and always with this documented
+            exception type, even for a direct Python caller bypassing the
+            HTTP endpoint's own Pydantic validation) rather than as a
+            confusing per-bill KeyError/TypeError deep inside
             _process_bill_inner. (Also raised, unchanged, for the
             pre-existing jurisdiction_iso2/session_code/limit/artifact_types
             validation below, regardless of which candidate-sourcing mode
@@ -1002,19 +1014,53 @@ async def run_legbot_pipeline(
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
     if bill_candidates is not None:
-        # SYNC-63: fail loudly and early on a malformed caller-supplied list,
-        # before any dispatch -- the alternative is a confusing KeyError deep
-        # inside _process_bill_inner for whichever entry happens to be
-        # missing a key, on whichever bill the semaphore gets to first.
-        missing_keys = [
+        # SYNC-63 /pm-review: fail loudly and early on a malformed
+        # caller-supplied list, before any dispatch -- the alternative is a
+        # confusing KeyError/TypeError deep inside _process_bill_inner for
+        # whichever entry happens to be bad, on whichever bill the
+        # semaphore gets to first. Checks a non-dict entry explicitly
+        # (a bare `"gov_id" not in entry` on e.g. None or an int raises
+        # TypeError, not the documented ValueError, for a direct Python
+        # caller bypassing the HTTP endpoint's own Pydantic validation) and
+        # treats an empty-string value the same as a missing key (an empty
+        # gov_id/bill_openstates_id is exactly as useless to every
+        # downstream call as an absent one).
+        bad_entries = [
             i for i, entry in enumerate(bill_candidates)
-            if "gov_id" not in entry or "bill_openstates_id" not in entry
+            if not isinstance(entry, dict)
+            or not entry.get("gov_id")
+            or not entry.get("bill_openstates_id")
         ]
-        if missing_keys:
+        if bad_entries:
             raise ValueError(
-                "bill_candidates entries missing 'gov_id' or "
-                f"'bill_openstates_id' at index/indices: {missing_keys}"
+                "bill_candidates entries must be dicts with non-empty "
+                f"'gov_id' and 'bill_openstates_id' -- bad at index/indices: {bad_entries}"
             )
+        # SYNC-63 /pm-review: dedup by bill_openstates_id, same precedent as
+        # list_current_session_bill_candidates's own SYNC-23 dedup for the
+        # session-scan path -- a caller-supplied list has no equivalent
+        # protection otherwise, and duplicate entries would each run their
+        # own concurrent coverage check/dispatch for the same bill (wasted
+        # work at best, a race against each other's write at worst). Keeps
+        # the first occurrence of each id, logged so a caller's own list
+        # isn't silently regenerated smaller than what they submitted.
+        deduped: list[dict] = []
+        seen_ids: set[str] = set()
+        duplicates_dropped = 0
+        for entry in bill_candidates:
+            bill_id = entry["bill_openstates_id"]
+            if bill_id in seen_ids:
+                duplicates_dropped += 1
+                continue
+            seen_ids.add(bill_id)
+            deduped.append(entry)
+        if duplicates_dropped:
+            logger.warning(
+                "bill_candidates had duplicate bill_openstates_id entries -- "
+                "kept first occurrence of each, dropped the rest",
+                duplicates_dropped=duplicates_dropped,
+            )
+        bill_candidates = deduped
 
     run_id = str(uuid.uuid4())
     run_started = time.monotonic()

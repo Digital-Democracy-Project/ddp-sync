@@ -381,3 +381,22 @@ def test_bill_candidates_entry_missing_required_field_returns_422():
 
     assert response.status_code == 422
     mock_run.assert_not_awaited()
+
+
+def test_bill_candidates_entry_empty_string_field_returns_422():
+    """/pm-review: an empty gov_id/bill_openstates_id must be rejected at
+    the HTTP layer too, not just accepted as a technically-present string."""
+    client = _make_authed_client()
+    payload = dict(
+        _VALID_PAYLOAD,
+        bill_candidates=[{"gov_id": "", "bill_openstates_id": "id-1"}],
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()

@@ -94,9 +94,11 @@ class BillCandidateInput(BaseModel):
     list_current_session_bill_candidates already returns internally, so a
     caller with a broker-derived gap list can pass it through directly."""
 
-    gov_id: str = Field(..., description="Bill's short public identifier, e.g. 'SJR 2F'.")
+    gov_id: str = Field(
+        ..., min_length=1, description="Bill's short public identifier, e.g. 'SJR 2F'."
+    )
     bill_openstates_id: str = Field(
-        ...,
+        ..., min_length=1,
         description=(
             "Bare UUID identifying this bill in OpenStates/the local api-v3 "
             "instance (no 'ocd-bill/' prefix)."

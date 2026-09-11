@@ -301,6 +301,93 @@ async def test_bill_candidates_missing_required_key_raises_before_any_dispatch()
 
 
 @pytest.mark.asyncio
+async def test_bill_candidates_empty_string_value_raises_same_as_missing():
+    """/pm-review: an empty gov_id/bill_openstates_id is exactly as
+    useless downstream as an absent one -- must be rejected the same way,
+    not silently accepted as "present"."""
+    bad_candidates = [{"gov_id": "", "bill_openstates_id": "id-1"}]
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        with pytest.raises(ValueError, match="non-empty"):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10,
+                include_concept_statements=False, retry_failed=False,
+                bill_candidates=bad_candidates,
+            )
+
+    mock_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_non_dict_entry_raises_value_error_not_type_error():
+    """/pm-review: a direct Python caller (bypassing the HTTP endpoint's
+    own Pydantic validation) passing a non-dict entry must still get the
+    documented ValueError, not a confusing TypeError from a bare
+    `"gov_id" not in entry` membership check on e.g. None."""
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        with pytest.raises(ValueError, match="must be dicts"):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10,
+                include_concept_statements=False, retry_failed=False,
+                bill_candidates=[None],
+            )
+
+    mock_artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_empty_list_is_a_valid_zero_bill_no_op():
+    """Distinct from omitting bill_candidates entirely (None) -- an
+    explicit empty list still bypasses the session scan and simply
+    processes nothing, rather than being treated as invalid input."""
+    with _patch_lister([]) as mock_lister:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=[],
+        )
+
+    mock_lister.assert_not_awaited()
+    assert result == {
+        "bills_considered": 0, "bills_processed": 0, "truncated": False,
+        "duration_seconds": result["duration_seconds"],
+        "peak_memory_mb": result["peak_memory_mb"],
+        "results": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_duplicate_bill_openstates_id_is_deduped():
+    """/pm-review: the session-wide scan already dedups by
+    bill_openstates_id (SYNC-23) -- a caller-supplied list needs the same
+    protection, or two entries for the same bill would each run their own
+    concurrent coverage check/dispatch for it."""
+    candidates = [
+        {"gov_id": "HB 1", "bill_openstates_id": "id-1"},
+        {"gov_id": "HB 1 DUPLICATE", "bill_openstates_id": "id-1"},
+        {"gov_id": "HB 2", "bill_openstates_id": "id-2"},
+    ]
+    with _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+
+    assert result["bills_considered"] == 2
+    assert {r["gov_id"] for r in result["results"]} == {"HB 1", "HB 2"}
+    assert mock_artifact.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_bill_candidates_coverage_aware_skip_still_applies():
     """A caller shouldn't have to pre-filter "already done" entries
     themselves -- the same coverage check every session-wide candidate
