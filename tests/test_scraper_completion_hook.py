@@ -19,9 +19,12 @@ Covers:
   * a per-session trigger exception doesn't stop the remaining sessions
   * the `_run_scrape` / `_run_scrape_impl` wrapper split: success invokes the hook,
     failure does not
-  * a cloud-owned jurisdiction's success is skipped explicitly (pm-review round 1: its
-    scraped data lands in RDS, not the local Postgres `resolve_touched_sessions()`
-    reads -- resolution would otherwise silently find nothing there forever)
+  * a cloud-owned jurisdiction's success routes to SYNC-59's own cloud hook
+    (`_maybe_trigger_legbot_for_cloud_scrape`, cloud_scrape_trigger.py) instead of this
+    module's mac-side one -- its scraped data lands in RDS, not the local Postgres
+    `resolve_touched_sessions()` reads by default, so the mac-side hook would silently
+    find nothing there forever; see test_cloud_scrape_trigger.py for that hook's own
+    coverage
   * a hook-body exception (including one from `get_settings()` or a lazy import, not
     just the two call sites `_maybe_trigger_legbot_for_scrape` already wraps in its own
     try/except) can never propagate out of `_run_scrape` and replace a successful
@@ -243,13 +246,16 @@ async def test_run_scrape_skips_hook_after_a_failed_scrape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_scrape_skips_hook_for_a_cloud_owned_jurisdiction_even_on_success(monkeypatch):
-    """pm-review round 1: OPEN-193's cloud-owned branch loads into RDS, a separate
-    database from the local Postgres resolve_touched_sessions() reads -- resolving
-    against local api-v3 for a cloud-owned jurisdiction would silently find nothing,
-    forever, not because nothing changed but because it's the wrong database. The
-    wrapper must skip the hook entirely for a cloud-owned jurisdiction rather than
-    let that play out as a permanent silent no-op."""
+async def test_run_scrape_routes_a_cloud_owned_success_to_the_cloud_hook_not_the_mac_one(
+    monkeypatch,
+):
+    """SYNC-59: OPEN-193's cloud-owned branch loads into RDS, a separate database
+    from the local Postgres resolve_touched_sessions() reads by default -- so a
+    cloud-owned jurisdiction's success must route to the cloud-specific hook
+    (_maybe_trigger_legbot_for_cloud_scrape, cloud_scrape_trigger.py), which
+    resolves session_arg/RDS-scoped ground truth and reaches the Mac Studio's
+    ddp-sync over WireGuard, not the mac-side hook (which would resolve against
+    the wrong database and never find anything, forever)."""
     config = {"cloud_path": {"enabled": True, "jurisdictions": ["mi"]}}
     monkeypatch.setattr(
         "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
@@ -265,11 +271,17 @@ async def test_run_scrape_skips_hook_for_a_cloud_owned_jurisdiction_even_on_succ
     with patch(
         "ddp_sync.pipelines.openstates_scrape._maybe_trigger_legbot_for_scrape",
         new=AsyncMock(),
-    ) as mock_hook:
-        result = await _run_scrape("mi", None, "/fake/root", config=config)
+    ) as mock_mac_hook, patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger._maybe_trigger_legbot_for_cloud_scrape",
+        new=AsyncMock(),
+    ) as mock_cloud_hook:
+        result = await _run_scrape("mi", "session=2026", "/fake/root", config=config)
 
     assert result["cloud_run_id"] == "mi-abc123"
-    mock_hook.assert_not_awaited()
+    mock_mac_hook.assert_not_awaited()
+    mock_cloud_hook.assert_awaited_once()
+    assert mock_cloud_hook.await_args.args[0] == "mi"
+    assert mock_cloud_hook.await_args.args[1] == "session=2026"
 
 
 @pytest.mark.asyncio

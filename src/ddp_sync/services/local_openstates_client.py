@@ -749,10 +749,12 @@ async def resolve_touched_sessions(
     *,
     since: datetime,
     max_bills_scanned: int,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> list[str]:
     """SYNC-50: resolve which session_code(s) actually had a bill touched
-    (created or updated) in this jurisdiction since `since`, from the local
-    api-v3 instance's own `updated_since` filter -- real ground truth for
+    (created or updated) in this jurisdiction since `since`, from an api-v3
+    instance's own `updated_since` filter -- real ground truth for
     "what did this scrape run touch", not a guess at "the jurisdiction's
     current session" (which cannot represent more than one session
     simultaneously active -- confirmed real for Virginia and Utah, both of
@@ -773,6 +775,17 @@ async def resolve_touched_sessions(
             scan specifically (see SyncSettings.
             legbot_scrape_completion_trigger_resolution_max_bills's own
             docstring), not a limit on anything a caller goes on to dispatch.
+        api_base/api_key (SYNC-59): override which api-v3 instance this
+            reads from. None (the default) preserves SYNC-50's original
+            behavior exactly -- settings.local_openstates_api_base/
+            local_openstates_api_key, the Mac Studio's own local read
+            replica. Added for OPEN-193's cloud-owned scrape path, which
+            loads into RDS rather than local Postgres -- resolving "what did
+            this run touch" there needs a read path against RDS instead
+            (settings.rds_openstates_api_base, empty/unconfigured until an
+            RDS-facing read replica exists -- see that setting's own
+            docstring), not the Mac's local instance, which would never see
+            RDS-loaded data at all.
 
     Returns:
         Distinct session_code strings, in first-seen order (the order
@@ -799,16 +812,18 @@ async def resolve_touched_sessions(
         more machinery than this ticket's scope calls for.
     """
     settings = get_settings()
-    if not settings.local_openstates_api_base or max_bills_scanned <= 0:
+    resolved_api_base = api_base if api_base is not None else settings.local_openstates_api_base
+    resolved_api_key = api_key if api_key is not None else settings.local_openstates_api_key
+    if not resolved_api_base or max_bills_scanned <= 0:
         return []
 
-    url = f"{settings.local_openstates_api_base}/bills"
+    url = f"{resolved_api_base}/bills"
     base_params: dict[str, str] = {
         "jurisdiction": jurisdiction_iso2.upper(),
         "updated_since": since.isoformat(),
     }
-    if settings.local_openstates_api_key:
-        base_params["apikey"] = settings.local_openstates_api_key
+    if resolved_api_key:
+        base_params["apikey"] = resolved_api_key
 
     session_codes: list[str] = []
     seen_sessions: set[str] = set()
