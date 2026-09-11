@@ -31,6 +31,31 @@ def test_load_from_env_honors_explicit_session_pipeline_concurrency_override(mon
     assert _load_from_env()["session_pipeline_concurrency"] == 4
 
 
+def test_load_from_env_defaults_replica_freshness_allowlist_to_empty(monkeypatch):
+    """OPEN-276: unset must resolve to an empty frozenset -- trusting no jurisdiction by default,
+    not "everything," matching plan §3.6's own default (skip, don't fall back to trusting
+    unverified data)."""
+    monkeypatch.delenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", raising=False)
+    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset()
+
+
+def test_load_from_env_parses_replica_freshness_allowlist_normalizing_case_and_whitespace(
+    monkeypatch,
+):
+    monkeypatch.setenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "fl, VA ,ut")
+    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset(
+        {"FL", "VA", "UT"}
+    )
+
+
+def test_load_from_env_replica_freshness_allowlist_ignores_empty_entries(monkeypatch):
+    """A trailing comma or accidental double-comma must not produce a bogus empty-string
+    'jurisdiction' that could never legitimately match anything, but shouldn't be silently
+    counted as a configured entry either."""
+    monkeypatch.setenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "fl,,va,")
+    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset({"FL", "VA"})
+
+
 def test_load_from_env_defaults_every_sync51_task_flag_to_true(monkeypatch):
     """SYNC-51: every per-task flag must default True -- merging this change alone must
     change nothing on any existing host (Mac, EC2-civic), since none of them will have

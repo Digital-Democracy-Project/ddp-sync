@@ -651,12 +651,16 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
     assert result["results"][1]["artifacts_generated"] == ["bill_summary"]
 
 
-def _patch_freshness_enabled(enabled: bool):
+def _patch_freshness_enabled(enabled: bool, *, allowlist: frozenset[str] = frozenset({"FL"})):
     return patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_settings",
         return_value=SimpleNamespace(
             replica_freshness_check_enabled=enabled,
             session_pipeline_concurrency=1,
+            # Defaults to allowing "FL" (every existing test candidate's jurisdiction) so these
+            # freshness-check tests exercise the freshness check itself, not the OPEN-276
+            # allowlist gate that now runs ahead of it -- that gate has its own dedicated tests.
+            legbot_rds_replica_jurisdiction_allowlist=allowlist,
         ),
     )
 
@@ -734,6 +738,99 @@ async def test_freshness_check_not_called_when_flag_is_off():
         )
 
     mock_freshness.assert_not_awaited()
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_not_on_allowlist_skips_with_no_broker_writes_and_no_rds_query():
+    """OPEN-276: a jurisdiction absent from the allowlist must skip with no broker write (same
+    self-healing posture as a not-fresh result) AND must never reach the freshness check at all --
+    there's no reason to pay an RDS round-trip for a jurisdiction dispatch won't trust regardless
+    of what it finds."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"WA"})
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness",
+        new=AsyncMock(),
+    ) as mock_freshness, _patch_coverage(None) as mock_coverage, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_freshness.assert_not_awaited()
+    mock_coverage.assert_not_awaited()
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["error"] == "jurisdiction_not_on_rds_replica_allowlist: FL"
+    assert bill_result["artifacts_generated"] == []
+    assert bill_result["artifacts_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_jurisdiction_allowlist_check_is_case_insensitive():
+    """The allowlist is normalized to uppercase at both config-parse time and check time -- a
+    lowercase candidate jurisdiction (as list_current_session_bill_candidates' own real caller
+    convention actually passes, e.g. "fl") must still match an uppercase allowlist entry."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"FL"})
+    ), _patch_freshness_check(True), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert result["results"][0]["error"] is None
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_allowlist_matching_normalizes_case_even_if_settings_were_not_normalized():
+    """pm-review round 1: _load_from_env() already uppercases every entry, but the check itself
+    must not silently rely on that -- a SyncSettings constructed directly (bypassing the env
+    loader, e.g. in a test or an alternate config path) with lowercase entries must still match."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"fl"})
+    ), _patch_freshness_check(True), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert result["results"][0]["error"] is None
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_allowlist_not_checked_when_freshness_flag_is_off():
+    """The empty-by-default allowlist must have zero effect on today's existing dispatch -- this
+    gate only exists nested inside replica_freshness_check_enabled, which stays off until real RDS
+    replication infrastructure lands."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        False, allowlist=frozenset()
+    ), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert result["results"][0]["error"] is None
     assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
 
 
