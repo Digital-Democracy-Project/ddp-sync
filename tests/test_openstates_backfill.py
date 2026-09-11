@@ -116,6 +116,9 @@ async def test_unknown_subcommand_refused_without_touching_ecs():
     assert result["success"] is False
     assert "unknown_subcommand" in result["error"]
     assert ecs.run_task_calls == []
+    # pm-review round 2: run_id must be present on every failure path, including this one,
+    # since a caller may already have it from the trigger endpoint's own response.
+    assert "run_id" in result
 
 
 @pytest.mark.asyncio
@@ -125,6 +128,20 @@ async def test_unknown_mode_refused_without_touching_ecs():
     assert result["success"] is False
     assert "unknown_mode" in result["error"]
     assert ecs.run_task_calls == []
+    assert "run_id" in result
+
+
+@pytest.mark.asyncio
+async def test_caller_supplied_run_id_is_honored_even_on_a_validation_failure():
+    """pm-review round 2: the trigger endpoint generates run_id and returns it to the caller
+    BEFORE run_backfill_job runs at all -- if the job then fails validation internally, the
+    run_id in that failure's log/result must be the SAME one the caller already has, not a
+    freshly generated one they'd have no way to match."""
+    ecs = FakeEcsClient()
+    result = await ob.run_backfill_job(
+        "fl", "archive", ecs_client=ecs, run_id="fl-archive-dry-run-deadbeef0000"
+    )
+    assert result["run_id"] == "fl-archive-dry-run-deadbeef0000"
 
 
 @pytest.mark.asyncio
@@ -141,6 +158,7 @@ async def test_unresolvable_rds_credential_refuses_without_touching_ecs(monkeypa
     assert result["success"] is False
     assert "cannot resolve an RDS target" in result["error"]
     assert ecs.run_task_calls == []
+    assert "run_id" in result
 
 
 @pytest.mark.asyncio
@@ -151,6 +169,7 @@ async def test_missing_fargate_config_fails_without_touching_ecs(monkeypatch):
     assert result["success"] is False
     assert result["error"].startswith("config_error")
     assert ecs.run_task_calls == []
+    assert "run_id" in result
 
 
 # ── launch + wait + log fetch ────────────────────────────────────────────────────────────────
@@ -247,9 +266,9 @@ def test_fetch_task_output_builds_expected_stream_name_and_joins_messages(monkey
     )
 
     assert output == "line one\nline two"
-    # One call gets the (only) page of events, a second confirms the stream has stabilized
-    # (no new events on top of what's already collected) before returning -- not just one call.
-    assert len(logs.get_log_events_calls) == 2
+    # One call gets the (only) page of events, then two consecutive quiet rounds confirm the
+    # stream has stabilized (_STABLE_ROUNDS_REQUIRED) before returning -- not just one call.
+    assert len(logs.get_log_events_calls) == 1 + ob._STABLE_ROUNDS_REQUIRED
     call = logs.get_log_events_calls[0]
     assert call["logGroupName"] == "/aws/ecs/ddp-scrapers"
     assert call["logStreamName"] == "scraper/scraper/abc123"
@@ -276,6 +295,27 @@ def test_fetch_task_output_waits_for_a_later_page_instead_of_returning_the_first
         "some early log noise\n"
         "fl: [DRY RUN] 7685 bills checked | unchanged=17325 corrected=2712 nulled=1"
     )
+
+
+def test_fetch_task_output_does_not_stop_after_a_single_quiet_round(monkeypatch):
+    """pm-review, round 2: the first fix stopped as soon as ONE round came back with no new
+    events, which is still too eager -- an ingestion gap doesn't prove the stream has actually
+    reached its end, only that nothing new had landed in that one instant. A quiet round
+    followed by MORE data arriving proves a single quiet round is no longer treated as done."""
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
+    logs = FakeLogsClient(
+        pages=[
+            [{"message": "line one"}],
+            [],  # one quiet round -- must NOT be treated as "stream finished"
+            [{"message": "fl: [DRY RUN] final summary line"}],
+        ]
+    )
+
+    output = ob._fetch_task_output(
+        "arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc123", _FARGATE_CFG, logs
+    )
+
+    assert output == "line one\nfl: [DRY RUN] final summary line"
 
 
 def test_fetch_task_output_retries_then_gives_up_without_raising(monkeypatch):

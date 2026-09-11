@@ -44,8 +44,13 @@ ALLOWED_MODES = frozenset({"dry-run", "commit"})
 # awslogs-group), overridable via cloud_path.fargate.log_group for a differently-configured
 # cluster rather than assumed unconditionally.
 _DEFAULT_LOG_GROUP = "/aws/ecs/ddp-scrapers"
-_LOG_FETCH_ATTEMPTS = 5
+_LOG_FETCH_ATTEMPTS = 6
 _LOG_FETCH_RETRY_S = 2.0
+# pm-review (round 2): one quiet poll right after some output arrived isn't a safe signal that
+# the stream is actually done -- CloudWatch can still deliver more in a later burst. Require
+# this many CONSECUTIVE rounds with no new events (not just one) before treating the stream as
+# stabilized.
+_STABLE_ROUNDS_REQUIRED = 2
 
 
 def _build_command(
@@ -129,11 +134,16 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
     came back non-empty, which can be a real bug for exactly the output this function exists
     to fetch -- CloudWatch's own ingestion is not atomic with the task stopping, and there is
     no guarantee the first successful `get_log_events` call already carries the final summary
-    line rather than just whatever early log noise had landed first. Follows
-    `nextForwardToken` (AWS's own documented "call again with the returned token; an unchanged
-    token means no new events arrived" pattern) and keeps polling until a call in progress
-    returns no *new* events on top of what's already been collected, or the attempt budget
-    runs out -- not merely until the first non-empty response.
+    line rather than just whatever early log noise had landed first.
+
+    pm-review (round 2): the first fix required only ONE quiet round (no new events) before
+    declaring the stream stable, which round 2 correctly flagged as still too eager -- a single
+    gap in ingestion isn't proof the stream has truly reached its end, only that nothing new had
+    landed in that one instant. Now requires `_STABLE_ROUNDS_REQUIRED` (2) CONSECUTIVE rounds
+    with no new events before returning, and always advances `next_token` from the response
+    (including on an empty round) rather than only when events were present, so a stream that
+    starts out empty still gets a real token to page forward from instead of re-querying from
+    the head every time. Still bounded by `_LOG_FETCH_ATTEMPTS` regardless -- always terminates.
 
     Never raises -- a log-fetch failure is real information ("logs unavailable"), not a reason
     to fail a task that otherwise exited 0.
@@ -146,6 +156,7 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
 
     messages: list[str] = []
     next_token: str | None = None
+    consecutive_empty = 0
     for attempt in range(_LOG_FETCH_ATTEMPTS):
         try:
             kwargs = {"logGroupName": log_group, "logStreamName": stream_name}
@@ -156,17 +167,14 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
             resp = logs_client.get_log_events(**kwargs)
             events = resp.get("events", [])
             messages.extend(e.get("message", "") for e in events)
-            new_token = resp.get("nextForwardToken")
+            next_token = resp.get("nextForwardToken")  # advance regardless of events this round
             if events:
-                # New events arrived this round -- keep polling in case there's more (the
-                # summary line may not be in this batch yet), unless this was the last
-                # attempt anyway.
-                next_token = new_token
-            elif messages:
-                # Nothing new arrived, and we already have something from an earlier round --
-                # the stream has stabilized, this is the full output.
-                return "\n".join(messages)
-            # else: nothing yet at all, keep retrying below.
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if messages and consecutive_empty >= _STABLE_ROUNDS_REQUIRED:
+                    return "\n".join(messages)
+                # else: either nothing collected at all yet, or not yet stable -- keep polling.
         except Exception as e:  # noqa: BLE001 -- ResourceNotFoundException while logs are still
             # propagating looks the same as "never will exist" from here; only the retry loop
             # below tells them apart.
@@ -204,16 +212,25 @@ async def run_backfill_job(
     still has a handle to grep this job's eventual result out of the structured logs). Falls
     back to generating one when called directly (tests, a REPL) rather than requiring every
     caller to invent an ID it doesn't care about.
+
+    pm-review (round 2): the first fix only threaded `run_id` through the launch-failure and
+    later stages, so a caller who got a `run_id` back from the trigger endpoint but then hit an
+    RDS-resolution or config error had no way to find that failure's log line by it -- exactly
+    the correlation gap this parameter exists to close. Generated (or accepted) first, before
+    any of the validation/precondition checks below, so every single return path carries it.
     """
     from ddp_sync.pipelines.cloud_scrape_trigger import (
         _fargate_config,
         _wait_for_task_stop,
     )
 
+    run_id = run_id or f"{jurisdiction}-{subcommand}-{mode}-{uuid.uuid4().hex[:12]}"
+
     if subcommand not in ALLOWED_SUBCOMMANDS:
         return {
             "success": False,
             "error": f"unknown_subcommand: {subcommand} (allowed: {sorted(ALLOWED_SUBCOMMANDS)})",
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "duration_seconds": 0.0,
         }
@@ -221,6 +238,7 @@ async def run_backfill_job(
         return {
             "success": False,
             "error": f"unknown_mode: {mode} (allowed: {sorted(ALLOWED_MODES)})",
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "duration_seconds": 0.0,
         }
@@ -233,6 +251,7 @@ async def run_backfill_job(
         error = f"cannot resolve an RDS target: {rds_error}"
         logger.error(
             "openstates_backfill: fargate launch refused",
+            run_id=run_id,
             jurisdiction=jurisdiction,
             subcommand=subcommand,
             error=error,
@@ -240,6 +259,7 @@ async def run_backfill_job(
         return {
             "success": False,
             "error": error,
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "duration_seconds": 0.0,
         }
@@ -249,6 +269,7 @@ async def run_backfill_job(
     except ValueError as e:
         logger.error(
             "openstates_backfill: fargate config error",
+            run_id=run_id,
             jurisdiction=jurisdiction,
             subcommand=subcommand,
             error=str(e),
@@ -256,12 +277,12 @@ async def run_backfill_job(
         return {
             "success": False,
             "error": f"config_error: {e}",
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "duration_seconds": 0.0,
         }
 
     client = ecs_client or boto3.client("ecs")
-    run_id = run_id or f"{jurisdiction}-{subcommand}-{mode}-{uuid.uuid4().hex[:12]}"
 
     start = time.monotonic()
     started, task_arn, detail = _launch_backfill_fargate_task(
