@@ -719,15 +719,17 @@ openstates_scrape:
 # day since both pairs are already ~fully archived and do almost no work once caught up.
 openstates_archive:
   enabled: true
-  use_fargate: false  # OPEN-192 (reopened): cloud_archiver.py runs as a real Fargate task
-                      # when true, instead of run-archive.sh locally. Off by default -- this
-                      # is a live cutover decision (moves archiving's data source from the
-                      # Mac's local Postgres to RDS), not something this ticket's own PR
-                      # should flip on its own. pm-review: do NOT flip this before the
-                      # deployed "ddp-scrapers" ECS task definition's image actually contains
-                      # cloud_archiver.py and docker-entrypoint.sh's RUNNER_SCRIPT dispatch
-                      # (ddp-open-states#225) -- an older image has neither, so the first
-                      # task launched this way would fail at container startup, not cleanly.
+  use_fargate: true   # OPEN-192: Ramon's deliberate cutover decision (2026-09-09) -- archiving
+                      # now runs cloud_archiver.py as a real Fargate task, reading from RDS
+                      # instead of run-archive.sh against the Mac's local Postgres. **Do not
+                      # merge/deploy this ahead of the new "ddp-scrapers" ECS task-definition
+                      # revision that actually contains cloud_archiver.py and
+                      # docker-entrypoint.sh's RUNNER_SCRIPT dispatch (ddp-open-states#225,
+                      # notes/ops-handoff)** -- an older image has neither, so the first task
+                      # launched this way would fail at container startup, not cleanly. In
+                      # parallel with, not blocked on, the separate RDS data-quality backfill
+                      # effort (PLAN-rds-data-quality-backfill.md) -- that's about historical
+                      # data parity, not whether new archiving can read/write RDS at all.
   cloud_path:
     fargate:
       # Same real values as openstates_scrape.cloud_path.fargate above (same cluster, same
