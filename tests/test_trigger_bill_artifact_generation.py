@@ -88,7 +88,7 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500,
         include_concept_statements=False, retry_failed=False, dry_run=False,
-        broker_api_base=None, broker_api_token=None,
+        broker_api_base=None, broker_api_token=None, bill_candidates=None,
     )
 
 
@@ -120,7 +120,7 @@ def test_valid_payload_returns_200_and_calls_pipeline_with_exact_args():
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
         include_concept_statements=False, retry_failed=False, dry_run=False,
-        broker_api_base=None, broker_api_token=None,
+        broker_api_base=None, broker_api_token=None, bill_candidates=None,
     )
 
 
@@ -313,3 +313,90 @@ def test_retry_failed_true_is_passed_through():
 
     assert response.status_code == 200
     assert mock_run.await_args.kwargs["retry_failed"] is True
+
+
+# --- bill_candidates (SYNC-63) ----------------------------------------------
+
+def test_bill_candidates_omitted_defaults_to_none_unchanged_behavior():
+    """No field on this request forces a caller to think about
+    bill_candidates -- omitting it entirely must reach run_legbot_pipeline
+    as bill_candidates=None, exactly like before this ticket."""
+    client = _make_authed_client()
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 3, "results": []}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=_VALID_PAYLOAD)
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["bill_candidates"] is None
+
+
+def test_bill_candidates_list_is_passed_through_as_plain_dicts():
+    client = _make_authed_client()
+    payload = dict(
+        _VALID_PAYLOAD,
+        bill_candidates=[
+            {"gov_id": "HB 1", "bill_openstates_id": "id-1"},
+            {
+                "gov_id": "HB 2", "bill_openstates_id": "id-2",
+                "live_url_fallback": "https://example.com/hb2.pdf",
+            },
+        ],
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 2, "results": []}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["bill_candidates"] == [
+        {"gov_id": "HB 1", "bill_openstates_id": "id-1", "live_url_fallback": ""},
+        {
+            "gov_id": "HB 2", "bill_openstates_id": "id-2",
+            "live_url_fallback": "https://example.com/hb2.pdf",
+        },
+    ]
+
+
+def test_bill_candidates_entry_missing_required_field_returns_422():
+    """Caught by FastAPI/Pydantic request validation before the pipeline is
+    ever called -- same "fail loudly and early" posture as
+    run_legbot_pipeline's own bill_candidates validation, just one layer
+    further out for an HTTP caller."""
+    client = _make_authed_client()
+    payload = dict(
+        _VALID_PAYLOAD,
+        bill_candidates=[{"gov_id": "HB 1"}],  # missing bill_openstates_id
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()
+
+
+def test_bill_candidates_entry_empty_string_field_returns_422():
+    """/pm-review: an empty gov_id/bill_openstates_id must be rejected at
+    the HTTP layer too, not just accepted as a technically-present string."""
+    client = _make_authed_client()
+    payload = dict(
+        _VALID_PAYLOAD,
+        bill_candidates=[{"gov_id": "", "bill_openstates_id": "id-1"}],
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()

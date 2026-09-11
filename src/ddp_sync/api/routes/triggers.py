@@ -88,12 +88,43 @@ async def trigger_bill_status_sync(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class BillCandidateInput(BaseModel):
+    """One entry of BillArtifactGenerationRequest.bill_candidates (SYNC-63) --
+    the same {"gov_id", "bill_openstates_id", "live_url_fallback"} shape
+    list_current_session_bill_candidates already returns internally, so a
+    caller with a broker-derived gap list can pass it through directly."""
+
+    gov_id: str = Field(
+        ..., min_length=1, description="Bill's short public identifier, e.g. 'SJR 2F'."
+    )
+    bill_openstates_id: str = Field(
+        ..., min_length=1,
+        description=(
+            "Bare UUID identifying this bill in OpenStates/the local api-v3 "
+            "instance (no 'ocd-bill/' prefix)."
+        ),
+    )
+    live_url_fallback: str = Field(
+        "",
+        description=(
+            "Optional live-fetch fallback bill_source, used only if no "
+            "archived text exists for this bill. Empty string (the "
+            "default) matches this pipeline's existing behavior when a "
+            "candidate has none."
+        ),
+    )
+
+
 class BillArtifactGenerationRequest(BaseModel):
     """Request body for POST /trigger/bill-artifact-generation.
 
     No field has a default -- every cost-relevant parameter must be an
     explicit, reviewed choice per call, mirroring run_legbot_pipeline's own
     "no silent defaults" discipline (pipelines/session_pipeline_runner.py).
+    bill_candidates (below) is the one exception, since it's an opt-in mode
+    switch rather than a cost-relevant knob -- omitting it (None, the
+    default) preserves this endpoint's original session-wide-scan behavior
+    unchanged.
     """
 
     jurisdiction_iso2: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
@@ -163,6 +194,23 @@ class BillArtifactGenerationRequest(BaseModel):
         ),
     )
     dry_run: bool = Field(False, description="Preview scope without dispatching anything.")
+    bill_candidates: list[BillCandidateInput] | None = Field(
+        default=None,
+        description=(
+            "SYNC-63: optional explicit list of bills to process, as an "
+            "alternative to scanning the whole jurisdiction/session for "
+            "candidates. When provided, `limit` does not select or truncate "
+            "which bills are considered -- every entry here is processed, "
+            "through the exact same bounded-concurrency, coverage-aware "
+            "pipeline as the session-wide scan (retry_failed and dry_run "
+            "work identically). Use this for a targeted backfill against a "
+            "caller-supplied list (e.g. bills known to be missing a "
+            "specific artifact_type) instead of calling the on-demand "
+            "single-bill endpoint in an uncoordinated loop -- that shape of "
+            "ad hoc script overloaded CAMS and triggered the SYNC-56/60/61/"
+            "62 incident chain this mode exists to prevent a repeat of."
+        ),
+    )
 
 
 def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, str | None]:
@@ -234,6 +282,14 @@ async def trigger_bill_artifact_generation(
     session run required a manual, global .env swap to avoid writing to
     production, with no per-request way to ask for dev instead. Omitted
     (the default) preserves this endpoint's original behavior unchanged.
+
+    body.bill_candidates (SYNC-63): when set, replaces the session-wide
+    scan with this caller-supplied list -- see BillArtifactGenerationRequest
+    and run_legbot_pipeline's own bill_candidates docstring for the full
+    rationale (the incident this mode exists to prevent a repeat of). This
+    is the intended way to run a large targeted backfill going forward,
+    rather than an uncoordinated external script hitting the on-demand
+    single-bill endpoint in a loop.
     """
     if body.limit < 1:
         raise HTTPException(
@@ -244,6 +300,11 @@ async def trigger_bill_artifact_generation(
     broker_api_base, broker_api_token = _resolve_batch_broker_target(x_ddp_environment)
 
     from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
+
+    bill_candidates = (
+        [c.model_dump() for c in body.bill_candidates]
+        if body.bill_candidates is not None else None
+    )
 
     try:
         return await run_legbot_pipeline(
@@ -257,6 +318,7 @@ async def trigger_bill_artifact_generation(
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
+            bill_candidates=bill_candidates,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

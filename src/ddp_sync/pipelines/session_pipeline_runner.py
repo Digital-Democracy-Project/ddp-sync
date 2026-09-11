@@ -817,8 +817,70 @@ async def run_legbot_pipeline(
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    bill_candidates: list[dict] | None = None,
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
+
+    bill_candidates (SYNC-63): optional explicit list of bills to process,
+    as an alternative to scanning the whole jurisdiction/session for
+    candidates via list_current_session_bill_candidates. Each entry is a
+    dict with the same shape that scan already returns: {"gov_id",
+    "bill_openstates_id"} required and non-empty, "live_url_fallback"
+    optional (defaults to "" -- the same default _process_bill_inner's own
+    candidate.get already falls back to). None (the default) preserves
+    this function's original session-wide-scan behavior for every existing
+    caller unchanged. Deduped by bill_openstates_id (keeping the first
+    occurrence of each), the same precedent list_current_session_bill_
+    candidates' own SYNC-23 dedup already set for the session-scan path --
+    a caller-supplied list has no equivalent protection otherwise, and two
+    entries for the same bill would each run their own concurrent coverage
+    check/dispatch. Every entry is trusted to actually belong to this
+    call's own jurisdiction_iso2/session_code -- not independently
+    re-verified per entry, the same trust model the session-scan path
+    already has (nothing downstream of candidate resolution re-checks a
+    candidate's jurisdiction membership either way).
+
+    Root cause this exists to fix: the SYNC-56/60/61/62 incident chain
+    (2026-09-10/11) traced back to a 947-bill bill_changelog backfill run by
+    calling /trigger/legbot-analyze-bill (the on-demand, single-bill
+    endpoint) once per bill from an external script, with no concurrency
+    awareness at all -- send-side pacing controls nothing about how many
+    dispatches are actually in flight at once, since each call's own poll
+    loop runs for potentially minutes. Hundreds ended up genuinely
+    concurrent regardless of the delay between sends, which is what
+    overloaded CAMS's status-check endpoint. The session-wide scan this
+    function already does was not a fit either -- it has no way to target
+    "just these specific bills" (SYNC-56's own investigation hit this same
+    limitation first; see feedback_ddp_sync_batch_endpoint_limit_scope).
+    Every existing safety property this function already has -- bounded
+    concurrency via session_pipeline_concurrency, coverage-aware skip
+    logic, retry_failed, dry_run -- applies identically here, since
+    bill_candidates only changes where the candidate list comes from, not
+    anything about how each one is processed (same _process_bill_bounded
+    loop below, unmodified).
+
+    When provided, `limit` is NOT used to select or truncate which bills
+    are considered -- every entry in bill_candidates is processed. (limit
+    is still validated as > 0 below regardless, the same as always, so
+    this function's existing "no parameter here has a silent default"
+    posture doesn't grow a special case; callers in this mode can pass
+    len(bill_candidates) or any other positive value.) `truncated` in the
+    return value is always False in this mode -- there is no "more exist
+    beyond what was considered" to report when the caller supplied the
+    complete list themselves.
+
+    Raises:
+        ValueError: any bill_candidates entry is not a dict, or is missing
+            a non-empty "gov_id" or "bill_openstates_id" -- checked up
+            front, before any dispatch, so a malformed caller-supplied
+            list fails loudly and early (and always with this documented
+            exception type, even for a direct Python caller bypassing the
+            HTTP endpoint's own Pydantic validation) rather than as a
+            confusing per-bill KeyError/TypeError deep inside
+            _process_bill_inner. (Also raised, unchanged, for the
+            pre-existing jurisdiction_iso2/session_code/limit/artifact_types
+            validation below, regardless of which candidate-sourcing mode
+            is in play.)
 
     artifact_types, include_org_research, include_concept_statements,
     retry_failed, and limit all have NO default -- the caller must decide
@@ -951,6 +1013,54 @@ async def run_legbot_pipeline(
     unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
+    if bill_candidates is not None:
+        # SYNC-63 /pm-review: fail loudly and early on a malformed
+        # caller-supplied list, before any dispatch -- the alternative is a
+        # confusing KeyError/TypeError deep inside _process_bill_inner for
+        # whichever entry happens to be bad, on whichever bill the
+        # semaphore gets to first. Checks a non-dict entry explicitly
+        # (a bare `"gov_id" not in entry` on e.g. None or an int raises
+        # TypeError, not the documented ValueError, for a direct Python
+        # caller bypassing the HTTP endpoint's own Pydantic validation) and
+        # treats an empty-string value the same as a missing key (an empty
+        # gov_id/bill_openstates_id is exactly as useless to every
+        # downstream call as an absent one).
+        bad_entries = [
+            i for i, entry in enumerate(bill_candidates)
+            if not isinstance(entry, dict)
+            or not entry.get("gov_id")
+            or not entry.get("bill_openstates_id")
+        ]
+        if bad_entries:
+            raise ValueError(
+                "bill_candidates entries must be dicts with non-empty "
+                f"'gov_id' and 'bill_openstates_id' -- bad at index/indices: {bad_entries}"
+            )
+        # SYNC-63 /pm-review: dedup by bill_openstates_id, same precedent as
+        # list_current_session_bill_candidates's own SYNC-23 dedup for the
+        # session-scan path -- a caller-supplied list has no equivalent
+        # protection otherwise, and duplicate entries would each run their
+        # own concurrent coverage check/dispatch for the same bill (wasted
+        # work at best, a race against each other's write at worst). Keeps
+        # the first occurrence of each id, logged so a caller's own list
+        # isn't silently regenerated smaller than what they submitted.
+        deduped: list[dict] = []
+        seen_ids: set[str] = set()
+        duplicates_dropped = 0
+        for entry in bill_candidates:
+            bill_id = entry["bill_openstates_id"]
+            if bill_id in seen_ids:
+                duplicates_dropped += 1
+                continue
+            seen_ids.add(bill_id)
+            deduped.append(entry)
+        if duplicates_dropped:
+            logger.warning(
+                "bill_candidates had duplicate bill_openstates_id entries -- "
+                "kept first occurrence of each, dropped the rest",
+                duplicates_dropped=duplicates_dropped,
+            )
+        bill_candidates = deduped
 
     run_id = str(uuid.uuid4())
     run_started = time.monotonic()
@@ -964,18 +1074,28 @@ async def run_legbot_pipeline(
         include_concept_statements=include_concept_statements,
         limit=limit,
         dry_run=dry_run,
+        bill_candidates_count=(len(bill_candidates) if bill_candidates is not None else None),
         peak_memory_mb=round(_peak_memory_mb(), 1),
     )
 
-    # Request limit + 1 so truncated is actually computable: if more than
-    # `limit` candidates come back, we know more exist beyond what's
-    # considered, without misreporting a specific further count (a
-    # limit + 1 probe only proves "more than limit exist").
-    candidates = await list_current_session_bill_candidates(
-        jurisdiction_iso2, session_code=session_code, limit=limit + 1
-    )
-    truncated = len(candidates) > limit
-    candidates = candidates[:limit]
+    if bill_candidates is not None:
+        # SYNC-63: an explicit, caller-supplied list replaces the session-wide
+        # scan entirely -- limit does not select or truncate here (every
+        # supplied entry is processed), and there's no "more exist beyond
+        # what was considered" for truncated to report, since the caller
+        # already supplied their own complete list.
+        candidates = list(bill_candidates)
+        truncated = False
+    else:
+        # Request limit + 1 so truncated is actually computable: if more than
+        # `limit` candidates come back, we know more exist beyond what's
+        # considered, without misreporting a specific further count (a
+        # limit + 1 probe only proves "more than limit exist").
+        candidates = await list_current_session_bill_candidates(
+            jurisdiction_iso2, session_code=session_code, limit=limit + 1
+        )
+        truncated = len(candidates) > limit
+        candidates = candidates[:limit]
     bills_considered = len(candidates)
 
     # Bounded concurrency (2026-08-18): several bills' own _process_bill
