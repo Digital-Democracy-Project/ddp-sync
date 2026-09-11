@@ -430,6 +430,22 @@ class SyncSettings:
     # jurisdiction's dispatch (plan §6 step 7/OPEN-276).
     replica_freshness_check_enabled: bool = False
 
+    # OPEN-276 (plan §3.6, §6 step 7): the consumption-side pilot allowlist -- the publication
+    # itself (OPEN-271) replicates all 7 tables' current contents for every jurisdiction RDS holds
+    # ANY data for, with no per-jurisdiction filter possible (§3.6's own correction: a jurisdiction
+    # can have rows present in the local replica before OPEN-193 has actually finished migrating
+    # it, e.g. a partial/in-progress load), so gating happens here instead: a bill is only
+    # dispatched from the RDS-fed local replica if its jurisdiction is on this allowlist. Empty by
+    # default -- deliberately not "trust everything replication has any data for," matching this
+    # plan's own §3.6 default ("skip the bill for this pass," not "process bill without proof its
+    # jurisdiction is genuinely, currently RDS-fed"). Only checked when
+    # replica_freshness_check_enabled is also on (nested inside that same block in
+    # _process_bill_inner) -- this list has no effect at all otherwise, so a set of jurisdictions
+    # left in this env var doesn't accidentally start gating dispatch before the freshness
+    # infrastructure is even live. Comma-separated 2-letter codes, case-insensitive
+    # (normalized to uppercase at parse time).
+    legbot_rds_replica_jurisdiction_allowlist: frozenset[str] = frozenset()
+
     # SYNC-48: independent enable flag for an automated scraper-completion
     # caller of run_legbot_pipeline (pipelines/scraper_triggered_legbot.py).
     # Deliberately NOT the same switch as LEGBOT_ENABLED (ddp-agents/CAMS
@@ -640,6 +656,11 @@ def _load_from_env() -> dict:
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
         "replica_freshness_check_enabled": (
             os.getenv("REPLICA_FRESHNESS_CHECK_ENABLED", "false").lower() == "true"
+        ),
+        "legbot_rds_replica_jurisdiction_allowlist": frozenset(
+            code.strip().upper()
+            for code in os.getenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "").split(",")
+            if code.strip()
         ),
         "legbot_scrape_completion_trigger_enabled": (
             os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "false").lower() == "true"

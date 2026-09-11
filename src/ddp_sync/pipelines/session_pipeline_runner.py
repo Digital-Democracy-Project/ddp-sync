@@ -461,7 +461,24 @@ async def _process_bill_inner(
     # turn transient replication lag into a bill stuck skipped-as-failed indefinitely. Skipping
     # here instead, with no row written, means the next scheduled run reconsiders this bill
     # exactly as if this attempt never happened.
-    if get_settings().replica_freshness_check_enabled:
+    settings = get_settings()
+    if settings.replica_freshness_check_enabled:
+        # OPEN-276 (plan §3.6): the publication itself has no per-jurisdiction filter -- once the
+        # subscription is live, the local replica can hold rows for a jurisdiction OPEN-193 hasn't
+        # actually finished migrating yet (e.g. a partial in-progress load), so trust is gated
+        # here, at dispatch, not at the replication layer. Checked first (before the RDS
+        # round-trip the freshness check needs) since it's a cheap local membership test -- no
+        # reason to query RDS at all for a jurisdiction this dispatch won't trust regardless of
+        # what it finds. Same skip-with-no-write posture as the freshness check below: a
+        # jurisdiction not yet on the allowlist should be reconsidered on the next scheduled run
+        # once it's added, not permanently recorded as failed.
+        if jurisdiction_iso2.upper() not in settings.legbot_rds_replica_jurisdiction_allowlist:
+            result["error"] = (
+                f"jurisdiction_not_on_rds_replica_allowlist: {jurisdiction_iso2.upper()}"
+            )
+            result["duration_seconds"] = time.monotonic() - bill_started
+            return result
+
         freshness = await check_bill_version_freshness(bill_openstates_id)
         if not freshness.is_fresh:
             result["error"] = f"replica_not_fresh: {freshness.reason}"
