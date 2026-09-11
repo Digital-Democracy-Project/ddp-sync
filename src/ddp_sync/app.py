@@ -100,11 +100,26 @@ async def _prewarm_congress_legislators(source) -> None:
 
 
 async def _zombie_sync_watchdog(redis_store):
-    """Poll for stale sync tasks every 30 minutes."""
+    """Poll for stale sync tasks every 30 minutes.
+
+    SYNC-61: also sweeps ddp:legbot:task:* on the same cadence, reusing this
+    loop rather than standing up a second watchdog for it -- see
+    recover_stale_legbot_dispatches' own docstring for what that sweep does.
+    That function never raises (per-task failures are logged and left for
+    the next sweep), but it's still wrapped in the same try/except as the
+    sync-task check below so one misbehaving sweep can never kill this loop.
+    """
+    from ddp_sync.pipelines.bill_artifact_generation import (
+        recover_stale_legbot_dispatches,
+    )
+
     while True:
         try:
             await asyncio.sleep(1800)
             await _check_and_resume_stale_syncs(redis_store)
+            legbot_counts = await recover_stale_legbot_dispatches()
+            if legbot_counts["checked"]:
+                logger.info(f"LegBot dispatch recovery sweep: {legbot_counts}")
         except asyncio.CancelledError:
             break
         except Exception as e:

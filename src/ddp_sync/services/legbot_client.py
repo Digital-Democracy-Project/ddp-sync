@@ -25,6 +25,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import httpx
 import structlog
@@ -89,6 +90,7 @@ async def dispatch_bill_changelog(
     *,
     diff_format: str = "unified_diff_v1",
     timeout_seconds: float | None = None,
+    on_task_created: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict:
     """Dispatch a bill_changelog task to LegBot and return its structured answer.
 
@@ -108,6 +110,18 @@ async def dispatch_bill_changelog(
         timeout_seconds: how long to poll before giving up. None (the
             default) resolves to settings.legbot_dispatch_timeout_seconds
             at call time.
+        on_task_created (SYNC-61): awaited with the CAMS task_id immediately
+            after task creation succeeds, before the poll loop begins --
+            ddp-sync's own process can die mid-poll (confirmed live: a
+            947-bill backfill left 193 finished CAMS answers uncollected
+            when the poller crashed, not the task), so recording the task_id
+            durably has to happen before any polling, not after. None (the
+            default) skips this entirely, matching every caller that
+            doesn't need crash recovery. Never blocks or is retried here --
+            a callback failure would strand a real dispatch over a
+            bookkeeping problem, so it propagates uncaught to the caller
+            (who owns the callback and decides how much that failure
+            should cost).
 
     Returns:
         See _dispatch_and_await. answer["insufficient_information"] is True
@@ -132,6 +146,7 @@ async def dispatch_bill_changelog(
             "caller": "ddp_sync",
         },
         question_type="bill_changelog",
+        on_task_created=on_task_created,
         timeout_seconds=timeout_seconds,
     )
 
@@ -196,8 +211,13 @@ async def _dispatch_and_await(
     *,
     question_type: str,
     timeout_seconds: float | None,
+    on_task_created: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict:
     """Shared dispatch/poll/read-result mechanics for any analyze_bill payload.
+
+    on_task_created (SYNC-61): see dispatch_bill_changelog's own docstring --
+    None (the default) here too, so every caller not passed through is
+    unaffected.
 
     SYNC-20: if the poll loop gives up on timeout, this attempts a
     best-effort DELETE /api/v1/tasks/{task_id} on CAMS before raising --
@@ -253,6 +273,12 @@ async def _dispatch_and_await(
         logger.info(
             "LegBot task dispatched", task_id=task_id, question_type=question_type,
         )
+        if on_task_created is not None:
+            # SYNC-61: recorded before any polling, deliberately -- the whole
+            # point is surviving this process dying somewhere in the loop
+            # below, so the record has to exist before that loop starts, not
+            # after it (successfully or not) finishes.
+            await on_task_created(task_id)
 
         # AGENTS-42: two-phase deadline, replacing one flat timeout measured
         # from dispatch. `deadline` starts generous
@@ -358,6 +384,39 @@ async def _dispatch_and_await(
     if status != "completed":
         raise LegBotDispatchError(f"LegBot task {task_id} ended with status={status}")
 
+    result = read_task_result(task_id)
+    logger.info(
+        "LegBot task completed", task_id=task_id, question_type=question_type,
+        insufficient_information=result["answer"].get("insufficient_information"),
+    )
+    return result
+
+
+def read_task_result(task_id: str) -> dict:
+    """Read a completed CAMS task's result off the shared local disk.
+
+    SYNC-61: factored out of _dispatch_and_await's own tail so the recovery
+    path (a stale-dispatch sweep re-checking a task this process never
+    polled to completion itself) can read the exact same file the same way,
+    without re-deriving this logic. Both processes share CAMS_ARTIFACTS_DIR
+    on the same Mac Studio; confirmed the file has no expiry/cleanup, so a
+    completed task's result stays readable indefinitely after the fact.
+
+    Deliberately does not check the task's CAMS status itself -- callers
+    (both the normal poll loop above and the recovery sweep) already know
+    the task is "completed" before calling this; calling it on anything
+    else risks reading a stale result left over from a previous attempt at
+    the same task_id, or a partially-written file for a still-running one.
+
+    Returns:
+        {"answer": ..., "backend": ...} -- same shape _dispatch_and_await
+        itself returns on success.
+
+    Raises:
+        LegBotDispatchError: the file is missing/unreadable/not valid JSON,
+        or has no "answer" key.
+    """
+    settings = get_settings()
     result_path = Path(settings.cams_artifacts_dir) / task_id / "task_result.json"
     try:
         snapshot = json.loads(result_path.read_text())
@@ -371,9 +430,34 @@ async def _dispatch_and_await(
         raise LegBotDispatchError(
             f"task_result.json for {task_id} has no 'answer' key: {snapshot}"
         )
-
-    logger.info(
-        "LegBot task completed", task_id=task_id, question_type=question_type,
-        insufficient_information=answer.get("insufficient_information"),
-    )
     return {"answer": answer, "backend": snapshot.get("backend")}
+
+
+async def check_task_status(task_id: str) -> dict:
+    """One-shot CAMS task status check -- GET /api/v1/tasks/{task_id}.
+
+    SYNC-61: the recovery sweep's own equivalent of _dispatch_and_await's
+    poll loop, minus the loop -- it needs to ask CAMS "what happened to
+    this task" exactly once per sweep, not wait around for a terminal
+    status the way a live dispatch does.
+
+    Returns:
+        The raw JSON body CAMS returns, e.g. {"status": "completed", ...}.
+        Not narrowed to any particular shape -- the caller only ever reads
+        "status" today, but this is the same response the normal poll loop
+        already handles, so no information is thrown away here that a
+        future caller might need.
+
+    Raises:
+        httpx.HTTPStatusError: CAMS returned a non-2xx response (including
+            404 for a task_id it has no record of at all).
+        httpx.RequestError: CAMS was unreachable.
+    """
+    settings = get_settings()
+    headers = {"Authorization": f"Bearer {settings.cams_api_token}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{settings.cams_base_url}/api/v1/tasks/{task_id}", headers=headers
+        )
+        resp.raise_for_status()
+        return resp.json()

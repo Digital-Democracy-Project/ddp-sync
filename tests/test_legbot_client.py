@@ -231,6 +231,176 @@ async def test_changelog_happy_path_sends_two_input_payload(tmp_path):
     assert payload["caller"] == "ddp_sync"
 
 
+# ---------------------------------------------------------------------------
+# SYNC-61: on_task_created is awaited with the task_id before any polling, so
+# a caller can durably record it in case this process dies partway through
+# the poll loop below -- and check_task_status/read_task_result are the
+# recovery sweep's own one-shot equivalents of that same poll/read sequence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_task_created_is_awaited_with_the_task_id_before_polling(tmp_path):
+    task_id = "chg789"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"insufficient_information": False}
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "mlx"})
+    )
+
+    calls = []
+
+    async def _on_task_created(created_task_id):
+        calls.append(created_task_id)
+
+    mock_client = _mock_client(statuses=["queued", "completed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        await dispatch_bill_changelog(
+            "https://example.com/old-bill.pdf",
+            "--- a/old\n+++ b/new\n@@ -1 +1 @@\n-old line\n+new line",
+            on_task_created=_on_task_created,
+        )
+
+    assert calls == [task_id]
+
+
+@pytest.mark.asyncio
+async def test_on_task_created_failure_is_not_swallowed():
+    """A callback that fails must not be silently absorbed -- see the
+    parameter's own docstring: a real dispatch shouldn't be judged to have
+    "worked" over a bookkeeping failure the caller has no way to notice."""
+    async def _broken_callback(task_id):
+        raise RuntimeError("redis is down")
+
+    mock_client = _mock_client(statuses=["queued"], task_id="whatever")
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir="/tmp/unused"),
+    ), _patch_async_client(mock_client):
+        with pytest.raises(RuntimeError, match="redis is down"):
+            await dispatch_bill_changelog(
+                "https://example.com/old-bill.pdf", "--- a\n+++ b\n",
+                on_task_created=_broken_callback,
+            )
+
+
+@pytest.mark.asyncio
+async def test_on_task_created_omitted_is_a_no_op():
+    """Every pre-existing caller passes nothing here -- confirm that still
+    behaves exactly as before (already covered by every other test in this
+    file not passing it, but made explicit once)."""
+    task_id = "no-callback"
+    mock_client = _mock_client(statuses=["queued", "failed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir="/tmp/unused"),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        with pytest.raises(LegBotDispatchError, match="status=failed"):
+            await dispatch_bill_question("https://example.com/bill.pdf", "pros_cons")
+
+
+def test_read_task_result_returns_answer_and_backend(tmp_path):
+    from ddp_sync.services.legbot_client import read_task_result
+
+    task_id = "read123"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"text": "recovered answer", "insufficient_information": False}
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": answer, "backend": "opus"})
+    )
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ):
+        result = read_task_result(task_id)
+
+    assert result == {"answer": answer, "backend": "opus"}
+
+
+def test_read_task_result_missing_file_raises():
+    from ddp_sync.services.legbot_client import read_task_result
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir="/nonexistent-dir-xyz"),
+    ):
+        with pytest.raises(LegBotDispatchError, match="Could not read task_result.json"):
+            read_task_result("missing-task")
+
+
+def test_read_task_result_no_answer_key_raises(tmp_path):
+    from ddp_sync.services.legbot_client import read_task_result
+
+    task_id = "no-answer"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    (artifacts_dir / task_id / "task_result.json").write_text(json.dumps({"backend": "mlx"}))
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ):
+        with pytest.raises(LegBotDispatchError, match="no 'answer' key"):
+            read_task_result(task_id)
+
+
+@pytest.mark.asyncio
+async def test_check_task_status_returns_the_raw_response_body():
+    from ddp_sync.services.legbot_client import check_task_status
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"status": "completed", "mlx_generation_started_at": "x"}
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(),
+    ), patch("ddp_sync.services.legbot_client.httpx.AsyncClient", return_value=cm):
+        result = await check_task_status("some-task-id")
+
+    assert result == {"status": "completed", "mlx_generation_started_at": "x"}
+    get_call = mock_client.get.await_args
+    assert get_call.args[0] == "http://localhost:8000/api/v1/tasks/some-task-id"
+    assert get_call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+
+
+@pytest.mark.asyncio
+async def test_check_task_status_raises_on_error_response():
+    from ddp_sync.services.legbot_client import check_task_status
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
+    )
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(),
+    ), patch("ddp_sync.services.legbot_client.httpx.AsyncClient", return_value=cm):
+        with pytest.raises(httpx.HTTPStatusError):
+            await check_task_status("unknown-task-id")
+
+
 @pytest.mark.asyncio
 async def test_timeout_raises_without_hanging_forever(tmp_path):
     """No mlx_generation_started_at marker ever appears in these mocked GET

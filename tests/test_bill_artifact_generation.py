@@ -7,8 +7,10 @@ module docstring.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from ddp_sync.pipelines.bill_artifact_generation import (
@@ -16,9 +18,33 @@ from ddp_sync.pipelines.bill_artifact_generation import (
     dispatch_and_record_bill_artifact,
     generate_and_store_bill_artifact,
     generate_and_store_bill_changelog,
+    recover_stale_legbot_dispatches,
 )
 from ddp_sync.services.broker_client import BrokerClientError
 from ddp_sync.services.legbot_client import LegBotDispatchError
+
+
+class _FakeLegbotTaskStore:
+    """In-memory stand-in for RedisStore's SYNC-61 legbot-task methods --
+    same role as test_redis_store_legbot_tasks.py's fake client, but at the
+    RedisStore method level (this module calls get_redis_store(), not the
+    raw client), so bill_artifact_generation.py's own tracking/recovery code
+    can be exercised without a real Redis."""
+
+    def __init__(self):
+        self._tasks: dict[str, dict] = {}
+
+    async def set_legbot_task(self, task_id, data):
+        self._tasks[task_id] = data
+
+    async def get_legbot_task(self, task_id):
+        return self._tasks.get(task_id)
+
+    async def delete_legbot_task(self, task_id):
+        self._tasks.pop(task_id, None)
+
+    async def get_all_legbot_task_ids(self):
+        return list(self._tasks.keys())
 
 _COMMON_KWARGS = dict(
     bill_openstates_id="8d71a94e-0000-0000-0000-000000000001",
@@ -737,10 +763,14 @@ async def test_changelog_happy_path_writes_broker_with_compare_version():
         result = await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
 
     assert result == {"id": 2, "created": True, "status": "complete"}
-    mock_dispatch.assert_awaited_once_with(
-        old_bill_source="Archived introduced text.",
-        diff_source="--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n",
-    )
+    dispatch_kwargs = mock_dispatch.await_args.kwargs
+    assert dispatch_kwargs["old_bill_source"] == "Archived introduced text."
+    assert dispatch_kwargs["diff_source"] == "--- Introduced\n+++ Engrossed\n@@ -1 +1 @@\n-old\n+new\n"
+    # SYNC-61: on_task_created is always passed (Redis tracking is not
+    # opt-in per call) -- not asserting its identity here, just that this
+    # call includes it, matching every other assertion in this file that
+    # checks specific kwargs rather than the exact full call.
+    assert "on_task_created" in dispatch_kwargs
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "complete"
     assert write_kwargs["model_name"] == "mlx"
@@ -956,7 +986,7 @@ async def test_changelog_generates_every_transition_oldest_first():
     hop, which is what produced whitespace-only changelogs on FL 2026E."""
     dispatch_calls = []
 
-    async def _fake_dispatch(*, old_bill_source, diff_source):
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
         dispatch_calls.append((old_bill_source, diff_source))
         return _CHANGELOG_DISPATCH_RESULT
 
@@ -1061,7 +1091,7 @@ async def test_changelog_processes_every_transition_uncapped():
 
     dispatch_calls = []
 
-    async def _fake_dispatch(*, old_bill_source, diff_source):
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
         dispatch_calls.append(old_bill_source)
         return _CHANGELOG_DISPATCH_RESULT
 
@@ -1105,7 +1135,7 @@ async def test_changelog_reports_the_first_failed_transition_not_the_last():
         write_calls.append(kwargs)
         return {"id": len(write_calls), "created": True}
 
-    async def _fake_dispatch(*, old_bill_source, diff_source):
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
         if old_bill_source == "Archived filed text.":
             return {
                 "answer": {"insufficient_information": True, "reason": "diff_too_ambiguous"},
@@ -1204,7 +1234,7 @@ async def test_changelog_skips_a_transition_already_covered_when_gov_id_given():
     }
     dispatch_calls = []
 
-    async def _fake_dispatch(*, old_bill_source, diff_source):
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
         dispatch_calls.append(old_bill_source)
         return _CHANGELOG_DISPATCH_RESULT
 
@@ -1340,7 +1370,7 @@ async def test_changelog_coverage_filter_matches_unclassified_versions_too():
     }
     dispatch_calls = []
 
-    async def _fake_dispatch(*, old_bill_source, diff_source):
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
         dispatch_calls.append(old_bill_source)
         return _CHANGELOG_DISPATCH_RESULT
 
@@ -1522,6 +1552,454 @@ async def test_changelog_backfill_threads_broker_target_override():
         broker_api_base="http://localhost:8080",
         broker_api_token="dev-token",
     )
+
+
+# ---------------------------------------------------------------------------
+# SYNC-61: dispatch-time Redis tracking. A tracked task's record must exist
+# before dispatch_bill_changelog's own poll loop begins (so it survives a
+# crash anywhere in that loop) and be gone again once THIS process has
+# handled the outcome itself, success or failure -- only a genuine crash
+# should ever leave one behind for recover_stale_legbot_dispatches to find.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_the_task_before_polling_and_deletes_it_on_success():
+    store = _FakeLegbotTaskStore()
+    seen_during_dispatch = {}
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        await on_task_created("task-abc")
+        # The record must already be readable at this point -- i.e. before
+        # dispatch_bill_changelog itself would start polling for real.
+        seen_during_dispatch["record"] = await store.get_legbot_task("task-abc")
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 2, "created": True}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ):
+        await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS, target_artifact_id=198773)
+
+    record = seen_during_dispatch["record"]
+    assert record["artifact_type"] == "bill_changelog"
+    assert record["bill_openstates_id"] == _CHANGELOG_KWARGS["bill_openstates_id"]
+    assert record["version_date"] == "2026-02-01"
+    assert record["version_note"] == "Engrossed"
+    assert record["old_version_date"] == "2026-01-01"
+    assert record["old_version_note"] == "Introduced"
+    assert record["target_artifact_id"] == 198773
+    assert "dispatched_at" in record
+    # Deleted once this same process finished handling the outcome.
+    assert await store.get_legbot_task("task-abc") is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_deletes_the_record_even_when_the_write_fails():
+    """The finally block's whole point -- an exception path is still this
+    process handling the outcome, not a crash, so the record must not be
+    left behind for the recovery sweep to needlessly re-check."""
+    store = _FakeLegbotTaskStore()
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        await on_task_created("task-fails")
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("rejected")),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ):
+        with pytest.raises(BrokerClientError):
+            await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert await store.get_legbot_task("task-fails") is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_deletes_the_record_when_legbot_itself_raises():
+    store = _FakeLegbotTaskStore()
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        await on_task_created("task-timeout")
+        raise LegBotDispatchError("timed out")
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_ONE_TRANSITION),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=1),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ):
+        with pytest.raises(LegBotDispatchError):
+            await generate_and_store_bill_changelog(**_CHANGELOG_KWARGS)
+
+    assert await store.get_legbot_task("task-timeout") is None
+
+
+# ---------------------------------------------------------------------------
+# SYNC-61: recover_stale_legbot_dispatches -- the watchdog-driven sweep that
+# resolves a tracked dispatch whose own poller never came back.
+# ---------------------------------------------------------------------------
+
+_STALE_RECORD = {
+    "artifact_type": "bill_changelog",
+    "bill_openstates_id": _CHANGELOG_KWARGS["bill_openstates_id"],
+    "jurisdiction": _CHANGELOG_KWARGS["jurisdiction"],
+    "session_code": _CHANGELOG_KWARGS["session_code"],
+    "version_date": _CHANGELOG_KWARGS["version_date"],
+    "version_note": _CHANGELOG_KWARGS["version_note"],
+    "old_version_date": "2026-01-01",
+    "old_version_note": "Introduced",
+    "target_artifact_id": 198773,
+    "broker_api_base": "http://localhost:8080",
+    "broker_api_token": "dev-token",
+}
+
+
+def _stale_record(**overrides):
+    age_seconds = overrides.pop("age_seconds", 10000)
+    record = dict(_STALE_RECORD)
+    record["dispatched_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    ).isoformat()
+    record.update(overrides)
+    return record
+
+
+@pytest.mark.asyncio
+async def test_recovers_a_completed_task_and_writes_the_real_content_no_redispatch():
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-1", _stale_record())
+    answer = {
+        "insufficient_information": False,
+        "sections_added": ["A new section."],
+        "sections_removed": [],
+        "sections_modified": [],
+        "policy_implications": "",
+    }
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "completed"}),
+    ) as mock_status, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.read_task_result",
+        return_value={"answer": answer, "backend": "opus"},
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_status.assert_awaited_once_with("task-1")
+    # The whole point: no fresh LegBot dispatch, just the recovered answer.
+    mock_dispatch.assert_not_awaited()
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "complete"
+    assert write_kwargs["model_name"] == "opus"
+    assert write_kwargs["artifact_id"] == 198773
+    assert "A new section." in write_kwargs["content"]
+    assert counts == {"checked": 1, "recovered": 1, "marked_failed": 0}
+    assert await store.get_legbot_task("task-1") is None
+
+
+@pytest.mark.asyncio
+async def test_cams_reports_failed_falls_through_to_retry_failed_not_redispatched():
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-2", _stale_record())
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "failed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_dispatch.assert_not_awaited()
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert write_kwargs["artifact_id"] == 198773
+    assert "cams_status=failed" in write_kwargs["failure_reason"]
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 1}
+    assert await store.get_legbot_task("task-2") is None
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_write_itself_failing_leaves_the_record_in_place():
+    """If the broker rejects even the failed-row write, deleting the Redis
+    record anyway would lose the only trace of this stale dispatch -- must
+    stay tracked so a future sweep gets another chance."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-2b", _stale_record())
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "failed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("broker rejected it")),
+    ):
+        counts = await recover_stale_legbot_dispatches()
+
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 0}
+    assert await store.get_legbot_task("task-2b") is not None
+
+
+@pytest.mark.asyncio
+async def test_recovered_write_itself_failing_leaves_the_record_in_place():
+    """Same posture on the happy path: if the real recovered answer can't
+    actually be written, the record must survive to be retried, not be
+    discarded as if the recovery had succeeded."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-1b", _stale_record())
+    answer = {
+        "insufficient_information": False,
+        "sections_added": ["A new section."],
+        "sections_removed": [],
+        "sections_modified": [],
+        "policy_implications": "",
+    }
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "completed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.read_task_result",
+        return_value={"answer": answer, "backend": "opus"},
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(side_effect=BrokerClientError("broker rejected it")),
+    ):
+        counts = await recover_stale_legbot_dispatches()
+
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 0}
+    assert await store.get_legbot_task("task-1b") is not None
+
+
+@pytest.mark.asyncio
+async def test_cams_has_no_record_of_the_task_also_falls_through_to_failed():
+    """A 404 -- CAMS genuinely never heard of this task_id, the "destroyed
+    by a restart" case this ticket originally described -- must resolve the
+    same way as an explicit failed/cancelled status, not hang forever."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-3", _stale_record())
+    request = httpx.Request("GET", "http://localhost:8000/api/v1/tasks/task-3")
+    response = httpx.Response(404, request=request)
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(
+            side_effect=httpx.HTTPStatusError("404", request=request, response=response)
+        ),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert "cams_status=not_found" in write_kwargs["failure_reason"]
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 1}
+    assert await store.get_legbot_task("task-3") is None
+
+
+@pytest.mark.asyncio
+async def test_cams_returns_a_non_404_error_status_leaves_the_record_for_next_sweep():
+    """Distinct from the 404 case above -- a 500 or other error response is
+    a transient reachability problem, not proof CAMS has no record of the
+    task, and must not be treated as resolved."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-3b", _stale_record())
+    request = httpx.Request("GET", "http://localhost:8000/api/v1/tasks/task-3b")
+    response = httpx.Response(500, request=request)
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(
+            side_effect=httpx.HTTPStatusError("500", request=request, response=response)
+        ),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_write.assert_not_awaited()
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 0}
+    assert await store.get_legbot_task("task-3b") is not None
+
+
+@pytest.mark.asyncio
+async def test_completed_but_unreadable_result_falls_through_to_failed():
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-4", _stale_record())
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "completed"}),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.read_task_result",
+        side_effect=LegBotDispatchError("could not read task_result.json"),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    write_kwargs = mock_write.await_args.kwargs
+    assert write_kwargs["status"] == "failed"
+    assert "completed_but_unreadable" in write_kwargs["failure_reason"]
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 1}
+    assert await store.get_legbot_task("task-4") is None
+
+
+@pytest.mark.asyncio
+async def test_a_recently_dispatched_task_is_left_alone():
+    """Still plausibly in-flight -- its own dispatcher owns it, and touching
+    it here would race a live poller that is about to resolve it itself."""
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-fresh", _stale_record(age_seconds=5))
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(),
+    ) as mock_status:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_status.assert_not_awaited()
+    assert counts == {"checked": 0, "recovered": 0, "marked_failed": 0}
+    assert await store.get_legbot_task("task-fresh") is not None
+
+
+@pytest.mark.asyncio
+async def test_cams_unreachable_leaves_the_record_for_next_sweep():
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-5", _stale_record())
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(side_effect=httpx.ConnectError("connection refused")),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_write:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_write.assert_not_awaited()
+    # Still counted as "checked" -- the counter increments before the CAMS
+    # call is attempted, since a sweep still looked at this task even
+    # though it couldn't get an answer; only resolution failed.
+    assert counts == {"checked": 1, "recovered": 0, "marked_failed": 0}
+    assert await store.get_legbot_task("task-5") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_record_with_no_dispatched_at_is_skipped_not_guessed_at():
+    store = _FakeLegbotTaskStore()
+    record = _stale_record()
+    del record["dispatched_at"]
+    await store.set_legbot_task("task-6", record)
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(),
+    ) as mock_status:
+        counts = await recover_stale_legbot_dispatches()
+
+    mock_status.assert_not_awaited()
+    assert counts == {"checked": 0, "recovered": 0, "marked_failed": 0}
+
+
+@pytest.mark.asyncio
+async def test_custom_stale_after_seconds_is_honored():
+    store = _FakeLegbotTaskStore()
+    await store.set_legbot_task("task-7", _stale_record(age_seconds=100))
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_redis_store",
+        return_value=store,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.check_task_status",
+        new=AsyncMock(return_value={"status": "completed"}),
+    ) as mock_status, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.read_task_result",
+        return_value={"answer": {"insufficient_information": True}, "backend": "mlx"},
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 198773, "created": False}),
+    ):
+        counts = await recover_stale_legbot_dispatches(stale_after_seconds=50)
+
+    mock_status.assert_awaited_once()
+    assert counts["checked"] == 1
 
 
 # ---------------------------------------------------------------------------

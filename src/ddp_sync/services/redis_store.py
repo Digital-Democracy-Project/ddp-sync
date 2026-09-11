@@ -117,6 +117,94 @@ class RedisStore:
             logger.error("Redis: failed to get sync task", task_id=task_id, error=str(e))
         return None
 
+    # -- LegBot dispatch tracking (SYNC-61) --
+    #
+    # Sibling namespace to SYNC_TASK_PREFIX above, same shape of problem: an
+    # in-flight LegBot dispatch's only record used to be one async task's own
+    # process memory, so a ddp-sync crash mid-poll left nothing anywhere
+    # connecting a stuck bill back to its CAMS task_id -- confirmed live in a
+    # 947-bill backfill where 193 of 723 dispatched tasks had already
+    # finished on CAMS's side, untouched, hours after ddp-sync's own poller
+    # died. Recorded at dispatch time (before polling begins, so it survives
+    # a crash anywhere in the poll loop) and deleted once the SAME process
+    # finishes handling the dispatch, one way or another -- a record still
+    # present after the dispatch's own maximum possible lifetime has elapsed
+    # means the poller that would have deleted it never got the chance to.
+    #
+    # No heartbeat, unlike SYNC_TASK_PREFIX's multi-step sync jobs: a LegBot
+    # dispatch is one bounded operation with its own real timeout
+    # (legbot_queue_wait_timeout_seconds + legbot_dispatch_timeout_seconds),
+    # so "old enough to be stale" is just age against that ceiling, not a
+    # separately-maintained liveness signal.
+
+    LEGBOT_TASK_PREFIX = "ddp:legbot:task:"
+    # 7 days: a generous backstop, not the primary cleanup mechanism (that's
+    # the recovery sweep's own explicit delete once it resolves a record).
+    # Long enough that a sweep briefly failing (CAMS/Redis both down at once)
+    # doesn't lose the record before the next sweep 30 minutes later; short
+    # enough that a record nobody ever resolves doesn't accumulate forever.
+    LEGBOT_TASK_TTL = 86400 * 7
+
+    async def set_legbot_task(self, task_id: str, task_data: dict) -> None:
+        """Record an in-flight LegBot dispatch, keyed by its CAMS task_id."""
+        if not self._client:
+            return
+        try:
+            await self._client.set(
+                f"{self.LEGBOT_TASK_PREFIX}{task_id}",
+                json.dumps(task_data),
+                ex=self.LEGBOT_TASK_TTL,
+            )
+        except Exception as e:
+            logger.error("Redis: failed to set legbot task", task_id=task_id, error=str(e))
+
+    async def get_legbot_task(self, task_id: str) -> dict | None:
+        """Retrieve a tracked LegBot dispatch's recorded context, or None."""
+        if not self._client:
+            return None
+        try:
+            data = await self._client.get(f"{self.LEGBOT_TASK_PREFIX}{task_id}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.error("Redis: failed to get legbot task", task_id=task_id, error=str(e))
+        return None
+
+    async def delete_legbot_task(self, task_id: str) -> None:
+        """Remove a LegBot dispatch's tracking record -- called once this
+        process has handled the dispatch's outcome itself (success, a
+        normal failure, or a raised exception the caller goes on to handle),
+        so the recovery sweep never needs to look at it. Never raises: a
+        failed delete just means the record outlives its usefulness until
+        its TTL expires, not a correctness problem for the dispatch itself.
+        """
+        if not self._client:
+            return
+        try:
+            await self._client.delete(f"{self.LEGBOT_TASK_PREFIX}{task_id}")
+        except Exception as e:
+            logger.error("Redis: failed to delete legbot task", task_id=task_id, error=str(e))
+
+    async def get_all_legbot_task_ids(self) -> list[str]:
+        """List every currently-tracked LegBot task_id, for the recovery
+        sweep to check. Same KEYS-based enumeration _zombie_sync_watchdog
+        already uses for SYNC_TASK_PREFIX -- consistent with the existing
+        pattern rather than a new scanning mechanism, and this namespace is
+        a small working set (in-flight dispatches only, not a permanent
+        log), not the large keyspace KEYS is normally risky against.
+        """
+        if not self._client:
+            return []
+        try:
+            keys = await self._client.keys(f"{self.LEGBOT_TASK_PREFIX}*")
+            return [
+                (k.decode() if isinstance(k, bytes) else k).removeprefix(self.LEGBOT_TASK_PREFIX)
+                for k in keys
+            ]
+        except Exception as e:
+            logger.error("Redis: failed to list legbot tasks", error=str(e))
+            return []
+
     # -- Sync checkpoint tracking --
 
     async def add_sync_checkpoint(self, task_id: str, item_id: str):
