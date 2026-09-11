@@ -378,6 +378,30 @@ def test_read_task_result_no_answer_key_raises(tmp_path):
             read_task_result(task_id)
 
 
+def test_read_task_result_non_dict_answer_raises(tmp_path):
+    """A real production task_result.json had `answer` stored as a string
+    (itself truncated/invalid JSON) instead of the expected dict. Every
+    caller of read_task_result treats `answer` as a dict without checking
+    again, so this must be caught here, not surface later as a bare
+    AttributeError -- which is exactly what happened: _dispatch_and_await's
+    own completion log line crashed on `result["answer"].get(...)`."""
+    from ddp_sync.services.legbot_client import read_task_result
+
+    task_id = "corrupted-answer"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": "not a dict, truncated json...", "backend": "opus"})
+    )
+
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ):
+        with pytest.raises(LegBotDispatchError, match="non-dict 'answer'"):
+            read_task_result(task_id)
+
+
 @pytest.mark.asyncio
 async def test_check_task_status_returns_the_raw_response_body():
     from ddp_sync.services.legbot_client import check_task_status
