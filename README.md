@@ -87,6 +87,19 @@ The `cms:*` token does NOT carry `assets:write` — confirmed via 2026-04-30 pro
 | `LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS` | `3600` | AGENTS-42 (2026-08-19): the *queue-wait* timeout — how long `_dispatch_and_await` waits from dispatch for `mlx_generation_started_at` to first appear before giving up, before `LEGBOT_DISPATCH_TIMEOUT_SECONDS` above ever takes over. Added after a single crashed MLX request wedged `ddp-agents`' single-instance MLX pool and 45 consecutive tasks each burned their full (old, single, too-short) dispatch timeout waiting for a pool turn that never came — ~14h wasted. If the marker never appears at all (a non-MLX-routed task, or an older CAMS deployed without this field), this generous ceiling is what bounds the wait instead — still finite, just not the older, tighter number, since a genuinely-still-queued task and a task that will never start look identical until one of them actually happens. |
 | `LEGBOT_POLL_INTERVAL_SECONDS` | `1` | SYNC-39: how often `_dispatch_and_await` asks CAMS whether a task has finished. Was a hardcoded `5`. The dominant cost of that was latency on every call, not cache loss: measured on VA 2026S1 (2026-08-27) from CAMS's own un-quantised `mlx_artifact_started`→`mlx_artifact_complete` timestamps, real generation ran a median of **1.72s** (p90 3.57s, n=220) while the client observed **5.10s** — so ~3.4s of every call was this loop sleeping, across 220 calls in an 830s run. A second, weaker effect: the interval also sets how long a bill leaves its MLX worker idle between calls, which is how competing bills claimed warm workers (13 of 18 cold `concept_statements` prefills). Do not over-claim that one — shortening the interval shortens the competitor's cadence too, so the steal rate may not improve; and on a small-bill corpus a lost prefill costs under a second (median 0.80s), though it costs far more on a large bill. Rejected below 0 or non-finite, falling back to the default rather than raising. `scrapebot_client.py` keeps its own `5` deliberately: its mint holds no per-bill cache. |
 | `LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS` | `500` | Cap on how many organizations `pipelines/bill_organization_position_research.py` will dispatch `verify_bill_position` calls for per invocation. Raised 2026-08-15 from a hardcoded 20 — some bills have hundreds of real supporting/opposing organizations. |
+| `LEGBOT_POLL_RETRY_MAX_ATTEMPTS` | `5` | SYNC-60 (2026-09-11): `_dispatch_and_await`'s status poll (`GET /api/v1/tasks/{task_id}`) retries a *transient* failure — a connection-level error (CAMS unreachable, e.g. a brief window during a `cams reload`) or a `5xx` HTTP response (CAMS reachable but overloaded/erroring) — against the *same* `task_id`, rather than treating either as a real task failure. Confirmed live 2026-09-11: a 947-bill backfill fired near-simultaneous polls and CAMS returned real `500`s 618 times over ~6 minutes; at least two affected bills had actually finished successfully on CAMS's side, but the poller gave up on the first `500` and never came back to collect the result. A non-5xx error (e.g. a 404) is **not** retried — no change to that path. Exhausting the retry budget cancels the orphaned CAMS task and raises `LegBotDispatchError`, the same as a normal client-side timeout (SYNC-20) — never an unbounded wait. |
+| `LEGBOT_POLL_RETRY_BACKOFF_SECONDS` | `2.0` | SYNC-60: fixed backoff between the retries above. Deliberately separate from `LEGBOT_POLL_INTERVAL_SECONDS` (that cadence is tuned for throughput against a *healthy* CAMS; retrying a transient failure calls for a little more breathing room, not the same brisk interval). Rejected below 0 or non-finite, falling back to the default rather than raising, same posture as `LEGBOT_POLL_INTERVAL_SECONDS`. |
+
+**2026-09-11 (SYNC-61): in-flight dispatches are tracked in Redis and recovered, not lost.** Before this, the only
+record of a dispatched CAMS task was this process' own in-memory poll loop — if `ddp-sync` crashed or restarted
+mid-poll, that record was gone even though CAMS itself often kept running and finished the work. A 947-bill
+`bill_changelog` backfill found 193 of 723 dispatched tasks had already finished with real, complete answers
+sitting untouched on disk hours after the poller died. `dispatch_bill_changelog` now records its `task_id` in
+Redis (`ddp:legbot:task:*`, sibling to the scraper pipeline's own `ddp:sync:task:*`) before polling begins, and
+`app.py`'s existing `_zombie_sync_watchdog` (30-minute loop) sweeps stale records: a genuinely-completed CAMS
+task's real result is recovered and written to the original placeholder (no re-dispatch); a genuinely-failed one
+falls through to the existing `retry_failed` mechanism (SYNC-42). Scoped to `bill_changelog` today; other
+artifact types can follow later.
 
 **2026-08-14/15 full-pipeline validation:** all of the above was live-validated end-to-end against a real bill (WA HB 2499) through the real dev `ddp-sync` → CAMS → `ddp-broker-py` path — every `BillArtifact` question type plus organization-position research completed and landed real content in the dev broker. This run is also what surfaced the two config gaps above and the AGENTS-16/SYNC-20 zombie-task fixes, plus a separate, still-open `ddp-broker-py` bug (BROKER-79 — that repo's own "latest BillVersion" resolution uses insertion order, not real chronology) and SYNC-19 (`session_pipeline_runner` can report an artifact as "generated" even when the row it wrote has `status="failed"` — filed, not yet fixed).
 
@@ -118,7 +131,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 |--------|------|-------------|
 | POST | `/trigger/bill-version-check` | Trigger daily bill sync (Flow 1 + Flow 2) |
 | POST | `/trigger/bill-status-sync` | Trigger Webflow CMS status sync only (Flow 1) |
-| POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session |
+| POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session, or for a caller-supplied `bill_candidates` list (SYNC-63) |
 | POST | `/trigger/legbot-analyze-bill` | On-demand single-bill LegBot analysis, for ddp-next's interactive UX |
 | POST | `/trigger/legbot-analyze-bill-full` | Run every requested artifact type (default: all 8) plus org research for one bill, in a single call |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
@@ -142,6 +155,19 @@ hard cap of 25 assumed there was no concurrency protection for a shared CAMS/Leg
 protection already exists one layer down (CAMS's own `_mlx_semaphore`, `ddp-agents/src/legbot/reasoning.py`,
 shipped 2026-08-04, serializes every MLX call regardless of caller), and this pipeline dispatches sequentially
 anyway; MLX inference also has no per-call cost, unlike a metered cloud API.
+
+**Updated 2026-09-11 (SYNC-63): optional `bill_candidates` field targets a specific list of bills instead of
+scanning the whole session.** Root cause of a real incident (2026-09-10/11): a 947-bill `bill_changelog` backfill
+was run by calling `/trigger/legbot-analyze-bill` (the on-demand, single-bill endpoint, no concurrency awareness)
+once per bill from an external script — the send-side pacing controlled nothing about how many dispatches were
+actually in flight at once, and hundreds ended up genuinely concurrent, overloading CAMS. `bill_candidates`
+(a list of `{gov_id, bill_openstates_id, live_url_fallback?}` objects) feeds this same `session_pipeline_
+concurrency`-bounded, coverage-aware pipeline a caller-supplied list instead of a session scan — the same
+mechanism, fed differently, not a new one. When supplied, `limit` does not select or truncate (every entry is
+processed; `limit` is still required and validated, just unused for that purpose in this mode), and duplicate
+`bill_openstates_id` entries are deduped (keeping the first occurrence) the same way the session-wide scan
+already dedups its own candidates. **This is the intended way to run a large targeted backfill going forward** —
+not an uncoordinated external script.
 
 **Updated 2026-08-28 (SYNC-42): `retry_failed` is required, and it reaches `failed` and nothing else.**
 Once a `BillArtifact` was recorded `failed`, no later run ever retried it and there was no option to —

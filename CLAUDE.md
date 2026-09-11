@@ -68,6 +68,51 @@ Full write-up and data: `ddp-agents`' `bench/legbot-throughput-2026-08-27/`.
 `scrapebot_client.py` has its own copy of the constant, still 5, deliberately —
 its mint holds no per-bill cache, so cadence costs it nothing there.
 
+## Running a targeted LegBot backfill: use `bill_candidates`, not a loop over the on-demand endpoint
+
+A 947-bill `bill_changelog` backfill (2026-09-10/11) was run by calling
+`/trigger/legbot-analyze-bill` (the on-demand, single-bill endpoint, with zero
+concurrency awareness) once per bill from an external script, paced only by a
+0.3s delay between *sending* each request. That pacing controlled nothing
+about how many dispatches were actually in flight at once — each call's own
+poll loop runs for potentially minutes, so hundreds ended up genuinely
+concurrent regardless of the send-side delay. That overloaded CAMS's
+status-check endpoint (618 real `500`s in ~6 minutes) and triggered a chain of
+fixes: SYNC-56 (a stuck-placeholder bug this surfaced), SYNC-60 (retry past a
+brief connection failure/5xx instead of hard-failing), SYNC-61 (track
+in-flight dispatches in Redis and recover a genuinely-completed one instead of
+losing it), SYNC-62 (id-targeted BillArtifact writes the recovery path needed),
+and SYNC-63 (this section).
+
+**Don't reach for an uncoordinated script again.** For a large targeted
+backfill against a specific, known list of bills (not "every bill in a
+session"), use `/trigger/bill-artifact-generation`'s `bill_candidates` field
+(SYNC-63) instead of scripting a loop over `/trigger/legbot-analyze-bill`. It
+feeds the same `session_pipeline_concurrency`-bounded, coverage-aware pipeline
+the session-wide scan already uses (`session_pipeline_runner.py`'s
+`run_legbot_pipeline`) a caller-supplied list instead of a session scan — real
+concurrency stays capped regardless of how large the list is, `retry_failed`/
+`dry_run` work exactly the same way, and an already-covered bill is skipped
+automatically rather than requiring a caller's own ad hoc checkpoint file:
+
+```
+POST /trigger/bill-artifact-generation
+{
+  "jurisdiction_iso2": "fl", "session_code": "2026F",
+  "artifact_types": ["bill_changelog"],
+  "include_org_research": false, "include_concept_statements": false,
+  "retry_failed": false, "limit": 1,
+  "bill_candidates": [
+    {"gov_id": "SJR 2F", "bill_openstates_id": "a3afb726-0000-0000-0000-000000000001"},
+    ...
+  ]
+}
+```
+
+`limit` is still a required, validated positive value, but it does not
+select or truncate `bill_candidates` in this mode — every supplied entry is
+processed regardless of what `limit` is set to; pass any positive integer.
+
 ## Dev/prod checkout discipline
 
 `~/Developer/repos/ddp-sync` is **production** — the `com.ddp.ddp-sync` LaunchDaemon
