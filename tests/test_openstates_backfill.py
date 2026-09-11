@@ -37,16 +37,32 @@ class FakeEcsClient:
 
 
 class FakeLogsClient:
-    def __init__(self, events=None, error=None):
-        self._events = events if events is not None else []
+    """Simulates real CloudWatch pagination: each call consumes the next page of `pages` and
+    returns a token that advances only while pages remain -- once exhausted, further calls
+    with that same token return no new events and the same token again (matching CloudWatch's
+    own "unchanged token means no more data" contract), never re-serving old events.
+    """
+
+    def __init__(self, pages=None, events=None, error=None):
+        # `events` is a convenience alias for the common one-page case.
+        self._pages = list(pages) if pages is not None else ([events] if events is not None else [])
         self._error = error
+        self._calls_made = 0
         self.get_log_events_calls = []
 
     def get_log_events(self, **kwargs):
         self.get_log_events_calls.append(kwargs)
         if self._error:
             raise self._error
-        return {"events": self._events}
+        page_index = self._calls_made
+        self._calls_made += 1
+        if page_index < len(self._pages):
+            events = self._pages[page_index]
+            token = f"token-{page_index + 1}"
+        else:
+            events = []
+            token = f"token-{len(self._pages)}"
+        return {"events": events, "nextForwardToken": token}
 
 
 def _run_task_ok(task_arn="arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc123"):
@@ -143,6 +159,7 @@ async def test_missing_fargate_config_fails_without_touching_ecs(monkeypatch):
 @pytest.mark.asyncio
 async def test_successful_dry_run_passes_runner_script_command_and_database_url(monkeypatch):
     monkeypatch.setattr(ob, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
     logs = FakeLogsClient(events=[{"message": "fl: [DRY RUN] 7685 bills checked | unchanged=17325 corrected=2712 nulled=1"}])
 
@@ -156,6 +173,7 @@ async def test_successful_dry_run_passes_runner_script_command_and_database_url(
     assert result["subcommand"] == "recompute-diff-order"
     assert result["mode"] == "dry-run"
     assert "nulled=1" in result["output"]
+    assert result["run_id"].startswith("fl-recompute-diff-order-dry-run-")
 
     [call] = ecs.run_task_calls
     override = call["overrides"]["containerOverrides"][0]
@@ -171,6 +189,7 @@ async def test_successful_dry_run_passes_runner_script_command_and_database_url(
 @pytest.mark.asyncio
 async def test_commit_mode_with_session_builds_correct_command(monkeypatch):
     monkeypatch.setattr(ob, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
     logs = FakeLogsClient(events=[{"message": "ut: committed"}])
 
@@ -202,6 +221,7 @@ async def test_run_task_exception_fails_cleanly(monkeypatch):
 @pytest.mark.asyncio
 async def test_nonzero_exit_code_reports_failure_with_whatever_output_exists(monkeypatch):
     monkeypatch.setattr(ob, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=1)])
     logs = FakeLogsClient(events=[{"message": "Traceback (most recent call last): ..."}])
 
@@ -218,15 +238,44 @@ async def test_nonzero_exit_code_reports_failure_with_whatever_output_exists(mon
 # ── _fetch_task_output ───────────────────────────────────────────────────────────────────────
 
 
-def test_fetch_task_output_builds_expected_stream_name_and_joins_messages():
+def test_fetch_task_output_builds_expected_stream_name_and_joins_messages(monkeypatch):
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
     logs = FakeLogsClient(events=[{"message": "line one"}, {"message": "line two"}])
+
     output = ob._fetch_task_output(
         "arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc123", _FARGATE_CFG, logs
     )
+
     assert output == "line one\nline two"
-    [call] = logs.get_log_events_calls
+    # One call gets the (only) page of events, a second confirms the stream has stabilized
+    # (no new events on top of what's already collected) before returning -- not just one call.
+    assert len(logs.get_log_events_calls) == 2
+    call = logs.get_log_events_calls[0]
     assert call["logGroupName"] == "/aws/ecs/ddp-scrapers"
     assert call["logStreamName"] == "scraper/scraper/abc123"
+
+
+def test_fetch_task_output_waits_for_a_later_page_instead_of_returning_the_first_batch(monkeypatch):
+    """pm-review, round 1: the original version returned as soon as ANY events came back,
+    which could mean returning only early log noise before the actual dry-run summary line
+    (a later page) had even been ingested by CloudWatch yet. This proves that no longer
+    happens -- a second page arriving after the first is still collected."""
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
+    logs = FakeLogsClient(
+        pages=[
+            [{"message": "some early log noise"}],
+            [{"message": "fl: [DRY RUN] 7685 bills checked | unchanged=17325 corrected=2712 nulled=1"}],
+        ]
+    )
+
+    output = ob._fetch_task_output(
+        "arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc123", _FARGATE_CFG, logs
+    )
+
+    assert output == (
+        "some early log noise\n"
+        "fl: [DRY RUN] 7685 bills checked | unchanged=17325 corrected=2712 nulled=1"
+    )
 
 
 def test_fetch_task_output_retries_then_gives_up_without_raising(monkeypatch):

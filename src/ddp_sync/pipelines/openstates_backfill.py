@@ -123,9 +123,17 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
     A dry-run's entire value is the summary line it prints (e.g. "fl: [DRY RUN] 7685 bills
     checked | unchanged=17325 corrected=2712 nulled=1") -- unlike cloud_archiver.py, which
     writes its result straight to the database and can be verified there, a dry-run writes
-    nothing anywhere else. Retries a few times: CloudWatch's own ingestion has a short,
-    variable delay after a task stops, and the log stream may not be queryable in the same
-    instant DescribeTasks first reports STOPPED.
+    nothing anywhere else.
+
+    pm-review (round 1): the original version returned as soon as the *first* batch of events
+    came back non-empty, which can be a real bug for exactly the output this function exists
+    to fetch -- CloudWatch's own ingestion is not atomic with the task stopping, and there is
+    no guarantee the first successful `get_log_events` call already carries the final summary
+    line rather than just whatever early log noise had landed first. Follows
+    `nextForwardToken` (AWS's own documented "call again with the returned token; an unchanged
+    token means no new events arrived" pattern) and keeps polling until a call in progress
+    returns no *new* events on top of what's already been collected, or the attempt budget
+    runs out -- not merely until the first non-empty response.
 
     Never raises -- a log-fetch failure is real information ("logs unavailable"), not a reason
     to fail a task that otherwise exited 0.
@@ -136,14 +144,29 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
     task_id = task_arn.rsplit("/", 1)[-1]
     stream_name = f"{stream_prefix}/{container_name}/{task_id}"
 
+    messages: list[str] = []
+    next_token: str | None = None
     for attempt in range(_LOG_FETCH_ATTEMPTS):
         try:
-            resp = logs_client.get_log_events(
-                logGroupName=log_group, logStreamName=stream_name, startFromHead=True
-            )
+            kwargs = {"logGroupName": log_group, "logStreamName": stream_name}
+            if next_token is None:
+                kwargs["startFromHead"] = True
+            else:
+                kwargs["nextToken"] = next_token
+            resp = logs_client.get_log_events(**kwargs)
             events = resp.get("events", [])
+            messages.extend(e.get("message", "") for e in events)
+            new_token = resp.get("nextForwardToken")
             if events:
-                return "\n".join(e.get("message", "") for e in events)
+                # New events arrived this round -- keep polling in case there's more (the
+                # summary line may not be in this batch yet), unless this was the last
+                # attempt anyway.
+                next_token = new_token
+            elif messages:
+                # Nothing new arrived, and we already have something from an earlier round --
+                # the stream has stabilized, this is the full output.
+                return "\n".join(messages)
+            # else: nothing yet at all, keep retrying below.
         except Exception as e:  # noqa: BLE001 -- ResourceNotFoundException while logs are still
             # propagating looks the same as "never will exist" from here; only the retry loop
             # below tells them apart.
@@ -156,7 +179,7 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
         if attempt < _LOG_FETCH_ATTEMPTS - 1:
             time.sleep(_LOG_FETCH_RETRY_S)
 
-    return ""
+    return "\n".join(messages)
 
 
 async def run_backfill_job(
@@ -167,6 +190,7 @@ async def run_backfill_job(
     config: dict | None = None,
     ecs_client=None,
     logs_client=None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run one os-text-extract data-quality subcommand for one jurisdiction as a Fargate task.
 
@@ -174,6 +198,12 @@ async def run_backfill_job(
     recompute-diff-order invocation that runs inside the currently-deployed image instead of
     this EC2 host's own bare venv. Returns a result dict with `output` holding whatever the
     task printed (the dry-run summary line, most importantly) whenever the log fetch succeeds.
+
+    `run_id`: pass one in when the caller already handed it back synchronously (the trigger
+    endpoint does, precisely so a caller who only ever sees the immediate "started" response
+    still has a handle to grep this job's eventual result out of the structured logs). Falls
+    back to generating one when called directly (tests, a REPL) rather than requiring every
+    caller to invent an ID it doesn't care about.
     """
     from ddp_sync.pipelines.cloud_scrape_trigger import (
         _fargate_config,
@@ -231,7 +261,7 @@ async def run_backfill_job(
         }
 
     client = ecs_client or boto3.client("ecs")
-    run_id = f"{jurisdiction}-{subcommand}-{mode}-{uuid.uuid4().hex[:12]}"
+    run_id = run_id or f"{jurisdiction}-{subcommand}-{mode}-{uuid.uuid4().hex[:12]}"
 
     start = time.monotonic()
     started, task_arn, detail = _launch_backfill_fargate_task(
@@ -241,6 +271,7 @@ async def run_backfill_job(
         duration = round(time.monotonic() - start, 1)
         logger.error(
             "openstates_backfill: fargate launch failed",
+            run_id=run_id,
             jurisdiction=jurisdiction,
             subcommand=subcommand,
             detail=detail,
@@ -248,9 +279,16 @@ async def run_backfill_job(
         return {
             "success": False,
             "error": f"run_task_failed: {detail}",
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "duration_seconds": duration,
         }
+
+    # pm-review: the caller (the trigger endpoint, via BackgroundTasks) gets back only
+    # {"status": "started", ...} before this even runs -- run_id is the only handle anyone
+    # watching this job's own structured logs has to find its eventual result, so every log
+    # line and the returned dict both carry it from here on.
+    logger.info("openstates_backfill: fargate task launched", run_id=run_id, task_arn=task_arn)
 
     exit_code, wait_detail = await asyncio.to_thread(
         _wait_for_task_stop, task_arn, fargate_cfg, client
@@ -263,15 +301,18 @@ async def run_backfill_job(
         error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
         logger.error(
             "openstates_backfill: fargate task failed",
+            run_id=run_id,
             jurisdiction=jurisdiction,
             subcommand=subcommand,
             exit_code=exit_code,
             detail=wait_detail,
             duration_seconds=duration,
+            output=output,
         )
         return {
             "success": False,
             "error": error,
+            "run_id": run_id,
             "jurisdiction": jurisdiction,
             "subcommand": subcommand,
             "mode": mode,
@@ -281,13 +322,16 @@ async def run_backfill_job(
 
     logger.info(
         "openstates_backfill: fargate task done",
+        run_id=run_id,
         jurisdiction=jurisdiction,
         subcommand=subcommand,
         mode=mode,
         duration_seconds=duration,
+        output=output,
     )
     return {
         "success": True,
+        "run_id": run_id,
         "jurisdiction": jurisdiction,
         "subcommand": subcommand,
         "mode": mode,

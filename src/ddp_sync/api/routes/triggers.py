@@ -928,7 +928,7 @@ async def trigger_openstates_archive(
     )
 
 
-@router.post("/trigger/openstates-backfill/{jurisdiction}")
+@router.post("/trigger/openstates-backfill/{jurisdiction}", status_code=202)
 async def trigger_openstates_backfill(
     jurisdiction: str,
     subcommand: str,
@@ -940,18 +940,23 @@ async def trigger_openstates_backfill(
     """OPEN-268: run an os-text-extract data-quality subcommand for one jurisdiction as a
     Fargate task, instead of an ad-hoc invocation in this host's own bare venv.
 
-    Returns 202 Accepted immediately; the job runs in the background and logs to ddp-sync's
-    structured log. Unlike the scrape/archive triggers, there is no flow-status Redis key or
-    jurisdiction allowlist here -- this is meant for occasional, deliberate, human/prod-agent-
-    watched invocations (the RDS data-quality backfill this ticket comes out of), not a
-    scheduled job with its own config section, so the caller is trusted to know which
-    jurisdiction and subcommand they mean rather than this endpoint validating against a
-    pre-declared list.
+    Returns 202 Accepted immediately, with a `run_id` that also appears in every structured
+    log line the job itself produces (openstates_backfill.py) -- the correlation handle
+    between this immediate response and the job's eventual result, since a dry-run's whole
+    value is its printed summary (`output` in the log line, once the job finishes) and
+    nothing about it lands anywhere else to check instead. Unlike the scrape/archive triggers,
+    there is no flow-status Redis key or jurisdiction allowlist here -- this is meant for
+    occasional, deliberate, human/prod-agent-watched invocations (the RDS data-quality
+    backfill this ticket comes out of), not a scheduled job with its own config section, so
+    the caller is trusted to know which jurisdiction and subcommand they mean rather than this
+    endpoint validating against a pre-declared list.
 
     subcommand: one of reextract, refresh-extraction, recompute-diff-order
     mode: dry-run (default) or commit
     session: optional, passed through as os-text-extract's own --session flag
     """
+    import uuid
+
     from ddp_sync.pipelines.openstates_backfill import (
         ALLOWED_MODES,
         ALLOWED_SUBCOMMANDS,
@@ -972,11 +977,19 @@ async def trigger_openstates_backfill(
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    run_id = f"{jurisdiction}-{subcommand}-{mode}-{uuid.uuid4().hex[:12]}"
     background_tasks.add_task(
-        run_backfill_job, jurisdiction, subcommand, mode, session, config
+        run_backfill_job,
+        jurisdiction,
+        subcommand,
+        mode,
+        session=session,
+        config=config,
+        run_id=run_id,
     )
     return {
         "status": "started",
+        "run_id": run_id,
         "jurisdiction": jurisdiction,
         "subcommand": subcommand,
         "mode": mode,
