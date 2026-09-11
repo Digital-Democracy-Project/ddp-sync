@@ -420,6 +420,16 @@ class SyncSettings:
     # contention -- both remain open, tracked on AGENTS-37.
     session_pipeline_concurrency: int = 1
 
+    # OPEN-275: independent enable flag for the pre-dispatch replica-freshness check
+    # (services/replica_freshness.py, ddp-infra PLAN-rds-local-postgres-replication.md §5/§7.7).
+    # Defaults to disabled: this check requires a live RDS logical-replication subscription and a
+    # resolvable RDS dispatch-time credential (plan §3.4 item 3), neither of which exist yet as of
+    # this ticket (RDS's own wal_level is still "replica", not "logical" -- OPEN-271) -- enabling
+    # this before that infrastructure is live would fail every single bill dispatch closed. Turn
+    # on only once the replication rollout (OPEN-269's epic) reaches the point of trusting a real
+    # jurisdiction's dispatch (plan §6 step 7/OPEN-276).
+    replica_freshness_check_enabled: bool = False
+
     # SYNC-48: independent enable flag for an automated scraper-completion
     # caller of run_legbot_pipeline (pipelines/scraper_triggered_legbot.py).
     # Deliberately NOT the same switch as LEGBOT_ENABLED (ddp-agents/CAMS
@@ -628,6 +638,9 @@ def _load_from_env() -> dict:
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
         ),
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
+        "replica_freshness_check_enabled": (
+            os.getenv("REPLICA_FRESHNESS_CHECK_ENABLED", "false").lower() == "true"
+        ),
         "legbot_scrape_completion_trigger_enabled": (
             os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "false").lower() == "true"
         ),

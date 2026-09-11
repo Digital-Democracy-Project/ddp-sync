@@ -17,6 +17,7 @@ from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
     get_archived_changelog_inputs,
     get_archived_version_transitions,
+    get_bill_version_document_text,
     get_current_version_identity,
     list_current_session_bill_candidates,
     resolve_touched_sessions,
@@ -573,6 +574,129 @@ async def test_archived_bill_text_picks_latest_not_first_with_raw_text():
         result = await get_archived_bill_text("some-uuid")
 
     assert result == "New text."
+
+
+# ---------------------------------------------------------------------------
+# get_bill_version_document_text
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_bill_version_document_text_matches_exact_natural_key():
+    """OPEN-275: unlike get_archived_bill_text (always 'whatever local thinks is latest'), this
+    must find the SPECIFIC version RDS already resolved as latest, even when a newer-dated
+    version also exists locally -- unrestricted to the last array entry."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [
+            {
+                "note": "Introduced",
+                "date": "2026-01-01",
+                "links": [{"url": "https://x/introduced.pdf", "raw_text": "Old text."}],
+            },
+            {
+                "note": "Engrossed",
+                "date": "2026-02-01",
+                "links": [{"url": "https://x/engrossed.pdf", "raw_text": "New text."}],
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_version_document_text(
+            "some-uuid",
+            version_note="Introduced",
+            version_date="2026-01-01",
+            source_url="https://x/introduced.pdf",
+        )
+
+    assert result == "Old text."
+
+
+@pytest.mark.asyncio
+async def test_bill_version_document_text_none_when_natural_key_not_found():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [
+            {
+                "note": "Introduced",
+                "date": "2026-01-01",
+                "links": [{"url": "https://x/introduced.pdf", "raw_text": "Old text."}],
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_version_document_text(
+            "some-uuid",
+            version_note="Engrossed",
+            version_date="2026-02-01",
+            source_url="https://x/engrossed.pdf",
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_bill_version_document_text_none_when_matching_version_has_no_raw_text_yet():
+    """The version/link natural key matches, but raw_text is empty -- not yet replicated/archived
+    for this specific link, not a bug in the matching itself."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "versions": [
+            {
+                "note": "Engrossed",
+                "date": "2026-02-01",
+                "links": [{"url": "https://x/engrossed.pdf", "raw_text": None}],
+            },
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_version_document_text(
+            "some-uuid",
+            version_note="Engrossed",
+            version_date="2026-02-01",
+            source_url="https://x/engrossed.pdf",
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_bill_version_document_text_none_on_unreachable_api():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_bill_version_document_text(
+            "some-uuid",
+            version_note="Engrossed",
+            version_date="2026-02-01",
+            source_url="https://x/engrossed.pdf",
+        )
+
+    assert result is None
 
 
 # ---------------------------------------------------------------------------

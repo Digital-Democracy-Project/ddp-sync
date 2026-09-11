@@ -651,6 +651,92 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
     assert result["results"][1]["artifacts_generated"] == ["bill_summary"]
 
 
+def _patch_freshness_enabled(enabled: bool):
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_settings",
+        return_value=SimpleNamespace(
+            replica_freshness_check_enabled=enabled,
+            session_pipeline_concurrency=1,
+        ),
+    )
+
+
+def _patch_freshness_check(is_fresh: bool, reason: str = "content_matches"):
+    from ddp_sync.services.replica_freshness import FreshnessResult
+
+    return patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness",
+        new=AsyncMock(return_value=FreshnessResult(is_fresh, reason)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_replica_not_fresh_skips_the_bill_with_no_broker_writes():
+    """OPEN-275: a not-fresh result must skip the whole bill (no coverage read, no dispatch, no
+    broker write of any kind) -- writing even a 'failed' row here would get stuck forever unless
+    a future run passes retry_failed=True (SYNC-42), which defeats the point of a transient,
+    self-healing replication-lag skip."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True), _patch_freshness_check(
+        False, "row_not_yet_replicated_locally"
+    ), _patch_coverage(None) as mock_coverage, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_coverage.assert_not_awaited()
+    mock_artifact.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["error"] == "replica_not_fresh: row_not_yet_replicated_locally"
+    assert bill_result["artifacts_generated"] == []
+    assert bill_result["artifacts_failed"] == []
+    assert bill_result["artifacts_skipped_failed_previously"] == []
+
+
+@pytest.mark.asyncio
+async def test_replica_fresh_proceeds_normally():
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True), _patch_freshness_check(
+        True
+    ), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["error"] is None
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_freshness_check_not_called_when_flag_is_off():
+    """Default-off behavior (matches production today, before any real RDS replication exists):
+    the check must not even be called, let alone gate anything."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(False), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness",
+        new=AsyncMock(),
+    ) as mock_freshness, _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_freshness.assert_not_awaited()
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
 @pytest.mark.asyncio
 async def test_missing_version_identity_fails_the_needed_artifacts_not_the_whole_bill():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(None), _patch_org_status(
@@ -1612,7 +1698,12 @@ def _make_candidates(n: int) -> list[dict]:
 def _patch_settings(concurrency: int):
     return patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_settings",
-        return_value=SimpleNamespace(session_pipeline_concurrency=concurrency),
+        return_value=SimpleNamespace(
+            session_pipeline_concurrency=concurrency,
+            # OPEN-275: these concurrency tests don't exercise the freshness check at all --
+            # keep it off so _process_bill_inner takes its pre-existing path unchanged.
+            replica_freshness_check_enabled=False,
+        ),
     )
 
 
