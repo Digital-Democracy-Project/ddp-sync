@@ -33,6 +33,13 @@ dependencies = [
     # Config + infra
     "boto3>=1.34.0",
     "redis>=5.0.0",
+    # OPEN-275: the one-off RDS dispatch-time freshness-query connection (plan
+    # §3.4 item 3, §7.7) -- ddp-sync has no other direct Postgres client anywhere
+    # else (every other DB access is either HTTP-mediated via api-v3, or a
+    # DATABASE_URL handed to a separate Fargate task's own process). asyncpg
+    # over psycopg2 to match this codebase's existing async-first style
+    # (httpx.AsyncClient throughout) rather than needing a thread-pool wrapper.
+    "asyncpg>=0.29.0",
     "python-dotenv>=1.0.0",
     "structlog>=24.1.0",
     "pyyaml>=6.0",

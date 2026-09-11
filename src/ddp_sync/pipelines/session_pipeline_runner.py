@@ -25,7 +25,13 @@ once real concurrent MLX-LM throughput is validated) bills' own
 `_process_bill` calls at once (`asyncio.Semaphore`-bounded, not unbounded
 `asyncio.gather` -- see that setting's own docstring for why an actual cap
 still matters even with the pool's own backpressure). Fills only absent
-rows -- no freshness/version-currency check.
+rows -- no freshness/version-currency check against the *upstream* source
+this batch's own bill list was itself resolved from (OPEN-193/Fargate,
+once that's live). OPEN-275 (services/replica_freshness.py) adds a distinct,
+narrower check: whether the Mac's local Postgres replica has caught up to
+RDS for the ONE bill about to dispatch, gated behind
+`replica_freshness_check_enabled` (default off until that infrastructure
+exists).
 
 Two real callers now (SYNC-9): the on-demand API route
 (``POST /trigger/bill-artifact-generation``, api/routes/triggers.py) and
@@ -87,6 +93,7 @@ from ddp_sync.services.local_openstates_client import (
     get_current_version_identity,
     list_current_session_bill_candidates,
 )
+from ddp_sync.services.replica_freshness import check_bill_version_freshness
 
 logger = structlog.get_logger()
 
@@ -442,6 +449,24 @@ async def _process_bill_inner(
         "duration_seconds": None,
         "error": None,
     }
+
+    # OPEN-275: the pre-dispatch replica-freshness check (plan §5/§7.7) -- gated behind an
+    # explicit flag, default off (see that setting's own docstring for why: this requires live
+    # RDS replication infrastructure that does not exist yet). Checked once per bill, before the
+    # coverage read and before any dispatch, and reuses the exact same per-bill "isolated soft
+    # failure" mechanism the coverage-check-failure branch right below already uses -- not a new
+    # pattern. Deliberately does NOT write any BillArtifact row (unlike the "no archived bill
+    # text" case inside generate_and_store_bill_artifact): a row recorded status="failed" only
+    # gets retried when the caller explicitly passes retry_failed=True (SYNC-42), which would
+    # turn transient replication lag into a bill stuck skipped-as-failed indefinitely. Skipping
+    # here instead, with no row written, means the next scheduled run reconsiders this bill
+    # exactly as if this attempt never happened.
+    if get_settings().replica_freshness_check_enabled:
+        freshness = await check_bill_version_freshness(bill_openstates_id)
+        if not freshness.is_fresh:
+            result["error"] = f"replica_not_fresh: {freshness.reason}"
+            result["duration_seconds"] = time.monotonic() - bill_started
+            return result
 
     try:
         coverage = await get_bill_artifacts(

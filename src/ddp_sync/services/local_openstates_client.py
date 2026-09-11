@@ -158,6 +158,74 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
     return None
 
 
+async def get_bill_version_document_text(
+    bill_openstates_id: str, *, version_note: str, version_date: str, source_url: str
+) -> str | None:
+    """Look up the local replica's raw_text for ONE SPECIFIC version-document row, matched by
+    its exact natural key -- OPEN-275's freshness check (ddp-infra
+    PLAN-rds-local-postgres-replication.md §7.7). Unlike get_archived_bill_text (always "whatever
+    the local replica currently thinks is latest"), this looks up the exact
+    (bill_id, version_note, version_date, source_url) tuple the RDS side already resolved as
+    latest, so a caller can tell "local doesn't have this bill's newest version at all yet"
+    (replication lag) apart from "local's raw_text for this exact row differs from RDS's"
+    (a stale in-place reextract) -- get_archived_bill_text's own "latest" alone conflates both,
+    since it never compares against a specific already-known-correct key.
+
+    Reads the same single-bill detail endpoint every sibling function in this module reads;
+    searches `versions` for the entry matching version_note/version_date, then that entry's
+    `links` for one matching source_url with a non-empty raw_text.
+
+    Returns:
+        The matching raw_text if found, else None -- covering every "not there" case identically
+        (bill not found, no version matching that exact note/date, no link matching that exact
+        source_url, that link has no raw_text yet, local api-v3 unreachable/rejecting/non-JSON).
+        Never raises, same posture as every other function in this module -- OPEN-275's caller
+        treats None as "not ready" and fails closed, it does not need to distinguish why.
+    """
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return None
+
+    params: dict[str, str] = {"include": "versions"}
+    if settings.local_openstates_api_key:
+        params["apikey"] = settings.local_openstates_api_key
+
+    url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, params=params)
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Local api-v3 unreachable -- cannot resolve version-document text",
+            bill_openstates_id=bill_openstates_id,
+            error=str(exc),
+        )
+        return None
+
+    if resp.status_code >= 400:
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "Local api-v3 returned a non-JSON response -- cannot resolve version-document text",
+            bill_openstates_id=bill_openstates_id,
+        )
+        return None
+
+    for version in data.get("versions") or []:
+        if version.get("note") != version_note or version.get("date") != version_date:
+            continue
+        for link in version.get("links") or []:
+            if link.get("url") == source_url:
+                raw_text = link.get("raw_text")
+                return raw_text if raw_text else None
+
+    return None
+
+
 async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
     """Resolve a bill's current (latest) version_date/version_note plus its
     title, from the same single-bill detail endpoint get_archived_bill_text
