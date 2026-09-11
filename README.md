@@ -121,6 +121,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/bill-artifact-generation` | Fill in missing BillArtifact rows (bill_summary, bill_pros_cons, etc.) for one jurisdiction/session |
 | POST | `/trigger/legbot-analyze-bill` | On-demand single-bill LegBot analysis, for ddp-next's interactive UX |
 | POST | `/trigger/legbot-analyze-bill-full` | Run every requested artifact type (default: all 8) plus org research for one bill, in a single call |
+| POST | `/trigger/scraper-session-legbot` | SYNC-59: remote entry point for SYNC-48's `trigger_scraper_session_pipeline`, reached over WireGuard by OPEN-193's EC2-broker instance after a cloud-owned scrape+RDS-load finishes -- not meant for direct/manual use |
 | POST | `/trigger/user-sync` | Trigger Voatz → Brevo incremental sync |
 | POST | `/trigger/full-sync` | Trigger Voatz → Brevo full-attribute sync |
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |

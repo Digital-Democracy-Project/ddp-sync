@@ -15,6 +15,36 @@ as a hook point — must be built on the newer, Webflow-independent reach instea
 session history around that date for the context this came up in — a discussion
 of how to auto-trigger `bill_changelog` generation on a new scraped bill version).
 
+## ddp-sync runs as two independent instances -- settings do not carry across them
+
+There are two separate, independently-configured deployments of this same codebase, not
+one: the **Mac Studio** instance (the only one with CAMS/LegBot/MLX access — it runs the
+scheduler for most jurisdictions' scraping into local Postgres), and the **EC2-broker**
+instance (OPEN-193, co-located with production `ddp-broker-py` — it owns Fargate-based
+scraping + RDS loading for a specific, configured list of jurisdictions). Exactly one
+instance owns any given jurisdiction (`_cloud_path_owns()`); a jurisdiction never runs on
+both.
+
+Because these are separate processes, **an env var/setting set on one has no effect on the
+other** — there is no shared config store. This bit SYNC-59 directly: the EC2 instance now
+reaches the Mac's `ddp-sync` over the existing WireGuard mesh (`MAC_DDP_SYNC_BASE_URL`,
+same live pattern `ddp-api`'s proxy already uses to reach the Mac's local api-v3, API-6) to
+trigger LegBot after a cloud-owned scrape+RDS-load finishes. The gate for this,
+`LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED`, is checked independently on **both** sides —
+enabling it only on the Mac (already the case for the pre-existing in-process scrape hook)
+does **not** also enable the cloud path; both deployments need their own copy turned on.
+If a cloud-owned jurisdiction's LegBot trigger looks silently inactive, check both
+instances' own env, not just one.
+
+**Known, deliberate gap as of 2026-09-11 (SYNC-59):** cloud-owned jurisdictions with no
+single, explicitly-configured session (VA/UT/MI/MA/AZ/NC — everything in `secondary`'s
+config, all cloud-owned per `sync_schedule.yaml`) do not trigger LegBot via this path at
+all yet — resolving "which session actually got touched" for them needs a real ground-truth
+read against RDS (`RDS_OPENSTATES_API_BASE`), and no RDS-facing api-v3 read replica exists
+yet. FL/USA (which always specify one explicit session) already work. Do not build the
+missing RDS read replica speculatively without checking with Ramon first — it's a real
+piece of infrastructure, not just a settings value.
+
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
 Every recurring/scheduled pipeline in this stack is meant to be scheduled by **ddp-sync's own
