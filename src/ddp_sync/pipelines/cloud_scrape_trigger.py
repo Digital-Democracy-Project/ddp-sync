@@ -805,10 +805,25 @@ async def _maybe_trigger_legbot_for_cloud_scrape(
     `resolve_touched_sessions()`'s ground-truth read -- this process
     already knows exactly which session it just told `cloud_loader.py` to
     load, whenever the caller named one explicitly (fl/usa-shaped
-    `sessions:` config -- see `_explicit_session_code_from_arg`). Ground-
-    truth resolution is used only when `session_arg` is `None` (VA/UT-
-    shaped `secondary` jurisdictions, where `do_scrape()` picks up every
-    currently-active session on its own) -- and even then, only against
+    `sessions:` config -- see `_explicit_session_code_from_arg`). Trusted
+    directly as-requested, not re-verified against a "did this specific
+    run actually touch a bill in that session" read, by this ticket's own
+    design (its scope explicitly does not require rebuilding
+    `resolve_touched_sessions()`'s read-after-the-fact resolution for a
+    caller who already knows what it asked to be loaded) -- collection for
+    an explicit session is itself scoped to that one session (`cloud_
+    collector.py <jurisdiction> session=<value>`), so a successful load
+    for it means real work for that session ran, even on a rare no-op
+    reload of already-current data. `run_legbot_pipeline`'s own coverage
+    check downstream is what actually prevents any wasted redispatch of
+    bills already covered -- this function only decides which session(s)
+    to ask it to check, not whether any individual bill within one needs
+    real work.
+
+    Ground-truth resolution is used only when `session_arg` is `None`
+    (VA/UT-shaped `secondary` jurisdictions, where `do_scrape()` picks up
+    every currently-active session on its own, so this process has no
+    single requested session to trust) -- and even then, only against
     `settings.rds_openstates_api_base`, never the Mac's own
     `local_openstates_api_base`, which never sees RDS-loaded data at all
     (a cloud-owned jurisdiction's local-Postgres read would always find
@@ -817,7 +832,13 @@ async def _maybe_trigger_legbot_for_cloud_scrape(
     default), this case safely resolves zero sessions and no-ops -- the
     same graceful-empty contract `resolve_touched_sessions` already
     documents -- rather than guessing at infrastructure that isn't deployed
-    yet.
+    yet. **Known partial-rollout gap, not silently missed**: VA/UT/MI/MA/
+    AZ/NC (every jurisdiction in `secondary`'s config, all currently
+    cloud-owned per sync_schedule.yaml) do not trigger LegBot at all via
+    this path until that setting is configured -- logged distinctly
+    (`scraper_triggered_legbot_cloud_rds_read_path_not_configured`) so this
+    is visibly different from a real "nothing touched" outcome, not
+    conflated with it.
     """
     settings = get_settings()
     if not settings.legbot_scrape_completion_trigger_enabled:
@@ -833,6 +854,24 @@ async def _maybe_trigger_legbot_for_cloud_scrape(
     if explicit_session_code is not None:
         session_codes = [explicit_session_code]
     else:
+        if not settings.rds_openstates_api_base:
+            # SYNC-59 /pm-review: distinct from "resolution genuinely found
+            # nothing" below -- an operator watching for that log line would
+            # see this jurisdiction produce it forever, indistinguishable
+            # from a real "nothing changed" run, and never learn that the
+            # actual reason is a setting nobody has configured yet. This is
+            # the known, deliberate partial-rollout gap (see this function's
+            # own docstring): VA/UT-shaped cloud-owned jurisdictions do not
+            # trigger LegBot at all until rds_openstates_api_base points at
+            # a real RDS-facing read replica.
+            logger.warning(
+                "scraper_triggered_legbot_cloud_rds_read_path_not_configured -- "
+                "ambiguous-session resolution cannot run, ever, until "
+                "rds_openstates_api_base is set",
+                jurisdiction=jurisdiction,
+            )
+            return
+
         from ddp_sync.services.local_openstates_client import resolve_touched_sessions
 
         try:
@@ -888,9 +927,23 @@ async def _maybe_trigger_legbot_for_cloud_scrape(
                 error=str(e),
             )
             continue
-        logger.info(
-            "scraper_triggered_legbot_cloud_result",
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            result=result,
-        )
+        # SYNC-59 /pm-review: the Mac's own trigger_scraper_session_pipeline never
+        # raises -- a logical failure (trigger_disabled, redis_unavailable,
+        # already_running, pipeline_error) comes back as a normal 200 with
+        # "success": False, not an exception this except block above would catch.
+        # Logging it identically to a real success would hide an operational
+        # problem behind an ordinary info line.
+        if result.get("success"):
+            logger.info(
+                "scraper_triggered_legbot_cloud_result",
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                result=result,
+            )
+        else:
+            logger.warning(
+                "scraper_triggered_legbot_cloud_trigger_not_successful",
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                result=result,
+            )

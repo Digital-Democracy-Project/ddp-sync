@@ -913,7 +913,7 @@ async def test_cloud_hook_ambiguous_session_arg_resolves_ground_truth_against_rd
 async def test_cloud_hook_zero_resolved_sessions_makes_no_call():
     with patch(
         "ddp_sync.pipelines.cloud_scrape_trigger.get_settings",
-        return_value=_cloud_hook_settings(),
+        return_value=_cloud_hook_settings(rds_openstates_api_base="http://rds-api-v3.internal:8002"),
     ), patch(
         "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
         new=AsyncMock(return_value=[]),
@@ -930,7 +930,7 @@ async def test_cloud_hook_resolution_exception_is_swallowed():
     """Must never affect the scrape job's own already-successful result."""
     with patch(
         "ddp_sync.pipelines.cloud_scrape_trigger.get_settings",
-        return_value=_cloud_hook_settings(),
+        return_value=_cloud_hook_settings(rds_openstates_api_base="http://rds-api-v3.internal:8002"),
     ), patch(
         "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
         new=AsyncMock(side_effect=RuntimeError("boom")),
@@ -942,6 +942,63 @@ async def test_cloud_hook_resolution_exception_is_swallowed():
         )  # must not raise
 
     mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cloud_hook_unconfigured_rds_base_short_circuits_before_resolution():
+    """/pm-review: the known, deliberate partial-rollout gap -- VA/UT-shaped
+    jurisdictions with an ambiguous session_arg do not trigger LegBot at all
+    until rds_openstates_api_base is configured. Must never even attempt
+    resolve_touched_sessions (there is nothing useful for it to query) and
+    must not be silently indistinguishable from a real zero-sessions-found
+    outcome in the logs."""
+    with patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.get_settings",
+        return_value=_cloud_hook_settings(rds_openstates_api_base=""),
+    ), patch(
+        "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+        new=AsyncMock(),
+    ) as mock_resolve, patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.httpx.AsyncClient"
+    ) as mock_client_cls:
+        await cst._maybe_trigger_legbot_for_cloud_scrape("va", None, datetime.now(timezone.utc))
+
+    mock_resolve.assert_not_called()
+    mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cloud_hook_logs_a_logical_failure_result_distinctly_from_success():
+    """/pm-review: trigger_scraper_session_pipeline never raises -- a logical
+    failure (trigger_disabled, already_running, etc.) comes back as a normal
+    200 with "success": False, and must not be logged identically to a real
+    success."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"success": False, "error": "already_running"}
+    client = MagicMock()
+    client.post = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.get_settings",
+        return_value=_cloud_hook_settings(),
+    ), patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.httpx.AsyncClient", return_value=cm
+    ), patch(
+        "ddp_sync.pipelines.cloud_scrape_trigger.logger"
+    ) as mock_logger:
+        await cst._maybe_trigger_legbot_for_cloud_scrape(
+            "mi", "session=2026F", datetime.now(timezone.utc)
+        )
+
+    mock_logger.warning.assert_called_once()
+    assert mock_logger.warning.call_args.args[0] == (
+        "scraper_triggered_legbot_cloud_trigger_not_successful"
+    )
+    mock_logger.info.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -970,7 +1027,7 @@ async def test_cloud_hook_one_trigger_call_failure_does_not_stop_the_next():
 
     with patch(
         "ddp_sync.pipelines.cloud_scrape_trigger.get_settings",
-        return_value=_cloud_hook_settings(),
+        return_value=_cloud_hook_settings(rds_openstates_api_base="http://rds-api-v3.internal:8002"),
     ), patch(
         "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
         new=AsyncMock(return_value=["2026S1", "2027"]),

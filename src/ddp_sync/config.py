@@ -254,6 +254,15 @@ class SyncSettings:
     # finished -- the same live pattern ddp-api's proxy already uses to reach the Mac's
     # local api-v3 (API-6, 10.0.0.8:8002). Empty by default (no target configured) --
     # the calling side treats that the same as the feature being off, not an error.
+    #
+    # Deployment note (/pm-review): legbot_scrape_completion_trigger_enabled below is
+    # checked independently on BOTH sides of this call -- once here (this EC2 process,
+    # before it ever calls out) and once more inside trigger_scraper_session_pipeline
+    # on the Mac Studio's own instance, since these are two separate deployments with
+    # their own independent settings/env vars. Enabling it only on the Mac (already the
+    # case for the existing in-process scrape hook) does NOT also enable this cloud
+    # path -- both instances need their own copy of that flag turned on for a
+    # cloud-owned jurisdiction's LegBot trigger to actually fire end-to-end.
     mac_ddp_sync_base_url: str = ""
     # The Bearer token this process presents when calling the Mac's ddp-sync -- the
     # MAC's own configured DDP_SYNC_API_KEY, not this (EC2) process's own api_key
