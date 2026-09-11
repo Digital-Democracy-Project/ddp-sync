@@ -106,12 +106,30 @@ async def check_bill_version_freshness(bill_openstates_id: str) -> FreshnessResu
         )
         return FreshnessResult(False, f"rds_query_failed: {exc}")
     finally:
-        await conn.close()
+        # pm-review round 1: a bare `await conn.close()` here is a real bug -- an exception raised
+        # in a `finally` block replaces/propagates over a pending return value from the try/except
+        # above it (confirmed: a plain Python `finally: raise` silently discards an in-flight
+        # `return` from the preceding `except`). A close() failure has nothing to do with whether
+        # the query itself succeeded or what row it returned, and must never override or crash out
+        # of the actual freshness determination -- swallow it, matching this whole function's own
+        # "never let anything but the intended fail-closed path propagate" contract.
+        try:
+            await conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "replica_freshness: closing the RDS connection failed (ignored)",
+                bill_openstates_id=bill_openstates_id,
+                error=str(exc),
+            )
 
     if row is None:
         # Not itself a staleness signal -- this bill may simply not be RDS-fed at all yet
         # (§3.6's separate allowlist gating is the primary guard for that case). Still fails
         # closed here regardless, since dispatch has no source of truth to compare against.
+        logger.info(
+            "replica_freshness: no version-document row on RDS for this bill",
+            bill_openstates_id=bill_openstates_id,
+        )
         return FreshnessResult(False, "no_version_document_row_on_rds")
 
     local_text = await get_bill_version_document_text(
@@ -121,10 +139,22 @@ async def check_bill_version_freshness(bill_openstates_id: str) -> FreshnessResu
         source_url=row["source_url"],
     )
     if local_text is None:
+        logger.info(
+            "replica_freshness: RDS's latest version-document row has not replicated locally yet",
+            bill_openstates_id=bill_openstates_id,
+            version_note=row["version_note"],
+            version_date=row["version_date"],
+        )
         return FreshnessResult(False, "row_not_yet_replicated_locally")
 
     local_hash = hashlib.md5(local_text.encode("utf-8")).hexdigest()
     if local_hash != row["raw_text_hash"]:
+        logger.info(
+            "replica_freshness: local content hash does not match RDS -- stale local text",
+            bill_openstates_id=bill_openstates_id,
+            version_note=row["version_note"],
+            version_date=row["version_date"],
+        )
         return FreshnessResult(False, "content_hash_mismatch_stale_local_text")
 
     return FreshnessResult(True, "content_matches")

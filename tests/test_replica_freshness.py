@@ -65,6 +65,29 @@ async def test_not_fresh_when_rds_connection_fails():
 
 
 @pytest.mark.asyncio
+async def test_close_failure_does_not_override_the_query_failure_result():
+    """Regression test, pm-review round 1: an exception raised inside a bare `finally:
+    await conn.close()` silently replaces/propagates over a pending return from the preceding
+    try/except -- confirmed with a standalone repro before fixing. If conn.close() itself fails
+    after a query failure, the caller must still get back the query-failure FreshnessResult, not
+    an uncaught CloseFailedError that would crash _process_bill_inner's per-bill isolation."""
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(side_effect=RuntimeError("query timed out"))
+    conn.close = AsyncMock(side_effect=OSError("close failed"))
+    with (
+        patch(
+            "ddp_sync.services.replica_freshness.resolve_rds_database_url",
+            return_value=("postgresql://rds/openstates", ""),
+        ),
+        patch("ddp_sync.services.replica_freshness.asyncpg.connect", new=AsyncMock(return_value=conn)),
+    ):
+        result = await check_bill_version_freshness(_BILL_ID)
+
+    assert result.is_fresh is False
+    assert "rds_query_failed" in result.reason
+
+
+@pytest.mark.asyncio
 async def test_not_fresh_when_no_version_document_row_on_rds():
     conn = _mock_rds_connection(row=None)
     with (
