@@ -793,6 +793,27 @@ async def test_jurisdiction_allowlist_check_is_case_insensitive():
 
 
 @pytest.mark.asyncio
+async def test_allowlist_matching_normalizes_case_even_if_settings_were_not_normalized():
+    """pm-review round 1: _load_from_env() already uppercases every entry, but the check itself
+    must not silently rely on that -- a SyncSettings constructed directly (bypassing the env
+    loader, e.g. in a test or an alternate config path) with lowercase entries must still match."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"fl"})
+    ), _patch_freshness_check(True), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert result["results"][0]["error"] is None
+    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
 async def test_allowlist_not_checked_when_freshness_flag_is_off():
     """The empty-by-default allowlist must have zero effect on today's existing dispatch -- this
     gate only exists nested inside replica_freshness_check_enabled, which stays off until real RDS

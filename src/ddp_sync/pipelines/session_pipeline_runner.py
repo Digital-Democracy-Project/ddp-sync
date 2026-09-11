@@ -472,7 +472,24 @@ async def _process_bill_inner(
         # what it finds. Same skip-with-no-write posture as the freshness check below: a
         # jurisdiction not yet on the allowlist should be reconsidered on the next scheduled run
         # once it's added, not permanently recorded as failed.
-        if jurisdiction_iso2.upper() not in settings.legbot_rds_replica_jurisdiction_allowlist:
+        #
+        # pm-review round 1: intentionally the SAME flag as the freshness check below, not a
+        # second independent one -- there is no separate "is dispatch reading from the RDS-fed
+        # replica" toggle anywhere in this codebase to decouple from (the local Postgres a bill
+        # is read through is a single database, determined by real infrastructure state --
+        # whether it's been rebuilt from RDS per plan §7.4 -- not by a ddp-sync setting). A second
+        # flag here would control a distinction this codebase has no other code path for.
+        # Operationally, once that infrastructure cutover has actually happened: DO NOT disable
+        # replica_freshness_check_enabled as an incident workaround without first re-narrowing (or
+        # emptying) this allowlist -- doing so removes BOTH safety nets at once and would let
+        # every jurisdiction dispatch untrusted, not just skip the freshness check alone.
+        allowlist = {code.upper() for code in settings.legbot_rds_replica_jurisdiction_allowlist}
+        if jurisdiction_iso2.upper() not in allowlist:
+            logger.info(
+                "session_pipeline_bill_skipped_jurisdiction_not_on_rds_replica_allowlist",
+                jurisdiction_iso2=jurisdiction_iso2.upper(),
+                gov_id=gov_id,
+            )
             result["error"] = (
                 f"jurisdiction_not_on_rds_replica_allowlist: {jurisdiction_iso2.upper()}"
             )
