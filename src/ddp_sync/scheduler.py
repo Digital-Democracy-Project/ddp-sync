@@ -1,6 +1,7 @@
 """Scheduler for OpenStates bill sync and data pipeline jobs."""
 
 import asyncio
+import os
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -90,11 +91,45 @@ class UpdateScheduler:
             logger.error(f"Failed to load sync config: {e}")
             return {}
 
+    def _warn_if_alerting_unconfigured(self) -> None:
+        """OPEN-286: when neither alert channel is configured, _alert_scrape_failure's
+        own fallback is just a `warning` buried deep inside a scrape/load failure path
+        -- easy to miss for weeks (MA's real 2026-09-06 load failure went unnoticed
+        until an unrelated freshness audit found it). Logging this loudly once at
+        startup, in production, means the gap is visible in ordinary boot logs even if
+        nobody is watching scrape-failure paths specifically.
+
+        Checks BOTH channels _alert_scrape_failure itself checks (SLACK_BOT_TOKEN;
+        CAMS_API_TOKEN -- CAMS_BASE_URL always has a working default and is never
+        itself a gate, matching _alert_scrape_failure's own `if cams_token:` check) and
+        only fires when NEITHER is usable -- pm-review round 1 correctly flagged that
+        gating on Slack alone while claiming "nobody (Slack or CAMS)" would be
+        misleading the moment CAMS alone was configured. If exactly one channel is
+        configured, alerting still works end to end, so this deliberately stays quiet
+        rather than adding a second, lesser-severity warning tier for partial
+        redundancy loss -- not this ticket's scope.
+
+        Not a fix for the missing credential itself -- that has to be provisioned on
+        the host -- just a floor so total silence can't happen again unnoticed.
+        """
+        if self.settings.environment != "production":
+            return
+        slack_ok = bool(os.getenv("SLACK_BOT_TOKEN"))
+        cams_ok = bool(os.getenv("CAMS_API_TOKEN"))
+        if not slack_ok and not cams_ok:
+            logger.critical(
+                "ddp-sync startup: neither SLACK_BOT_TOKEN nor CAMS_API_TOKEN is set "
+                "in a production environment -- scrape/load failures will log a "
+                "warning but alert nobody. See OPEN-286."
+            )
+
     def start(self) -> None:
         """Start the scheduler."""
         if self._is_running:
             logger.warning("Scheduler already running")
             return
+
+        self._warn_if_alerting_unconfigured()
 
         # Parse sync time — prefer new bill_sync block, fall back to top-level
         bill_sync_config = self._sync_config.get("bill_sync", {})
