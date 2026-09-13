@@ -178,3 +178,32 @@ def test_mac_ddp_sync_base_url_and_rds_openstates_api_base_apply_over_secrets_ma
         assert settings.rds_openstates_api_base == "http://10.0.0.11:8002"
     finally:
         get_settings.cache_clear()
+
+
+def test_mac_ddp_sync_base_url_and_rds_openstates_api_base_env_wins_over_conflicting_secret(
+    monkeypatch,
+):
+    """pm-review: the previous test's Secrets Manager fixture omits both fields entirely,
+    which proves env values apply but not that they take PRECEDENCE over a real, conflicting
+    secret-supplied value -- the actual claim this override loop makes. This pins that down
+    directly, the same way redis_url's own test above does."""
+    monkeypatch.setenv("MAC_DDP_SYNC_BASE_URL", "http://10.0.0.8:8001")
+    monkeypatch.setenv("RDS_OPENSTATES_API_BASE", "http://10.0.0.11:8002")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={
+            "api_key": "from-secrets-manager",
+            "mac_ddp_sync_base_url": "http://stale-value-from-secret:9999",
+            "rds_openstates_api_base": "http://stale-value-from-secret:9999",
+        },
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"
+        assert settings.mac_ddp_sync_base_url == "http://10.0.0.8:8001"
+        assert settings.rds_openstates_api_base == "http://10.0.0.11:8002"
+    finally:
+        get_settings.cache_clear()
