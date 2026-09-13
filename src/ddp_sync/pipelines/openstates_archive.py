@@ -33,6 +33,7 @@ import boto3
 import requests
 import structlog
 
+from ddp_sync.config import get_settings
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
@@ -491,6 +492,149 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
         logger.warning("openstates_archive: redis write failed", flow=flow_key, error=str(e))
 
 
+async def _maybe_trigger_legbot_for_archive(
+    jurisdiction: str,
+    archive_started_at: datetime,
+) -> None:
+    """SYNC-65: the real archive-completion hook, replacing the scrape-completion
+    hooks SYNC-50/SYNC-59 built (`_maybe_trigger_legbot_for_scrape` /
+    `_maybe_trigger_legbot_for_cloud_scrape`, both removed by this same ticket).
+
+    Root cause this exists to fix: `_resolve_bill_source()`
+    (`bill_artifact_generation.py`) only ever reads already-archived,
+    already-extracted text (`get_archived_bill_text`, OPEN-13) -- it has no
+    live-fetch fallback. Archiving runs on its own separate, per-jurisdiction
+    weekly schedule with no connection to the scrape schedule, so triggering
+    off scrape completion routinely lost the race against archiving and
+    produced a permanent `status="failed", failure_reason="no_archived_bill_text"`
+    (`session_pipeline_runner.py` only retries a failed row when the caller
+    passes `retry_failed=True`, which this automated path deliberately never
+    does -- SYNC-42). Triggering off archive completion instead removes the
+    race outright: the text this hook depends on already exists by construction
+    by the time it fires.
+
+    Called only after an archive run has already succeeded -- a failure here
+    must never affect the archive job's own reported outcome, same never-raise,
+    log-and-continue contract as SYNC-50's original hook.
+
+    Reads touched sessions from the Mac's own local api-v3 instance
+    (`local_openstates_api_base`), same as SYNC-50's hook did for scraping.
+    Correct for BOTH Mac-run (`run-archive.sh`) and Fargate-run
+    (`cloud_archiver.py`/OPEN-192) archiving alike, unlike SYNC-59's own
+    scrape-side split (which needed a separate `rds_openstates_api_base` path
+    and a WireGuard hop to the Mac): this function is only ever called from
+    openstates_archive.py, which -- unlike scraping -- is not split across a
+    Mac/EC2 boundary (`OPENSTATES_ARCHIVE_ENABLED` is only ever true on the
+    Mac's own ddp-sync instance today), and OPEN-280's full-schema RDS
+    replication + OPEN-272's api-v3 repoint mean the Mac's local replica
+    already mirrors RDS-origin (Fargate-archived) data too.
+
+    Uses `since_param="document_updated_since"` (api-v3 PR #11), NOT the
+    default `updated_since` SYNC-50's scrape hook used -- pm-review on this
+    ticket's first version caught a real gap: `archive_bill_versions()`
+    (openstates-core) never touches `Bill.updated_at`, only the
+    `BillVersionDocument` row's own `updated_at` (confirmed by reading the
+    actual archiver code, not assumed). Reusing `updated_since` here would
+    have silently resolved zero sessions on every real archive run.
+    """
+    settings = get_settings()
+    if not settings.legbot_scrape_completion_trigger_enabled:
+        return
+
+    from ddp_sync.services.local_openstates_client import resolve_touched_sessions
+
+    try:
+        session_codes = await resolve_touched_sessions(
+            jurisdiction.upper(),
+            since=archive_started_at,
+            max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
+            since_param="document_updated_since",
+        )
+    except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+        logger.error(
+            "archiver_triggered_legbot_session_resolution_failed",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
+        return
+
+    if not session_codes:
+        logger.info(
+            "archiver_triggered_legbot_no_sessions_touched",
+            jurisdiction=jurisdiction,
+            since=archive_started_at.isoformat(),
+        )
+        return
+
+    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
+
+    for session_code in session_codes:
+        try:
+            result = await trigger_scraper_session_pipeline(
+                jurisdiction.upper(),
+                session_code,
+                settings.legbot_scrape_completion_trigger_artifact_types,
+                False,
+                settings.legbot_scrape_completion_trigger_limit,
+                include_concept_statements=(
+                    settings.legbot_scrape_completion_trigger_include_concept_statements
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "archiver_triggered_legbot_trigger_failed",
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                error=str(e),
+            )
+            continue
+        logger.info(
+            "archiver_triggered_legbot_result",
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            result=result,
+        )
+
+
+async def _run_archive_with_hook(
+    jurisdiction: str,
+    openstates_root: str | None = None,
+    config: dict | None = None,
+) -> dict[str, Any]:
+    """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) uniformly
+    over both archive branches (local run-archive.sh and Fargate cloud_archiver.py)
+    -- neither run_archive_jobs() nor run_single_archive_job() needs its own copy.
+
+    `archive_started_at` is captured here, before the archive itself runs, as a
+    real wall-clock floor for `resolve_touched_sessions`' own `since` filter --
+    same slack-tolerant contract SYNC-50's scrape-side capture already
+    established (a few seconds early/late only widens or narrows the window
+    slightly, never produces a wrong session).
+
+    The whole post-success block is wrapped in one catch-all, not just the hook
+    call, mirroring `_run_scrape`'s own fix for the same pm-review finding
+    (SYNC-59 round 1): this wrapper's contract is "nothing after a successful
+    archive may change that archive's result," not "nothing we currently believe
+    can raise."
+    """
+    archive_started_at = datetime.now(timezone.utc)
+    if (config or {}).get("use_fargate", False):
+        result = await _run_archive_fargate(jurisdiction, config=config)
+    else:
+        result = await _run_archive(jurisdiction, openstates_root or _get_root(config), config=config)
+
+    if result.get("success"):
+        try:
+            await _maybe_trigger_legbot_for_archive(jurisdiction, archive_started_at)
+        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+            logger.error(
+                "archiver_triggered_legbot_hook_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+    return result
+
+
 async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     """Archive every jurisdiction in ARCHIVE_ENABLED_STATES concurrently.
 
@@ -512,15 +656,13 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
 
     logger.info("openstates_archive: starting batch", jurisdictions=jurisdictions)
 
-    if (config or {}).get("use_fargate", False):
-        results: list[dict[str, Any]] = await asyncio.gather(
-            *[_run_archive_fargate(j, config=config) for j in jurisdictions]
-        )
-    else:
-        openstates_root = _get_root(config)
-        results = await asyncio.gather(
-            *[_run_archive(j, openstates_root, config=config) for j in jurisdictions]
-        )
+    openstates_root = None if (config or {}).get("use_fargate", False) else _get_root(config)
+    results: list[dict[str, Any]] = await asyncio.gather(
+        *[
+            _run_archive_with_hook(j, openstates_root, config=config)
+            for j in jurisdictions
+        ]
+    )
 
     duration = round(time.monotonic() - t, 1)
     failed = [r for r in results if not r["success"]]
@@ -560,9 +702,7 @@ async def run_single_archive_job(
 ) -> dict[str, Any]:
     """Archive a single arbitrary jurisdiction. Used by the manual trigger endpoint.
 
-    Same `use_fargate` dispatch as run_archive_jobs() -- see that function's docstring.
+    Same `use_fargate` dispatch (and same archive-completion LegBot hook) as
+    run_archive_jobs() -- see _run_archive_with_hook's docstring.
     """
-    if (config or {}).get("use_fargate", False):
-        return await _run_archive_fargate(jurisdiction, config=config)
-    openstates_root = _get_root(config)
-    return await _run_archive(jurisdiction, openstates_root, config=config)
+    return await _run_archive_with_hook(jurisdiction, config=config)
