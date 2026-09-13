@@ -146,3 +146,64 @@ def test_redis_url_still_applies_when_secrets_manager_supplies_the_base_config(m
         assert settings.redis_url == "redis://redis:6379/3"
     finally:
         get_settings.cache_clear()
+
+
+def test_mac_ddp_sync_base_url_and_rds_openstates_api_base_apply_over_secrets_manager(
+    monkeypatch,
+):
+    """SYNC-59/SYNC-65, found live on the EC2-broker host verifying PR #148's Mac/EC2 archive-
+    hook split (2026-09-13): third instance of the exact same bug. Both fields are per-host
+    resource addresses set only via docker-compose.prod.yml's environment block, not part of
+    the shared ddp-sync/credentials secret -- so a real value set in the container's
+    environment was silently losing to whatever (or nothing) Secrets Manager supplied.
+    Confirmed live: both settings came back "" despite being correctly set in the real
+    container environment, causing resolve_touched_sessions(api_base="") to raise
+    httpx.UnsupportedProtocol -- caught and logged by the archive-completion hook's own
+    except Exception, so the hook appeared to run successfully while silently never
+    triggering LegBot."""
+    monkeypatch.setenv("MAC_DDP_SYNC_BASE_URL", "http://10.0.0.8:8001")
+    monkeypatch.setenv("RDS_OPENSTATES_API_BASE", "http://10.0.0.11:8002")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        # the real secret's shape: neither field present at all, matching production today
+        return_value={"api_key": "from-secrets-manager"},
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"  # confirms Secrets Manager path was taken
+        assert settings.mac_ddp_sync_base_url == "http://10.0.0.8:8001"
+        assert settings.rds_openstates_api_base == "http://10.0.0.11:8002"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_mac_ddp_sync_base_url_and_rds_openstates_api_base_env_wins_over_conflicting_secret(
+    monkeypatch,
+):
+    """pm-review: the previous test's Secrets Manager fixture omits both fields entirely,
+    which proves env values apply but not that they take PRECEDENCE over a real, conflicting
+    secret-supplied value -- the actual claim this override loop makes. This pins that down
+    directly, the same way redis_url's own test above does."""
+    monkeypatch.setenv("MAC_DDP_SYNC_BASE_URL", "http://10.0.0.8:8001")
+    monkeypatch.setenv("RDS_OPENSTATES_API_BASE", "http://10.0.0.11:8002")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={
+            "api_key": "from-secrets-manager",
+            "mac_ddp_sync_base_url": "http://stale-value-from-secret:9999",
+            "rds_openstates_api_base": "http://stale-value-from-secret:9999",
+        },
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"
+        assert settings.mac_ddp_sync_base_url == "http://10.0.0.8:8001"
+        assert settings.rds_openstates_api_base == "http://10.0.0.11:8002"
+    finally:
+        get_settings.cache_clear()

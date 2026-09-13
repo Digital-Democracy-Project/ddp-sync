@@ -737,6 +737,28 @@ def get_settings() -> SyncSettings:
     if env_redis_url is not None:
         filtered["redis_url"] = env_redis_url
 
+    # SYNC-59/SYNC-65 (found live on the EC2-broker host, 2026-09-13, verifying PR #148's
+    # Mac/EC2 archive-hook split): third instance of the exact same SYNC-51/OPEN-193 bug
+    # class above. mac_ddp_sync_base_url and rds_openstates_api_base are per-host resource
+    # addresses set only via docker-compose.prod.yml's `environment:` block -- unlike
+    # mac_ddp_sync_api_key/rds_openstates_api_key, which flow through fine because they're
+    # stored directly in the shared `ddp-sync/credentials` secret Secrets Manager returns.
+    # Confirmed live: MAC_DDP_SYNC_BASE_URL/RDS_OPENSTATES_API_BASE were both correctly set
+    # in the container's real environment, but get_settings().mac_ddp_sync_base_url /
+    # .rds_openstates_api_base both came back "" regardless, since _load_from_env() (the only
+    # code that would have read them) never runs on a host where Secrets Manager succeeds.
+    # Silent, not crashing: resolve_touched_sessions(api_base="") raises
+    # httpx.UnsupportedProtocol, caught by _maybe_trigger_legbot_for_archive's own
+    # except Exception and logged -- the archive-completion hook looks like it ran
+    # successfully and simply never triggers LegBot, on every EC2-orchestrated archive
+    # completion.
+    env_mac_ddp_sync_base_url = os.getenv("MAC_DDP_SYNC_BASE_URL")
+    if env_mac_ddp_sync_base_url is not None:
+        filtered["mac_ddp_sync_base_url"] = env_mac_ddp_sync_base_url
+    env_rds_openstates_api_base = os.getenv("RDS_OPENSTATES_API_BASE")
+    if env_rds_openstates_api_base is not None:
+        filtered["rds_openstates_api_base"] = env_rds_openstates_api_base
+
     return SyncSettings(**filtered)
 
 
