@@ -535,6 +535,16 @@ async def _trigger_legbot_session_via_mac_wireguard(
             session_code=session_code,
         )
         return
+    if not settings.mac_ddp_sync_api_key:
+        # pm-review: catch this before ever sending a request that's guaranteed to
+        # come back 401 -- a base URL with no key is a real, distinguishable
+        # misconfiguration, not the same "nothing configured at all" case above.
+        logger.warning(
+            "archiver_triggered_legbot_no_mac_api_key_configured",
+            jurisdiction=jurisdiction_iso2,
+            session_code=session_code,
+        )
+        return
 
     headers = {
         "Authorization": f"Bearer {settings.mac_ddp_sync_api_key}",
@@ -542,6 +552,12 @@ async def _trigger_legbot_session_via_mac_wireguard(
     }
     url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/scraper-session-legbot"
 
+    # pm-review: the whole request/response cycle, INCLUDING interpreting the
+    # response body, lives inside this one try -- the first version's `result.get(
+    # "success")` sat outside the try block, so a 2xx response whose body wasn't a
+    # JSON object (null, a list, a bare string) would raise `AttributeError` past
+    # this function's own documented never-raise contract, aborting every session
+    # still left in the caller's loop, not just this one.
     try:
         async with httpx.AsyncClient(timeout=_MAC_TRIGGER_TIMEOUT_SECONDS) as client:
             resp = await client.post(
@@ -551,6 +567,7 @@ async def _trigger_legbot_session_via_mac_wireguard(
             )
             resp.raise_for_status()
             result = resp.json()
+        success = bool(isinstance(result, dict) and result.get("success"))
     except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
         logger.error(
             "archiver_triggered_legbot_wireguard_trigger_failed",
@@ -560,7 +577,7 @@ async def _trigger_legbot_session_via_mac_wireguard(
         )
         return
 
-    log_fn = logger.info if result.get("success") else logger.warning
+    log_fn = logger.info if success else logger.warning
     log_fn(
         "archiver_triggered_legbot_wireguard_result",
         jurisdiction=jurisdiction_iso2,

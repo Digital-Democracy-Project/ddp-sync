@@ -358,6 +358,44 @@ async def test_wireguard_helper_no_mac_target_configured_makes_no_call():
 
 
 @pytest.mark.asyncio
+async def test_wireguard_helper_no_mac_api_key_configured_makes_no_call():
+    """pm-review: a base URL with no key is a distinct, real misconfiguration --
+    catch it before ever sending a request guaranteed to come back 401."""
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        from ddp_sync.pipelines.openstates_archive import (
+            _trigger_legbot_session_via_mac_wireguard,
+        )
+
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "2026", _enabled_ec2_settings(mac_ddp_sync_api_key="")
+        )
+
+    mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_wireguard_helper_non_dict_json_response_never_raises(monkeypatch):
+    """pm-review round 1 found this real bug: the first version's `result.get(
+    "success")` sat outside the try block, so a 2xx response whose body wasn't a
+    JSON object (null, a list, a bare string) would raise AttributeError past this
+    function's own documented never-raise contract."""
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+    mock_resp.json = lambda: ["not", "a", "dict"]
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    from ddp_sync.pipelines.openstates_archive import _trigger_legbot_session_via_mac_wireguard
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "2026", _enabled_ec2_settings()
+        )  # must not raise
+
+
+@pytest.mark.asyncio
 async def test_wireguard_helper_request_failure_is_swallowed():
     with patch("httpx.AsyncClient", side_effect=RuntimeError("network blew up")):
         from ddp_sync.pipelines.openstates_archive import (
