@@ -1,6 +1,7 @@
 """Scheduler for OpenStates bill sync and data pipeline jobs."""
 
 import asyncio
+import os
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -90,11 +91,30 @@ class UpdateScheduler:
             logger.error(f"Failed to load sync config: {e}")
             return {}
 
+    def _warn_if_alerting_unconfigured(self) -> None:
+        """OPEN-286: a missing SLACK_BOT_TOKEN turns _alert_scrape_failure's own warning
+        into the only signal that alerting is broken -- and that warning fires from
+        deep inside a scrape/load failure path, easy to miss for weeks (MA's real
+        2026-09-06 load failure went unnoticed until an unrelated freshness audit found
+        it). Logging this loudly once at startup, in production, means the gap is
+        visible in ordinary boot logs even if nobody is looking at scrape-failure paths
+        specifically. Not a fix for the missing credential itself -- that has to be
+        provisioned on the host -- just a floor so its absence can't stay silent again.
+        """
+        if self.settings.environment == "production" and not os.getenv("SLACK_BOT_TOKEN"):
+            logger.critical(
+                "ddp-sync startup: SLACK_BOT_TOKEN is not set in a production "
+                "environment -- scrape/load failures will log a warning but alert "
+                "nobody (Slack or CAMS). See OPEN-286."
+            )
+
     def start(self) -> None:
         """Start the scheduler."""
         if self._is_running:
             logger.warning("Scheduler already running")
             return
+
+        self._warn_if_alerting_unconfigured()
 
         # Parse sync time — prefer new bill_sync block, fall back to top-level
         bill_sync_config = self._sync_config.get("bill_sync", {})
