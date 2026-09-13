@@ -104,8 +104,16 @@ LABEL description="ddp-sync"
 # unconditionally, `[Errno 2] No such file or directory: 'pdftotext'`, indistinguishable from a
 # real extractor regression until traced back to this missing binary. Not a build-time
 # dependency either, so it belongs here, not the builder stage above.
+#
+# git: `run_people_refresh_job()` (openstates_scrape.py) shells out to run-people-refresh.sh,
+# which does a real `git pull --ff-only` against the openstates/people checkout at RUNTIME --
+# a separate need from the builder stage's own `git clone` of openstates-core/
+# openstates-scrapers at build time (line ~29 above). Found live 2026-09-13 (OPEN-285): every
+# run of this job failed instantly, `exit_code_127`, `git: command not found` -- same class of
+# gap as libgdal32/poppler-utils above, a build-stage-only dependency assumption that turned out
+# to also be needed here, for a different runtime reason each time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgdal32 poppler-utils \
+        libgdal32 poppler-utils git \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
