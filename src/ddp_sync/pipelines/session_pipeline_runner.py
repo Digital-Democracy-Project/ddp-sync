@@ -507,6 +507,17 @@ async def _process_bill_inner(
                 result["error"] = f"replica_not_fresh: {freshness.reason}"
                 result["duration_seconds"] = time.monotonic() - bill_started
                 return result
+        else:
+            # pm-review: a bypass with no visible trace invites exactly the "did we actually
+            # check this?" confusion this flag's own docstring is trying to prevent -- log it
+            # per bill (cheap, this path is already logging elsewhere) and record it on the
+            # result so it shows up in the run's own output, not just the process log.
+            logger.warning(
+                "replica_freshness_content_check_bypassed",
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction_iso2=jurisdiction_iso2.upper(),
+            )
+            result["replica_freshness_content_check_bypassed"] = True
 
     try:
         coverage = await get_bill_artifacts(

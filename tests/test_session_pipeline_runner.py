@@ -778,6 +778,9 @@ async def test_content_check_disabled_skips_rds_query_but_allowlist_gate_still_a
     bill_result = result["results"][0]
     assert bill_result["error"] is None
     assert bill_result["artifacts_generated"] == ["bill_summary"]
+    # pm-review: the bypass must leave a visible trace in the run's own output, not just the
+    # process log -- a reader of the result shouldn't have to already know this flag exists.
+    assert bill_result["replica_freshness_content_check_bypassed"] is True
 
     # Same flag combination, but a jurisdiction absent from the allowlist must still be
     # skipped -- proves the allowlist gate does not depend on the content check running.
