@@ -1960,10 +1960,19 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         # leader but nothing then targets that group, so a timeout still orphaned the real work
         # (git pull, os-people to-database across every state). Routed through the helper so the
         # group actually gets killed.
+        # OPEN-285 (round 2): run-people-refresh.sh sources activate.sh, which unconditionally
+        # does `export DATABASE_URL="${DATABASE_URL_OVERRIDE:-postgresql://...localhost:5433...}"`
+        # (OPEN-159's own safety gate, deliberately keyed on the differently-named
+        # DATABASE_URL_OVERRIDE so no unrelated service's pre-set DATABASE_URL silently becomes
+        # the import target). That gate clobbered the plain DATABASE_URL set below right back to
+        # the local-dev default -- confirmed live, all 9 states failed identically even with the
+        # resolved RDS URL injected. DATABASE_URL_OVERRIDE is the variable activate.sh actually
+        # honors; setting DATABASE_URL too costs nothing and documents intent for a reader who
+        # hasn't memorized activate.sh's own precedence.
         returncode, _stdout, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
             _run_with_group_kill,
             ["/bin/bash", script],
-            {**os.environ, "DATABASE_URL": rds_url},
+            {**os.environ, "DATABASE_URL": rds_url, "DATABASE_URL_OVERRIDE": rds_url},
             3600,
         )
         duration = round(time.monotonic() - t, 1)
