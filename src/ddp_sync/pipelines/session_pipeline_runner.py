@@ -496,11 +496,17 @@ async def _process_bill_inner(
             result["duration_seconds"] = time.monotonic() - bill_started
             return result
 
-        freshness = await check_bill_version_freshness(bill_openstates_id)
-        if not freshness.is_fresh:
-            result["error"] = f"replica_not_fresh: {freshness.reason}"
-            result["duration_seconds"] = time.monotonic() - bill_started
-            return result
+        # OPEN-289 follow-up (2026-09-13, Ramon's call): the RDS content-hash round-trip
+        # itself is independently toggleable now -- see
+        # replica_freshness_content_check_enabled's own docstring in config.py for why. The
+        # allowlist gate above still applies regardless of this flag; this only skips the
+        # per-bill RDS query on top of that, trusting logical replication's own mechanics.
+        if settings.replica_freshness_content_check_enabled:
+            freshness = await check_bill_version_freshness(bill_openstates_id)
+            if not freshness.is_fresh:
+                result["error"] = f"replica_not_fresh: {freshness.reason}"
+                result["duration_seconds"] = time.monotonic() - bill_started
+                return result
 
     try:
         coverage = await get_bill_artifacts(
