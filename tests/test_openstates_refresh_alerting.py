@@ -142,7 +142,14 @@ async def test_people_refresh_refuses_without_running_when_rds_unresolvable():
 @pytest.mark.asyncio
 async def test_people_refresh_passes_resolved_url_as_database_url_env():
     """The whole point of the fix -- os-people must actually see the live-resolved RDS URL,
-    not the container's own inherited (RDS-less) environment."""
+    not the container's own inherited (RDS-less) environment.
+
+    Round 2 (found live): run-people-refresh.sh sources activate.sh, whose own OPEN-159 safety
+    gate unconditionally rebuilds DATABASE_URL from DATABASE_URL_OVERRIDE (falling back to a
+    local-dev default), clobbering a plain DATABASE_URL right back out. DATABASE_URL_OVERRIDE
+    is the variable that actually survives that gate -- confirmed live, a run with only
+    DATABASE_URL set still failed identically. Asserting on the override name specifically so
+    this test would have caught that regression."""
     with (
         patch(
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
@@ -160,6 +167,7 @@ async def test_people_refresh_passes_resolved_url_as_database_url_env():
     assert result["success"] is True
     passed_env = mock_helper.call_args.args[1]
     assert passed_env["DATABASE_URL"] == "postgresql://user:pass@rds-host/openstates"
+    assert passed_env["DATABASE_URL_OVERRIDE"] == "postgresql://user:pass@rds-host/openstates"
 
 
 @pytest.mark.asyncio
