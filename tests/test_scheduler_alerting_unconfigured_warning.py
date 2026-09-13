@@ -1,7 +1,10 @@
-"""OPEN-286: a missing SLACK_BOT_TOKEN must be loud at startup, not just a warning
-buried inside a scrape-failure path nobody hits until something actually fails (MA's
-real 2026-09-06 load failure went unnoticed for a week -- see notes/ops-handoff). Light-
-touch, matching this module's own established convention (test_scheduler_per_task_flags.py)."""
+"""OPEN-286: when NEITHER alert channel (Slack, CAMS) is configured, that must be loud
+at startup, not just a warning buried inside a scrape-failure path nobody hits until
+something actually fails (MA's real 2026-09-06 load failure went unnoticed for a week --
+see notes/ops-handoff). Only fires when both are missing -- one working channel means
+alerting still reaches somebody, matching _alert_scrape_failure's own per-channel gating.
+Light-touch, matching this module's own established convention
+(test_scheduler_per_task_flags.py)."""
 
 from __future__ import annotations
 
@@ -45,20 +48,24 @@ def _scheduler(environment: str) -> UpdateScheduler:
 
 
 @pytest.mark.asyncio
-async def test_production_with_no_slack_token_logs_critical(monkeypatch):
+async def test_production_with_neither_channel_configured_logs_critical(monkeypatch):
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("CAMS_API_TOKEN", raising=False)
     sched = _scheduler("production")
     with patch("ddp_sync.scheduler.logger") as mock_logger:
         sched.start()
         assert mock_logger.critical.called
         (msg,), _ = mock_logger.critical.call_args
-        assert "SLACK_BOT_TOKEN" in msg
+        assert "SLACK_BOT_TOKEN" in msg and "CAMS_API_TOKEN" in msg
     sched.stop()
 
 
 @pytest.mark.asyncio
-async def test_production_with_slack_token_set_stays_quiet(monkeypatch):
+async def test_production_with_only_slack_configured_stays_quiet(monkeypatch):
+    """One working channel means alerting still reaches somebody -- not this
+    ticket's scope to add a lesser-severity warning for partial redundancy loss."""
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-real-token")
+    monkeypatch.delenv("CAMS_API_TOKEN", raising=False)
     sched = _scheduler("production")
     with patch("ddp_sync.scheduler.logger") as mock_logger:
         sched.start()
@@ -67,10 +74,22 @@ async def test_production_with_slack_token_set_stays_quiet(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_production_with_no_slack_token_stays_quiet(monkeypatch):
-    """Dev/test environments are expected to run without a real Slack token --
+async def test_production_with_only_cams_configured_stays_quiet(monkeypatch):
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("CAMS_API_TOKEN", "real-cams-token")
+    sched = _scheduler("production")
+    with patch("ddp_sync.scheduler.logger") as mock_logger:
+        sched.start()
+        assert not mock_logger.critical.called
+    sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_non_production_with_neither_channel_configured_stays_quiet(monkeypatch):
+    """Dev/test environments are expected to run without real alert credentials --
     only production should ever raise this alarm."""
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("CAMS_API_TOKEN", raising=False)
     sched = _scheduler("development")
     with patch("ddp_sync.scheduler.logger") as mock_logger:
         sched.start()

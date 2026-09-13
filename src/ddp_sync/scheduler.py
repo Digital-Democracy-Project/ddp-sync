@@ -92,20 +92,35 @@ class UpdateScheduler:
             return {}
 
     def _warn_if_alerting_unconfigured(self) -> None:
-        """OPEN-286: a missing SLACK_BOT_TOKEN turns _alert_scrape_failure's own warning
-        into the only signal that alerting is broken -- and that warning fires from
-        deep inside a scrape/load failure path, easy to miss for weeks (MA's real
-        2026-09-06 load failure went unnoticed until an unrelated freshness audit found
-        it). Logging this loudly once at startup, in production, means the gap is
-        visible in ordinary boot logs even if nobody is looking at scrape-failure paths
-        specifically. Not a fix for the missing credential itself -- that has to be
-        provisioned on the host -- just a floor so its absence can't stay silent again.
+        """OPEN-286: when neither alert channel is configured, _alert_scrape_failure's
+        own fallback is just a `warning` buried deep inside a scrape/load failure path
+        -- easy to miss for weeks (MA's real 2026-09-06 load failure went unnoticed
+        until an unrelated freshness audit found it). Logging this loudly once at
+        startup, in production, means the gap is visible in ordinary boot logs even if
+        nobody is watching scrape-failure paths specifically.
+
+        Checks BOTH channels _alert_scrape_failure itself checks (SLACK_BOT_TOKEN;
+        CAMS_API_TOKEN -- CAMS_BASE_URL always has a working default and is never
+        itself a gate, matching _alert_scrape_failure's own `if cams_token:` check) and
+        only fires when NEITHER is usable -- pm-review round 1 correctly flagged that
+        gating on Slack alone while claiming "nobody (Slack or CAMS)" would be
+        misleading the moment CAMS alone was configured. If exactly one channel is
+        configured, alerting still works end to end, so this deliberately stays quiet
+        rather than adding a second, lesser-severity warning tier for partial
+        redundancy loss -- not this ticket's scope.
+
+        Not a fix for the missing credential itself -- that has to be provisioned on
+        the host -- just a floor so total silence can't happen again unnoticed.
         """
-        if self.settings.environment == "production" and not os.getenv("SLACK_BOT_TOKEN"):
+        if self.settings.environment != "production":
+            return
+        slack_ok = bool(os.getenv("SLACK_BOT_TOKEN"))
+        cams_ok = bool(os.getenv("CAMS_API_TOKEN"))
+        if not slack_ok and not cams_ok:
             logger.critical(
-                "ddp-sync startup: SLACK_BOT_TOKEN is not set in a production "
-                "environment -- scrape/load failures will log a warning but alert "
-                "nobody (Slack or CAMS). See OPEN-286."
+                "ddp-sync startup: neither SLACK_BOT_TOKEN nor CAMS_API_TOKEN is set "
+                "in a production environment -- scrape/load failures will log a "
+                "warning but alert nobody. See OPEN-286."
             )
 
     def start(self) -> None:
