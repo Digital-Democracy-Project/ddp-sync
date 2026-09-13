@@ -528,6 +528,14 @@ async def _maybe_trigger_legbot_for_archive(
     Mac's own ddp-sync instance today), and OPEN-280's full-schema RDS
     replication + OPEN-272's api-v3 repoint mean the Mac's local replica
     already mirrors RDS-origin (Fargate-archived) data too.
+
+    Uses `since_param="document_updated_since"` (api-v3 PR #11), NOT the
+    default `updated_since` SYNC-50's scrape hook used -- pm-review on this
+    ticket's first version caught a real gap: `archive_bill_versions()`
+    (openstates-core) never touches `Bill.updated_at`, only the
+    `BillVersionDocument` row's own `updated_at` (confirmed by reading the
+    actual archiver code, not assumed). Reusing `updated_since` here would
+    have silently resolved zero sessions on every real archive run.
     """
     settings = get_settings()
     if not settings.legbot_scrape_completion_trigger_enabled:
@@ -540,6 +548,7 @@ async def _maybe_trigger_legbot_for_archive(
             jurisdiction.upper(),
             since=archive_started_at,
             max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
+            since_param="document_updated_since",
         )
     except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
         logger.error(

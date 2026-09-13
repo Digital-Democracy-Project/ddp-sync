@@ -112,6 +112,28 @@ async def test_one_resolved_session_triggers_once_with_org_research_disabled(mon
 
 
 @pytest.mark.asyncio
+async def test_resolution_uses_document_updated_since_not_updated_since(monkeypatch):
+    """The actual bug pm-review caught in this ticket's first version:
+    archive_bill_versions() (openstates-core) never touches Bill.updated_at,
+    only the BillVersionDocument row's own updated_at -- so reusing the
+    scrape hook's default `since_param="updated_since"` here would have
+    silently resolved zero sessions on every real archive run. Regression
+    guard for that specific mistake, not just "resolve_touched_sessions gets
+    called" (which every other test in this file already covers)."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_settings(),
+    )
+    with patch(
+        "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+        new=AsyncMock(return_value=[]),
+    ) as mock_resolve:
+        await _maybe_trigger_legbot_for_archive("va", datetime.now(timezone.utc))
+
+    assert mock_resolve.await_args.kwargs["since_param"] == "document_updated_since"
+
+
+@pytest.mark.asyncio
 async def test_multiple_resolved_sessions_each_trigger_once(monkeypatch):
     """The VA/UT-shaped case: two simultaneously active sessions in one
     jurisdiction must both get triggered, not just one."""
