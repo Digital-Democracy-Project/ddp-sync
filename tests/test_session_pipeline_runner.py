@@ -651,11 +651,21 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
     assert result["results"][1]["artifacts_generated"] == ["bill_summary"]
 
 
-def _patch_freshness_enabled(enabled: bool, *, allowlist: frozenset[str] = frozenset({"FL"})):
+def _patch_freshness_enabled(
+    enabled: bool,
+    *,
+    allowlist: frozenset[str] = frozenset({"FL"}),
+    content_check_enabled: bool = True,
+):
     return patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_settings",
         return_value=SimpleNamespace(
             replica_freshness_check_enabled=enabled,
+            # OPEN-289 follow-up: independent of the master flag above -- defaults True so
+            # every pre-existing test here (written before this flag existed) keeps
+            # exercising the real freshness check unchanged. See its own dedicated test
+            # below for content_check_enabled=False.
+            replica_freshness_content_check_enabled=content_check_enabled,
             session_pipeline_concurrency=1,
             # Defaults to allowing "FL" (every existing test candidate's jurisdiction) so these
             # freshness-check tests exercise the freshness check itself, not the OPEN-276
@@ -739,6 +749,56 @@ async def test_freshness_check_not_called_when_flag_is_off():
 
     mock_freshness.assert_not_awaited()
     assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_content_check_disabled_skips_rds_query_but_allowlist_gate_still_applies():
+    """OPEN-289 follow-up (2026-09-13): replica_freshness_content_check_enabled=False must
+    skip the RDS content-hash round-trip (check_bill_version_freshness never called, bill
+    proceeds as if fresh) while leaving the OPEN-276 allowlist gate fully intact -- a
+    jurisdiction not on the allowlist must still be skipped, proving this flag only
+    controls the content check, not the master replica_freshness_check_enabled switch or
+    the trust decision it gates."""
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"FL"}), content_check_enabled=False
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness",
+        new=AsyncMock(),
+    ) as mock_freshness, _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_freshness.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["error"] is None
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    # pm-review: the bypass must leave a visible trace in the run's own output, not just the
+    # process log -- a reader of the result shouldn't have to already know this flag exists.
+    assert bill_result["replica_freshness_content_check_bypassed"] is True
+
+    # Same flag combination, but a jurisdiction absent from the allowlist must still be
+    # skipped -- proves the allowlist gate does not depend on the content check running.
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
+        True, allowlist=frozenset({"WA"}), content_check_enabled=False
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness",
+        new=AsyncMock(),
+    ) as mock_freshness_2, _patch_coverage(None) as mock_coverage:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_freshness_2.assert_not_awaited()
+    mock_coverage.assert_not_awaited()
+    assert result["results"][0]["error"] == "jurisdiction_not_on_rds_replica_allowlist: FL"
 
 
 @pytest.mark.asyncio

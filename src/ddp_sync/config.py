@@ -430,6 +430,24 @@ class SyncSettings:
     # jurisdiction's dispatch (plan §6 step 7/OPEN-276).
     replica_freshness_check_enabled: bool = False
 
+    # OPEN-289 follow-up (2026-09-13, Ramon's call, during the FL 2026E production-path
+    # test): independent override for JUST the RDS content-hash round-trip inside the
+    # freshness check (services/replica_freshness.py) -- deliberately NOT the same flag as
+    # replica_freshness_check_enabled above, even though that field's own docstring
+    # originally argued against a second flag ("there is no separate ... toggle ... to
+    # decouple from"). That reasoning held until OPEN-274's replica health-check script
+    # turned out to need its own live RDS credential too (RDS_MONITORING_DATABASE_URL,
+    # unset, never actually run against real RDS) -- so "trust the health check instead"
+    # doesn't avoid the live-RDS dependency, it just moves it. Decision: drop the live
+    # content-hash verification for now and trust logical replication's own mechanics
+    # (already verified working, OPEN-270-274), while leaving
+    # replica_freshness_check_enabled's own allowlist gate fully intact -- a jurisdiction
+    # still has to be on legbot_rds_replica_jurisdiction_allowlist to dispatch at all, this
+    # only skips the per-bill RDS query on top of that. Revert (set back to True) once
+    # OPEN-274 is properly built out: a real RDS_MONITORING_DATABASE_URL configured and the
+    # health-check script actually running on a schedule.
+    replica_freshness_content_check_enabled: bool = True
+
     # OPEN-276 (plan §3.6, §6 step 7): the consumption-side pilot allowlist -- the publication
     # itself (OPEN-271) replicates all 7 tables' current contents for every jurisdiction RDS holds
     # ANY data for, with no per-jurisdiction filter possible (§3.6's own correction: a jurisdiction
@@ -656,6 +674,9 @@ def _load_from_env() -> dict:
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
         "replica_freshness_check_enabled": (
             os.getenv("REPLICA_FRESHNESS_CHECK_ENABLED", "false").lower() == "true"
+        ),
+        "replica_freshness_content_check_enabled": (
+            os.getenv("REPLICA_FRESHNESS_CONTENT_CHECK_ENABLED", "true").lower() == "true"
         ),
         "legbot_rds_replica_jurisdiction_allowlist": frozenset(
             code.strip().upper()
