@@ -1237,6 +1237,37 @@ async def test_resolve_touched_sessions_happy_path_dedupes_one_session():
 
 
 @pytest.mark.asyncio
+async def test_resolve_touched_sessions_since_param_override_reaches_the_query_string():
+    """SYNC-65: since_param lets a caller (the archive-completion hook) send
+    document_updated_since instead of updated_since -- archive_bill_versions()
+    never touches Bill.updated_at, only the BillVersionDocument row's own
+    updated_at, so the archive hook needs a different api-v3 filter entirely,
+    not just a different `since` value under the same key."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "2026"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va",
+            since=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            max_bills_scanned=500,
+            since_param="document_updated_since",
+        )
+
+    assert result == ["2026"]
+    call = mock_client.get.await_args
+    params = call.kwargs["params"]
+    assert params["document_updated_since"] == "2026-01-01T00:00:00+00:00"
+    assert "updated_since" not in params
+
+
+@pytest.mark.asyncio
 async def test_resolve_touched_sessions_finds_multiple_sessions_same_jurisdiction():
     """The whole reason this function exists: VA/UT can have two sessions
     simultaneously active, and a real scrape run can touch bills in both."""

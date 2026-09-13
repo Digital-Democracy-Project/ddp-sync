@@ -55,6 +55,7 @@ raw_text, on the same single-bill detail endpoint.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 import httpx
 import structlog
@@ -819,6 +820,7 @@ async def resolve_touched_sessions(
     max_bills_scanned: int,
     api_base: str | None = None,
     api_key: str | None = None,
+    since_param: Literal["updated_since", "document_updated_since"] = "updated_since",
 ) -> list[str]:
     """SYNC-50: resolve which session_code(s) actually had a bill touched
     (created or updated) in this jurisdiction since `since`, from an api-v3
@@ -854,6 +856,15 @@ async def resolve_touched_sessions(
             RDS-facing read replica exists -- see that setting's own
             docstring), not the Mac's local instance, which would never see
             RDS-loaded data at all.
+        since_param (SYNC-65): which api-v3 `/bills` query param `since` is sent
+            as. Defaults to `"updated_since"` (Bill.updated_at) -- the original
+            scrape-completion behavior, unchanged. The archive-completion hook
+            passes `"document_updated_since"` instead (api-v3 PR #11): a bill's
+            scrape doesn't necessarily bump the same timestamp its *archiving*
+            does -- `archive_bill_versions()` only ever saves the
+            BillVersionDocument row's own `updated_at`, never `Bill.updated_at`
+            -- so reusing `updated_since` for an archive-triggered read would
+            silently resolve zero sessions on every real run.
 
     Returns:
         Distinct session_code strings, in first-seen order (the order
@@ -888,7 +899,7 @@ async def resolve_touched_sessions(
     url = f"{resolved_api_base}/bills"
     base_params: dict[str, str] = {
         "jurisdiction": jurisdiction_iso2.upper(),
-        "updated_since": since.isoformat(),
+        since_param: since.isoformat(),
     }
     if resolved_api_key:
         base_params["apikey"] = resolved_api_key

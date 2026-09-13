@@ -430,6 +430,24 @@ class SyncSettings:
     # jurisdiction's dispatch (plan §6 step 7/OPEN-276).
     replica_freshness_check_enabled: bool = False
 
+    # OPEN-289 follow-up (2026-09-13, Ramon's call, during the FL 2026E production-path
+    # test): independent override for JUST the RDS content-hash round-trip inside the
+    # freshness check (services/replica_freshness.py) -- deliberately NOT the same flag as
+    # replica_freshness_check_enabled above, even though that field's own docstring
+    # originally argued against a second flag ("there is no separate ... toggle ... to
+    # decouple from"). That reasoning held until OPEN-274's replica health-check script
+    # turned out to need its own live RDS credential too (RDS_MONITORING_DATABASE_URL,
+    # unset, never actually run against real RDS) -- so "trust the health check instead"
+    # doesn't avoid the live-RDS dependency, it just moves it. Decision: drop the live
+    # content-hash verification for now and trust logical replication's own mechanics
+    # (already verified working, OPEN-270-274), while leaving
+    # replica_freshness_check_enabled's own allowlist gate fully intact -- a jurisdiction
+    # still has to be on legbot_rds_replica_jurisdiction_allowlist to dispatch at all, this
+    # only skips the per-bill RDS query on top of that. Revert (set back to True) once
+    # OPEN-274 is properly built out: a real RDS_MONITORING_DATABASE_URL configured and the
+    # health-check script actually running on a schedule.
+    replica_freshness_content_check_enabled: bool = True
+
     # OPEN-276 (plan §3.6, §6 step 7): the consumption-side pilot allowlist -- the publication
     # itself (OPEN-271) replicates all 7 tables' current contents for every jurisdiction RDS holds
     # ANY data for, with no per-jurisdiction filter possible (§3.6's own correction: a jurisdiction
@@ -657,6 +675,9 @@ def _load_from_env() -> dict:
         "replica_freshness_check_enabled": (
             os.getenv("REPLICA_FRESHNESS_CHECK_ENABLED", "false").lower() == "true"
         ),
+        "replica_freshness_content_check_enabled": (
+            os.getenv("REPLICA_FRESHNESS_CONTENT_CHECK_ENABLED", "true").lower() == "true"
+        ),
         "legbot_rds_replica_jurisdiction_allowlist": frozenset(
             code.strip().upper()
             for code in os.getenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "").split(",")
@@ -736,6 +757,28 @@ def get_settings() -> SyncSettings:
     env_redis_url = os.getenv("REDIS_URL")
     if env_redis_url is not None:
         filtered["redis_url"] = env_redis_url
+
+    # SYNC-59/SYNC-65 (found live on the EC2-broker host, 2026-09-13, verifying PR #148's
+    # Mac/EC2 archive-hook split): third instance of the exact same SYNC-51/OPEN-193 bug
+    # class above. mac_ddp_sync_base_url and rds_openstates_api_base are per-host resource
+    # addresses set only via docker-compose.prod.yml's `environment:` block -- unlike
+    # mac_ddp_sync_api_key/rds_openstates_api_key, which flow through fine because they're
+    # stored directly in the shared `ddp-sync/credentials` secret Secrets Manager returns.
+    # Confirmed live: MAC_DDP_SYNC_BASE_URL/RDS_OPENSTATES_API_BASE were both correctly set
+    # in the container's real environment, but get_settings().mac_ddp_sync_base_url /
+    # .rds_openstates_api_base both came back "" regardless, since _load_from_env() (the only
+    # code that would have read them) never runs on a host where Secrets Manager succeeds.
+    # Silent, not crashing: resolve_touched_sessions(api_base="") raises
+    # httpx.UnsupportedProtocol, caught by _maybe_trigger_legbot_for_archive's own
+    # except Exception and logged -- the archive-completion hook looks like it ran
+    # successfully and simply never triggers LegBot, on every EC2-orchestrated archive
+    # completion.
+    env_mac_ddp_sync_base_url = os.getenv("MAC_DDP_SYNC_BASE_URL")
+    if env_mac_ddp_sync_base_url is not None:
+        filtered["mac_ddp_sync_base_url"] = env_mac_ddp_sync_base_url
+    env_rds_openstates_api_base = os.getenv("RDS_OPENSTATES_API_BASE")
+    if env_rds_openstates_api_base is not None:
+        filtered["rds_openstates_api_base"] = env_rds_openstates_api_base
 
     return SyncSettings(**filtered)
 

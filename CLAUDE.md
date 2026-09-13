@@ -45,30 +45,51 @@ yet. FL/USA (which always specify one explicit session) already work. Do not bui
 missing RDS read replica speculatively without checking with Ramon first — it's a real
 piece of infrastructure, not just a settings value.
 
-**Update, same night (OPEN-275/OPEN-276): a real mechanism for reading RDS-loaded data on
-the Mac now exists in code, but it is a *different shape* than the `RDS_OPENSTATES_API_BASE`
-override above, and the two have not been reconciled.** `ddp-infra`'s
-`PLAN-rds-local-postgres-replication.md` sets up Postgres **logical replication from RDS
-into the Mac's own local Postgres** (a `ddp_local_replication` subscription, publishing 7
-tables for every jurisdiction RDS holds any data for, with no per-jurisdiction filter at the
-replication layer itself) — the idea being that the Mac's *existing* `local_openstates_api_base`
-read path becomes correct for cloud-owned jurisdictions too, once replication has caught up,
-rather than reading through a second, separate RDS-facing api-v3 instance. Two new pieces
-landed for this: `services/replica_freshness.py` (`check_bill_version_freshness`, OPEN-275) —
-a per-bill, fail-closed content-hash comparison against RDS directly, gated behind
-`REPLICA_FRESHNESS_CHECK_ENABLED` (default off) — and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST`
-(OPEN-276, default empty) gating *which* jurisdictions' replicated rows are trusted at all,
-both wired into `session_pipeline_runner.py`'s `_process_bill_inner`.
+## Crash-survivable LegBot dispatch tracking, and the RDS-replica gates layered on top of it (SYNC-61/275/276)
 
-**Neither mechanism is live yet.** RDS's own `wal_level` is still `replica`, not `logical`
-(OPEN-271, not done as of this writing) — the replication subscription this all depends on
-cannot exist until that lands, so `replica_freshness_check_enabled` staying `False` is not
-optional caution, it is the only correct value today. If asked to make cloud-owned
-jurisdictions (esp. VA/UT) actually trigger LegBot end-to-end: **check with Ramon which
-direction is current** — SYNC-59's own `RDS_OPENSTATES_API_BASE` (a second api-v3 instance
-pointed at RDS) and OPEN-275/276's replication-based approach both target the same problem
-from this same ticket thread, and only one of them should end up being the real, load-bearing
-path. Do not build or wire up both.
+`pipelines/bill_artifact_generation.py`'s `bill_changelog` dispatch records each in-flight
+task in Redis (`ddp:legbot:task:*`, sibling to the scraper pipeline's own `ddp:sync:task:*`
+convention) before polling starts, so a process crash mid-dispatch doesn't lose a real,
+already-computed CAMS answer — `recover_stale_legbot_dispatches()`, wired into the existing
+`_zombie_sync_watchdog`, sweeps stale records on the next cycle. `read_task_result()` is the
+one place that validates a stored CAMS answer is actually a dict before any caller touches
+it — two real production crashes (a corrupted stored answer hitting first the recovery
+sweep, then a live dispatch's own completion log line) were both fixed here, at the source,
+rather than patched at each call site individually. If you add a new caller of a CAMS task
+result, it goes through this function; don't re-implement your own JSON read.
+
+**A real mechanism for reading RDS-loaded data on the Mac is a *different shape* than the
+`RDS_OPENSTATES_API_BASE` override above, and the two have not been fully reconciled.**
+`ddp-infra`'s `PLAN-rds-local-postgres-replication.md` sets up Postgres logical replication
+from RDS into the Mac's own local Postgres (a `ddp_local_replication` subscription,
+publishing all tables for every jurisdiction RDS holds any data for) — the idea being that
+the Mac's *existing* `local_openstates_api_base` read path becomes correct for cloud-owned
+jurisdictions too, once replication has caught up, rather than reading through a second,
+separate RDS-facing api-v3 instance. Two gates sit in `session_pipeline_runner.py`'s
+`_process_bill_inner`, both from the `PLAN-rds-local-postgres-replication.md`/OPEN-269 epic:
+- `REPLICA_FRESHNESS_CHECK_ENABLED` (OPEN-275) — before dispatching a bill, compares an
+  `md5(raw_text)` content hash between RDS's current version-document row and the Mac's
+  local replica, failing closed (skip, no `BillArtifact` write) on any mismatch or error.
+  Independently overridable via `REPLICA_FRESHNESS_CONTENT_CHECK_ENABLED` (OPEN-289
+  follow-up) — set `False` in production for now, since OPEN-274's own health-check script
+  also needs a live RDS credential that isn't configured, so "trust the health check
+  instead" doesn't avoid a live-RDS dependency, it just moves it. Revert to `True` once
+  OPEN-274 is properly built out (real `RDS_MONITORING_DATABASE_URL` + a scheduled run).
+- `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` (OPEN-276) — checked *before* the freshness
+  check (cheap local test, no reason to pay an RDS round-trip for a jurisdiction dispatch
+  won't trust regardless), gates which jurisdictions may dispatch from the RDS-fed replica
+  at all.
+
+**As of 2026-09-13, both are live in production**, not just built: real logical replication
+from production RDS is up (OPEN-271/272/273/274 all Done, independently verified), and
+`LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` covers 9 of the 10 tracked jurisdictions
+(`mi,ut,fl,va,wa,us,ma,az,nc` — only `al` excluded, since it never migrated to the RDS/cloud
+path at all). If asked to make a cloud-owned jurisdiction trigger LegBot end-to-end and it's
+not already working: **check `PLAN-rds-local-postgres-replication.md` and this epic's own
+Jira tickets for current status** before assuming either this mechanism or SYNC-59's own
+`RDS_OPENSTATES_API_BASE` needs building — most of this epic's build work is done; what's
+most likely still open is the specific per-jurisdiction session-resolution gap SYNC-59's own
+section above describes.
 
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 

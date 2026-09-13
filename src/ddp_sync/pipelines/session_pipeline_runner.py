@@ -496,11 +496,28 @@ async def _process_bill_inner(
             result["duration_seconds"] = time.monotonic() - bill_started
             return result
 
-        freshness = await check_bill_version_freshness(bill_openstates_id)
-        if not freshness.is_fresh:
-            result["error"] = f"replica_not_fresh: {freshness.reason}"
-            result["duration_seconds"] = time.monotonic() - bill_started
-            return result
+        # OPEN-289 follow-up (2026-09-13, Ramon's call): the RDS content-hash round-trip
+        # itself is independently toggleable now -- see
+        # replica_freshness_content_check_enabled's own docstring in config.py for why. The
+        # allowlist gate above still applies regardless of this flag; this only skips the
+        # per-bill RDS query on top of that, trusting logical replication's own mechanics.
+        if settings.replica_freshness_content_check_enabled:
+            freshness = await check_bill_version_freshness(bill_openstates_id)
+            if not freshness.is_fresh:
+                result["error"] = f"replica_not_fresh: {freshness.reason}"
+                result["duration_seconds"] = time.monotonic() - bill_started
+                return result
+        else:
+            # pm-review: a bypass with no visible trace invites exactly the "did we actually
+            # check this?" confusion this flag's own docstring is trying to prevent -- log it
+            # per bill (cheap, this path is already logging elsewhere) and record it on the
+            # result so it shows up in the run's own output, not just the process log.
+            logger.warning(
+                "replica_freshness_content_check_bypassed",
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction_iso2=jurisdiction_iso2.upper(),
+            )
+            result["replica_freshness_content_check_bypassed"] = True
 
     try:
         coverage = await get_bill_artifacts(

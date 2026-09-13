@@ -40,6 +40,10 @@ async def test_timeout_alerts(job, label):
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
             return_value=(-9, b"", b"", True, False),
         ),
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+            return_value=("postgresql://rds/openstates", ""),
+        ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()) as st,
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -68,6 +72,10 @@ async def test_nonzero_exit_alerts_because_these_scripts_do_not_self_alert(job, 
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
             return_value=(1, b"", b"boom", False, False),
         ),
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+            return_value=("postgresql://rds/openstates", ""),
+        ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -89,6 +97,10 @@ async def test_success_does_not_alert(job):
             "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
             return_value=(0, b"", b"", False, False),
         ),
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+            return_value=("postgresql://rds/openstates", ""),
+        ),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
         patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
     ):
@@ -96,6 +108,66 @@ async def test_success_does_not_alert(job):
 
     assert result["success"] is True
     mock_alert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_people_refresh_refuses_without_running_when_rds_unresolvable():
+    """OPEN-285: os-people needs a real DATABASE_URL (resolved live, matching _run_load's own
+    OPEN-260 pattern) -- confirm this refuses up front, before ever invoking the script, rather
+    than letting os-people fall through to a localhost default that fails per-state instead."""
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+        ) as mock_helper,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+            return_value=(None, "RDS_CREDENTIALS_SECRET_ARN not set -- refusing to guess which secret to read"),
+        ),
+        patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()) as st,
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as mock_alert,
+    ):
+        result = await run_people_refresh_job(CONFIG)
+
+    assert result["success"] is False
+    assert "cannot resolve an RDS target" in result["error"]
+    mock_helper.assert_not_called()
+    # This refusal path is deliberately silent on Slack/CAMS (matching _run_load's own
+    # preflight refusal) -- it's a config problem to surface via flow-status, not treated as
+    # the same class of failure as a real scrape/refresh going wrong mid-run.
+    mock_alert.assert_not_called()
+    st.assert_awaited_once()
+    assert st.await_args.args[1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_people_refresh_passes_resolved_url_as_database_url_env():
+    """The whole point of the fix -- os-people must actually see the live-resolved RDS URL,
+    not the container's own inherited (RDS-less) environment.
+
+    Round 2 (found live): run-people-refresh.sh sources activate.sh, whose own OPEN-159 safety
+    gate unconditionally rebuilds DATABASE_URL from DATABASE_URL_OVERRIDE (falling back to a
+    local-dev default), clobbering a plain DATABASE_URL right back out. DATABASE_URL_OVERRIDE
+    is the variable that actually survives that gate -- confirmed live, a run with only
+    DATABASE_URL set still failed identically. Asserting on the override name specifically so
+    this test would have caught that regression."""
+    with (
+        patch(
+            "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
+            return_value=(0, b"", b"", False, False),
+        ) as mock_helper,
+        patch(
+            "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+            return_value=("postgresql://user:pass@rds-host/openstates", ""),
+        ),
+        patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
+        result = await run_people_refresh_job(CONFIG)
+
+    assert result["success"] is True
+    passed_env = mock_helper.call_args.args[1]
+    assert passed_env["DATABASE_URL"] == "postgresql://user:pass@rds-host/openstates"
+    assert passed_env["DATABASE_URL_OVERRIDE"] == "postgresql://user:pass@rds-host/openstates"
 
 
 @pytest.mark.asyncio
@@ -112,6 +184,10 @@ async def test_both_jobs_go_through_the_group_kill_helper():
                 "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
                 return_value=(0, b"", b"", False, False),
             ) as mock_helper,
+            patch(
+                "ddp_sync.pipelines.openstates_scrape.resolve_rds_database_url",
+                return_value=("postgresql://rds/openstates", ""),
+            ),
             patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
             patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
         ):

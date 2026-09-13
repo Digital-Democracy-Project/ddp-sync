@@ -28,9 +28,9 @@ from typing import Any, NamedTuple
 import requests
 import structlog
 
-from ddp_sync.config import get_settings
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
+from ddp_sync.services.rds_credentials import resolve_rds_database_url
 
 logger = structlog.get_logger()
 
@@ -1038,90 +1038,6 @@ def _run_with_group_kill(
             watchdog.join(timeout=_STALL_POLL_SECONDS + 5)
 
 
-async def _maybe_trigger_legbot_for_scrape(
-    jurisdiction: str,
-    scrape_started_at: datetime,
-) -> None:
-    """SYNC-50: the real scraper-completion hook SYNC-48 deliberately did not build.
-
-    Called only after a scrape has already succeeded (see `_run_scrape` below) --
-    a failure here must never affect the scrape job's own reported outcome, so
-    every exception is caught and logged, not raised.
-
-    The real blocker SYNC-48 left open: a completed scrape tells you a
-    jurisdiction, not a session -- and a jurisdiction can have more than one
-    session simultaneously active (VA and UT both have). Guessing "the
-    jurisdiction's current session" would silently miss the other one, or
-    trigger the wrong one, undermining the full-session-re-evaluation safety
-    property `trigger_scraper_session_pipeline`'s own overlap lock depends on.
-
-    Resolved here the way the ticket's own scope describes: read back which
-    session(s) actually had bills touched by *this* scrape run, from the local
-    api-v3 instance's own `updated_since` filter -- real ground truth (what
-    changed), not a guess (what's "current").
-    """
-    settings = get_settings()
-    if not settings.legbot_scrape_completion_trigger_enabled:
-        return
-
-    from ddp_sync.services.local_openstates_client import resolve_touched_sessions
-
-    try:
-        session_codes = await resolve_touched_sessions(
-            jurisdiction.upper(),
-            since=scrape_started_at,
-            max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
-        )
-    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
-        logger.error(
-            "scraper_triggered_legbot_session_resolution_failed",
-            jurisdiction=jurisdiction,
-            error=str(e),
-        )
-        return
-
-    if not session_codes:
-        logger.info(
-            "scraper_triggered_legbot_no_sessions_touched",
-            jurisdiction=jurisdiction,
-            since=scrape_started_at.isoformat(),
-        )
-        return
-
-    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
-
-    for session_code in session_codes:
-        try:
-            result = await trigger_scraper_session_pipeline(
-                jurisdiction.upper(),
-                session_code,
-                settings.legbot_scrape_completion_trigger_artifact_types,
-                # Gate 1 item 4 (ddp-infra PLAN-legbot.md §32, 2026-09-01): org research is a
-                # deliberate operator decision, not a tunable default -- burst-week cost
-                # exposure (Virginia's own filing-deadline week alone: ~$670 in 7 days) has no
-                # spend visibility yet (AGENTS-89, still open). Revisit there, not here.
-                False,
-                settings.legbot_scrape_completion_trigger_limit,
-                include_concept_statements=(
-                    settings.legbot_scrape_completion_trigger_include_concept_statements
-                ),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                "scraper_triggered_legbot_trigger_failed",
-                jurisdiction=jurisdiction,
-                session_code=session_code,
-                error=str(e),
-            )
-            continue
-        logger.info(
-            "scraper_triggered_legbot_result",
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            result=result,
-        )
-
-
 async def _run_scrape(
     jurisdiction: str,
     session_arg: str | None,
@@ -1129,65 +1045,23 @@ async def _run_scrape(
     timeout_s: int | None = None,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Thin wrapper around `_run_scrape_impl` (the real scrape) that adds a
-    scraper-completion hook on top, uniformly for both of `_run_scrape_impl`'s own
-    success paths (the local run-scrape.sh branch and OPEN-193's cloud-owned
-    branch) -- neither needs its own copy of this logic.
+    """Thin wrapper around `_run_scrape_impl`.
 
-    `scrape_started_at` is captured here, before the scrape itself runs, rather
-    than read back from `_run_scrape_impl`'s own internal timing -- it only
-    needs to be a real wall-clock floor for "what changed because of this run",
-    a few seconds of slack on either side is harmless.
-
-    Two separate hooks, by which branch actually ran: SYNC-50's
-    `_maybe_trigger_legbot_for_scrape` for the local run-scrape.sh branch (reads
-    ground truth from the Mac's own local Postgres via `resolve_touched_sessions`),
-    and SYNC-59's `_maybe_trigger_legbot_for_cloud_scrape` for OPEN-193's
-    cloud-owned branch, which loads into RDS -- a separate database the local
-    Postgres read would never see data in, so it needs its own resolution path
-    (an explicit session named by `session_arg` when the caller already supplied
-    one, or `resolve_touched_sessions` pointed at `settings.rds_openstates_api_base`
-    otherwise) and reaches the Mac Studio's ddp-sync over WireGuard instead of
-    calling anything in-process, since this process has no CAMS/LegBot access of
-    its own once a jurisdiction is cloud-owned.
-
-    The whole post-success block -- the cloud-ownership check AND whichever hook
-    it calls -- is wrapped in one catch-all: pm-review (round 1) found the original version
-    only wrapped the hook call itself, leaving `_cloud_path_owns()` free to escape
-    and turn an already-successful scrape into a raised exception if it ever
-    raised. `_cloud_path_owns()` is a pure config read and not expected to raise
-    in practice, but this wrapper's own contract is "nothing after a successful
-    scrape may change that scrape's result," not "nothing we currently believe
-    can raise" -- so it's inside the same try, not exempted on that assumption.
+    SYNC-65: this used to also carry a scrape-completion LegBot-triggering hook
+    (SYNC-50's `_maybe_trigger_legbot_for_scrape` / SYNC-59's
+    `_maybe_trigger_legbot_for_cloud_scrape`, both removed). Both hooks fired
+    before archiving necessarily had, and LegBot's `_resolve_bill_source()` only
+    reads already-archived, already-extracted text with no live-fetch fallback
+    -- triggering off scrape completion routinely lost that race and produced a
+    permanent `no_archived_bill_text` failure. The trigger now lives in
+    `openstates_archive.py` (`_maybe_trigger_legbot_for_archive`,
+    `_run_archive_with_hook`), which fires only once the text this hook depends
+    on is guaranteed to already exist. This wrapper is kept as a distinct
+    function from `_run_scrape_impl` in case a scrape-side concern needs to
+    hook in here again later, not because it currently does anything beyond
+    delegate.
     """
-    scrape_started_at = datetime.now(timezone.utc)
-    result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
-    if result.get("success"):
-        try:
-            if _cloud_path_owns(jurisdiction, config):
-                # SYNC-59: this used to be a bare skip -- nothing on the Mac ever runs
-                # this function for a cloud-owned jurisdiction again once OPEN-193 takes
-                # it over, so SYNC-50's hook below (which assumes scraping and LegBot-
-                # triggering happen in the same process) simply never fired for it. The
-                # cloud-owned counterpart reaches the Mac Studio's ddp-sync over
-                # WireGuard instead of calling anything in-process -- see
-                # cloud_scrape_trigger.py's own docstring for the full rationale.
-                from ddp_sync.pipelines.cloud_scrape_trigger import (
-                    _maybe_trigger_legbot_for_cloud_scrape,
-                )
-
-                await _maybe_trigger_legbot_for_cloud_scrape(
-                    jurisdiction, session_arg, scrape_started_at
-                )
-            else:
-                await _maybe_trigger_legbot_for_scrape(jurisdiction, scrape_started_at)
-        except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
-            logger.error(
-                "scraper_triggered_legbot_hook_failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
-    return result
+    return await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
 
 
 async def _run_scrape_impl(
@@ -1931,16 +1805,47 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     logger.info("openstates_people_refresh: starting")
     t = time.monotonic()
 
+    # OPEN-285: os-people (via Django/openstates-core, same as os-update) reads a plain
+    # DATABASE_URL env var, defaulting to localhost when unset -- but this container's own
+    # environment only carries RDS_HOST/RDS_PORT/RDS_DBNAME/RDS_CREDENTIALS_SECRET_ARN, the
+    # same quartet _run_load()/openstates_archive.py already resolve from live rather than a
+    # cached value (OPEN-260: RDS's managed-secret rotation goes stale under a cached DATABASE_URL
+    # regardless of how recently this process started). Matching that same established pattern
+    # here rather than inventing a second way to reach RDS for this one caller.
+    rds_url, rds_error = resolve_rds_database_url()
+    if rds_error:
+        duration = round(time.monotonic() - t, 1)
+        error = f"cannot resolve an RDS target: {rds_error}"
+        logger.error("openstates_people_refresh: refused", error=error)
+        await _write_flow_status("openstates_people_refresh", {
+            "flow": "openstates_people_refresh",
+            "started_at": start_time.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "status": "failed",
+            "error": error,
+            "duration_seconds": duration,
+        })
+        return {"success": False, "error": error, "duration_seconds": duration}
+
     try:
         # This call site already passed start_new_session=True, which _run_with_group_kill's own
         # docstring explains is not sufficient on its own — it makes the child a process-group
         # leader but nothing then targets that group, so a timeout still orphaned the real work
         # (git pull, os-people to-database across every state). Routed through the helper so the
         # group actually gets killed.
+        # OPEN-285 (round 2): run-people-refresh.sh sources activate.sh, which unconditionally
+        # does `export DATABASE_URL="${DATABASE_URL_OVERRIDE:-postgresql://...localhost:5433...}"`
+        # (OPEN-159's own safety gate, deliberately keyed on the differently-named
+        # DATABASE_URL_OVERRIDE so no unrelated service's pre-set DATABASE_URL silently becomes
+        # the import target). That gate clobbered the plain DATABASE_URL set below right back to
+        # the local-dev default -- confirmed live, all 9 states failed identically even with the
+        # resolved RDS URL injected. DATABASE_URL_OVERRIDE is the variable activate.sh actually
+        # honors; setting DATABASE_URL too costs nothing and documents intent for a reader who
+        # hasn't memorized activate.sh's own precedence.
         returncode, _stdout, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
             _run_with_group_kill,
             ["/bin/bash", script],
-            dict(os.environ),
+            {**os.environ, "DATABASE_URL": rds_url, "DATABASE_URL_OVERRIDE": rds_url},
             3600,
         )
         duration = round(time.monotonic() - t, 1)
