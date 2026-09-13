@@ -55,6 +55,7 @@ raw_text, on the same single-bill detail endpoint.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 import httpx
 import structlog
@@ -819,7 +820,7 @@ async def resolve_touched_sessions(
     max_bills_scanned: int,
     api_base: str | None = None,
     api_key: str | None = None,
-    since_param: str = "updated_since",
+    since_param: Literal["updated_since", "document_updated_since"] = "updated_since",
 ) -> list[str]:
     """SYNC-50: resolve which session_code(s) actually had a bill touched
     (created or updated) in this jurisdiction since `since`, from an api-v3
