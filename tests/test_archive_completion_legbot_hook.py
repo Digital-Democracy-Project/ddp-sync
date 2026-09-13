@@ -51,15 +51,34 @@ from ddp_sync.pipelines.openstates_archive import (
 
 
 def _enabled_settings(**overrides) -> SyncSettings:
+    """Defaults to the Mac-capable path (cams_api_token set) -- most of this file's
+    existing coverage predates the Mac/EC2 split and assumes in-process dispatch.
+    See _enabled_ec2_settings() for the non-Mac-capable (WireGuard-hop) path."""
     defaults = dict(
         legbot_scrape_completion_trigger_enabled=True,
         legbot_scrape_completion_trigger_artifact_types=["bill_summary", "bill_changelog"],
         legbot_scrape_completion_trigger_limit=10000,
         legbot_scrape_completion_trigger_include_concept_statements=True,
         legbot_scrape_completion_trigger_resolution_max_bills=500,
+        cams_api_token="fake-mac-cams-token",
     )
     defaults.update(overrides)
     return SyncSettings(**defaults)
+
+
+def _enabled_ec2_settings(**overrides) -> SyncSettings:
+    """SYNC-65 (real conflict found by the prod agent, 2026-09-13): the EC2-broker
+    instance's own shape -- no cams_api_token, but rds_openstates_api_base and the
+    Mac WireGuard target both configured."""
+    defaults = dict(
+        cams_api_token="",
+        rds_openstates_api_base="http://10.0.0.9:8002",
+        rds_openstates_api_key="fake-rds-api-key",
+        mac_ddp_sync_base_url="http://10.0.0.8:8001",
+        mac_ddp_sync_api_key="fake-mac-ddp-sync-key",
+    )
+    defaults.update(overrides)
+    return _enabled_settings(**defaults)
 
 
 # ── _maybe_trigger_legbot_for_archive: the flag gate ────────────────────────────────────
@@ -222,6 +241,132 @@ async def test_one_session_trigger_exception_does_not_stop_the_next(monkeypatch)
         await _maybe_trigger_legbot_for_archive("va", datetime.now(timezone.utc))  # must not raise
 
     assert mock_trigger.await_count == 2
+
+
+# ── _maybe_trigger_legbot_for_archive: EC2 (not Mac-capable) routes over WireGuard ──────
+#
+# SYNC-65 (real conflict found by the prod agent, 2026-09-13): this ticket's first version
+# assumed archiving only ever runs on the Mac's own ddp-sync instance. OPENSTATES_ARCHIVE_
+# ENABLED is now also true on the EC2-broker instance (OPEN-192), which has no local CAMS
+# server at all -- confirmed directly (CAMS_BASE_URL unset there). These tests cover the
+# fix: when cams_api_token isn't configured, resolve sessions via rds_openstates_api_base
+# instead of the Mac's local api-v3, and dispatch each session over WireGuard instead of
+# calling trigger_scraper_session_pipeline in-process.
+
+
+@pytest.mark.asyncio
+async def test_ec2_resolves_sessions_via_rds_api_base_not_local(monkeypatch):
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_ec2_settings(),
+    )
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+            new=AsyncMock(return_value=["2026"]),
+        ) as mock_resolve,
+        patch(
+            "ddp_sync.pipelines.openstates_archive._trigger_legbot_session_via_mac_wireguard",
+            new=AsyncMock(),
+        ),
+    ):
+        await _maybe_trigger_legbot_for_archive("us", datetime.now(timezone.utc))
+
+    assert mock_resolve.await_args.kwargs["api_base"] == "http://10.0.0.9:8002"
+    assert mock_resolve.await_args.kwargs["api_key"] == "fake-rds-api-key"
+    assert mock_resolve.await_args.kwargs["since_param"] == "document_updated_since"
+
+
+@pytest.mark.asyncio
+async def test_ec2_dispatches_over_wireguard_not_in_process(monkeypatch):
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_ec2_settings(),
+    )
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+            new=AsyncMock(return_value=["2026", "2026S1"]),
+        ),
+        patch(
+            "ddp_sync.pipelines.openstates_archive._trigger_legbot_session_via_mac_wireguard",
+            new=AsyncMock(),
+        ) as mock_wireguard,
+        patch(
+            "ddp_sync.pipelines.scraper_triggered_legbot.trigger_scraper_session_pipeline",
+            new=AsyncMock(),
+        ) as mock_in_process,
+    ):
+        await _maybe_trigger_legbot_for_archive("us", datetime.now(timezone.utc))
+
+    assert mock_wireguard.await_count == 2
+    triggered = {call.args[1] for call in mock_wireguard.await_args_list}
+    assert triggered == {"2026", "2026S1"}
+    mock_in_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ec2_skips_entirely_when_rds_api_base_unconfigured(monkeypatch):
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_ec2_settings(rds_openstates_api_base=""),
+    )
+    with patch(
+        "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+        new=AsyncMock(),
+    ) as mock_resolve:
+        await _maybe_trigger_legbot_for_archive("us", datetime.now(timezone.utc))
+
+    mock_resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wireguard_helper_posts_to_the_mac_and_logs_success(monkeypatch):
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+    mock_resp.json = lambda: {"success": True, "run_id": "abc123"}
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    from ddp_sync.pipelines.openstates_archive import _trigger_legbot_session_via_mac_wireguard
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "2026", _enabled_ec2_settings()
+        )
+
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://10.0.0.8:8001/ddp-sync/v1/trigger/scraper-session-legbot"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer fake-mac-ddp-sync-key"
+    assert call.kwargs["json"] == {"jurisdiction_iso2": "US", "session_code": "2026"}
+
+
+@pytest.mark.asyncio
+async def test_wireguard_helper_no_mac_target_configured_makes_no_call():
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        from ddp_sync.pipelines.openstates_archive import (
+            _trigger_legbot_session_via_mac_wireguard,
+        )
+
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "2026", _enabled_ec2_settings(mac_ddp_sync_base_url="")
+        )
+
+    mock_client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_wireguard_helper_request_failure_is_swallowed():
+    with patch("httpx.AsyncClient", side_effect=RuntimeError("network blew up")):
+        from ddp_sync.pipelines.openstates_archive import (
+            _trigger_legbot_session_via_mac_wireguard,
+        )
+
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "2026", _enabled_ec2_settings()
+        )  # must not raise
 
 
 # ── _run_archive_with_hook: local + Fargate branches, both wired to the hook ───────────

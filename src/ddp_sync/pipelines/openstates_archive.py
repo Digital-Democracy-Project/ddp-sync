@@ -30,10 +30,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+import httpx
 import requests
 import structlog
 
-from ddp_sync.config import get_settings
+from ddp_sync.config import SyncSettings, get_settings
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
@@ -492,6 +493,82 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
         logger.warning("openstates_archive: redis write failed", flow=flow_key, error=str(e))
 
 
+_MAC_TRIGGER_TIMEOUT_SECONDS = 3600.0
+
+
+def _mac_capable() -> bool:
+    """SYNC-65 (real conflict found by the prod agent, 2026-09-13): does THIS process
+    have real, local CAMS/LegBot access, or does it need to reach the Mac Studio over
+    WireGuard instead?
+
+    The first version of this hook assumed archiving only ever runs on the Mac's own
+    ddp-sync instance -- true when written, false as of this fix: `OPENSTATES_ARCHIVE_
+    ENABLED` is now also `true` on the EC2-broker instance (OPEN-192's `us` cutover),
+    which has no local CAMS server at all (`CAMS_BASE_URL` unset there, confirmed by
+    the prod agent directly). `cams_api_token` being configured is the right signal --
+    it's the one thing that's true on the Mac and false everywhere else, unlike
+    `OPENSTATES_ARCHIVE_ENABLED` itself, which is now true on both.
+    """
+    return bool(get_settings().cams_api_token)
+
+
+async def _trigger_legbot_session_via_mac_wireguard(
+    jurisdiction_iso2: str,
+    session_code: str,
+    settings: SyncSettings,
+) -> None:
+    """SYNC-65: the EC2-side counterpart to calling `trigger_scraper_session_pipeline`
+    in-process -- reaches the Mac Studio's own ddp-sync over the existing WireGuard
+    mesh instead, the same live pattern SYNC-59 built (and this same ticket's first
+    version removed, on the mistaken assumption it was now dead). `MAC_DDP_SYNC_BASE_
+    URL`/`MAC_DDP_SYNC_API_KEY` were left wired and verified working specifically for
+    this contingency -- see the prod agent's own note, `notes/open285-real-status-and-
+    sync65-conflict-20260913.md`.
+
+    Never raises -- same log-and-continue contract as the in-process branch; a
+    failure here must never affect the archive job's own already-successful result.
+    """
+    if not settings.mac_ddp_sync_base_url:
+        logger.warning(
+            "archiver_triggered_legbot_no_mac_target_configured",
+            jurisdiction=jurisdiction_iso2,
+            session_code=session_code,
+        )
+        return
+
+    headers = {
+        "Authorization": f"Bearer {settings.mac_ddp_sync_api_key}",
+        "X-DDP-Environment": "prod",
+    }
+    url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/scraper-session-legbot"
+
+    try:
+        async with httpx.AsyncClient(timeout=_MAC_TRIGGER_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                url,
+                headers=headers,
+                json={"jurisdiction_iso2": jurisdiction_iso2, "session_code": session_code},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+        logger.error(
+            "archiver_triggered_legbot_wireguard_trigger_failed",
+            jurisdiction=jurisdiction_iso2,
+            session_code=session_code,
+            error=str(e),
+        )
+        return
+
+    log_fn = logger.info if result.get("success") else logger.warning
+    log_fn(
+        "archiver_triggered_legbot_wireguard_result",
+        jurisdiction=jurisdiction_iso2,
+        session_code=session_code,
+        result=result,
+    )
+
+
 async def _maybe_trigger_legbot_for_archive(
     jurisdiction: str,
     archive_started_at: datetime,
@@ -517,31 +594,51 @@ async def _maybe_trigger_legbot_for_archive(
     must never affect the archive job's own reported outcome, same never-raise,
     log-and-continue contract as SYNC-50's original hook.
 
-    Reads touched sessions from the Mac's own local api-v3 instance
-    (`local_openstates_api_base`), same as SYNC-50's hook did for scraping.
-    Correct for BOTH Mac-run (`run-archive.sh`) and Fargate-run
-    (`cloud_archiver.py`/OPEN-192) archiving alike, unlike SYNC-59's own
-    scrape-side split (which needed a separate `rds_openstates_api_base` path
-    and a WireGuard hop to the Mac): this function is only ever called from
-    openstates_archive.py, which -- unlike scraping -- is not split across a
-    Mac/EC2 boundary (`OPENSTATES_ARCHIVE_ENABLED` is only ever true on the
-    Mac's own ddp-sync instance today), and OPEN-280's full-schema RDS
-    replication + OPEN-272's api-v3 repoint mean the Mac's local replica
-    already mirrors RDS-origin (Fargate-archived) data too.
+    **Mac-vs-EC2 split (added after the prod agent caught a real conflict,
+    2026-09-13):** this function's first version assumed archiving only ever runs
+    on the Mac's own ddp-sync instance and always dispatched in-process. That's no
+    longer true -- `OPENSTATES_ARCHIVE_ENABLED` is now also `true` on the EC2-broker
+    instance (OPEN-192), which has no local CAMS server. `_mac_capable()` decides
+    which of two paths this run takes:
 
-    Uses `since_param="document_updated_since"` (api-v3 PR #11), NOT the
-    default `updated_since` SYNC-50's scrape hook used -- pm-review on this
-    ticket's first version caught a real gap: `archive_bill_versions()`
-    (openstates-core) never touches `Bill.updated_at`, only the
-    `BillVersionDocument` row's own `updated_at` (confirmed by reading the
-    actual archiver code, not assumed). Reusing `updated_since` here would
-    have silently resolved zero sessions on every real archive run.
+    - Mac-capable: session resolution reads the Mac's own local api-v3
+      (`local_openstates_api_base`), dispatch calls `trigger_scraper_session_pipeline`
+      in-process. Unchanged from this ticket's first version.
+    - Not Mac-capable (EC2): session resolution reads `rds_openstates_api_base`
+      instead (the Mac's local replica reflects RDS-origin data via OPEN-280, but
+      only the MAC can reach `local_openstates_api_base` at all -- from the EC2 host
+      that address resolves to nothing), and dispatch reaches the Mac Studio's own
+      ddp-sync over WireGuard (`_trigger_legbot_session_via_mac_wireguard`), mirroring
+      SYNC-59's now-removed cloud-scrape hook.
+
+    Uses `since_param="document_updated_since"` (api-v3 PR #11) in both cases, NOT the
+    default `updated_since` SYNC-50's scrape hook used -- pm-review on this ticket's
+    first version caught a real gap: `archive_bill_versions()` (openstates-core) never
+    touches `Bill.updated_at`, only the `BillVersionDocument` row's own `updated_at`
+    (confirmed by reading the actual archiver code, not assumed). Reusing
+    `updated_since` here would have silently resolved zero sessions on every real
+    archive run.
     """
     settings = get_settings()
     if not settings.legbot_scrape_completion_trigger_enabled:
         return
 
+    mac_capable = _mac_capable()
+
     from ddp_sync.services.local_openstates_client import resolve_touched_sessions
+
+    resolution_kwargs: dict = {}
+    if not mac_capable:
+        if not settings.rds_openstates_api_base:
+            logger.warning(
+                "archiver_triggered_legbot_rds_read_path_not_configured",
+                jurisdiction=jurisdiction,
+            )
+            return
+        resolution_kwargs = {
+            "api_base": settings.rds_openstates_api_base,
+            "api_key": settings.rds_openstates_api_key,
+        }
 
     try:
         session_codes = await resolve_touched_sessions(
@@ -549,6 +646,7 @@ async def _maybe_trigger_legbot_for_archive(
             since=archive_started_at,
             max_bills_scanned=settings.legbot_scrape_completion_trigger_resolution_max_bills,
             since_param="document_updated_since",
+            **resolution_kwargs,
         )
     except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
         logger.error(
@@ -564,6 +662,13 @@ async def _maybe_trigger_legbot_for_archive(
             jurisdiction=jurisdiction,
             since=archive_started_at.isoformat(),
         )
+        return
+
+    if not mac_capable:
+        for session_code in session_codes:
+            await _trigger_legbot_session_via_mac_wireguard(
+                jurisdiction.upper(), session_code, settings
+            )
         return
 
     from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
