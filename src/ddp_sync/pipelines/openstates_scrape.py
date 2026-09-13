@@ -31,6 +31,7 @@ import structlog
 from ddp_sync.config import get_settings
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
+from ddp_sync.services.rds_credentials import resolve_rds_database_url
 
 logger = structlog.get_logger()
 
@@ -1931,6 +1932,28 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     logger.info("openstates_people_refresh: starting")
     t = time.monotonic()
 
+    # OPEN-285: os-people (via Django/openstates-core, same as os-update) reads a plain
+    # DATABASE_URL env var, defaulting to localhost when unset -- but this container's own
+    # environment only carries RDS_HOST/RDS_PORT/RDS_DBNAME/RDS_CREDENTIALS_SECRET_ARN, the
+    # same quartet _run_load()/openstates_archive.py already resolve from live rather than a
+    # cached value (OPEN-260: RDS's managed-secret rotation goes stale under a cached DATABASE_URL
+    # regardless of how recently this process started). Matching that same established pattern
+    # here rather than inventing a second way to reach RDS for this one caller.
+    rds_url, rds_error = resolve_rds_database_url()
+    if rds_error:
+        duration = round(time.monotonic() - t, 1)
+        error = f"cannot resolve an RDS target: {rds_error}"
+        logger.error("openstates_people_refresh: refused", error=error)
+        await _write_flow_status("openstates_people_refresh", {
+            "flow": "openstates_people_refresh",
+            "started_at": start_time.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "status": "failed",
+            "error": error,
+            "duration_seconds": duration,
+        })
+        return {"success": False, "error": error, "duration_seconds": duration}
+
     try:
         # This call site already passed start_new_session=True, which _run_with_group_kill's own
         # docstring explains is not sufficient on its own — it makes the child a process-group
@@ -1940,7 +1963,7 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         returncode, _stdout, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
             _run_with_group_kill,
             ["/bin/bash", script],
-            dict(os.environ),
+            {**os.environ, "DATABASE_URL": rds_url},
             3600,
         )
         duration = round(time.monotonic() - t, 1)
