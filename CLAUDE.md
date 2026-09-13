@@ -45,6 +45,37 @@ yet. FL/USA (which always specify one explicit session) already work. Do not bui
 missing RDS read replica speculatively without checking with Ramon first — it's a real
 piece of infrastructure, not just a settings value.
 
+## Crash-survivable LegBot dispatch tracking, and the RDS-replica gates layered on top of it (SYNC-61/275/276)
+
+`pipelines/bill_artifact_generation.py`'s `bill_changelog` dispatch records each in-flight
+task in Redis (`ddp:legbot:task:*`, sibling to the scraper pipeline's own `ddp:sync:task:*`
+convention) before polling starts, so a process crash mid-dispatch doesn't lose a real,
+already-computed CAMS answer — `recover_stale_legbot_dispatches()`, wired into the existing
+`_zombie_sync_watchdog`, sweeps stale records on the next cycle. `read_task_result()` is the
+one place that validates a stored CAMS answer is actually a dict before any caller touches
+it — two real production crashes (a corrupted stored answer hitting first the recovery
+sweep, then a live dispatch's own completion log line) were both fixed here, at the source,
+rather than patched at each call site individually. If you add a new caller of a CAMS task
+result, it goes through this function; don't re-implement your own JSON read.
+
+Two more gates sit in `session_pipeline_runner.py`'s `_process_bill_inner`, both from the
+`PLAN-rds-local-postgres-replication.md`/OPEN-269 epic, both **disabled by default and not
+yet exercised against real RDS** as of 2026-09-12:
+- `REPLICA_FRESHNESS_CHECK_ENABLED` (OPEN-275) — before dispatching a bill, compares an
+  `md5(raw_text)` content hash between RDS's current version-document row and the Mac's
+  local replica, failing closed (skip, no `BillArtifact` write) on any mismatch or error.
+  Needs a live RDS credential and a real logical-replication subscription, neither of which
+  exist yet.
+- `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` (OPEN-276) — checked *before* the freshness
+  check (cheap local test, no reason to pay an RDS round-trip for a jurisdiction dispatch
+  won't trust regardless), gates which jurisdictions may dispatch from the RDS-fed replica
+  at all. Empty by default; no real jurisdiction has been added to it yet.
+
+Both are meant to be turned on together, once OPEN-193 confirms a first real migrated
+jurisdiction and the replication epic's own build tickets (OPEN-270 through OPEN-277) have
+actually run against real RDS — check `PLAN-rds-local-postgres-replication.md` directly for
+current status before enabling either.
+
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
 Every recurring/scheduled pipeline in this stack is meant to be scheduled by **ddp-sync's own
