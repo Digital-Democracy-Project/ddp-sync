@@ -249,6 +249,7 @@ def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, s
 async def trigger_bill_artifact_generation(
     body: BillArtifactGenerationRequest,
     x_ddp_environment: str | None = Header(default=None),
+    x_ddp_automated_trigger: bool = Header(default=False),
     token: str = Depends(api_key_auth),
 ):
     """Fill in missing BillArtifact rows for every bill in one jurisdiction/session.
@@ -269,14 +270,28 @@ async def trigger_bill_artifact_generation(
     closes a real gap found in production 2026-09-13: a manual dispatch here
     and an automated one for the same jurisdiction+session could run fully
     concurrently, neither visible to the other, because only the automated
-    path's own trigger had a lock. require_trigger_enabled=False means this
-    endpoint is NOT paused by LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED --
-    that flag pauses only the automated path by design (see that wrapper's
-    own docstring); this endpoint keeps working exactly as before, just
-    lock-protected now too. A non-2xx result from the wrapper is translated
-    to an HTTP response below rather than returned as a 200 body the way the
-    old automated-only endpoint did, since this one has always had a real
-    human/caller inspecting the status code, not just a body field.
+    path's own trigger had a lock.
+
+    x_ddp_automated_trigger (pm-review, OPEN-290): the old
+    /trigger/scraper-session-legbot gave the Mac operator an independent
+    kill switch for automated dispatch (LEGBOT_SCRAPE_COMPLETION_TRIGGER_
+    ENABLED, checked on the Mac, regardless of what the EC2 caller's own
+    copy of that flag says) -- naively defaulting this endpoint's
+    require_trigger_enabled to False for every caller would have silently
+    dropped that switch for the one real automated caller that still
+    reaches this endpoint (the archive-completion hook's WireGuard hop,
+    _trigger_legbot_session_via_mac_wireguard), leaving only EC2's own
+    flag as protection with no Mac-side override. This header lets that one
+    caller identify itself so its call is still gated by THIS instance's
+    LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED, same as before OPEN-290. Every
+    other caller (the default, omitted) keeps this endpoint's original,
+    always-available manual behavior, unaffected by that flag -- exactly
+    like before this ticket.
+
+    A non-2xx result from the wrapper is translated to an HTTP response
+    below rather than returned as a 200 body the way the old automated-only
+    endpoint did, since this one has always had a real human/caller
+    inspecting the status code, not just a body field.
 
     `limit` has no upper ceiling (removed 2026-08-15 -- the previous hard
     cap of 25 was meant to protect against concurrent load on a shared
@@ -336,7 +351,7 @@ async def trigger_bill_artifact_generation(
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
         bill_candidates=bill_candidates,
-        require_trigger_enabled=False,
+        require_trigger_enabled=x_ddp_automated_trigger,
     )
 
     if result.get("success"):

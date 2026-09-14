@@ -527,13 +527,22 @@ async def _trigger_legbot_session_via_mac_wireguard(
 
     OPEN-290: posts to /trigger/bill-artifact-generation, not the removed
     /trigger/scraper-session-legbot -- that endpoint now shares the same
-    overlap lock (trigger_scraper_session_pipeline, require_trigger_enabled=
-    False) that this WireGuard hop itself relies on, so the two are no
-    longer distinguishable at the HTTP layer. Every cost-relevant dispatch
-    parameter is still resolved from THIS (the EC2 caller's own) instance's
-    settings.legbot_scrape_completion_trigger_* values, exactly as before --
-    bill-artifact-generation's request body just makes that explicit instead
-    of the old endpoint resolving them itself on the Mac side.
+    overlap lock (trigger_scraper_session_pipeline) that this WireGuard hop
+    relied on before. The X-DDP-Automated-Trigger header (below) is what
+    still identifies this specific call as the automated one, so the Mac's
+    own LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED still gates it exactly like
+    before -- a plain manual caller (the endpoint's original, only use case)
+    omits that header and is never subject to that flag, same as always.
+    Every cost-relevant dispatch parameter is still resolved from THIS (the
+    EC2 caller's own) instance's settings.legbot_scrape_completion_trigger_*
+    values, exactly as before -- bill-artifact-generation's request body
+    just makes that explicit instead of the old endpoint resolving them
+    itself on the Mac side. **This does mean EC2's own copy of those three
+    settings must be configured to match the Mac's** (previously only the
+    boolean enabled flag needed to agree across hosts; the dispatch-shape
+    values were resolved purely on the Mac and EC2 never needed them) --
+    flagged to the prod agent as a pre-deploy check, not something this
+    code can verify for itself.
 
     Never raises -- same log-and-continue contract as the in-process branch; a
     failure here must never affect the archive job's own already-successful result.
@@ -559,6 +568,12 @@ async def _trigger_legbot_session_via_mac_wireguard(
     headers = {
         "Authorization": f"Bearer {settings.mac_ddp_sync_api_key}",
         "X-DDP-Environment": "prod",
+        # pm-review (OPEN-290): identifies this call to the now-shared endpoint as
+        # the automated caller, so the Mac's own LEGBOT_SCRAPE_COMPLETION_TRIGGER_
+        # ENABLED still gates it independently of this (EC2) host's own copy of that
+        # flag -- restores the Mac-side kill switch the removed, automated-only
+        # /trigger/scraper-session-legbot used to provide.
+        "X-DDP-Automated-Trigger": "true",
     }
     url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/bill-artifact-generation"
 

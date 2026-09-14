@@ -481,6 +481,32 @@ def test_overlap_with_an_in_flight_automated_trigger_returns_409():
     mock_run.assert_not_awaited()
 
 
+def test_overlap_is_case_insensitive_matching_the_archive_hooks_own_casing():
+    """pm-review: the archive-completion hook always locks with
+    jurisdiction.upper() (openstates_archive.py's _maybe_trigger_legbot_for_
+    archive), while this endpoint's caller can type any case -- _VALID_
+    PAYLOAD itself uses lowercase 'fl'. Before the lock-key normalization
+    fix, an automated 'FL' lock and a manual 'fl' call would never contend,
+    silently defeating this whole ticket's fix for exactly the mismatched-
+    casing shape the real callers actually use."""
+    client = _make_authed_client()
+    # Prefilled directly with the raw, uppercase key the archive hook would
+    # produce -- not via _lock_key -- so this test doesn't just confirm
+    # _lock_key is consistent with itself.
+    from ddp_sync.pipelines.scraper_triggered_legbot import _LOCK_KEY_PREFIX
+    raw_uppercase_key = f"{_LOCK_KEY_PREFIX}FL:2026F"
+
+    with _patch_redis(_fake_redis_store({raw_uppercase_key: b"archive-hook-run-id"})), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=_VALID_PAYLOAD)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["current_run_id"] == "archive-hook-run-id"
+    mock_run.assert_not_awaited()
+
+
 def test_redis_unavailable_returns_503_without_calling_pipeline():
     client = _make_authed_client()
     unavailable = MagicMock()
@@ -513,6 +539,54 @@ def test_automated_trigger_disabled_flag_does_not_block_this_endpoint():
         new=AsyncMock(return_value={"bills_considered": 3, "results": []}),
     ) as mock_run:
         response = client.post("/trigger/bill-artifact-generation", json=_VALID_PAYLOAD)
+
+    assert response.status_code == 200
+    mock_run.assert_awaited_once()
+
+
+# --- OPEN-290 (pm-review): X-DDP-Automated-Trigger restores the Mac-side --
+# --- kill switch for the one real automated caller (the WireGuard hop) ---
+
+def test_automated_trigger_header_is_still_paused_by_the_disabled_flag():
+    """The one thing that must NOT change post-consolidation: the archive-
+    completion hook's WireGuard call (which sends this header) is still
+    paused by THIS instance's own LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED,
+    exactly like the removed /trigger/scraper-session-legbot used to be --
+    unlike a plain manual call (the test above), which never was."""
+    client = _make_authed_client()
+
+    with patch(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        return_value=SyncSettings(legbot_scrape_completion_trigger_enabled=False),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post(
+            "/trigger/bill-artifact-generation",
+            json=_VALID_PAYLOAD,
+            headers={"X-DDP-Automated-Trigger": "true"},
+        )
+
+    assert response.status_code == 500
+    mock_run.assert_not_awaited()
+
+
+def test_automated_trigger_header_still_dispatches_when_enabled():
+    client = _make_authed_client()
+
+    with _patch_redis(), patch(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        return_value=SyncSettings(legbot_scrape_completion_trigger_enabled=True),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 3, "results": []}),
+    ) as mock_run:
+        response = client.post(
+            "/trigger/bill-artifact-generation",
+            json=_VALID_PAYLOAD,
+            headers={"X-DDP-Automated-Trigger": "true"},
+        )
 
     assert response.status_code == 200
     mock_run.assert_awaited_once()

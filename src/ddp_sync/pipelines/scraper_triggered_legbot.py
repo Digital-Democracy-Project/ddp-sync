@@ -70,7 +70,20 @@ _LOCK_KEY_PREFIX = "ddp_sync:scraper_triggered_legbot:lock:"
 
 
 def _lock_key(jurisdiction_iso2: str, session_code: str) -> str:
-    return f"{_LOCK_KEY_PREFIX}{jurisdiction_iso2}:{session_code}"
+    """Uppercased (pm-review, OPEN-290): the two real callers that now share
+    this lock don't agree on casing -- the archive-completion hook always
+    passes jurisdiction.upper() (openstates_archive.py), while a manual
+    bill-artifact-generation caller can send whatever case they typed (e.g.
+    the lowercase 'fl' this project's own tests use). Before OPEN-290 this
+    never mattered (only one caller, always uppercase, ever touched the
+    lock); consolidating a second caller with untrusted casing onto the same
+    lock means an exact-string mismatch would silently defeat the very
+    overlap protection this ticket exists to add. session_pipeline_runner.py
+    already treats jurisdiction_iso2 as case-insensitive the same way
+    (`.upper()` before its own allowlist check) -- same normalization here,
+    for the same reason.
+    """
+    return f"{_LOCK_KEY_PREFIX}{jurisdiction_iso2.upper()}:{session_code.upper()}"
 
 
 async def trigger_scraper_session_pipeline(
