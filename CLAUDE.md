@@ -58,23 +58,38 @@ sweep, then a live dispatch's own completion log line) were both fixed here, at 
 rather than patched at each call site individually. If you add a new caller of a CAMS task
 result, it goes through this function; don't re-implement your own JSON read.
 
-Two more gates sit in `session_pipeline_runner.py`'s `_process_bill_inner`, both from the
-`PLAN-rds-local-postgres-replication.md`/OPEN-269 epic, both **disabled by default and not
-yet exercised against real RDS** as of 2026-09-12:
+**A real mechanism for reading RDS-loaded data on the Mac is a *different shape* than the
+`RDS_OPENSTATES_API_BASE` override above, and the two have not been fully reconciled.**
+`ddp-infra`'s `PLAN-rds-local-postgres-replication.md` sets up Postgres logical replication
+from RDS into the Mac's own local Postgres (a `ddp_local_replication` subscription,
+publishing all tables for every jurisdiction RDS holds any data for) — the idea being that
+the Mac's *existing* `local_openstates_api_base` read path becomes correct for cloud-owned
+jurisdictions too, once replication has caught up, rather than reading through a second,
+separate RDS-facing api-v3 instance. Two gates sit in `session_pipeline_runner.py`'s
+`_process_bill_inner`, both from the `PLAN-rds-local-postgres-replication.md`/OPEN-269 epic:
 - `REPLICA_FRESHNESS_CHECK_ENABLED` (OPEN-275) — before dispatching a bill, compares an
   `md5(raw_text)` content hash between RDS's current version-document row and the Mac's
   local replica, failing closed (skip, no `BillArtifact` write) on any mismatch or error.
-  Needs a live RDS credential and a real logical-replication subscription, neither of which
-  exist yet.
+  Independently overridable via `REPLICA_FRESHNESS_CONTENT_CHECK_ENABLED` (OPEN-289
+  follow-up) — set `False` in production for now, since OPEN-274's own health-check script
+  also needs a live RDS credential that isn't configured, so "trust the health check
+  instead" doesn't avoid a live-RDS dependency, it just moves it. Revert to `True` once
+  OPEN-274 is properly built out (real `RDS_MONITORING_DATABASE_URL` + a scheduled run).
 - `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` (OPEN-276) — checked *before* the freshness
   check (cheap local test, no reason to pay an RDS round-trip for a jurisdiction dispatch
   won't trust regardless), gates which jurisdictions may dispatch from the RDS-fed replica
-  at all. Empty by default; no real jurisdiction has been added to it yet.
+  at all.
 
-Both are meant to be turned on together, once OPEN-193 confirms a first real migrated
-jurisdiction and the replication epic's own build tickets (OPEN-270 through OPEN-277) have
-actually run against real RDS — check `PLAN-rds-local-postgres-replication.md` directly for
-current status before enabling either.
+**As of 2026-09-13, both are live in production**, not just built: real logical replication
+from production RDS is up (OPEN-271/272/273/274 all Done, independently verified), and
+`LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` covers 9 of the 10 tracked jurisdictions
+(`mi,ut,fl,va,wa,us,ma,az,nc` — only `al` excluded, since it never migrated to the RDS/cloud
+path at all). If asked to make a cloud-owned jurisdiction trigger LegBot end-to-end and it's
+not already working: **check `PLAN-rds-local-postgres-replication.md` and this epic's own
+Jira tickets for current status** before assuming either this mechanism or SYNC-59's own
+`RDS_OPENSTATES_API_BASE` needs building — most of this epic's build work is done; what's
+most likely still open is the specific per-jurisdiction session-resolution gap SYNC-59's own
+section above describes.
 
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
@@ -128,6 +143,51 @@ Full write-up and data: `ddp-agents`' `bench/legbot-throughput-2026-08-27/`.
 
 `scrapebot_client.py` has its own copy of the constant, still 5, deliberately —
 its mint holds no per-bill cache, so cadence costs it nothing there.
+
+## Running a targeted LegBot backfill: use `bill_candidates`, not a loop over the on-demand endpoint
+
+A 947-bill `bill_changelog` backfill (2026-09-10/11) was run by calling
+`/trigger/legbot-analyze-bill` (the on-demand, single-bill endpoint, with zero
+concurrency awareness) once per bill from an external script, paced only by a
+0.3s delay between *sending* each request. That pacing controlled nothing
+about how many dispatches were actually in flight at once — each call's own
+poll loop runs for potentially minutes, so hundreds ended up genuinely
+concurrent regardless of the send-side delay. That overloaded CAMS's
+status-check endpoint (618 real `500`s in ~6 minutes) and triggered a chain of
+fixes: SYNC-56 (a stuck-placeholder bug this surfaced), SYNC-60 (retry past a
+brief connection failure/5xx instead of hard-failing), SYNC-61 (track
+in-flight dispatches in Redis and recover a genuinely-completed one instead of
+losing it), SYNC-62 (id-targeted BillArtifact writes the recovery path needed),
+and SYNC-63 (this section).
+
+**Don't reach for an uncoordinated script again.** For a large targeted
+backfill against a specific, known list of bills (not "every bill in a
+session"), use `/trigger/bill-artifact-generation`'s `bill_candidates` field
+(SYNC-63) instead of scripting a loop over `/trigger/legbot-analyze-bill`. It
+feeds the same `session_pipeline_concurrency`-bounded, coverage-aware pipeline
+the session-wide scan already uses (`session_pipeline_runner.py`'s
+`run_legbot_pipeline`) a caller-supplied list instead of a session scan — real
+concurrency stays capped regardless of how large the list is, `retry_failed`/
+`dry_run` work exactly the same way, and an already-covered bill is skipped
+automatically rather than requiring a caller's own ad hoc checkpoint file:
+
+```
+POST /trigger/bill-artifact-generation
+{
+  "jurisdiction_iso2": "fl", "session_code": "2026F",
+  "artifact_types": ["bill_changelog"],
+  "include_org_research": false, "include_concept_statements": false,
+  "retry_failed": false, "limit": 1,
+  "bill_candidates": [
+    {"gov_id": "SJR 2F", "bill_openstates_id": "a3afb726-0000-0000-0000-000000000001"},
+    ...
+  ]
+}
+```
+
+`limit` is still a required, validated positive value, but it does not
+select or truncate `bill_candidates` in this mode — every supplied entry is
+processed regardless of what `limit` is set to; pass any positive integer.
 
 ## Dev/prod checkout discipline
 
