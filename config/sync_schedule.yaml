@@ -595,7 +595,14 @@ openstates_scrape:
     startup_review_delay_s: 300   # catch-up review after a restart, before the daily cron
     escalate_window: 2      # a productive run in the last N reviews -> nightly
     quiet_window: 4         # N quiet runs before demotion is even *suggested*
-    jurisdictions_excluded: ["mi"]
+    # MI was excluded here (OPEN-53: more traffic against a WAF worsens a block) until
+    # Ramon's direct decision (2026-09-14) to make MI eligible for escalation, so it can
+    # reach nightly via this mechanism instead of a separate hardcoded schedule entry --
+    # see notes/ops-handoff for the cadence discussion this followed from. Nightly for MI
+    # still means the same conservative per-request pacing the resilience profile already
+    # enforces (RESILIENCE_PROFILES / mi_waf_get) -- this list only controls whether MI is
+    # ELIGIBLE to be escalated, not how aggressively it's scraped once escalated.
+    jurisdictions_excluded: []
 
   patch_refresh:
     enabled: true
