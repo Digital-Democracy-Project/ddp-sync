@@ -590,7 +590,10 @@ openstates_scrape:
   # override already in Redis is simply not consulted (registration never reads it);
   # DEL ddp:scrape_cadence:<juris> clears it for good.
   dynamic_cadence:
-    enabled: false
+    enabled: true  # Ramon's direct decision, 2026-09-14, following the MI exclusion removal
+                   # above. Affects every jurisdiction eligible for review (FL + the whole
+                   # `secondary` batch: va/mi/ma/ut/az/nc), not MI alone -- rollback per the
+                   # runbook above is this line back to false plus a restart.
     review_time_utc: "00:30"
     startup_review_delay_s: 300   # catch-up review after a restart, before the daily cron
     escalate_window: 2      # a productive run in the last N reviews -> nightly
