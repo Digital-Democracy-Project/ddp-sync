@@ -323,3 +323,132 @@ def test_default_enable_flag_is_off():
 
 def test_default_lock_ttl_is_a_finite_positive_number():
     assert SyncSettings().legbot_scrape_completion_trigger_lock_ttl_seconds > 0
+
+
+# --- OPEN-290: manual-caller support (bill-artifact-generation consolidation) ---
+
+@pytest.mark.asyncio
+async def test_require_trigger_enabled_false_bypasses_the_disabled_flag(
+    fake_redis_store, monkeypatch
+):
+    """/trigger/bill-artifact-generation must keep working even with the
+    automated-only trigger disabled (its default) -- that flag pauses only
+    the automated path, per this function's own docstring."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_enabled=False),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 3, "results": []}),
+    ) as mock_run:
+        result = await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+            require_trigger_enabled=False,
+        )
+    assert result["success"] is True
+    mock_run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_require_trigger_enabled_true_is_the_unchanged_default(
+    fake_redis_store, monkeypatch
+):
+    """Omitting require_trigger_enabled must preserve every existing
+    automated-caller test's behavior above -- disabled still means
+    trigger_disabled, no Redis touched."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_enabled=False),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        result = await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+        )
+    assert result == {"success": False, "error": "trigger_disabled"}
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_is_passed_through_to_the_pipeline(
+    fake_redis_store, monkeypatch
+):
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    candidates = [{"gov_id": "HB 1", "bill_openstates_id": "id-1", "live_url_fallback": ""}]
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 1, "results": []}),
+    ) as mock_run:
+        result = await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+            bill_candidates=candidates,
+        )
+    assert result["success"] is True
+    assert mock_run.await_args.kwargs["bill_candidates"] == candidates
+
+
+@pytest.mark.asyncio
+async def test_bill_candidates_omitted_defaults_to_none(fake_redis_store, monkeypatch):
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 0, "results": []}),
+    ) as mock_run:
+        await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+        )
+    assert mock_run.await_args.kwargs["bill_candidates"] is None
+
+
+@pytest.mark.asyncio
+async def test_value_error_from_the_pipeline_returns_invalid_request_not_pipeline_error(
+    fake_redis_store, monkeypatch
+):
+    """OPEN-290: a manual caller (bill-artifact-generation) needs ValueError
+    (caller-fixable bad input) distinguished from an unexpected pipeline_error
+    so its own route can map it to 400, matching this endpoint's pre-
+    consolidation behavior exactly. Also must still release the lock."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(side_effect=ValueError("Unrecognized artifact_types: ['bogus']")),
+    ):
+        result = await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bogus"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+        )
+    assert result["success"] is False
+    assert result["error"] == "invalid_request"
+    assert "Unrecognized artifact_types" in result["detail"]
+    assert _lock_key("FL", "2026E") not in fake_redis_store._client.store

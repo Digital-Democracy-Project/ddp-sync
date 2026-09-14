@@ -70,7 +70,20 @@ _LOCK_KEY_PREFIX = "ddp_sync:scraper_triggered_legbot:lock:"
 
 
 def _lock_key(jurisdiction_iso2: str, session_code: str) -> str:
-    return f"{_LOCK_KEY_PREFIX}{jurisdiction_iso2}:{session_code}"
+    """Uppercased (pm-review, OPEN-290): the two real callers that now share
+    this lock don't agree on casing -- the archive-completion hook always
+    passes jurisdiction.upper() (openstates_archive.py), while a manual
+    bill-artifact-generation caller can send whatever case they typed (e.g.
+    the lowercase 'fl' this project's own tests use). Before OPEN-290 this
+    never mattered (only one caller, always uppercase, ever touched the
+    lock); consolidating a second caller with untrusted casing onto the same
+    lock means an exact-string mismatch would silently defeat the very
+    overlap protection this ticket exists to add. session_pipeline_runner.py
+    already treats jurisdiction_iso2 as case-insensitive the same way
+    (`.upper()` before its own allowlist check) -- same normalization here,
+    for the same reason.
+    """
+    return f"{_LOCK_KEY_PREFIX}{jurisdiction_iso2.upper()}:{session_code.upper()}"
 
 
 async def trigger_scraper_session_pipeline(
@@ -85,13 +98,26 @@ async def trigger_scraper_session_pipeline(
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    bill_candidates: list[dict] | None = None,
+    require_trigger_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Overlap-safe, independently-gated entry point for an automated
-    scraper-completion caller. Manual dispatches (the existing
-    /trigger/bill-artifact-generation endpoint, Agent Smith's own dispatches)
-    should keep calling run_legbot_pipeline directly -- this wrapper's lock
-    and enable-flag gate exist specifically for an automated caller with no
-    human reviewing each call before it fires.
+    """Overlap-safe entry point for both an automated scraper/archive-
+    completion caller AND (OPEN-290) a manual dispatch via
+    /trigger/bill-artifact-generation. Both now share this same Redis
+    overlap lock, closing the gap where a manual call and an automated call
+    for the same jurisdiction+session could run concurrently -- confirmed as
+    a real, live incident on 2026-09-13 (two full FL/2026E runs dispatched
+    20 seconds apart through the two previously-separate endpoints, neither
+    visible to the other's lock).
+
+    require_trigger_enabled: the automated caller's own
+    LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED gate exists to let an operator
+    pause *only* the automated path while manual dispatches keep working
+    (see module docstring, point 3) -- a manual caller must not become
+    newly subject to that same flag just by sharing this function, or
+    flipping it off would silently break the manual endpoint too. Pass
+    False for a manual/human-reviewed call; the lock itself (below) still
+    always applies regardless of this flag's value.
 
     Never raises: mirrors run_votebot_eval's own "always return a dict,
     caller decides what to do with success=False" convention, since this is
@@ -102,11 +128,12 @@ async def trigger_scraper_session_pipeline(
         {"success": False, "error": "trigger_disabled"}
         {"success": False, "error": "redis_unavailable"}
         {"success": False, "error": "already_running", "current_run_id": str}
+        {"success": False, "error": "invalid_request", "detail": str}
         {"success": False, "error": "pipeline_error", "detail": str}
         {"success": True, "run_id": str, **run_legbot_pipeline's own result}
     """
     settings = get_settings()
-    if not settings.legbot_scrape_completion_trigger_enabled:
+    if require_trigger_enabled and not settings.legbot_scrape_completion_trigger_enabled:
         logger.info(
             "scraper_triggered_legbot_disabled",
             jurisdiction_iso2=jurisdiction_iso2,
@@ -182,6 +209,7 @@ async def trigger_scraper_session_pipeline(
             dry_run=dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
+            bill_candidates=bill_candidates,
         )
         logger.info(
             "scraper_triggered_legbot_complete",
@@ -191,6 +219,20 @@ async def trigger_scraper_session_pipeline(
             duration_seconds=(datetime.now(timezone.utc) - start_time).total_seconds(),
         )
         return {"success": True, "run_id": run_id, **result}
+    except ValueError as e:
+        # OPEN-290: a manual caller (bill-artifact-generation) needs this
+        # distinguished from pipeline_error so its route can map it to 400,
+        # same as before this function mediated the call -- run_legbot_
+        # pipeline raises ValueError for caller-fixable bad input (unknown
+        # artifact_types, missing jurisdiction, etc.), not a server fault.
+        logger.warning(
+            "scraper_triggered_legbot_invalid_request",
+            run_id=run_id,
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=session_code,
+            error=str(e),
+        )
+        return {"success": False, "error": "invalid_request", "detail": str(e)}
     except Exception as e:  # noqa: BLE001 -- never raise into a background caller
         logger.exception(
             "scraper_triggered_legbot_pipeline_error",

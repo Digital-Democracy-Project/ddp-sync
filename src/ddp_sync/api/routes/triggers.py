@@ -249,6 +249,7 @@ def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, s
 async def trigger_bill_artifact_generation(
     body: BillArtifactGenerationRequest,
     x_ddp_environment: str | None = Header(default=None),
+    x_ddp_automated_trigger: bool = Header(default=False),
     token: str = Depends(api_key_auth),
 ):
     """Fill in missing BillArtifact rows for every bill in one jurisdiction/session.
@@ -259,6 +260,38 @@ async def trigger_bill_artifact_generation(
     /trigger/bill-version-check: returns the full result payload so an
     operator can review exactly what was generated/skipped/failed before
     running a broader batch.
+
+    OPEN-290: dispatches through pipelines.scraper_triggered_legbot.
+    trigger_scraper_session_pipeline (SYNC-48's overlap-safe wrapper,
+    require_trigger_enabled=False) instead of calling run_legbot_pipeline
+    directly, so this endpoint now shares the same Redis overlap lock as
+    the archive-completion hook (previously /trigger/scraper-session-legbot,
+    now removed -- see that endpoint's old docstring in git history). This
+    closes a real gap found in production 2026-09-13: a manual dispatch here
+    and an automated one for the same jurisdiction+session could run fully
+    concurrently, neither visible to the other, because only the automated
+    path's own trigger had a lock.
+
+    x_ddp_automated_trigger (pm-review, OPEN-290): the old
+    /trigger/scraper-session-legbot gave the Mac operator an independent
+    kill switch for automated dispatch (LEGBOT_SCRAPE_COMPLETION_TRIGGER_
+    ENABLED, checked on the Mac, regardless of what the EC2 caller's own
+    copy of that flag says) -- naively defaulting this endpoint's
+    require_trigger_enabled to False for every caller would have silently
+    dropped that switch for the one real automated caller that still
+    reaches this endpoint (the archive-completion hook's WireGuard hop,
+    _trigger_legbot_session_via_mac_wireguard), leaving only EC2's own
+    flag as protection with no Mac-side override. This header lets that one
+    caller identify itself so its call is still gated by THIS instance's
+    LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED, same as before OPEN-290. Every
+    other caller (the default, omitted) keeps this endpoint's original,
+    always-available manual behavior, unaffected by that flag -- exactly
+    like before this ticket.
+
+    A non-2xx result from the wrapper is translated to an HTTP response
+    below rather than returned as a 200 body the way the old automated-only
+    endpoint did, since this one has always had a real human/caller
+    inspecting the status code, not just a body field.
 
     `limit` has no upper ceiling (removed 2026-08-15 -- the previous hard
     cap of 25 was meant to protect against concurrent load on a shared
@@ -299,104 +332,57 @@ async def trigger_bill_artifact_generation(
 
     broker_api_base, broker_api_token = _resolve_batch_broker_target(x_ddp_environment)
 
-    from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
+    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
 
     bill_candidates = (
         [c.model_dump() for c in body.bill_candidates]
         if body.bill_candidates is not None else None
     )
 
-    try:
-        return await run_legbot_pipeline(
-            body.jurisdiction_iso2,
-            body.session_code,
-            body.artifact_types,
-            body.include_org_research,
-            body.limit,
-            include_concept_statements=body.include_concept_statements,
-            retry_failed=body.retry_failed,
-            dry_run=body.dry_run,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-            bill_candidates=bill_candidates,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Bill artifact generation trigger failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class ScraperSessionLegbotTriggerRequest(BaseModel):
-    """Request body for POST /trigger/scraper-session-legbot (SYNC-59)."""
-
-    jurisdiction_iso2: str = Field(..., description="Two-letter state code, e.g. 'VA'.")
-    session_code: str = Field(
-        ..., description="The specific session_code that just had bills touched, e.g. '2026S1'."
-    )
-
-
-@router.post("/trigger/scraper-session-legbot")
-async def trigger_scraper_session_legbot(
-    body: ScraperSessionLegbotTriggerRequest,
-    x_ddp_environment: str | None = Header(default=None),
-    token: str = Depends(api_key_auth),
-):
-    """Remote entry point for `pipelines.scraper_triggered_legbot.
-    trigger_scraper_session_pipeline` (SYNC-48's overlap-safe, independently-
-    gated automated-caller wrapper) -- SYNC-59.
-
-    Distinct from /trigger/bill-artifact-generation above, which calls
-    run_legbot_pipeline directly for a manual/human-reviewed dispatch.
-    trigger_scraper_session_pipeline's own Redis overlap lock and
-    LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED gate exist specifically for an
-    automated caller firing with no human reviewing each call first -- this
-    endpoint IS that caller's entry point, just reached over HTTP/WireGuard
-    instead of an in-process call, for OPEN-193's EC2-broker ddp-sync
-    instance (which runs the Fargate/RDS-load path and therefore has no
-    CAMS/LegBot of its own to dispatch to -- it has to reach the Mac
-    Studio's ddp-sync, the one instance that does, same live pattern
-    ddp-api's proxy already uses to reach the Mac's local api-v3, API-6).
-
-    Every cost-relevant dispatch parameter (artifact_types, limit,
-    include_concept_statements) is resolved from THIS instance's own
-    settings -- the same settings.legbot_scrape_completion_trigger_* values
-    the existing in-process scraper-completion hook
-    (_maybe_trigger_legbot_for_scrape, openstates_scrape.py) already reads
-    -- not accepted from the caller. A remote automated caller supplying its
-    own artifact_types/limit would bypass the same "no silent defaults for
-    an automated trigger" review this settings-based approach already
-    passed for the in-process case; this endpoint's whole job is dispatching
-    a known jurisdiction/session through that same, already-decided policy,
-    not accepting a new one per call.
-
-    x_ddp_environment: same optional 'dev'/'prod' switch
-    /trigger/bill-artifact-generation already exposes -- SYNC-59's own
-    caller sends `X-DDP-Environment: prod` so this writes to the real
-    production broker, not silently defaulting to dev.
-
-    Returns trigger_scraper_session_pipeline's own result dict verbatim,
-    always as a 200 -- that function never raises, and none of its
-    "success": False outcomes (trigger_disabled, redis_unavailable,
-    already_running, pipeline_error) are this endpoint's own error to
-    report; the caller inspects the body's own success/error fields.
-    """
-    broker_api_base, broker_api_token = _resolve_batch_broker_target(x_ddp_environment)
-    settings = get_settings()
-
-    from ddp_sync.pipelines.scraper_triggered_legbot import trigger_scraper_session_pipeline
-
-    return await trigger_scraper_session_pipeline(
+    result = await trigger_scraper_session_pipeline(
         body.jurisdiction_iso2,
         body.session_code,
-        settings.legbot_scrape_completion_trigger_artifact_types,
-        False,  # include_org_research -- Gate 1 item 4, PLAN-legbot.md §32: a deliberate
-        # operator decision, not a tunable default, same as the in-process hook.
-        settings.legbot_scrape_completion_trigger_limit,
-        include_concept_statements=settings.legbot_scrape_completion_trigger_include_concept_statements,
+        body.artifact_types,
+        body.include_org_research,
+        body.limit,
+        include_concept_statements=body.include_concept_statements,
+        retry_failed=body.retry_failed,
+        dry_run=body.dry_run,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
+        bill_candidates=bill_candidates,
+        require_trigger_enabled=x_ddp_automated_trigger,
     )
+
+    if result.get("success"):
+        return result
+
+    error = result.get("error")
+    if error == "trigger_disabled":
+        # Reachable only via X-DDP-Automated-Trigger (require_trigger_enabled=True) --
+        # a manual caller can never hit this, since it defaults require_trigger_enabled
+        # to False. An operator deliberately pausing the automated path is an expected,
+        # routine state, not a server fault -- returned as 200 (matching the removed
+        # /trigger/scraper-session-legbot's own always-200 contract for this exact case)
+        # so the WireGuard caller's own success-field check logs it at warning, not the
+        # error-level alert a raised HTTPException here would produce on every archive
+        # completion for as long as the pause is in effect.
+        return result
+    if error == "invalid_request":
+        raise HTTPException(status_code=400, detail=result.get("detail"))
+    if error == "already_running":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "already_running", "current_run_id": result.get("current_run_id")},
+        )
+    if error == "redis_unavailable":
+        raise HTTPException(
+            status_code=503,
+            detail="Overlap lock unavailable (Redis unreachable) -- retry shortly.",
+        )
+    # pipeline_error, or any other value this wrapper might return in the future.
+    logger.error(f"Bill artifact generation trigger failed: {result.get('detail')}")
+    raise HTTPException(status_code=500, detail=result.get("detail", "Unknown pipeline error."))
 
 
 # Which of the two configured ddp-broker-py instances (dev vs. prod) an
