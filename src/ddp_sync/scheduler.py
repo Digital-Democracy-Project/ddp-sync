@@ -562,9 +562,12 @@ class UpdateScheduler:
         # says. cadence_review() already enforces this at the decision point, but that
         # only covers decisions this process made -- a value hand-written into Redis, or
         # a future caller passing a map straight to this method, would otherwise reach
-        # APScheduler unchecked. MI is the one that matters: OPEN-53 established that
-        # more traffic against a WAF worsens a block, which is why it is already barred
-        # from scrape retries. A safety property is worth asserting twice.
+        # APScheduler unchecked. This is why the check is asserted twice, not just once at
+        # the decision point. MI was the original reason this list existed at all (OPEN-53:
+        # more traffic against a WAF worsens a block) until Ramon's direct 2026-09-14
+        # decision to make MI eligible for escalation instead -- the list itself, and this
+        # belt-and-suspenders enforcement, stay in place for whichever jurisdiction is
+        # actually configured as excluded at any given time.
         excluded_juris = set(
             config.get("dynamic_cadence", {}).get("jurisdictions_excluded", [])
         )
