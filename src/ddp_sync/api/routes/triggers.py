@@ -359,16 +359,19 @@ async def trigger_scraper_session_legbot(
     ddp-api's proxy already uses to reach the Mac's local api-v3, API-6).
 
     Every cost-relevant dispatch parameter (artifact_types, limit,
-    include_concept_statements) is resolved from THIS instance's own
-    settings -- the same settings.legbot_scrape_completion_trigger_* values
-    the existing in-process scraper-completion hook
+    include_concept_statements, retry_failed) is resolved from THIS
+    instance's own settings -- the same settings.legbot_scrape_completion_trigger_*
+    values the existing in-process scraper-completion hook
     (_maybe_trigger_legbot_for_scrape, openstates_scrape.py) already reads
     -- not accepted from the caller. A remote automated caller supplying its
-    own artifact_types/limit would bypass the same "no silent defaults for
-    an automated trigger" review this settings-based approach already
-    passed for the in-process case; this endpoint's whole job is dispatching
-    a known jurisdiction/session through that same, already-decided policy,
-    not accepting a new one per call.
+    own artifact_types/limit/retry_failed would bypass the same "no silent
+    defaults for an automated trigger" review this settings-based approach
+    already passed for the in-process case; this endpoint's whole job is
+    dispatching a known jurisdiction/session through that same,
+    already-decided policy, not accepting a new one per call.
+    retry_failed (OPEN-289 follow-up) defaults False -- flip
+    LEGBOT_SCRAPE_COMPLETION_TRIGGER_RETRY_FAILED true only for a deliberate,
+    one-off operator action, then flip it back.
 
     x_ddp_environment: same optional 'dev'/'prod' switch
     /trigger/bill-artifact-generation already exposes -- SYNC-59's own
@@ -394,6 +397,12 @@ async def trigger_scraper_session_legbot(
         # operator decision, not a tunable default, same as the in-process hook.
         settings.legbot_scrape_completion_trigger_limit,
         include_concept_statements=settings.legbot_scrape_completion_trigger_include_concept_statements,
+        # OPEN-289 follow-up: previously always implicitly False (the parameter was never
+        # passed at all) -- now resolved from this instance's own settings, same pattern as
+        # every other cost-relevant field above, so an operator can deliberately force a
+        # re-dispatch of rows already marked failed without changing default automated
+        # behavior for a real archive-completion trigger.
+        retry_failed=settings.legbot_scrape_completion_trigger_retry_failed,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )

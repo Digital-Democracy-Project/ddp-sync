@@ -514,6 +514,20 @@ class SyncSettings:
     # reintroduce here -- see _maybe_trigger_legbot_for_scrape's own call site.
     legbot_scrape_completion_trigger_include_concept_statements: bool = True
 
+    # OPEN-289 follow-up (2026-09-13, Ramon's call): independent enable flag for
+    # trigger_scraper_session_pipeline's own retry_failed parameter (SYNC-42), which this
+    # endpoint previously never passed at all -- always implicitly False, with no way for
+    # an operator to force a deliberate re-dispatch of rows already marked `failed`.
+    # Defaults to False (unchanged automated behavior: a real archive-completion trigger
+    # should never silently reprocess old failures on every run). Same "resolved from this
+    # instance's own settings, not the caller's request body" pattern every other
+    # cost-relevant field on this trigger already follows -- see
+    # trigger_scraper_session_legbot's own docstring for why a remote caller doesn't get to
+    # supply this kind of parameter directly. Meant to be flipped true only for a
+    # deliberate, one-off operator action (e.g. forcing a full regeneration after marking
+    # specific rows failed on purpose), then flipped back.
+    legbot_scrape_completion_trigger_retry_failed: bool = False
+
     # SYNC-50: safety bound on how many bills resolve_touched_sessions() will
     # scan (paginating the local api-v3 instance) before giving up on finding
     # every touched session for one scrape run. Not a limit on what LegBot
@@ -710,6 +724,10 @@ def _load_from_env() -> dict:
             os.getenv(
                 "LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "true"
             ).lower()
+            == "true"
+        ),
+        "legbot_scrape_completion_trigger_retry_failed": (
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_RETRY_FAILED", "false").lower()
             == "true"
         ),
         "legbot_scrape_completion_trigger_resolution_max_bills": int(

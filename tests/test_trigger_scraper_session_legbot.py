@@ -72,9 +72,9 @@ def test_missing_required_field_returns_422():
 def test_valid_payload_calls_the_pipeline_with_settings_derived_args_not_the_callers():
     """The whole point: a remote automated caller supplies only
     jurisdiction_iso2/session_code -- every cost-relevant parameter
-    (artifact_types, limit, include_concept_statements, include_org_research)
-    comes from THIS instance's own settings, not the request body, matching
-    the in-process hook's own policy exactly."""
+    (artifact_types, limit, include_concept_statements, include_org_research,
+    retry_failed) comes from THIS instance's own settings, not the request
+    body, matching the in-process hook's own policy exactly."""
     client = _make_authed_client()
 
     with patch(
@@ -91,6 +91,34 @@ def test_valid_payload_calls_the_pipeline_with_settings_derived_args_not_the_cal
     mock_trigger.assert_awaited_once_with(
         "va", "2026S1", ["bill_summary", "bill_changelog"], False, 10000,
         include_concept_statements=True,
+        retry_failed=False,
+        broker_api_base=None, broker_api_token=None,
+    )
+
+
+def test_retry_failed_setting_threads_through_to_the_pipeline():
+    """OPEN-289 follow-up: legbot_scrape_completion_trigger_retry_failed=True
+    must reach trigger_scraper_session_pipeline as retry_failed=True -- the
+    one way to force a deliberate re-dispatch of rows already marked
+    `failed` through this endpoint, since the request body itself never
+    accepts this parameter (same "resolved from settings, not the caller"
+    policy as every other cost-relevant field here)."""
+    client = _make_authed_client()
+
+    with patch(
+        "ddp_sync.api.routes.triggers.get_settings",
+        return_value=_configured_settings(legbot_scrape_completion_trigger_retry_failed=True),
+    ), patch(
+        "ddp_sync.pipelines.scraper_triggered_legbot.trigger_scraper_session_pipeline",
+        new=AsyncMock(return_value={"success": True, "run_id": "abc123"}),
+    ) as mock_trigger:
+        response = client.post("/trigger/scraper-session-legbot", json=_VALID_PAYLOAD)
+
+    assert response.status_code == 200
+    mock_trigger.assert_awaited_once_with(
+        "va", "2026S1", ["bill_summary", "bill_changelog"], False, 10000,
+        include_concept_statements=True,
+        retry_failed=True,
         broker_api_base=None, broker_api_token=None,
     )
 
