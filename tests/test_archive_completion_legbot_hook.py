@@ -338,9 +338,18 @@ async def test_wireguard_helper_posts_to_the_mac_and_logs_success(monkeypatch):
         )
 
     call = mock_client.post.await_args
-    assert call.args[0] == "http://10.0.0.8:8001/ddp-sync/v1/trigger/scraper-session-legbot"
+    assert call.args[0] == "http://10.0.0.8:8001/ddp-sync/v1/trigger/bill-artifact-generation"
     assert call.kwargs["headers"]["Authorization"] == "Bearer fake-mac-ddp-sync-key"
-    assert call.kwargs["json"] == {"jurisdiction_iso2": "US", "session_code": "2026"}
+    assert call.kwargs["json"] == {
+        "jurisdiction_iso2": "US",
+        "session_code": "2026",
+        "artifact_types": ["bill_summary", "bill_changelog"],
+        "include_org_research": False,
+        "include_concept_statements": True,
+        "limit": 10000,
+        "retry_failed": False,
+        "dry_run": False,
+    }
 
 
 @pytest.mark.asyncio

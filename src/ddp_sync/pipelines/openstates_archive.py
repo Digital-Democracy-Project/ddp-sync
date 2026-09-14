@@ -525,6 +525,16 @@ async def _trigger_legbot_session_via_mac_wireguard(
     this contingency -- see the prod agent's own note, `notes/open285-real-status-and-
     sync65-conflict-20260913.md`.
 
+    OPEN-290: posts to /trigger/bill-artifact-generation, not the removed
+    /trigger/scraper-session-legbot -- that endpoint now shares the same
+    overlap lock (trigger_scraper_session_pipeline, require_trigger_enabled=
+    False) that this WireGuard hop itself relies on, so the two are no
+    longer distinguishable at the HTTP layer. Every cost-relevant dispatch
+    parameter is still resolved from THIS (the EC2 caller's own) instance's
+    settings.legbot_scrape_completion_trigger_* values, exactly as before --
+    bill-artifact-generation's request body just makes that explicit instead
+    of the old endpoint resolving them itself on the Mac side.
+
     Never raises -- same log-and-continue contract as the in-process branch; a
     failure here must never affect the archive job's own already-successful result.
     """
@@ -550,7 +560,7 @@ async def _trigger_legbot_session_via_mac_wireguard(
         "Authorization": f"Bearer {settings.mac_ddp_sync_api_key}",
         "X-DDP-Environment": "prod",
     }
-    url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/scraper-session-legbot"
+    url = f"{settings.mac_ddp_sync_base_url.rstrip('/')}/ddp-sync/v1/trigger/bill-artifact-generation"
 
     # pm-review: the whole request/response cycle, INCLUDING interpreting the
     # response body, lives inside this one try -- the first version's `result.get(
@@ -563,7 +573,19 @@ async def _trigger_legbot_session_via_mac_wireguard(
             resp = await client.post(
                 url,
                 headers=headers,
-                json={"jurisdiction_iso2": jurisdiction_iso2, "session_code": session_code},
+                json={
+                    "jurisdiction_iso2": jurisdiction_iso2,
+                    "session_code": session_code,
+                    "artifact_types": settings.legbot_scrape_completion_trigger_artifact_types,
+                    "include_org_research": False,  # Gate 1 item 4, PLAN-legbot.md §32: a
+                    # deliberate operator decision, not a tunable default.
+                    "include_concept_statements": (
+                        settings.legbot_scrape_completion_trigger_include_concept_statements
+                    ),
+                    "limit": settings.legbot_scrape_completion_trigger_limit,
+                    "retry_failed": False,  # SYNC-42: this automated path never retries.
+                    "dry_run": False,
+                },
             )
             resp.raise_for_status()
             result = resp.json()
