@@ -207,3 +207,97 @@ def test_mac_ddp_sync_base_url_and_rds_openstates_api_base_env_wins_over_conflic
         assert settings.rds_openstates_api_base == "http://10.0.0.11:8002"
     finally:
         get_settings.cache_clear()
+
+
+def test_legbot_scrape_completion_trigger_fields_apply_over_secrets_manager(monkeypatch):
+    """OPEN-290, found live on the EC2-broker host verifying the WireGuard-relayed dispatch
+    body OPEN-290 added (2026-09-14): fourth instance of the exact same bug. These four
+    fields are per-host the same way mac_ddp_sync_base_url/rds_openstates_api_base are, but
+    nothing on EC2 ever needed to resolve them locally until OPEN-290's WireGuard caller
+    started building its own request body from them -- confirmed live: all four came back
+    their dataclass defaults regardless of what was set in the container's real environment."""
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "true")
+    monkeypatch.setenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES", "bill_summary,bill_changelog"
+    )
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT", "25")
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "false")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        # the real secret's shape: none of these four fields present, matching production today
+        return_value={"api_key": "from-secrets-manager"},
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"  # confirms Secrets Manager path was taken
+        assert settings.legbot_scrape_completion_trigger_enabled is True
+        assert settings.legbot_scrape_completion_trigger_artifact_types == [
+            "bill_summary", "bill_changelog",
+        ]
+        assert settings.legbot_scrape_completion_trigger_limit == 25
+        assert settings.legbot_scrape_completion_trigger_include_concept_statements is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_legbot_scrape_completion_trigger_fields_env_wins_over_conflicting_secret(monkeypatch):
+    """pm-review pattern (see the mac_ddp_sync_base_url test above): the previous test's
+    Secrets Manager fixture omits all four fields, which proves env values apply but not that
+    they take PRECEDENCE over a real, conflicting secret-supplied value."""
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "true")
+    monkeypatch.setenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES", "bill_summary,bill_changelog"
+    )
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT", "25")
+    monkeypatch.setenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS", "false")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={
+            "api_key": "from-secrets-manager",
+            "legbot_scrape_completion_trigger_enabled": False,
+            "legbot_scrape_completion_trigger_artifact_types": ["stale_from_secret"],
+            "legbot_scrape_completion_trigger_limit": 999999,
+            "legbot_scrape_completion_trigger_include_concept_statements": True,
+        },
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"
+        assert settings.legbot_scrape_completion_trigger_enabled is True
+        assert settings.legbot_scrape_completion_trigger_artifact_types == [
+            "bill_summary", "bill_changelog",
+        ]
+        assert settings.legbot_scrape_completion_trigger_limit == 25
+        assert settings.legbot_scrape_completion_trigger_include_concept_statements is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_legbot_scrape_completion_trigger_artifact_types_env_ignores_empty_entries(
+    monkeypatch,
+):
+    """Same trailing/double-comma hazard the replica-freshness allowlist parser above already
+    guards against."""
+    monkeypatch.setenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES", "bill_summary,,bill_changelog,"
+    )
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={"api_key": "from-secrets-manager"},
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.legbot_scrape_completion_trigger_artifact_types == [
+            "bill_summary", "bill_changelog",
+        ]
+    finally:
+        get_settings.cache_clear()

@@ -780,6 +780,45 @@ def get_settings() -> SyncSettings:
     if env_rds_openstates_api_base is not None:
         filtered["rds_openstates_api_base"] = env_rds_openstates_api_base
 
+    # OPEN-290 (found live on the EC2-broker host, 2026-09-14, verifying the WireGuard-
+    # relayed dispatch body OPEN-290 added): fourth instance of the same SYNC-51/OPEN-193
+    # bug class above. These four legbot_scrape_completion_trigger_* fields are per-host
+    # the same way mac_ddp_sync_base_url/rds_openstates_api_base are -- EC2 and the Mac can
+    # legitimately want different artifact_types/limit/include_concept_statements, and until
+    # OPEN-290, nothing on EC2 ever needed to resolve them locally (the old /trigger/scraper-
+    # session-legbot resolved them entirely on the Mac side, which receives the request).
+    # OPEN-290's replacement (_trigger_legbot_session_via_mac_wireguard building its own
+    # request body) is the first EC2-side code to read these fields, and found them silently
+    # inert: LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES/_LIMIT/
+    # _INCLUDE_CONCEPT_STATEMENTS/_ENABLED set in the container's real environment had zero
+    # effect, since _load_from_env() (the only code that would read them) never runs on a
+    # host where Secrets Manager succeeds. legbot_scrape_completion_trigger_enabled is
+    # included here too even though OPEN-290 didn't newly depend on it -- it's the exact same
+    # bug on a sibling field in the same feature area, already load-bearing for whether
+    # _maybe_trigger_legbot_for_archive's EC2 branch attempts a WireGuard call at all.
+    env_legbot_trigger_enabled = os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED")
+    if env_legbot_trigger_enabled is not None:
+        filtered["legbot_scrape_completion_trigger_enabled"] = (
+            env_legbot_trigger_enabled.lower() == "true"
+        )
+    env_legbot_trigger_artifact_types = os.getenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES"
+    )
+    if env_legbot_trigger_artifact_types is not None:
+        filtered["legbot_scrape_completion_trigger_artifact_types"] = [
+            t.strip() for t in env_legbot_trigger_artifact_types.split(",") if t.strip()
+        ]
+    env_legbot_trigger_limit = os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT")
+    if env_legbot_trigger_limit is not None:
+        filtered["legbot_scrape_completion_trigger_limit"] = int(env_legbot_trigger_limit)
+    env_legbot_trigger_include_concept_statements = os.getenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS"
+    )
+    if env_legbot_trigger_include_concept_statements is not None:
+        filtered["legbot_scrape_completion_trigger_include_concept_statements"] = (
+            env_legbot_trigger_include_concept_statements.lower() == "true"
+        )
+
     return SyncSettings(**filtered)
 
 
