@@ -552,7 +552,12 @@ def test_automated_trigger_header_is_still_paused_by_the_disabled_flag():
     completion hook's WireGuard call (which sends this header) is still
     paused by THIS instance's own LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED,
     exactly like the removed /trigger/scraper-session-legbot used to be --
-    unlike a plain manual call (the test above), which never was."""
+    unlike a plain manual call (the test above), which never was. Returns
+    200 with success=False (not a raised error) -- an operator deliberately
+    pausing the automated path is an expected, routine state, matching the
+    removed endpoint's own always-200 contract for this exact case; a
+    raised 500 here would fire an error-level alert on every archive
+    completion for as long as the pause is in effect."""
     client = _make_authed_client()
 
     with patch(
@@ -568,7 +573,8 @@ def test_automated_trigger_header_is_still_paused_by_the_disabled_flag():
             headers={"X-DDP-Automated-Trigger": "true"},
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 200
+    assert response.json() == {"success": False, "error": "trigger_disabled"}
     mock_run.assert_not_awaited()
 
 

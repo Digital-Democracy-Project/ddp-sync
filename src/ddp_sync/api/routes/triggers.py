@@ -358,6 +358,16 @@ async def trigger_bill_artifact_generation(
         return result
 
     error = result.get("error")
+    if error == "trigger_disabled":
+        # Reachable only via X-DDP-Automated-Trigger (require_trigger_enabled=True) --
+        # a manual caller can never hit this, since it defaults require_trigger_enabled
+        # to False. An operator deliberately pausing the automated path is an expected,
+        # routine state, not a server fault -- returned as 200 (matching the removed
+        # /trigger/scraper-session-legbot's own always-200 contract for this exact case)
+        # so the WireGuard caller's own success-field check logs it at warning, not the
+        # error-level alert a raised HTTPException here would produce on every archive
+        # completion for as long as the pause is in effect.
+        return result
     if error == "invalid_request":
         raise HTTPException(status_code=400, detail=result.get("detail"))
     if error == "already_running":
