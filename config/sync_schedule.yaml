@@ -542,14 +542,13 @@ openstates_scrape:
   # (quiet AND every run succeeded AND it has filed at some point) -- what is missing is the
   # decision, not the code.
   #
-  # DISABLED for the first cycle. This needs OPEN-139's bills_new figures in the run history
-  # before it can decide anything, and those only start accumulating when OPEN-139 ships. Enable
-  # after a few weeks of history exist, the same check OPEN-139's own filing_activity block
-  # describes.
+  # ENABLED 2026-09-14 (Ramon's direct decision, ddp-sync PR #155), after OPEN-139's bills_new
+  # figures had accumulated enough run history for the review to have something to decide from.
   #
-  # excluded: MI must never be escalated. OPEN-53 established that more traffic against a WAF
-  # worsens a block, which is why MI is already excluded from scrape retries. Same key shape as
-  # scrape_retry.jurisdictions_excluded above, on purpose.
+  # excluded: empty by default. MI was excluded here from OPEN-53 (more traffic against a WAF
+  # worsens a block) until PR #154 (2026-09-14, Ramon's direct decision) made it eligible for
+  # escalation like any other jurisdiction. MI's blind-retry exclusion is a separate, still-active
+  # mechanism (scrape_retry.jurisdictions_excluded above) -- unaffected by this one.
   #
   # Read by scrape_cadence.py via the cadence-review job.
   # HOW IT TAKES EFFECT, and what "without a restart" actually means here. A daily review
@@ -622,11 +621,15 @@ openstates_scrape:
       # that would have created it), so re-enabling here is based on that external confirmation,
       # not the marker.
       sync_time_utc: "02:00"   # longest job — starts first
-      # Weekly while FL is out of session — new draft bills aren't introduced
+      # Weekly floor while FL is out of session — new draft bills aren't introduced
       # until ~November, so daily scrapes are wasted work and each one wipes
       # _data/fl on startup (colliding with historical backfills). Runs Sunday
       # 02:00 UTC alongside the secondary batch (independent _data/ dirs).
-      # Remove sync_day (revert to daily) once the 2027 session opens.
+      # OPEN-140 (dynamic_cadence, enabled 2026-09-14): this is now a FLOOR, not a manual
+      # switch -- no more remembering to flip it in November. Once FL's own filing activity
+      # shows up in its run history, the cadence-review job escalates it to nightly on its
+      # own; this value is only what FL falls back to if that history is missing or Redis
+      # is down.
       sync_day: sunday
       sessions:
         - "2026"
