@@ -3,10 +3,16 @@
 Covers: overlap rejection while a trigger is in flight, safe recovery after
 that trigger releases (no permanent omission, no stale lock), lock release
 on both success and pipeline-exception paths, the independent enable flag,
-and per-(jurisdiction, session) lock scoping.
+per-(jurisdiction, session) lock scoping, and (OPEN-292) the lease-renewal
+heartbeat: renews on a cadence while a run is genuinely still going, never
+resurrects a lock a newer trigger already owns, a renewal failure never
+aborts the underlying pipeline, and the heartbeat task is reliably stopped
+on every exit path.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +20,9 @@ import pytest
 
 from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.scraper_triggered_legbot import (
+    _lock_heartbeat_loop,
     _lock_key,
+    _renew_lock_if_owned,
     trigger_scraper_session_pipeline,
 )
 
@@ -22,11 +30,14 @@ from ddp_sync.pipelines.scraper_triggered_legbot import (
 class FakeRedisClient:
     """Mirrors test_votebot_eval.py's own FakeRedisClient -- same minimal
     SET-NX-EX/GET/DELETE surface, duplicated here rather than shared since
-    the original isn't exported from a conftest fixture either."""
+    the original isn't exported from a conftest fixture either. `expire`
+    added for OPEN-292's lease renewal -- tracked separately from
+    `set_ex_history` since a renewal is EXPIRE, not a fresh SET."""
 
     def __init__(self):
         self.store: dict[str, bytes] = {}
         self.set_ex_history: list[tuple[str, int]] = []
+        self.expire_history: list[tuple[str, int]] = []
 
     async def set(self, key, value, nx=False, ex=None):
         if nx and key in self.store:
@@ -41,6 +52,12 @@ class FakeRedisClient:
 
     async def delete(self, key):
         return 1 if self.store.pop(key, None) is not None else 0
+
+    async def expire(self, key, ttl):
+        if key not in self.store:
+            return False
+        self.expire_history.append((key, ttl))
+        return True
 
 
 @pytest.fixture
@@ -452,3 +469,194 @@ async def test_value_error_from_the_pipeline_returns_invalid_request_not_pipelin
     assert result["error"] == "invalid_request"
     assert "Unrecognized artifact_types" in result["detail"]
     assert _lock_key("FL", "2026E") not in fake_redis_store._client.store
+
+
+# --- OPEN-292: lease renewal (a flat 4h TTL never covered a real full-session ---
+# --- sweep -- MI's own 2025-2026 run took 24-30+ hours) -------------------------
+
+
+def test_default_renewal_is_comfortably_under_the_default_ttl():
+    """The whole point of a renewal cadence is that one missed tick (a brief
+    Redis blip) doesn't let the lease expire -- confirms the shipped defaults
+    actually give real margin, not just "renewal happens before TTL" by a
+    hair."""
+    s = SyncSettings()
+    assert s.legbot_scrape_completion_trigger_lock_renewal_seconds > 0
+    assert s.legbot_scrape_completion_trigger_lock_renewal_seconds * 3 < (
+        s.legbot_scrape_completion_trigger_lock_ttl_seconds
+    )
+
+
+@pytest.mark.asyncio
+async def test_renew_extends_the_ttl_when_still_owned(fake_redis_store):
+    key = _lock_key("MI", "2025-2026")
+    fake_redis_store._client.store[key] = b"run-a"
+
+    result = await _renew_lock_if_owned(fake_redis_store, key, "run-a", 600)
+
+    assert result is True
+    assert fake_redis_store._client.expire_history == [(key, 600)]
+
+
+@pytest.mark.asyncio
+async def test_renew_does_not_resurrect_a_lock_a_newer_trigger_already_owns(
+    fake_redis_store,
+):
+    """The exact failure this ownership check exists to prevent: this run's
+    own lease already lapsed and a later trigger legitimately acquired the
+    key under its own run_id -- a stale renewal from the first run must not
+    extend that newer owner's lock's lifetime out from under it."""
+    key = _lock_key("MI", "2025-2026")
+    fake_redis_store._client.store[key] = b"run-b"  # the newer owner
+
+    result = await _renew_lock_if_owned(fake_redis_store, key, "run-a", 600)
+
+    assert result is False
+    assert fake_redis_store._client.expire_history == []
+    assert fake_redis_store._client.store[key] == b"run-b"  # untouched
+
+
+@pytest.mark.asyncio
+async def test_renew_of_a_key_that_no_longer_exists_is_a_clean_no_op(fake_redis_store):
+    """The lock was already released (or never existed) -- current is None,
+    which must never equal a real run_id, so this takes the same safe
+    not-owned path as a reassigned lock."""
+    result = await _renew_lock_if_owned(
+        fake_redis_store, _lock_key("MI", "2025-2026"), "run-a", 600
+    )
+    assert result is False
+    assert fake_redis_store._client.expire_history == []
+
+
+@pytest.mark.asyncio
+async def test_renew_swallows_a_redis_exception_and_returns_false():
+    """A renewal failure (a Redis blip, a dropped connection) must never
+    raise -- same 'an auxiliary concern can't affect the primary job's own
+    result' contract every other hook in this codebase already follows."""
+    broken = MagicMock()
+    broken._client = AsyncMock()
+    broken._client.get = AsyncMock(side_effect=ConnectionError("redis dropped"))
+
+    result = await _renew_lock_if_owned(broken, "some-key", "run-a", 600)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_renews_repeatedly_until_cancelled(fake_redis_store):
+    """The loop's only real job: keep calling the renewal on a fixed cadence
+    for as long as it's allowed to run, and stop cleanly (no exception
+    escaping) the moment it's cancelled."""
+    key = _lock_key("MI", "2025-2026")
+    fake_redis_store._client.store[key] = b"run-a"
+
+    task = asyncio.create_task(
+        _lock_heartbeat_loop(fake_redis_store, key, "run-a", 600, 0.01)
+    )
+    await asyncio.sleep(0.05)  # several renewal intervals at 0.01s each
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(fake_redis_store._client.expire_history) >= 2
+    assert all(ttl == 600 for (_, ttl) in fake_redis_store._client.expire_history)
+
+
+@pytest.mark.asyncio
+async def test_a_long_running_pipeline_keeps_getting_its_lease_renewed(
+    fake_redis_store, monkeypatch
+):
+    """End-to-end: a pipeline call that outlives several renewal intervals
+    (simulating a real multi-hour session sweep, compressed to milliseconds
+    here) gets its lock renewed by the background heartbeat while it runs --
+    this is the actual behavior OPEN-292 exists to add, not just the
+    isolated renewal/loop units above."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(
+            legbot_scrape_completion_trigger_lock_ttl_seconds=600,
+            legbot_scrape_completion_trigger_lock_renewal_seconds=0.01,
+        ),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+
+    async def _slow_pipeline(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return {"bills_considered": 1, "results": []}
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=_slow_pipeline,
+    ):
+        result = await trigger_scraper_session_pipeline(
+            "MI", "2025-2026", ["bill_summary"], False, 5000,
+            include_concept_statements=False, retry_failed=False,
+        )
+
+    assert result["success"] is True
+    assert len(fake_redis_store._client.expire_history) >= 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_task_is_cancelled_promptly_after_the_pipeline_finishes(
+    fake_redis_store, monkeypatch
+):
+    """If cancellation were broken (e.g. the finally block forgot to cancel,
+    or awaited the wrong task), this test would hang until wait_for's own
+    timeout -- a fast return here is itself the proof the heartbeat task
+    doesn't outlive the call that started it."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(
+            legbot_scrape_completion_trigger_lock_ttl_seconds=600,
+            legbot_scrape_completion_trigger_lock_renewal_seconds=0.01,
+        ),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 0, "results": []}),
+    ):
+        result = await asyncio.wait_for(
+            trigger_scraper_session_pipeline(
+                "MI", "2025-2026", ["bill_summary"], False, 5000,
+                include_concept_statements=False, retry_failed=False,
+            ),
+            timeout=2.0,
+        )
+
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_run_at_all_while_overlap_rejected(
+    fake_redis_store, monkeypatch
+):
+    """No lock was acquired, so there is nothing to renew -- confirms the
+    heartbeat task is only ever started after a successful acquisition, not
+    unconditionally."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.scraper_triggered_legbot.get_settings",
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_lock_renewal_seconds=0.01),
+    )
+    monkeypatch.setattr(
+        "ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store
+    )
+    fake_redis_store._client.store[_lock_key("FL", "2026E")] = b"existing-run-id"
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ):
+        await trigger_scraper_session_pipeline(
+            "FL", "2026E", ["bill_summary"], False, 10,
+            include_concept_statements=False, retry_failed=False,
+        )
+    await asyncio.sleep(0.03)  # would be enough for a stray heartbeat to fire
+
+    assert fake_redis_store._client.expire_history == []
