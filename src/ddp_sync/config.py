@@ -476,18 +476,31 @@ class SyncSettings:
     # is nothing for an operator to opt into today.
     legbot_scrape_completion_trigger_enabled: bool = False
 
-    # SYNC-48: TTL for the overlap-rejection lock in
-    # scraper_triggered_legbot.py, keyed per (jurisdiction, session). A
-    # coarse ceiling, not a correctness mechanism -- see that module's own
-    # docstring for why a lock that occasionally expires early (letting a
-    # second run start) or late (rejecting one extra trigger) is safe by
-    # construction, not something this TTL needs to get exactly right.
-    # Sized generously: real throughput after SYNC-37/38/39's 2026-08-27
-    # measurements was ~25s/bill on a 20-bill session (see PLAN-legbot.md),
-    # so a few hundred-bill session is on the order of an hour or two at
-    # session_pipeline_concurrency's default of 1 (sequential) -- 4 hours
-    # leaves real headroom above that without being unboundable.
-    legbot_scrape_completion_trigger_lock_ttl_seconds: int = 14400
+    # SYNC-48/OPEN-292: TTL for the overlap-rejection lock in
+    # scraper_triggered_legbot.py, keyed per (jurisdiction, session). Originally a
+    # flat, never-renewed ceiling sized at 4 hours from SYNC-37/38/39's 2026-08-27
+    # throughput measurements (~25s/bill on a 20-bill session) -- that assumed
+    # every dispatch was a bounded batch. OPEN-292: a real full-session sweep
+    # (limit=5000, no bill_candidates cap) has no such bound -- MI's real
+    # 2025-2026 session took 24-30+ hours, well past the old 4h TTL, leaving the
+    # run with zero overlap protection for the majority of its own runtime.
+    #
+    # Now a lease that gets renewed periodically (see
+    # legbot_scrape_completion_trigger_lock_renewal_seconds below) for as long as
+    # the pipeline is genuinely still running -- so this value no longer needs to
+    # cover a run's full duration, only the gap between one renewal and the next
+    # (with margin). Lowered accordingly: a hard-crashed process (no clean
+    # shutdown, no more heartbeats) now loses its lock within roughly one TTL
+    # window instead of the old 4 hours -- strictly better stale-lock recovery,
+    # not a tradeoff against the long-run fix.
+    legbot_scrape_completion_trigger_lock_ttl_seconds: int = 600
+
+    # OPEN-292: how often the lease above is renewed while a dispatch is still
+    # running (a background task alongside the actual pipeline call -- see
+    # scraper_triggered_legbot.py's own docstring on the heartbeat). Comfortably
+    # under the TTL (5x margin at these defaults) so one missed tick from a brief
+    # Redis blip doesn't let the lock expire out from under a still-live run.
+    legbot_scrape_completion_trigger_lock_renewal_seconds: int = 120
 
     # SYNC-50: what a real scraper-completion trigger dispatches once it has
     # resolved which session(s) a scrape run touched. Deliberately its own
@@ -687,7 +700,10 @@ def _load_from_env() -> dict:
             os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "false").lower() == "true"
         ),
         "legbot_scrape_completion_trigger_lock_ttl_seconds": int(
-            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_TTL_SECONDS", "14400")
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_TTL_SECONDS", "600")
+        ),
+        "legbot_scrape_completion_trigger_lock_renewal_seconds": int(
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_RENEWAL_SECONDS", "120")
         ),
         # SYNC-50. Default mirrors session_pipeline_runner.ALL_ARTIFACT_TYPES exactly --
         # not imported from there to avoid a pipelines-importing-into-config cycle; that
@@ -817,6 +833,27 @@ def get_settings() -> SyncSettings:
     if env_legbot_trigger_include_concept_statements is not None:
         filtered["legbot_scrape_completion_trigger_include_concept_statements"] = (
             env_legbot_trigger_include_concept_statements.lower() == "true"
+        )
+
+    # OPEN-292: same SYNC-51/OPEN-193 gap, two more fields in this same area --
+    # lock_ttl_seconds was already exposed to _load_from_env() but missing here (an
+    # operator's env override was silently inert on any host where Secrets Manager
+    # succeeds, same as the four fields above before OPEN-290 caught it), and
+    # lock_renewal_seconds is new with this ticket, so it needs this wiring from
+    # the start rather than waiting for its own separate discovery.
+    env_legbot_trigger_lock_ttl_seconds = os.getenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_TTL_SECONDS"
+    )
+    if env_legbot_trigger_lock_ttl_seconds is not None:
+        filtered["legbot_scrape_completion_trigger_lock_ttl_seconds"] = int(
+            env_legbot_trigger_lock_ttl_seconds
+        )
+    env_legbot_trigger_lock_renewal_seconds = os.getenv(
+        "LEGBOT_SCRAPE_COMPLETION_TRIGGER_LOCK_RENEWAL_SECONDS"
+    )
+    if env_legbot_trigger_lock_renewal_seconds is not None:
+        filtered["legbot_scrape_completion_trigger_lock_renewal_seconds"] = int(
+            env_legbot_trigger_lock_renewal_seconds
         )
 
     return SyncSettings(**filtered)

@@ -32,6 +32,24 @@ questions -- see the ticket for the full rationale):
    over-rejects (e.g. a slow release) costs a few minutes of staleness, not
    a missed bill.
 
+   OPEN-292: this lock is now a renewed LEASE, not a flat one-shot TTL. A
+   real full-session sweep (limit=5000, no bill_candidates cap) has no
+   bound on how long it takes -- MI's own 2025-2026 sweep ran 24-30+ hours,
+   far past the original flat 4-hour TTL, leaving the run with zero overlap
+   protection for most of its own runtime. `_lock_heartbeat_loop` below
+   renews the lease every `lock_renewal_seconds` (default 120s, comfortably
+   under the now-shorter `lock_ttl_seconds` default of 600s) for as long as
+   the pipeline is still genuinely running, re-checking ownership before
+   each renewal (same GET-and-compare pattern the existing fenced release
+   already uses) so it can never resurrect a lock a later trigger has
+   already legitimately acquired. This is still the anti-overengineering
+   instruction's spirit, not a reversal of it: a short TTL plus renewal is
+   less machinery than a fixed-but-large TTL that still eventually needs
+   raising again for whatever the next longer session turns out to be --
+   and it has a real, concrete side benefit the old flat TTL did not: a
+   process that crashes hard (no clean shutdown, no `finally` reached) now
+   loses its lock within roughly one TTL window instead of up to 4 hours.
+
 3. A trigger-specific enable flag, independent of CAMS's own LEGBOT_ENABLED.
    LEGBOT_ENABLED (on the ddp-agents/CAMS side) is the last-resort "stop
    everything, including Agent Smith's manual dispatches" switch. This
@@ -56,6 +74,8 @@ re-evaluates). Tracked as a named follow-up, not built here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -67,6 +87,54 @@ from ddp_sync.config import get_settings
 logger = structlog.get_logger()
 
 _LOCK_KEY_PREFIX = "ddp_sync:scraper_triggered_legbot:lock:"
+
+
+async def _renew_lock_if_owned(redis_store, lock_key: str, run_id: str, ttl: int) -> bool:
+    """OPEN-292: one lease-renewal attempt. Re-checks ownership (same GET-and-
+    compare pattern the fenced release below already uses) before extending the
+    expiry -- an EXPIRE issued blindly could otherwise resurrect a lock that has
+    already legitimately passed to a newer trigger (this run's own TTL lapsed
+    and nothing renewed it in time), silently defeating the exact overlap
+    protection this lock exists for.
+
+    Never raises: a renewal failure (a Redis blip, a dropped connection) must
+    never abort the LegBot pipeline this lease is only there to protect --
+    same "an auxiliary concern can't affect the primary job's own result"
+    contract every other hook in this codebase already follows. Returns
+    whether the renewal actually happened, for the heartbeat loop's own
+    logging; a caller that only cares about "did this raise" doesn't need to
+    look at the return value.
+    """
+    try:
+        current = await redis_store._client.get(lock_key)
+        current_id = current.decode() if isinstance(current, bytes) else current
+        if current_id != run_id:
+            return False
+        await redis_store._client.expire(lock_key, ttl)
+        return True
+    except Exception as e:  # noqa: BLE001 -- must never affect the pipeline's own result
+        logger.warning(
+            "scraper_triggered_legbot_lock_renewal_failed",
+            run_id=run_id,
+            lock_key=lock_key,
+            error=str(e),
+        )
+        return False
+
+
+async def _lock_heartbeat_loop(redis_store, lock_key: str, run_id: str, ttl: int, interval: int) -> None:
+    """OPEN-292: renews the lease on a fixed cadence for as long as this task is
+    alive. The caller starts this as a background asyncio task right after
+    acquiring the lock, and cancels it (see trigger_scraper_session_pipeline's
+    own finally block) the moment the pipeline itself finishes -- cancellation
+    is the only way this loop ever stops short of the process dying outright,
+    which is exactly the behavior wanted: a genuinely-crashed process stops
+    renewing and its lock expires within roughly one `ttl` window, same as
+    before this existed, just a much shorter window now.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        await _renew_lock_if_owned(redis_store, lock_key, run_id, ttl)
 
 
 def _lock_key(jurisdiction_iso2: str, session_code: str) -> str:
@@ -195,6 +263,14 @@ async def trigger_scraper_session_pipeline(
         jurisdiction_iso2=jurisdiction_iso2,
         session_code=session_code,
     )
+    # OPEN-292: keeps the lease above alive for as long as the pipeline call below
+    # actually runs -- started only now (after acquisition succeeded), cancelled in
+    # the finally block below before the existing fenced release runs, so the two
+    # never race each other over the same key.
+    renewal_seconds = settings.legbot_scrape_completion_trigger_lock_renewal_seconds
+    heartbeat_task = asyncio.create_task(
+        _lock_heartbeat_loop(redis_store, lock_key, run_id, lock_ttl, renewal_seconds)
+    )
     try:
         from ddp_sync.pipelines.session_pipeline_runner import run_legbot_pipeline
 
@@ -242,6 +318,16 @@ async def trigger_scraper_session_pipeline(
         )
         return {"success": False, "error": "pipeline_error", "detail": str(e)}
     finally:
+        # OPEN-292: stop renewing before releasing, on every exit path -- a
+        # cancelled-but-still-pending renewal racing the delete below could
+        # otherwise re-set the TTL on a key this same call is simultaneously
+        # deleting. asyncio.CancelledError is expected here, not a real failure;
+        # suppressing it is what "cancel and wait for it to actually stop"
+        # means for a task, not just "ask it to stop and move on."
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
         # Fenced release, same pattern as votebot_eval.py's own lock: only
         # delete the lock if we still own it, so a run that outlived its own
         # TTL (and was already picked up by a newer trigger) doesn't delete
