@@ -50,6 +50,27 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # added here 2026-08-10, exactly the class of bug a single shared constant prevents.
 DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us"]
 
+# OPEN-291: the scrape side's federal job is "usa" (openstates_scrape.primary.usa in
+# sync_schedule.yaml); the archive side's is "us" (matching OpenStates' own jurisdiction
+# code, see DEFAULT_ARCHIVE_JURISDICTIONS above). Every other jurisdiction uses the same
+# code on both sides. Kept as an explicit map rather than assumed identical strings --
+# maybe_trigger_archive_after_scrape() below is the one place this actually matters.
+_SCRAPE_TO_ARCHIVE_JURISDICTION = {"usa": "us"}
+
+# OPEN-291: how long a successful archive run "claims" its jurisdiction before another
+# attempt for the same jurisdiction is treated as a likely duplicate and skipped, not
+# launched. Exists because _run_archive_with_hook has no other overlap protection, and
+# two real callers can now land close together for the same jurisdiction: FL/USA each
+# call _run_scrape() once per session (this ticket's own new hook would otherwise fire
+# once per session, not once per run), and the still-registered weekly archive cron can
+# land on the same jurisdiction shortly after a scrape-triggered run. 30 minutes is
+# comfortably longer than the gap between sequential per-session scrape calls in
+# practice, comfortably shorter than "the next legitimate reason to archive this
+# jurisdiction again." A jurisdiction that never has two archive attempts land this
+# close together never notices this exists.
+_ARCHIVE_TRIGGER_DEBOUNCE_PREFIX = "ddp:archive_trigger_debounce:"
+_ARCHIVE_TRIGGER_DEBOUNCE_TTL_SECONDS = 1800
+
 # Per-jurisdiction archive timeouts. Downloads + extracts every not-yet-captured
 # document, so these scale with total historical bill count, not just what
 # changed recently — sized generously, matching the scrape timeouts' shape.
@@ -755,6 +776,121 @@ async def _maybe_trigger_legbot_for_archive(
         )
 
 
+async def _acquire_archive_debounce(jurisdiction: str) -> bool:
+    """OPEN-291: True means this call may proceed, False means skip -- another archive
+    attempt for this jurisdiction already claimed the debounce window and should be
+    treated as the one doing the real work.
+
+    Fails OPEN, not closed: if Redis is unavailable or the SETNX itself errors, this
+    returns True (proceed) rather than blocking archiving on a debounce mechanism that
+    didn't exist before OPEN-291 -- this feature must never make archiving less
+    reliable than it was before it existed. The cost of failing open is at worst the
+    same duplicate-run exposure archiving already had prior to this ticket; the cost of
+    failing closed would be a real archive skipped for a reason that has nothing to do
+    with whether it was actually needed.
+    """
+    try:
+        from ddp_sync.services.redis_store import get_redis_store
+
+        redis_store = get_redis_store()
+        if not redis_store._client:
+            return True
+        acquired = await redis_store._client.set(
+            f"{_ARCHIVE_TRIGGER_DEBOUNCE_PREFIX}{jurisdiction}",
+            "1",
+            nx=True,
+            ex=_ARCHIVE_TRIGGER_DEBOUNCE_TTL_SECONDS,
+        )
+        return bool(acquired)
+    except Exception as e:  # noqa: BLE001 -- a debounce-check failure must never block a real archive
+        logger.warning(
+            "archive_trigger_debounce_check_failed_proceeding",
+            jurisdiction=jurisdiction,
+            error=str(e),
+        )
+        return True
+
+
+def _archive_jurisdiction_code(scrape_jurisdiction: str) -> str:
+    """Maps a scrape-side jurisdiction code to the archive side's own code for the same
+    real jurisdiction -- see _SCRAPE_TO_ARCHIVE_JURISDICTION's docstring."""
+    return _SCRAPE_TO_ARCHIVE_JURISDICTION.get(scrape_jurisdiction, scrape_jurisdiction)
+
+
+def _load_archive_config_for_scrape_trigger() -> dict[str, Any]:
+    """OPEN-291: independently loads openstates_archive's own config section, the same
+    way _maybe_trigger_legbot_for_archive above independently calls get_settings() for
+    its own configuration rather than relying on whatever config object the caller
+    happens to have on hand. _run_scrape()'s own `config` parameter is scoped to
+    openstates_scrape only -- it has no view into openstates_archive at all, and giving
+    it one would mean threading an unrelated config section through every scrape job
+    wrapper's signature. Reuses scheduler.py's own DEFAULT_CONFIG_PATH (lazy import --
+    scheduler.py already imports this module lazily too, see its own _register_
+    openstates_archive_jobs, so a module-level import here would cycle) rather than
+    re-deriving the same path resolution a second time.
+    """
+    try:
+        from ddp_sync.scheduler import DEFAULT_CONFIG_PATH
+
+        import yaml
+
+        with open(DEFAULT_CONFIG_PATH) as f:
+            full_config = yaml.safe_load(f) or {}
+    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+        logger.warning("archive_trigger_for_scrape_config_load_failed", error=str(e))
+        return {}
+    return full_config.get("openstates_archive", {})
+
+
+async def maybe_trigger_archive_after_scrape(scrape_jurisdiction: str) -> None:
+    """OPEN-291: the scrape-completion-triggers-archive hook, called from _run_scrape()
+    on every successful scrape for every jurisdiction it covers (FL, WA, USA, and the
+    whole secondary batch) -- one hook, one call site, no per-jurisdiction code. A
+    jurisdiction opts in purely by config: being listed in both its own scrape config
+    and openstates_archive.jurisdictions. Alabama is the standing counter-example --
+    archived, but not scraped anywhere in ddp-sync, so it never reaches this function
+    at all and keeps its existing weekly cron untouched.
+
+    Deliberately does not replace the existing per-jurisdiction weekly archive cron --
+    that stays registered as a floor/backstop, the same "escalate, never remove the
+    fallback" shape dynamic_cadence already uses. _acquire_archive_debounce() is what
+    makes that safe rather than a source of duplicate runs.
+
+    Never raises -- same log-and-continue contract as every other post-success hook in
+    this file. `_run_scrape()` also wraps its call to this function in its own
+    catch-all (matching `_run_archive_with_hook`'s "wrap the whole block, not just the
+    hook" fix) -- belt and suspenders, not redundant, mirroring
+    `_maybe_trigger_legbot_for_archive`'s own defense-in-depth above: both layers guard
+    independently rather than one relying entirely on the other.
+    """
+    archive_jurisdiction = _archive_jurisdiction_code(scrape_jurisdiction)
+    archive_config = _load_archive_config_for_scrape_trigger()
+
+    if not archive_config.get("enabled", False):
+        return
+    if archive_jurisdiction not in archive_config.get("jurisdictions", []):
+        return
+
+    try:
+        result = await run_single_archive_job(archive_jurisdiction, archive_config)
+    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+        logger.error(
+            "scrape_triggered_archive_failed",
+            scrape_jurisdiction=scrape_jurisdiction,
+            archive_jurisdiction=archive_jurisdiction,
+            error=str(e),
+        )
+        return
+
+    log_fn = logger.info if result.get("success") else logger.warning
+    log_fn(
+        "scrape_triggered_archive_result",
+        scrape_jurisdiction=scrape_jurisdiction,
+        archive_jurisdiction=archive_jurisdiction,
+        result=result,
+    )
+
+
 async def _run_archive_with_hook(
     jurisdiction: str,
     openstates_root: str | None = None,
@@ -763,6 +899,12 @@ async def _run_archive_with_hook(
     """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) uniformly
     over both archive branches (local run-archive.sh and Fargate cloud_archiver.py)
     -- neither run_archive_jobs() nor run_single_archive_job() needs its own copy.
+
+    OPEN-291: also the debounce choke point for the new scrape-completion-triggers-
+    archive hook -- checked here, not just at that hook's own call site, so it also
+    covers the still-registered weekly cron landing close to a hook-triggered run,
+    not only FL/USA's multi-session case. Returns success-but-skipped rather than
+    running a second time.
 
     `archive_started_at` is captured here, before the archive itself runs, as a
     real wall-clock floor for `resolve_touched_sessions`' own `since` filter --
@@ -776,6 +918,13 @@ async def _run_archive_with_hook(
     archive may change that archive's result," not "nothing we currently believe
     can raise."
     """
+    if not await _acquire_archive_debounce(jurisdiction):
+        logger.info(
+            "archive_debounced_skipping_duplicate_run",
+            jurisdiction=jurisdiction,
+        )
+        return {"success": True, "jurisdiction": jurisdiction, "skipped": "debounced"}
+
     archive_started_at = datetime.now(timezone.utc)
     if (config or {}).get("use_fargate", False):
         result = await _run_archive_fargate(jurisdiction, config=config)

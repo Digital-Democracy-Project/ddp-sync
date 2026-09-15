@@ -731,6 +731,15 @@ openstates_scrape:
 # smaller jurisdictions' own runs. `us` gets a day entirely to itself; fl+ut and wa+va share a
 # day since both pairs are already ~fully archived and do almost no work once caught up.
 openstates_archive:
+  # OPEN-291: `enabled` and `jurisdictions` below are also read by
+  # maybe_trigger_archive_after_scrape() (openstates_archive.py), the hook inside
+  # _run_scrape() that fires a jurisdiction's archive job right after its own scrape
+  # completes -- not just by the weekly cron `schedule` map further down. A
+  # jurisdiction opts into that hook purely by appearing here (and in its own scrape
+  # config) -- no separate flag, no per-jurisdiction code. The weekly `schedule` below
+  # stays registered regardless, as a floor/backstop; a debounce inside
+  # _run_archive_with_hook is what keeps that from producing a duplicate run when it
+  # lands close to a hook-triggered one.
   enabled: true
   use_fargate: true   # OPEN-192: Ramon's deliberate cutover decision (2026-09-09) -- archiving
                       # now runs cloud_archiver.py as a real Fargate task, reading from RDS

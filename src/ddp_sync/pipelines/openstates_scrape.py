@@ -1053,15 +1053,40 @@ async def _run_scrape(
     before archiving necessarily had, and LegBot's `_resolve_bill_source()` only
     reads already-archived, already-extracted text with no live-fetch fallback
     -- triggering off scrape completion routinely lost that race and produced a
-    permanent `no_archived_bill_text` failure. The trigger now lives in
+    permanent `no_archived_bill_text` failure. That trigger lives in
     `openstates_archive.py` (`_maybe_trigger_legbot_for_archive`,
-    `_run_archive_with_hook`), which fires only once the text this hook depends
-    on is guaranteed to already exist. This wrapper is kept as a distinct
-    function from `_run_scrape_impl` in case a scrape-side concern needs to
-    hook in here again later, not because it currently does anything beyond
-    delegate.
+    `_run_archive_with_hook`), which fires only once the text it depends on is
+    guaranteed to already exist.
+
+    OPEN-291: this wrapper now carries a DIFFERENT hook this docstring's own
+    previous version said it was being kept around for -- on a successful
+    scrape, best-effort triggers that jurisdiction's ARCHIVE job (not LegBot;
+    archiving is the step that produces the text LegBot needs, so this pairing
+    doesn't have the race the removed hooks did). One hook, one call site,
+    covers every caller of `_run_scrape` (FL, WA, USA, the whole secondary
+    batch) uniformly regardless of which internal `_run_scrape_impl` branch
+    (cloud-owned or local subprocess) actually produced the result -- see
+    `maybe_trigger_archive_after_scrape`'s own docstring for the opt-in
+    mechanism (config-driven, not per-jurisdiction code) and the debounce that
+    keeps FL/USA's multi-session loop from firing this once per session.
+
+    Wrapped in its own catch-all, mirroring `_run_archive_with_hook`'s own fix
+    for the same pm-review finding: nothing after a successful scrape may
+    change that scrape's own already-successful result.
     """
-    return await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
+    result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
+    if result.get("success"):
+        try:
+            from ddp_sync.pipelines.openstates_archive import maybe_trigger_archive_after_scrape
+
+            await maybe_trigger_archive_after_scrape(jurisdiction)
+        except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+            logger.error(
+                "scrape_triggered_archive_hook_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+    return result
 
 
 async def _run_scrape_impl(
