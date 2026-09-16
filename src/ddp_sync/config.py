@@ -43,6 +43,22 @@ class SyncSettings:
     # External APIs
     openstates_api_key: str = ""
     congress_api_key: str = ""
+    # Public v3.openstates.org API base. Configurable so BillSyncService.
+    # fetch_bill_from_openstates() can be pointed at a different base in
+    # tests without patching a class constant.
+    openstates_api_base: str = "https://v3.openstates.org"
+    # Jurisdictions to route to the local/RDS-backed OpenStates replica
+    # instead of the public API. Empty by default: until this is set,
+    # falling back to "always public API" is the same behavior as before
+    # this setting existed.
+    ddp_openstates_jurisdictions: list = field(default_factory=list)
+    # Local/RDS-backed OpenStates-compatible API (api-v3) used for the
+    # jurisdictions listed in ddp_openstates_jurisdictions above -- NOT the
+    # same thing as openstates_api_key/openstates_api_base (the public API
+    # used for every other jurisdiction). No default key: this instance's
+    # apikey_auth has no dev bypass, must be set explicitly.
+    local_openstates_api_base: str = "http://localhost:8002"
+    local_openstates_api_key: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -128,6 +144,14 @@ def _load_from_env() -> dict:
         "pinecone_namespace": os.getenv("PINECONE_NAMESPACE", "default"),
         "openstates_api_key": os.getenv("OPENSTATES_API_KEY", ""),
         "congress_api_key": os.getenv("CONGRESS_API_KEY", ""),
+        "openstates_api_base": os.getenv("OPENSTATES_API_BASE", "https://v3.openstates.org"),
+        "ddp_openstates_jurisdictions": [
+            j.strip().upper()
+            for j in os.getenv("DDP_OPENSTATES_JURISDICTIONS", "").split(",")
+            if j.strip()
+        ],
+        "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
+        "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),

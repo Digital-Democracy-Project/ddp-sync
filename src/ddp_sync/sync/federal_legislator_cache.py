@@ -174,6 +174,34 @@ class FederalLegislatorCache:
         self._ensure_loaded()
         return self._cache.get(person_id)
 
+    def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
+        """
+        Choose which OpenStates-compatible backend to hit for this jurisdiction.
+
+        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py)
+        and the equivalent helpers on OpenStatesSource, LegislatorSyncService,
+        and OpenStatesPeopleClient: jurisdictions listed in
+        settings.ddp_openstates_jurisdictions are routed to the local/RDS-backed
+        OpenStates replica instead of the public v3.openstates.org API. This
+        cache only ever fetches jurisdiction "us" (US Congress).
+
+        Returns:
+            (api_base, api_key, is_local_replica) tuple. is_local_replica is
+            True when the replica's apikey_auth scheme applies -- it
+            authenticates via an `apikey` query param, not the public API's
+            `X-API-KEY` header.
+        """
+        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
+        if jurisdiction.upper() in replica_jurisdictions:
+            logger.debug(
+                "Routing jurisdiction to local OpenStates replica",
+                jurisdiction=jurisdiction,
+                api_base=self.settings.local_openstates_api_base,
+            )
+            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
+
+        return self.settings.openstates_api_base, self.settings.openstates_api_key, False
+
     async def refresh(self) -> dict:
         """
         Refresh the cache by fetching all US Congress members from OpenStates.
@@ -183,9 +211,19 @@ class FederalLegislatorCache:
         """
         logger.info("Refreshing federal legislator cache from OpenStates")
 
-        api_key = self.settings.openstates_api_key
+        # Always jurisdiction "us" -- resolve once. The api_key check below
+        # matches whichever backend was resolved (public vs local replica),
+        # not unconditionally the public OPENSTATES_API_KEY -- routing "US"
+        # to the replica shouldn't be blocked by a missing public key it
+        # will never use.
+        api_base, api_key, is_local_replica = self._get_api_base_and_key("us")
         if not api_key:
-            return {"success": False, "error": "OpenStates API key not configured"}
+            error = (
+                "Local OpenStates replica API key not configured"
+                if is_local_replica
+                else "OpenStates API key not configured"
+            )
+            return {"success": False, "error": error}
 
         legislators: dict[str, dict] = {}
         stats = {"senate": 0, "house": 0, "errors": []}
@@ -193,14 +231,14 @@ class FederalLegislatorCache:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Fetch Senate members
             senate_result = await self._fetch_chamber_members(
-                client, api_key, "upper", stats
+                client, api_base, api_key, is_local_replica, "upper", stats
             )
             legislators.update(senate_result)
             stats["senate"] = len(senate_result)
 
             # Fetch House members
             house_result = await self._fetch_chamber_members(
-                client, api_key, "lower", stats
+                client, api_base, api_key, is_local_replica, "lower", stats
             )
             legislators.update(house_result)
             stats["house"] = len(house_result)
@@ -242,29 +280,48 @@ class FederalLegislatorCache:
     async def _fetch_chamber_members(
         self,
         client: httpx.AsyncClient,
+        api_base: str,
         api_key: str,
+        is_local_replica: bool,
         chamber: str,  # "upper" (Senate) or "lower" (House)
         stats: dict,
     ) -> dict[str, dict]:
-        """Fetch all members of a chamber from OpenStates."""
+        """Fetch all members of a chamber from OpenStates.
+
+        Routes to the local/RDS-backed OpenStates replica instead of the
+        public API when "US" is listed in settings.ddp_openstates_jurisdictions
+        -- see _get_api_base_and_key(), resolved once by the caller (refresh())
+        since this cache only ever queries jurisdiction "us".
+        """
         legislators = {}
         page = 1
         per_page = 50
 
         chamber_name = "Senate" if chamber == "upper" else "House"
-        logger.info(f"Fetching US {chamber_name} members")
+        logger.info(f"Fetching US {chamber_name} members", api_base=api_base)
+
+        params = {
+            "jurisdiction": "us",
+            "org_classification": chamber,
+            "page": page,
+            "per_page": per_page,
+        }
+        if is_local_replica:
+            # Local api-v3's apikey_auth is a query param, not the public
+            # API's X-API-KEY header.
+            headers = {"accept": "application/json"}
+            if api_key:
+                params["apikey"] = api_key
+        else:
+            headers = {"X-API-KEY": api_key}
 
         while True:
+            params["page"] = page
             try:
                 response = await client.get(
-                    "https://v3.openstates.org/people",
-                    params={
-                        "jurisdiction": "us",
-                        "org_classification": chamber,
-                        "page": page,
-                        "per_page": per_page,
-                    },
-                    headers={"X-API-KEY": api_key},
+                    f"{api_base}/people",
+                    params=params,
+                    headers=headers,
                 )
                 response.raise_for_status()
                 data = response.json()
