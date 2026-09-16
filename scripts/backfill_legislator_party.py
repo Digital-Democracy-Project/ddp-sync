@@ -64,8 +64,8 @@ async def run(*, dry_run: bool, limit: int | None) -> BackfillResult:
             RateLimitConfig(requests_per_minute=30, delay_between_requests_ms=0)
         ),
         openstates_api_base=settings.openstates_api_base,
-        local_openstates_api_base=settings.local_openstates_api_base,
-        local_openstates_api_key=settings.local_openstates_api_key,
+        rds_openstates_api_base=settings.rds_openstates_api_base,
+        rds_openstates_api_key=settings.rds_openstates_api_key,
         ddp_openstates_jurisdictions=settings.ddp_openstates_jurisdictions,
     )
 

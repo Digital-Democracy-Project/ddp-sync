@@ -52,13 +52,18 @@ class SyncSettings:
     # falling back to "always public API" is the same behavior as before
     # this setting existed.
     ddp_openstates_jurisdictions: list = field(default_factory=list)
-    # Local/RDS-backed OpenStates-compatible API (api-v3) used for the
+    # RDS-backed OpenStates-compatible API (api-v3) used for the
     # jurisdictions listed in ddp_openstates_jurisdictions above -- NOT the
     # same thing as openstates_api_key/openstates_api_base (the public API
-    # used for every other jurisdiction). No default key: this instance's
-    # apikey_auth has no dev bypass, must be set explicitly.
-    local_openstates_api_base: str = "http://localhost:8002"
-    local_openstates_api_key: str = ""
+    # used for every other jurisdiction), and NOT the Mac Studio's own
+    # separate local Postgres instance (a completely different database).
+    # Empty by default -- no real default exists across environments; must
+    # be set explicitly. Shared field name/shape with other ddp-sync hosts'
+    # Secrets Manager secrets (this key already exists there for a
+    # different consumer, resolve_touched_sessions() in openstates_archive.py,
+    # not ported to this host).
+    rds_openstates_api_base: str = ""
+    rds_openstates_api_key: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -150,8 +155,8 @@ def _load_from_env() -> dict:
             for j in os.getenv("DDP_OPENSTATES_JURISDICTIONS", "").split(",")
             if j.strip()
         ],
-        "local_openstates_api_base": os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002"),
-        "local_openstates_api_key": os.getenv("LOCAL_OPENSTATES_API_KEY", ""),
+        "rds_openstates_api_base": os.getenv("RDS_OPENSTATES_API_BASE", ""),
+        "rds_openstates_api_key": os.getenv("RDS_OPENSTATES_API_KEY", ""),
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),

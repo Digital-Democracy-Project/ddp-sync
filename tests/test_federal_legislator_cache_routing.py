@@ -34,8 +34,8 @@ def _make_cache(tmp_path, monkeypatch, **settings_overrides) -> FederalLegislato
     defaults = {
         "openstates_api_key": "public-key",
         "openstates_api_base": "https://v3.openstates.org",
-        "local_openstates_api_base": "http://localhost:8002",
-        "local_openstates_api_key": "local-key",
+        "rds_openstates_api_base": "http://localhost:8002",
+        "rds_openstates_api_key": "local-key",
     }
     defaults.update(settings_overrides)
     settings = SyncSettings(**defaults)
@@ -115,7 +115,7 @@ async def test_refresh_fails_gracefully_when_routed_local_key_missing(tmp_path, 
         tmp_path,
         monkeypatch,
         ddp_openstates_jurisdictions=["US"],
-        local_openstates_api_key="",
+        rds_openstates_api_key="",
     )
     result = await cache.refresh()
     assert result["success"] is False

@@ -28,8 +28,8 @@ def _make_service(**settings_overrides) -> LegislatorSyncService:
         openai_api_key="test-openai-key",  # EmbeddingService constructs AsyncOpenAI eagerly
         openstates_api_key="public-key",
         openstates_api_base="https://v3.openstates.org",
-        local_openstates_api_base="http://localhost:8002",
-        local_openstates_api_key="local-key",
+        rds_openstates_api_base="http://localhost:8002",
+        rds_openstates_api_key="local-key",
         **settings_overrides,
     )
     return LegislatorSyncService(settings)

@@ -27,8 +27,8 @@ def _make_source(**settings_overrides) -> OpenStatesSource:
     settings = SyncSettings(
         openstates_api_key="public-key",
         openstates_api_base="https://v3.openstates.org",
-        local_openstates_api_base="http://localhost:8002",
-        local_openstates_api_key="local-key",
+        rds_openstates_api_base="http://localhost:8002",
+        rds_openstates_api_key="local-key",
         **settings_overrides,
     )
     return OpenStatesSource(settings)

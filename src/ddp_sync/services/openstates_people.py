@@ -198,8 +198,8 @@ class OpenStatesPeopleClient:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_pages: int = DEFAULT_MAX_PAGES,
         openstates_api_base: str | None = None,
-        local_openstates_api_base: str | None = None,
-        local_openstates_api_key: str | None = None,
+        rds_openstates_api_base: str | None = None,
+        rds_openstates_api_key: str | None = None,
         ddp_openstates_jurisdictions: list[str] | None = None,
     ):
         """
@@ -211,11 +211,11 @@ class OpenStatesPeopleClient:
                 docstring); the caller (e.g. legislator_bio.py's
                 BioSyncOrchestrator) threads its own `settings.
                 openstates_api_base` through.
-            local_openstates_api_base: Local/RDS-backed OpenStates replica
-                base (settings.local_openstates_api_base). Only used for
+            rds_openstates_api_base: Local/RDS-backed OpenStates replica
+                base (settings.rds_openstates_api_base). Only used for
                 jurisdictions listed in `ddp_openstates_jurisdictions`.
-            local_openstates_api_key: API key for the local replica
-                (settings.local_openstates_api_key).
+            rds_openstates_api_key: API key for the local replica
+                (settings.rds_openstates_api_key).
             ddp_openstates_jurisdictions: Jurisdictions to route to the local
                 replica instead of the public API. Empty by default -- always
                 public API, same as before this existed.
@@ -229,8 +229,8 @@ class OpenStatesPeopleClient:
         self.timeout_seconds = timeout_seconds
         self.max_pages = max_pages
         self.openstates_api_base = openstates_api_base or self.BASE_URL
-        self.local_openstates_api_base = local_openstates_api_base or ""
-        self.local_openstates_api_key = local_openstates_api_key or ""
+        self.rds_openstates_api_base = rds_openstates_api_base or ""
+        self.rds_openstates_api_key = rds_openstates_api_key or ""
         self.ddp_openstates_jurisdictions = ddp_openstates_jurisdictions or []
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
@@ -256,11 +256,11 @@ class OpenStatesPeopleClient:
         replica_jurisdictions = {j.upper() for j in self.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
             logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
+                "Routing jurisdiction to RDS-backed OpenStates replica",
                 jurisdiction=jurisdiction,
-                api_base=self.local_openstates_api_base,
+                api_base=self.rds_openstates_api_base,
             )
-            return self.local_openstates_api_base, self.local_openstates_api_key, True
+            return self.rds_openstates_api_base, self.rds_openstates_api_key, True
 
         return self.openstates_api_base, self.api_key, False
 

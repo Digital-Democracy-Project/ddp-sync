@@ -29,8 +29,8 @@ def _make_client(ddp_openstates_jurisdictions=None) -> OpenStatesPeopleClient:
     return OpenStatesPeopleClient(
         api_key="public-key",
         openstates_api_base="https://v3.openstates.org",
-        local_openstates_api_base="http://localhost:8002",
-        local_openstates_api_key="local-key",
+        rds_openstates_api_base="http://localhost:8002",
+        rds_openstates_api_key="local-key",
         ddp_openstates_jurisdictions=ddp_openstates_jurisdictions,
     )
 

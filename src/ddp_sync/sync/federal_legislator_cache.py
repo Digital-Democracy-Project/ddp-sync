@@ -194,11 +194,11 @@ class FederalLegislatorCache:
         replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
             logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
+                "Routing jurisdiction to RDS-backed OpenStates replica",
                 jurisdiction=jurisdiction,
-                api_base=self.settings.local_openstates_api_base,
+                api_base=self.settings.rds_openstates_api_base,
             )
-            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
+            return self.settings.rds_openstates_api_base, self.settings.rds_openstates_api_key, True
 
         return self.settings.openstates_api_base, self.settings.openstates_api_key, False
 

@@ -28,8 +28,8 @@ def _make_service(**settings_overrides) -> BillSyncService:
         openai_api_key="test-openai-key",  # EmbeddingService constructs AsyncOpenAI eagerly
         openstates_api_key="public-key",
         openstates_api_base="https://v3.openstates.org",
-        local_openstates_api_base="http://localhost:8002",
-        local_openstates_api_key="local-key",
+        rds_openstates_api_base="http://localhost:8002",
+        rds_openstates_api_key="local-key",
         **settings_overrides,
     )
     return BillSyncService(settings)
@@ -85,8 +85,8 @@ async def test_routes_flipped_jurisdiction_to_local_replica():
     assert result == {"id": "ocd-bill/123"}
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/bills/us/119/HR1"
-    # Local api-v3's apikey_auth is a query param, not the public API's
-    # x-api-key header (matches local_openstates_client.py's convention).
+    # RDS-backed api-v3's apikey_auth is a query param, not the public API's
+    # x-api-key header.
     assert "x-api-key" not in called_kwargs["headers"]
     assert ("apikey", "local-key") in called_kwargs["params"]
 
