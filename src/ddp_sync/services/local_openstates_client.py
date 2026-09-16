@@ -54,6 +54,7 @@ raw_text, on the same single-bill detail endpoint.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Literal
 
@@ -68,6 +69,17 @@ logger = structlog.get_logger()
 # convention) -- not a WireGuard hop, so this stays short. A slow/hung local
 # api-v3 shouldn't stall bill_source resolution for long before falling back.
 _REQUEST_TIMEOUT_SECONDS = 10.0
+
+# SYNC-66: a real production connection hiccup dropped an entire archive run's worth of
+# new content from ever reaching LegBot -- the same call, re-tried moments later from the
+# same container, succeeded immediately (see resolve_touched_sessions' own docstring).
+# Bounded to a small, fixed retry rather than a configurable setting: this addresses one
+# specific, confirmed-transient failure mode for one internal call, not a tunable
+# operational knob an operator needs to reach for. 3 attempts / a 2s gap is enough to ride
+# out a momentary blip without meaningfully delaying archive-completion's own hook (which
+# already runs after the archive job itself has finished).
+_RESOLVE_SESSIONS_MAX_ATTEMPTS = 3
+_RESOLVE_SESSIONS_RETRY_BACKOFF_SECONDS = 2.0
 
 
 async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
@@ -821,7 +833,7 @@ async def resolve_touched_sessions(
     api_base: str | None = None,
     api_key: str | None = None,
     since_param: Literal["updated_since", "document_updated_since"] = "updated_since",
-) -> list[str]:
+) -> list[str] | None:
     """SYNC-50: resolve which session_code(s) actually had a bill touched
     (created or updated) in this jurisdiction since `since`, from an api-v3
     instance's own `updated_since` filter -- real ground truth for
@@ -869,26 +881,48 @@ async def resolve_touched_sessions(
     Returns:
         Distinct session_code strings, in first-seen order (the order
         carries no meaning -- callers dispatch per session independently).
-        Empty when nothing changed, api-v3 is unreachable or rejects the
-        request, or the response isn't valid JSON -- never raises, same
-        never-abort posture as list_current_session_bill_candidates above:
-        a resolution failure should skip triggering for this scrape, not
-        crash the scrape job that already succeeded.
 
-        A failure partway through pagination (a later page's request fails,
-        or the cap is hit -- see the truncation warning below) returns
-        whatever sessions the earlier pages already found, rather than
-        discarding them: for pm-review's "does a later scrape recover a
-        session missed this way" question -- yes for the common case, no in
-        the worst case. An active legislative session gets scraped
-        repeatedly for as long as it stays active, so a session missed on
-        one run's truncated resolution is very likely to be found again (and
-        triggered then) on the next run that touches it. The genuine gap is
-        a session that goes dormant for the rest of this scrape cycle
-        immediately after being missed -- accepted here rather than solved,
-        since solving it needs either raising the cap (same failure mode
-        recurs at a larger size) or a reconciliation mechanism, which is
-        more machinery than this ticket's scope calls for.
+        Empty list (`[]`) means resolution genuinely completed and found
+        nothing touched, or this call has no api-v3 to check at all
+        (`resolved_api_base` unset, or `max_bills_scanned<=0`) -- a
+        deliberate no-op, not a failure. Callers should treat this as
+        "nothing to do."
+
+        `None` means resolution could not be completed and the truth is
+        unknown -- api-v3 stayed unreachable across
+        `_RESOLVE_SESSIONS_MAX_ATTEMPTS` attempts, rejected the request, or
+        returned a non-JSON or unexpectedly-shaped body, and no session had already been found on
+        an earlier page (see the partial-result note below for when a
+        later-page failure does NOT produce `None`). SYNC-66: before this,
+        this case and a genuine empty result were both just `[]` -- a real
+        production connection hiccup against the local api-v3 was silently
+        treated identically to "nothing was touched," dropping an entire
+        archive run's worth of new content from ever reaching LegBot, logged
+        at INFO with no distinguishing signal at all. Callers must treat
+        `None` as a real failure (log at ERROR, not the same "nothing to do"
+        path as `[]`).
+
+        Still never raises, same never-abort posture as
+        list_current_session_bill_candidates above: a resolution failure
+        should skip triggering for this scrape, not crash the scrape job
+        that already succeeded.
+
+        A failure partway through pagination -- a later page's request
+        fails after an earlier page already found a real session, or the
+        cap is hit (see the truncation warning below) -- returns whatever
+        sessions the earlier pages already found (a real, non-empty list,
+        never `None`) rather than discarding them: for pm-review's "does a
+        later scrape recover a session missed this way" question -- yes for
+        the common case, no in the worst case. An active legislative
+        session gets scraped repeatedly for as long as it stays active, so a
+        session missed on one run's truncated resolution is very likely to
+        be found again (and triggered then) on the next run that touches
+        it. The genuine gap is a session that goes dormant for the rest of
+        this scrape cycle immediately after being missed -- accepted here
+        rather than solved, since solving it needs either raising the cap
+        (same failure mode recurs at a larger size) or a reconciliation
+        mechanism, which is more machinery than this ticket's scope calls
+        for.
     """
     settings = get_settings()
     resolved_api_base = api_base if api_base is not None else settings.local_openstates_api_base
@@ -916,16 +950,30 @@ async def resolve_touched_sessions(
         params["per_page"] = per_page
         params["page"] = str(page)
 
-        try:
-            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-                resp = await client.get(url, params=params)
-        except httpx.RequestError as exc:
-            logger.warning(
-                "Local api-v3 unreachable -- cannot resolve touched sessions",
-                jurisdiction_iso2=jurisdiction_iso2,
-                error=str(exc),
-            )
-            return session_codes
+        attempt = 1
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+                    resp = await client.get(url, params=params)
+                break
+            except httpx.RequestError as exc:
+                if attempt >= _RESOLVE_SESSIONS_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Local api-v3 unreachable -- cannot resolve touched sessions",
+                        jurisdiction_iso2=jurisdiction_iso2,
+                        error=str(exc),
+                        attempts=attempt,
+                    )
+                    return session_codes if session_codes else None
+                logger.warning(
+                    "Local api-v3 unreachable -- retrying touched-sessions read",
+                    jurisdiction_iso2=jurisdiction_iso2,
+                    error=str(exc),
+                    attempt=attempt,
+                    max_attempts=_RESOLVE_SESSIONS_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(_RESOLVE_SESSIONS_RETRY_BACKOFF_SECONDS)
+                attempt += 1
 
         if resp.status_code >= 400:
             logger.warning(
@@ -933,7 +981,7 @@ async def resolve_touched_sessions(
                 jurisdiction_iso2=jurisdiction_iso2,
                 status_code=resp.status_code,
             )
-            return session_codes
+            return session_codes if session_codes else None
 
         try:
             data = resp.json()
@@ -942,11 +990,35 @@ async def resolve_touched_sessions(
                 "Local api-v3 returned a non-JSON touched-sessions response",
                 jurisdiction_iso2=jurisdiction_iso2,
             )
-            return session_codes
+            return session_codes if session_codes else None
 
-        results = data.get("results", []) or []
+        # pm-review (SYNC-66): valid JSON that isn't the expected {"results": [...]}
+        # shape -- a bare list/string/null at the top level, or a non-list "results"
+        # value -- would otherwise crash this function from `data.get(...)` or
+        # `len(results)` despite its own docstring promising it never raises. Treated
+        # identically to the non-JSON case right above: same failure class, same
+        # None-or-partial-data contract, not a new one.
+        if not isinstance(data, dict):
+            logger.warning(
+                "Local api-v3 returned an unexpected touched-sessions response shape",
+                jurisdiction_iso2=jurisdiction_iso2,
+                response_type=type(data).__name__,
+            )
+            return session_codes if session_codes else None
+
+        results = data.get("results") or []
+        if not isinstance(results, list):
+            logger.warning(
+                "Local api-v3 returned a non-list 'results' field",
+                jurisdiction_iso2=jurisdiction_iso2,
+                results_type=type(results).__name__,
+            )
+            return session_codes if session_codes else None
+
         bills_scanned += len(results)
         for bill in results:
+            if not isinstance(bill, dict):
+                continue
             session = (bill.get("session") or "").strip()
             if session and session not in seen_sessions:
                 seen_sessions.add(session)

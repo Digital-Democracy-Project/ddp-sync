@@ -724,10 +724,26 @@ async def _maybe_trigger_legbot_for_archive(
             **resolution_kwargs,
         )
     except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+        # resolve_touched_sessions itself never raises (see its own docstring) -- this
+        # remains a defense-in-depth backstop for the unexpected, not the path SYNC-66
+        # actually hit. That one comes back as session_codes is None below.
         logger.error(
             "archiver_triggered_legbot_session_resolution_failed",
             jurisdiction=jurisdiction,
             error=str(e),
+        )
+        return
+
+    if session_codes is None:
+        # SYNC-66: a real production connection hiccup made resolve_touched_sessions
+        # return the same empty result as "genuinely nothing touched," at ERROR-worthy
+        # INFO severity, and a whole archive run's new content never reached LegBot.
+        # None here means resolution itself failed -- log it as the real failure it is,
+        # distinct from the "nothing to do" case right below.
+        logger.error(
+            "archiver_triggered_legbot_session_resolution_failed",
+            jurisdiction=jurisdiction,
+            since=archive_started_at.isoformat(),
         )
         return
 

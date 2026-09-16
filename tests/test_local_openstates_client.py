@@ -1414,23 +1414,69 @@ async def test_resolve_touched_sessions_zero_max_bills_scanned_makes_no_request(
 
 
 @pytest.mark.asyncio
-async def test_resolve_touched_sessions_empty_on_unreachable_api():
+async def test_resolve_touched_sessions_none_on_unreachable_api_after_retries_exhausted():
+    """SYNC-66: a connection failure that never recovers must come back as None, not
+    [] -- [] means "genuinely resolved, nothing touched," which this isn't. Also
+    confirms the retry actually happens (SYNC-66's second fix item) before giving up."""
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
 
-    with patch(
-        "ddp_sync.services.local_openstates_client.get_settings",
-        return_value=_FakeSettings(),
-    ), _patch_async_client(mock_client):
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch(
+            "ddp_sync.services.local_openstates_client.asyncio.sleep",
+            new_callable=AsyncMock,
+        ),
+        _patch_async_client(mock_client),
+    ):
         result = await resolve_touched_sessions(
             "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
         )
 
-    assert result == []
+    assert result is None
+    assert mock_client.get.await_count == 3  # _RESOLVE_SESSIONS_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
-async def test_resolve_touched_sessions_empty_on_error_status():
+async def test_resolve_touched_sessions_recovers_if_a_retry_succeeds():
+    """The exact real-world case this ticket was filed from: a transient connection
+    hiccup on the first attempt, then a normal, successful response moments later."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(
+        side_effect=[
+            httpx.RequestError("boom"),
+            _response(json_value={
+                "results": [{"session": "119"}],
+                "pagination": {"max_page": 1},
+            }),
+        ]
+    )
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch(
+            "ddp_sync.services.local_openstates_client.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as mock_sleep,
+        _patch_async_client(mock_client),
+    ):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["119"]
+    assert mock_client.get.await_count == 2
+    mock_sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_none_on_error_status():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(return_value=_response(status_code=500))
 
@@ -1442,11 +1488,11 @@ async def test_resolve_touched_sessions_empty_on_error_status():
             "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
         )
 
-    assert result == []
+    assert result is None
 
 
 @pytest.mark.asyncio
-async def test_resolve_touched_sessions_empty_on_non_json_response():
+async def test_resolve_touched_sessions_none_on_non_json_response():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(return_value=_response(raises_on_json=True))
 
@@ -1458,11 +1504,110 @@ async def test_resolve_touched_sessions_empty_on_non_json_response():
             "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
         )
 
-    assert result == []
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_none_on_non_dict_json_body():
+    """pm-review (SYNC-66): valid JSON that isn't a dict at all (a bare list here)
+    would otherwise crash on data.get(...), despite the docstring's own promise
+    that this function never raises."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value=["unexpected"]))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_none_on_non_list_results_field():
+    """pm-review (SYNC-66): a dict body whose "results" field isn't a list would
+    otherwise crash on len(results)/iteration -- same never-raises contract."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": "not-a-list",
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_skips_non_dict_result_entries():
+    """A single malformed entry inside an otherwise well-formed results list must
+    be skipped, not crash the whole resolution -- real sessions on either side of
+    it still count."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_response(json_value={
+        "results": [{"session": "119"}, "garbage", {"session": "120"}],
+        "pagination": {"max_page": 1},
+    }))
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["119", "120"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_touched_sessions_partial_results_survive_a_later_page_failure():
+    """A failure is only ambiguous with "genuinely nothing touched" when nothing has
+    been found yet. Once an earlier page already found a real session, a later
+    page's failure must still return that real, partial data -- not None, which
+    would discard a session we already know for certain was touched."""
+    mock_client = AsyncMock()
+    page1 = _response(json_value={
+        "results": [{"session": "119"}],
+        "pagination": {"max_page": 2},
+    })
+    mock_client.get = AsyncMock(
+        side_effect=[page1, httpx.RequestError("boom"), httpx.RequestError("boom"),
+                     httpx.RequestError("boom")]
+    )
+
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.get_settings",
+            return_value=_FakeSettings(),
+        ),
+        patch(
+            "ddp_sync.services.local_openstates_client.asyncio.sleep",
+            new_callable=AsyncMock,
+        ),
+        _patch_async_client(mock_client),
+    ):
+        result = await resolve_touched_sessions(
+            "va", since=datetime(2026, 1, 1, tzinfo=timezone.utc), max_bills_scanned=500
+        )
+
+    assert result == ["119"]
 
 
 @pytest.mark.asyncio
 async def test_resolve_touched_sessions_empty_when_no_local_api_base_configured():
+    """Deliberately still [], not None -- there's no ambiguity here at all (this is a
+    static "nothing configured for this call" state, not a live resolution attempt
+    that failed), so it stays the existing "nothing to do" contract."""
     with patch(
         "ddp_sync.services.local_openstates_client.get_settings",
         return_value=_FakeSettings(local_openstates_api_base=""),
