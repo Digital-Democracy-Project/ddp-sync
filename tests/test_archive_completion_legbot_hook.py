@@ -198,6 +198,39 @@ async def test_zero_resolved_sessions_triggers_nothing(monkeypatch):
     mock_trigger.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_resolution_failure_logs_error_not_info_and_triggers_nothing(monkeypatch):
+    """SYNC-66: resolve_touched_sessions returning None means resolution itself
+    failed (e.g. api-v3 stayed unreachable across every retry) -- this must be
+    logged as a real failure (ERROR), not folded into the same INFO-level
+    "nothing touched" path a genuine empty result gets. Root cause of the
+    production incident this ticket was filed from: both cases used to look
+    identical in the logs."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_settings(),
+    )
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "ddp_sync.pipelines.scraper_triggered_legbot.trigger_scraper_session_pipeline",
+            new=AsyncMock(),
+        ) as mock_trigger,
+        patch("ddp_sync.pipelines.openstates_archive.logger") as mock_logger,
+    ):
+        await _maybe_trigger_legbot_for_archive("us", datetime.now(timezone.utc))
+
+    mock_trigger.assert_not_awaited()
+    mock_logger.error.assert_called_once()
+    assert mock_logger.error.call_args.args[0] == (
+        "archiver_triggered_legbot_session_resolution_failed"
+    )
+    mock_logger.info.assert_not_called()
+
+
 # ── _maybe_trigger_legbot_for_archive: failures never propagate ────────────────────────
 
 
