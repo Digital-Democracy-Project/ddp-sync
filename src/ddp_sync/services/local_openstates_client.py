@@ -891,7 +891,7 @@ async def resolve_touched_sessions(
         `None` means resolution could not be completed and the truth is
         unknown -- api-v3 stayed unreachable across
         `_RESOLVE_SESSIONS_MAX_ATTEMPTS` attempts, rejected the request, or
-        returned a non-JSON body, and no session had already been found on
+        returned a non-JSON or unexpectedly-shaped body, and no session had already been found on
         an earlier page (see the partial-result note below for when a
         later-page failure does NOT produce `None`). SYNC-66: before this,
         this case and a genuine empty result were both just `[]` -- a real
@@ -992,9 +992,33 @@ async def resolve_touched_sessions(
             )
             return session_codes if session_codes else None
 
-        results = data.get("results", []) or []
+        # pm-review (SYNC-66): valid JSON that isn't the expected {"results": [...]}
+        # shape -- a bare list/string/null at the top level, or a non-list "results"
+        # value -- would otherwise crash this function from `data.get(...)` or
+        # `len(results)` despite its own docstring promising it never raises. Treated
+        # identically to the non-JSON case right above: same failure class, same
+        # None-or-partial-data contract, not a new one.
+        if not isinstance(data, dict):
+            logger.warning(
+                "Local api-v3 returned an unexpected touched-sessions response shape",
+                jurisdiction_iso2=jurisdiction_iso2,
+                response_type=type(data).__name__,
+            )
+            return session_codes if session_codes else None
+
+        results = data.get("results") or []
+        if not isinstance(results, list):
+            logger.warning(
+                "Local api-v3 returned a non-list 'results' field",
+                jurisdiction_iso2=jurisdiction_iso2,
+                results_type=type(results).__name__,
+            )
+            return session_codes if session_codes else None
+
         bills_scanned += len(results)
         for bill in results:
+            if not isinstance(bill, dict):
+                continue
             session = (bill.get("session") or "").strip()
             if session and session not in seen_sessions:
                 seen_sessions.add(session)
