@@ -432,11 +432,14 @@ class BillSyncService:
                         }
                     response = await client.get(url, headers=headers, params=params)
 
-                    # Log the response for debugging
+                    # Log the response for debugging. Strip query params before
+                    # logging -- the RDS replica's apikey_auth sends the API key
+                    # as a query param (is_local_replica branch above), which
+                    # would otherwise leak into journalctl on every request.
                     logger.info(
                         "OpenStates API response",
                         status_code=response.status_code,
-                        url=str(response.url),
+                        url=str(response.url.copy_with(query=None)),
                     )
 
                     # Handle 404 - bill not found (don't retry)
