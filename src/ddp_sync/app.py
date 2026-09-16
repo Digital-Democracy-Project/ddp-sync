@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,6 +16,33 @@ logger = logging.getLogger(__name__)
 API_PREFIX = "/ddp-sync/v1"
 
 
+class _RedactQueryParamAPIKeysFilter(logging.Filter):
+    """Redact apikey/api_key query-param values from log messages.
+
+    httpx logs every outbound request at INFO level, including the full URL --
+    harmless for header-based auth (Congress.gov, the public OpenStates API),
+    but the RDS-backed OpenStates replica authenticates via an `apikey` query
+    param, which would otherwise land in journalctl in cleartext on every
+    RDS-routed bill/legislator/people fetch.
+    """
+
+    _PATTERN = re.compile(r"((?:api_?key)=)[^&\s\"]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and self._PATTERN.search(record.msg):
+            record.msg = self._PATTERN.sub(r"\1REDACTED", record.msg)
+        if record.args:
+            # httpx logs "HTTP Request: %s %s ..." with request.url as an
+            # httpx.URL object, not a str -- stringify before checking, or
+            # this filter silently never matches the one arg that matters.
+            new_args = []
+            for a in record.args:
+                s = a if isinstance(a, str) else str(a)
+                new_args.append(self._PATTERN.sub(r"\1REDACTED", s) if self._PATTERN.search(s) else a)
+            record.args = tuple(new_args)
+        return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: connect Redis, start scheduler. Shutdown: stop scheduler, disconnect."""
@@ -25,6 +53,9 @@ async def lifespan(app: FastAPI):
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # Redact apikey/api_key query params from httpx's own request-logging --
+    # see _RedactQueryParamAPIKeysFilter's docstring.
+    logging.getLogger("httpx").addFilter(_RedactQueryParamAPIKeysFilter())
 
     # Connect Redis
     from ddp_sync.services.redis_store import get_redis_store
