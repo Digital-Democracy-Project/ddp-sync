@@ -215,7 +215,12 @@ api_health_check:
 #   10:00  people refresh (USA finishes ~09:00, safe margin)
 #   12:00  votebot eval [existing — FL still running but different resources]
 openstates_scrape:
-  enabled: true
+  # Disabled on the votebot/ddp-api EC2 host (this branch): these jobs assume a Mac
+  # Studio-local openstates_root/CAMS/LegBot environment that doesn't exist here and
+  # never will -- this host only does Webflow CMS sync + Pinecone ingestion +
+  # Voatz/Brevo + votebot eval. Had been silently failing daily (returncode=127 /
+  # "No such file or directory") since this host's 2026-07-02 pin -- caught 2026-09-16.
+  enabled: false
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
 
   patch_refresh:
