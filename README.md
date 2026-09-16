@@ -173,6 +173,17 @@ pip install .
 sudo systemctl restart ddp-sync
 ```
 
+> **⚠️ Does NOT apply to the votebot/ddp-api EC2 host.** That host intentionally runs
+> `feat/rds-openstates-routing-standalone`, not `main` — it needs OpenStates-replica routing
+> but must not pick up `main`'s ddp-broker-py Flow 2 dependency or per-host job-disable flags,
+> and this host is slated for retirement (~Dec 2026, Webflow removal) rather than reconciled
+> with `main`. **Never run `git pull origin main` on that host** — since `git pull <remote>
+> <branch>` merges the named branch into whatever is currently checked out, running this while
+> on `feat/rds-openstates-routing-standalone` would merge in everything this branch deliberately
+> excludes. Deploy updates to that host with `git pull origin
+> feat/rds-openstates-routing-standalone` instead. Full history: `notes/ops-handoff` branch,
+> notes dated 2026-09-15/16.
+
 ### Systemd Service
 
 ```bash
