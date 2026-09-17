@@ -36,14 +36,13 @@ does **not** also enable the cloud path; both deployments need their own copy tu
 If a cloud-owned jurisdiction's LegBot trigger looks silently inactive, check both
 instances' own env, not just one.
 
-**Known, deliberate gap as of 2026-09-11 (SYNC-59):** cloud-owned jurisdictions with no
-single, explicitly-configured session (VA/UT/MI/MA/AZ/NC — everything in `secondary`'s
-config, all cloud-owned per `sync_schedule.yaml`) do not trigger LegBot via this path at
-all yet — resolving "which session actually got touched" for them needs a real ground-truth
-read against RDS (`RDS_OPENSTATES_API_BASE`), and no RDS-facing api-v3 read replica exists
-yet. FL/USA (which always specify one explicit session) already work. Do not build the
-missing RDS read replica speculatively without checking with Ramon first — it's a real
-piece of infrastructure, not just a settings value.
+**Known, deliberate gap as of 2026-09-11 (SYNC-59) — superseded, see the section below.**
+This originally said cloud-owned jurisdictions with no single, explicitly-configured
+session (VA/UT/MI/MA/AZ/NC) couldn't trigger LegBot at all, pending an RDS-facing read
+replica. That replica shipped and went live 2026-09-13 (OPEN-269 epic) — the real
+remaining gap by 2026-09-16 was narrower and different in kind (a trigger-path
+endpoint-duplication bug, then a silent session-resolution failure), both fixed. Kept
+here as a historical marker only; the section immediately below is current.
 
 ## Crash-survivable LegBot dispatch tracking, and the RDS-replica gates layered on top of it (SYNC-61/275/276)
 
@@ -90,6 +89,57 @@ Jira tickets for current status** before assuming either this mechanism or SYNC-
 `RDS_OPENSTATES_API_BASE` needs building — most of this epic's build work is done; what's
 most likely still open is the specific per-jurisdiction session-resolution gap SYNC-59's own
 section above describes.
+
+**OPEN-290 (2026-09-14): the two HTTP entry points into this dispatch machinery
+(`/trigger/scraper-session-legbot`, automated-only; `/trigger/bill-artifact-generation`,
+manual) were consolidated into one.** They called the identical underlying function
+(`run_legbot_pipeline`) but only one of them held SYNC-48's Redis overlap lock — a real
+incident (two full FL/2026E runs dispatched 20 seconds apart, invisible to each other)
+proved this. `/trigger/scraper-session-legbot` is deleted; `/trigger/bill-artifact-generation`
+now routes through `trigger_scraper_session_pipeline` (the lock wrapper) for every caller,
+manual or automated. An `X-DDP-Automated-Trigger` header on the request is what still lets
+the automated (WireGuard-relayed, archive-completion-hook) caller be gated independently by
+`LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED` — a plain manual call omits that header and is
+never subject to that flag. The lock key is case-normalized (`.upper()` on both jurisdiction
+and session) specifically because the two callers didn't agree on casing before this.
+
+**OPEN-291 (2026-09-14): a jurisdiction's archive job now fires automatically off that
+jurisdiction's own scrape completion**, not a fixed weekly cron alone — `_run_scrape()`
+(every scrape path funnels through it: FL, WA, USA, the whole secondary batch) calls
+`maybe_trigger_archive_after_scrape()` on success. Config-driven opt-in only (a
+jurisdiction just needs to be in both its own scrape config and
+`openstates_archive.jurisdictions` — no per-jurisdiction code). A Redis debounce inside
+`_run_archive_with_hook` itself (not just at the trigger call site) prevents FL/USA's
+multi-session-per-run shape, or the still-registered weekly cron landing close to a
+hook-triggered run, from launching two overlapping archive Fargate tasks for the same
+jurisdiction — it fails *open* (proceeds) if Redis is down, deliberately, since this
+feature must never make archiving less reliable than it was before it existed.
+
+**OPEN-292 (2026-09-15): the SYNC-48 overlap lock is now a renewed lease, not a flat
+TTL.** A real full-session sweep (`limit=5000`, no `bill_candidates` cap) has no natural
+duration bound — MI's own first full run took 31.4 hours (see `PLAN-legbot.md` §34),
+which blew straight through the old flat 4-hour TTL, leaving most of that run with zero
+overlap protection. The TTL is now short (`legbot_scrape_completion_trigger_lock_ttl_seconds`,
+default 600s) and renewed on a background heartbeat every
+`legbot_scrape_completion_trigger_lock_renewal_seconds` (default 120s) for as long as the
+pipeline call is actually still running — each renewal re-checks ownership (GET-and-compare)
+before extending the expiry, so it can never resurrect a lock a newer trigger has already
+legitimately acquired. Real side benefit: a hard-crashed process (no clean shutdown) now
+loses its lock within about one TTL window instead of up to 4 hours.
+
+**SYNC-66 (2026-09-16, caught live in production): `resolve_touched_sessions()` used to
+return `[]` both when nothing was genuinely touched AND when it couldn't check at all**
+(api-v3 unreachable, rejected the request, or returned a malformed body) — logged at the
+same INFO level either way. A real transient connection blip during the `us`
+archive→LegBot hook (46 documents genuinely archived that run) was silently indistinguishable
+from a clean no-op, and an entire archive run's worth of new content never reached LegBot.
+Fixed: the function now returns `None` (not `[]`) when resolution genuinely fails and no
+session was already found on an earlier page — `[]` is reserved for a real "nothing touched"
+result. The caller (`_maybe_trigger_legbot_for_archive`) logs `None` at ERROR, not the
+"nothing to do" INFO path. A small fixed retry (3 attempts, 2s apart) rides out the
+specific connection-failure mode that was confirmed transient in production. **If you touch
+this function, remember `None` and `[]` mean different things to every caller — don't
+special-case "falsy" without checking which one you actually got.**
 
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
@@ -143,6 +193,37 @@ Full write-up and data: `ddp-agents`' `bench/legbot-throughput-2026-08-27/`.
 
 `scrapebot_client.py` has its own copy of the constant, still 5, deliberately —
 its mint holds no per-bill cache, so cadence costs it nothing there.
+
+## Scrape cadence can now escalate itself (OPEN-140 `dynamic_cadence`, rolled out 2026-09-16)
+
+`sync_schedule.yaml`'s per-jurisdiction `sync_day`/cron entries used to be the
+whole story: a human decided how often a jurisdiction got scraped, and that
+stayed fixed until someone edited the file. `dynamic_cadence` adds a second,
+automatic layer on top, controlled by `config/sync_schedule.yaml`'s
+`dynamic_cadence` block (`enabled`, `jurisdictions_excluded`).
+
+**Redis holds the runtime truth; the YAML value is only a floor.** When a
+jurisdiction's own signals (real recent legislative activity — new bills,
+votes, status changes since last scrape) justify scraping more often than its
+configured cadence, ddp-sync escalates it by writing a shorter effective
+interval to Redis; the scheduler reads Redis first and falls back to the YAML
+value only when nothing is there. **Escalation is automatic. Demotion back
+down is advisory-only** — nothing here silently reduces a jurisdiction to a
+sleepier cadence than its configured floor; a human decides that.
+
+**MI was excluded from this mechanism from OPEN-140's initial rollout until
+2026-09-16**, for WAF-safety reasons tracked under OPEN-53 — MI's legislature
+site had a history of rate-limit/WAF trouble, and letting a self-escalating
+system scrape it more aggressively without a human in the loop was judged too
+risky until that history was reviewed. The exclusion was removed, and the
+mechanism enabled system-wide for FL plus all 6 `secondary` jurisdictions, only
+after two separate explicit confirmations from Ramon in the same session (one
+for lifting MI's exclusion specifically, one for enabling the mechanism itself
+beyond MI) — **treat either half of that as requiring its own sign-off if it
+ever needs touching again; a decision to relax one does not imply the other.**
+FL's `sync_day` comment, which had drifted into a stale manual-reminder TODO
+predating this mechanism, was cleaned up to describe the current automatic
+behavior instead.
 
 ## Running a targeted LegBot backfill: use `bill_candidates`, not a loop over the on-demand endpoint
 
