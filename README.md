@@ -504,21 +504,33 @@ var and a restart, no deploy.
 
 ## Deployment
 
-ddp-sync runs on **two hosts**, no leader election — each runs its own scheduler
-(`app.py`: "single worker, no leader election"), so their job sets overlap harmlessly:
+ddp-sync runs on **three hosts**, no leader election — each runs its own scheduler
+(`app.py`: "single worker, no leader election"), so their job sets overlap harmlessly. See
+`CLAUDE.md`'s "ddp-sync runs as three independent instances" section for the full picture —
+settings never carry across any of these.
 
 | Host | Manager | Role |
 |------|---------|------|
-| **EC2 civic** | systemd (`ddp-sync.service`) | Canonical scheduler for cloud jobs: Webflow CMS, Pinecone, Brevo, legislator-bio |
-| **Mac Studio** | **system LaunchDaemon** (`com.ddp.ddp-sync`) | Runs the OpenStates **scrapes** — must be local (subprocesses `run-scrape.sh` against the local Postgres) |
+| **EC2 civic** (votebot/ddp-api) | systemd (`ddp-sync.service`) | Webflow CMS, Pinecone, Brevo, legislator-bio. **Runs `feat/rds-openstates-routing-standalone`, not `main`** — see the warning below. Planned for retirement ~Dec 2026 (Webflow removal); its Pinecone-ingestion job is planned to eventually move to the EC2-broker instance's own pipeline instead. |
+| **EC2-broker** (OPEN-193) | Docker Compose (`infrastructure/docker-compose.prod.yml`) | Co-located with production `ddp-broker-py`/api-v3/RDS/Fargate. Fargate-based scraping + RDS loading for its configured jurisdiction list; every scheduled job here is deliberately disabled (manual/webhook-triggered only) — see that compose file's own comments. |
+| **Mac Studio** | **system LaunchDaemon** (`com.ddp.ddp-sync`) | Runs the OpenStates **scrapes** — must be local (subprocesses `run-scrape.sh` against the local Postgres). Only instance with CAMS/LegBot/MLX access. |
 
-A change to this repo should be deployed to **both** targets.
+A change to this repo's `main` should be deployed to the **Mac Studio and EC2-broker**
+targets. **Do not deploy `main` to the EC2 civic (votebot/ddp-api) host** — see below.
 
 ### EC2 civic (systemd)
 
+> **⚠️ This host runs `feat/rds-openstates-routing-standalone`, not `main`.** It needed
+> OpenStates-replica routing (SYNC-6/SYNC-8's capability) without `main`'s newer
+> `ddp-broker-py` Flow 2 dependency or per-host job-disable flags/LegBot/Fargate machinery
+> it will never use — and it's slated for retirement (~Dec 2026, Webflow removal) rather
+> than reconciled with `main`. **Never run `git pull origin main` on this host** — deploy
+> updates with `git pull origin feat/rds-openstates-routing-standalone` instead. Full
+> history and reasoning: the `notes/ops-handoff` branch, notes dated 2026-09-15/16.
+
 ```bash
 cd /home/ubuntu/ddp-sync
-git pull origin main
+git pull origin feat/rds-openstates-routing-standalone
 source .venv/bin/activate
 pip install .
 sudo systemctl restart ddp-sync

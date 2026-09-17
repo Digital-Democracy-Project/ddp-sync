@@ -15,15 +15,34 @@ as a hook point — must be built on the newer, Webflow-independent reach instea
 session history around that date for the context this came up in — a discussion
 of how to auto-trigger `bill_changelog` generation on a new scraped bill version).
 
-## ddp-sync runs as two independent instances -- settings do not carry across them
+## ddp-sync runs as three independent instances -- settings do not carry across them
 
-There are two separate, independently-configured deployments of this same codebase, not
+There are three separate, independently-configured deployments of this same codebase, not
 one: the **Mac Studio** instance (the only one with CAMS/LegBot/MLX access — it runs the
-scheduler for most jurisdictions' scraping into local Postgres), and the **EC2-broker**
+scheduler for most jurisdictions' scraping into local Postgres), the **EC2-broker**
 instance (OPEN-193, co-located with production `ddp-broker-py` — it owns Fargate-based
-scraping + RDS loading for a specific, configured list of jurisdictions). Exactly one
-instance owns any given jurisdiction (`_cloud_path_owns()`); a jurisdiction never runs on
-both.
+scraping + RDS loading for a specific, configured list of jurisdictions), and the
+**votebot/ddp-api EC2** instance (co-located with VoteBot and `ddp-api` — keeps the
+(deprecated) Webflow CMS current and populates Pinecone for VoteBot's knowledge base; this
+is README's older "EC2 civic" row). Exactly one instance owns any given jurisdiction's
+scraping (`_cloud_path_owns()`); a jurisdiction never runs on both of the scraping-capable
+instances.
+
+**The votebot/ddp-api instance is planned for retirement (~Dec 2026, once Webflow is fully
+removed)**, with its Pinecone/VoteBot-knowledge-base ingestion job eventually folding into
+the EC2-broker instance's own pipeline instead (which already runs scrape → archive →
+extract → LegBot-summarize for every bill — appending "send to Pinecone" there is the
+planned long-term home, not a fourth instance). Given that horizon, this instance
+deliberately runs its own permanently-diverged branch (`feat/rds-openstates-routing-
+standalone` as of 2026-09-16) rather than being kept current with `main` — it needed
+OpenStates-replica routing (SYNC-6/SYNC-8's capability, reimplemented by hand on its old
+pin) without also taking on `main`'s newer `ddp-broker-py` Flow 2 dependency or LegBot/
+Fargate machinery it will never use. **Do not "fix" this by pulling it up to `main`** —
+that's a deliberate, reviewed decision, not drift; see that branch's own `README.md`
+guardrail note and the `notes/ops-handoff` branch (dated 2026-09-15/16) for the full
+reasoning and history. No PLAN doc/ticket for the retirement + consolidation plan itself
+existed as of 2026-09-17 — check `ddp-infra` and Jira for one before assuming it's still
+unplanned.
 
 Because these are separate processes, **an env var/setting set on one has no effect on the
 other** — there is no shared config store. This bit SYNC-59 directly: the EC2 instance now
