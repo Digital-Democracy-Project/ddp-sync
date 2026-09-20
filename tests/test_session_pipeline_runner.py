@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ddp_sync.config import SyncSettings
+from ddp_sync.pipelines import session_pipeline_runner
 from ddp_sync.pipelines.session_pipeline_runner import (
     ALL_ARTIFACT_TYPES,
     run_scheduled_session_pipeline,
@@ -19,6 +20,25 @@ from ddp_sync.pipelines.session_pipeline_runner import (
     run_single_bill_full,
 )
 from ddp_sync.services.broker_client import BrokerClientError
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_pipeline_semaphore():
+    """SYNC-72: get_session_pipeline_semaphore() is a process-wide singleton
+    in production (the whole point -- one real event loop for the life of
+    the process), but pytest-asyncio gives each test its own fresh event
+    loop, and an asyncio.Semaphore is bound to whichever loop first uses it.
+    Without resetting the module-level singleton between tests, the second
+    test to touch it either raises "bound to a different event loop" or
+    silently inherits the FIRST test's concurrency value instead of its own
+    _patch_settings(n) -- both real failure modes hit while writing this
+    fixture, not hypothetical. Reset before *and* after, so a test that
+    creates the singleton doesn't leak it forward even if this fixture's own
+    teardown ordering relative to other fixtures ever changes.
+    """
+    session_pipeline_runner._session_pipeline_semaphore = None
+    yield
+    session_pipeline_runner._session_pipeline_semaphore = None
 
 _CANDIDATE = {
     "gov_id": "SJR 2F",
@@ -1977,6 +1997,55 @@ async def test_concurrency_is_capped_at_session_pipeline_concurrency():
             "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
             include_concept_statements=False,
             retry_failed=False,
+        )
+
+    assert max_seen["value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_jurisdiction_runs_share_one_global_concurrency_budget():
+    """SYNC-72: the actual regression this ticket exists to fix. Before it,
+    every run_legbot_pipeline call built its own LOCAL asyncio.Semaphore --
+    two calls in flight at once (e.g. two jurisdictions' scheduled batch
+    jobs overlapping, exactly what happened live with US Congress + MI on
+    2026-09-20) each got their own independent budget, for a real combined
+    total of cap*2 bills in flight rather than cap.
+
+    Runs two run_legbot_pipeline calls concurrently (via asyncio.gather,
+    not sequentially) against a shared in-flight counter, with the
+    concurrency cap set to 2. Before this fix, this would observe up to 4
+    bills in flight at once (2 per call); after it, never more than 2
+    across BOTH calls combined -- proving the semaphore is genuinely
+    process-wide, not just re-verifying the single-call cap
+    test_concurrency_is_capped_at_session_pipeline_concurrency already
+    covers.
+    """
+    candidates = _make_candidates(6)
+    in_flight = {"count": 0}
+    max_seen = {"value": 0}
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        in_flight["count"] += 1
+        max_seen["value"] = max(max_seen["value"], in_flight["count"])
+        await asyncio.sleep(0.05)
+        in_flight["count"] -= 1
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(2):
+        await asyncio.gather(
+            run_legbot_pipeline(
+                "us", "119", ["bill_summary"], False, limit=10, dry_run=True,
+                include_concept_statements=False,
+                retry_failed=False,
+            ),
+            run_legbot_pipeline(
+                "mi", "2025-2026", ["bill_summary"], False, limit=10, dry_run=True,
+                include_concept_statements=False,
+                retry_failed=False,
+            ),
         )
 
     assert max_seen["value"] == 2
