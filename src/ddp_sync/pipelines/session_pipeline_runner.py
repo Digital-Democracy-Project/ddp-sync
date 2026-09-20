@@ -734,18 +734,25 @@ async def _process_bill_inner(
             # SYNC-24: a normal (non-raising) return doesn't mean success --
             # generate_and_store_bill_artifact/_changelog deliberately return
             # normally with a written status="failed" row for a legitimate
-            # decline (insufficient_information, no_archived_bill_text,
-            # no_valid_topics), so the actual returned status has to be
-            # inspected. Anything other than "complete"/"not_applicable" --
-            # including "failed" or a missing/malformed status from an
-            # outdated mock -- is treated as a failure rather than ever being
-            # counted as generated.
+            # decline (insufficient_information, no_valid_topics), so the
+            # actual returned status has to be inspected. Anything other
+            # than "complete"/"not_applicable" -- including "failed" or a
+            # missing/malformed status from an outdated mock -- is treated
+            # as a failure rather than ever being counted as generated.
             #
-            # SYNC-44: "not_applicable" is bill_changelog-only -- a bill with
-            # no version transition ready yet (its earliest version, or a
-            # diff not archived yet) writes no row at all, which is neither a
-            # generation nor a failure. See generate_and_store_bill_
-            # changelog's own docstring for why this replaced a `failed` row.
+            # SYNC-44 (OPEN-297): "not_applicable" started as bill_changelog-
+            # only -- a bill with no version transition ready yet (its
+            # earliest version, or a diff not archived yet) writes no row at
+            # all, which is neither a generation nor a failure. See
+            # generate_and_store_bill_changelog's own docstring for why this
+            # replaced a `failed` row there. OPEN-297 extended the same
+            # status to every other artifact_type's own "no archived bill
+            # text yet" case (generate_and_store_bill_artifact) for the
+            # identical reason -- it used to attempt a `failed` write with
+            # no Bill row to attach to (ensure_bill_exists above never
+            # creates one while archived_text is falsy), which
+            # ddp-broker-py rejected with a confusing "No Bill exists"
+            # error instead of the real, mundane cause.
             status = artifact_result.get("status")
             if status == "complete":
                 result["artifacts_generated"].append(artifact_type)

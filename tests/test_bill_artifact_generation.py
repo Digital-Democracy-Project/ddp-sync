@@ -142,10 +142,24 @@ async def test_target_artifact_id_reaches_the_write_on_success():
 @pytest.mark.asyncio
 async def test_target_artifact_id_reaches_the_write_on_failure():
     """The same id must reach a failed-row write too -- a failed generation
-    is still meant to resolve onto the placeholder, not orphan it."""
+    is still meant to resolve onto the placeholder, not orphan it.
+
+    Uses LegBot's insufficient_information decline as the failure case, not
+    a missing archived text (OPEN-297 changed that path to write nothing at
+    all -- see test_no_archived_text_skips_dispatch_and_write_entirely) --
+    this test's own subject is specifically "a failed-row write carries the
+    placeholder id," which insufficient_information still genuinely is.
+    """
+    dispatch_result = {
+        "answer": {"insufficient_information": True},
+        "backend": "mlx",
+    }
     with patch(
         "ddp_sync.pipelines.bill_artifact_generation.get_archived_bill_text",
-        new=AsyncMock(return_value=None),
+        new=AsyncMock(return_value="ARCHIVED FULL BILL TEXT"),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=dispatch_result),
     ), patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
         new=AsyncMock(return_value={"id": 42, "created": False}),
@@ -531,11 +545,22 @@ async def test_archived_text_found_is_used_for_dispatch(archived_text_by_default
 
 
 @pytest.mark.asyncio
-async def test_no_archived_text_skips_dispatch_and_writes_failed_row(archived_text_by_default):
-    """When ddp-open-states has nothing archived for this bill, LegBot is
-    never dispatched at all -- no live-URL fallback exists anymore (removed
-    specifically so a missing archive can never silently undo OPEN-48's
-    data-quality work) -- and a failed BillArtifact row is written instead.
+async def test_no_archived_text_skips_dispatch_and_write_entirely(archived_text_by_default):
+    """OPEN-297: when ddp-open-states has nothing archived for this bill yet,
+    LegBot is never dispatched at all -- no live-URL fallback exists anymore
+    (removed specifically so a missing archive can never silently undo
+    OPEN-48's data-quality work) -- and, as of OPEN-297, no broker write is
+    attempted either.
+
+    This used to attempt a `failed` BillArtifact write here, but
+    write_bill_artifact only ever attaches to an EXISTING Bill row, and
+    session_pipeline_runner.py's own ensure_bill_exists gate (SYNC-21)
+    deliberately never creates that row while archived_text is falsy -- so
+    the write was doomed from the start and ddp-broker-py rejected it with a
+    confusing "No Bill exists" error instead of the real, mundane "nothing
+    archived yet" cause. Fixed to match generate_and_store_bill_changelog's
+    existing status="not_applicable" convention (SYNC-44) instead of
+    inventing a new one.
     """
     archived_text_by_default.return_value = None
     with patch(
@@ -543,20 +568,16 @@ async def test_no_archived_text_skips_dispatch_and_writes_failed_row(archived_te
         new=AsyncMock(),
     ) as mock_dispatch, patch(
         "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
-        new=AsyncMock(return_value={"id": 8, "created": True}),
+        new=AsyncMock(),
     ) as mock_write:
         result = await generate_and_store_bill_artifact(
             **_COMMON_KWARGS, artifact_type="bill_summary"
         )
 
-    assert result == {"id": 8, "created": True, "status": "failed"}
+    assert result == {"status": "not_applicable"}
     archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
     mock_dispatch.assert_not_awaited()
-    write_kwargs = mock_write.await_args.kwargs
-    assert write_kwargs["content"] == ""
-    assert write_kwargs["status"] == "failed"
-    assert write_kwargs["failure_stage"] == "generation"
-    assert write_kwargs["failure_reason"] == "no_archived_bill_text"
+    mock_write.assert_not_awaited()
 
 
 _CHANGELOG_KWARGS = dict(
