@@ -97,6 +97,62 @@ from ddp_sync.services.replica_freshness import check_bill_version_freshness
 
 logger = structlog.get_logger()
 
+# SYNC-72: process-wide, not per-call -- see get_session_pipeline_semaphore()'s
+# own docstring for why a semaphore created fresh inside run_legbot_pipeline on
+# every call can't actually bound anything once two calls are in flight at the
+# same time (e.g. two jurisdictions' scheduled batch runs overlapping).
+_session_pipeline_semaphore: asyncio.Semaphore | None = None
+
+
+def get_session_pipeline_semaphore() -> asyncio.Semaphore:
+    """The single, process-wide gate on how many _process_bill calls can be
+    in flight across ALL run_legbot_pipeline invocations at once -- not just
+    within one call.
+
+    SYNC-72: before this, run_legbot_pipeline created a fresh
+    asyncio.Semaphore(session_pipeline_concurrency) on every call, as a
+    local variable -- never shared across calls. That correctly bounded any
+    ONE call to session_pipeline_concurrency bills in flight, a clean 1:1
+    match with CAMS's configured MLX worker count (2) when only one
+    jurisdiction's run was active. But run_legbot_pipeline has two real
+    callers that run independently of each other and can overlap freely --
+    run_scheduled_session_pipeline's cron-driven batch jobs, and
+    scraper_triggered_legbot.py's archive-completion hook (SYNC-65) -- so
+    two jurisdictions' batch runs overlapping meant two separate
+    semaphores, each independently admitting 2 bills, for a real total of 4
+    competing for CAMS's 2 actual workers.
+
+    Confirmed live (US 119th Congress + MI running concurrently,
+    2026-09-20): throughput collapsed from 136.7 bills/hr (US alone) to
+    22.6 bills/hr combined -- far worse than ordinary queueing delay would
+    explain, because CAMS's own KV-cache reuse (a `branch=warm_hit` in its
+    own audit log, versus a full cold `mlx_prefill_started`) depends on a
+    bill's worker staying free until its own next follow-up call arrives.
+    With more distinct bills in flight than there are workers, a bill's
+    worker gets claimed by a competing bill from the OTHER semaphore first,
+    forcing a full prefill every single follow-up instead of ever reusing
+    that bill's own cache.
+
+    Same lazy-singleton idiom as get_redis_store() (services/redis_store.py)
+    -- constructed once, on first use, at module scope. Safe without a lock:
+    the check-then-create below has no `await` between the check and the
+    assignment, so nothing can interleave on asyncio's single-threaded event
+    loop.
+
+    Deliberately does NOT also gate run_single_bill_full or
+    dispatch_and_record_bill_artifact -- both bypass concurrency control
+    entirely today (confirmed while investigating SYNC-72) and are a
+    separate, lower-volume gap (human-triggered single-bill requests, not
+    automated backlogs), not widened into this fix's scope.
+    """
+    global _session_pipeline_semaphore
+    if _session_pipeline_semaphore is None:
+        _session_pipeline_semaphore = asyncio.Semaphore(
+            get_settings().session_pipeline_concurrency
+        )
+    return _session_pipeline_semaphore
+
+
 # The recognized BillArtifact types this plan ships -- matches
 # bill_artifact_generation.py's own _ARTIFACT_TYPE_TO_QUESTION_TYPE keys
 # (8 types, including bill_topics -- SYNC-1) plus bill_changelog, which
@@ -1181,19 +1237,27 @@ async def run_legbot_pipeline(
         candidates = candidates[:limit]
     bills_considered = len(candidates)
 
-    # Bounded concurrency (2026-08-18): several bills' own _process_bill
-    # calls run at once instead of strictly one at a time, up to
-    # session_pipeline_concurrency -- see this module's own docstring and
-    # that setting's docstring for why a caller that only ever has one
-    # request in flight can never exercise ddp-agents' AGENTS-33/34 MLX
-    # instance pool at all. A semaphore, not a bare asyncio.gather over
-    # every candidate at once: _process_bill() fires several non-MLX HTTP
-    # calls per bill (broker coverage check, OpenStates lookups,
-    # ensure_bill_exists) that a genuinely unbounded fan-out would send all
-    # at once for however many bills a session has -- potentially thousands
-    # -- for no throughput benefit once only a handful of MLX-LM instances
-    # can usefully be busy at the same time.
-    semaphore = asyncio.Semaphore(get_settings().session_pipeline_concurrency)
+    # Bounded concurrency (2026-08-18, made process-wide by SYNC-72 on
+    # 2026-09-20): several bills' own _process_bill calls run at once
+    # instead of strictly one at a time, up to session_pipeline_concurrency
+    # -- see this module's own docstring and that setting's docstring for
+    # why a caller that only ever has one request in flight can never
+    # exercise ddp-agents' AGENTS-33/34 MLX instance pool at all. A
+    # semaphore, not a bare asyncio.gather over every candidate at once:
+    # _process_bill() fires several non-MLX HTTP calls per bill (broker
+    # coverage check, OpenStates lookups, ensure_bill_exists) that a
+    # genuinely unbounded fan-out would send all at once for however many
+    # bills a session has -- potentially thousands -- for no throughput
+    # benefit once only a handful of MLX-LM instances can usefully be busy
+    # at the same time.
+    #
+    # get_session_pipeline_semaphore() (SYNC-72), not a local
+    # asyncio.Semaphore(...) constructed here -- see that function's own
+    # docstring for why a semaphore scoped to just this one call can't
+    # actually bound anything once a second run_legbot_pipeline call (a
+    # different jurisdiction's own scheduled batch, say) is in flight at
+    # the same time.
+    semaphore = get_session_pipeline_semaphore()
 
     async def _process_bill_bounded(candidate: dict) -> dict:
         async with semaphore:
