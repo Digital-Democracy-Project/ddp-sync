@@ -380,14 +380,27 @@ async def generate_and_store_bill_artifact(
     that doesn't need per-call broker routing (SYNC-9's batch pipeline).
 
     Returns:
-        The BillArtifact write response as ddp-broker-py's API reports it
-        (today, just `id`/`created` -- that serializer doesn't echo `status`
-        back), merged with this function's own authoritative `status`
-        ("complete" or "failed") under the `status` key -- applied last, so
-        it always wins over whatever the broker response itself contains.
-        SYNC-24: callers (session_pipeline_runner.py's `_process_bill`) need
-        to know which of the two actually happened without re-deriving it
-        from failure_stage/failure_reason themselves.
+        For "complete"/"failed": the BillArtifact write response as
+        ddp-broker-py's API reports it (today, just `id`/`created` -- that
+        serializer doesn't echo `status` back), merged with this function's
+        own authoritative `status` under the `status` key -- applied last,
+        so it always wins over whatever the broker response itself
+        contains. SYNC-24: callers (session_pipeline_runner.py's
+        `_process_bill`) need to know which of the two actually happened
+        without re-deriving it from failure_stage/failure_reason
+        themselves. Confirmed both current callers are safe regardless:
+        `_process_bill_inner` only ever reads `.get("status")`,
+        `dispatch_and_record_bill_artifact` discards the return value
+        entirely.
+
+        For "not_applicable" (OPEN-297: no archived text yet -- no
+        `id`/`created`, since no write is attempted at all): a bare
+        `{"status": "not_applicable"}`. Not a terminal state -- there is no
+        persisted row and no attempt record anywhere, so this bill is
+        indistinguishable from "never tried" and is re-dispatched on every
+        future run regardless of `retry_failed` (contrast a real `failed`
+        row, which SYNC-42 deliberately leaves stuck unless the caller
+        explicitly opts into `retry_failed=True`).
     """
     if artifact_type not in _ARTIFACT_TYPE_TO_QUESTION_TYPE:
         raise ValueError(f"Unsupported artifact_type for Phase 8 dispatch: {artifact_type}")
