@@ -983,6 +983,44 @@ async def test_a_normally_returned_not_applicable_status_is_neither_generated_no
 
 
 @pytest.mark.asyncio
+async def test_bill_with_no_archived_text_is_dispatched_again_on_a_later_run():
+    """OPEN-297/OPEN-301 (pm-review): proves the actual re-eligibility claim
+    end to end, not just the underlying candidate-selection rule in
+    isolation (`status is None -> needs_dispatch`, exercised implicitly by
+    _patch_coverage(None) in nearly every other test in this file).
+
+    Because a "no archived text" outcome writes no BillArtifact row at all
+    (this ticket's fix), the broker's own coverage read for that bill stays
+    exactly as empty after the first attempt as it was before -- there is
+    no persisted state anywhere that could make a later run skip it. This
+    runs the pipeline twice under that identical, unchanged coverage
+    condition and confirms generate_and_store_bill_artifact is genuinely
+    invoked both times (not skipped the second time), with retry_failed
+    left at its real production default of False throughout -- a bill
+    missing archived text is never stuck, without needing retry_failed=True
+    the way an actual `failed` row would (SYNC-42).
+    """
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"status": "not_applicable"}),
+    ) as mock_generate, _patch_org_status({"has_rows": True, "row_count": 0}):
+        first_run = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+        second_run = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    for result in (first_run, second_run):
+        assert result["results"][0]["artifacts_not_applicable"] == ["bill_summary"]
+    assert mock_generate.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_bill_changelog_normally_returned_failed_status_is_not_counted_as_generated():
     """Same status-inspection fix applies to the bill_changelog branch, which
     dispatches via a separate function than every other artifact_type."""
