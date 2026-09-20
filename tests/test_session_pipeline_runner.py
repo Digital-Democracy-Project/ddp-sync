@@ -958,6 +958,31 @@ async def test_a_normally_returned_complete_status_is_still_counted_as_generated
 
 
 @pytest.mark.asyncio
+async def test_a_normally_returned_not_applicable_status_is_neither_generated_nor_failed():
+    """OPEN-297: generate_and_store_bill_artifact now also returns
+    status="not_applicable" (no BillArtifact row written) when there's no
+    archived bill text yet -- previously this status value was only ever
+    reached via the bill_changelog branch (SYNC-44). The routing itself
+    (the `elif status == "not_applicable"` branch below) is unchanged; this
+    confirms it already does the right thing for the artifact branch too,
+    without needing its own new caller-side handling."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"status": "not_applicable"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == []
+    assert bill_result["artifacts_failed"] == []
+    assert bill_result["artifacts_not_applicable"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
 async def test_bill_changelog_normally_returned_failed_status_is_not_counted_as_generated():
     """Same status-inspection fix applies to the bill_changelog branch, which
     dispatches via a separate function than every other artifact_type."""

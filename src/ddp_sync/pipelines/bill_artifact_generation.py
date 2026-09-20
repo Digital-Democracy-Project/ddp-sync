@@ -395,27 +395,33 @@ async def generate_and_store_bill_artifact(
     question_type = _ARTIFACT_TYPE_TO_QUESTION_TYPE[artifact_type]
     resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
     if resolved_bill_source is None:
+        # OPEN-297: this used to attempt a `failed` BillArtifact write here,
+        # but write_bill_artifact only ever attaches to an EXISTING Bill row
+        # -- and session_pipeline_runner.py's own ensure_bill_exists gate
+        # (SYNC-21) deliberately never creates that row while archived_text
+        # is falsy, for the exact same reason this function has none to
+        # work with. The two checks agreeing was never in question; the bug
+        # was this function still trying to write anyway, which
+        # ddp-broker-py then rejected with a confusing "No Bill exists"
+        # error instead of the real, mundane "nothing archived yet" cause.
+        #
+        # Fixed the same way generate_and_store_bill_changelog already
+        # handles its own "nothing to work with yet" case (SYNC-44/AC4) --
+        # log and return status="not_applicable" without attempting any
+        # broker write. The caller (session_pipeline_runner.py's per-type
+        # dispatch) already has an `elif status == "not_applicable"` branch
+        # feeding result["artifacts_not_applicable"], previously reached
+        # only via bill_changelog -- no caller-side change needed. A bill
+        # naturally falls through to "needs dispatch" again on its next run
+        # once real text shows up, rather than being retried forever (no
+        # row written) or stuck skipped (a `failed` row, retried only with
+        # retry_failed=True, which the standing production runs don't set).
         logger.info(
-            "No archived bill text -- recording a failed artifact",
+            "No archived bill text -- not a failure, nothing to write",
             bill_openstates_id=bill_openstates_id,
             artifact_type=artifact_type,
         )
-        broker_result = await write_bill_artifact(
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            version_date=version_date,
-            version_note=version_note,
-            artifact_type=artifact_type,
-            content="",
-            status="failed",
-            failure_stage="generation",
-            failure_reason="no_archived_bill_text",
-            artifact_id=target_artifact_id,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
-        return {**broker_result, "status": "failed"}
+        return {"status": "not_applicable"}
 
     dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
     answer = dispatch_result["answer"]
