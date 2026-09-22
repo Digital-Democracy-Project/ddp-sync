@@ -1114,3 +1114,48 @@ async def trigger_openstates_backfill(
         "subcommand": subcommand,
         "mode": mode,
     }
+
+
+@router.post("/trigger/vote-person-backfill", status_code=202)
+async def trigger_vote_person_backfill(
+    background_tasks: BackgroundTasks,
+    mode: str = "dry-run",
+    token: str = Depends(api_key_auth),
+):
+    """SYNC-74 (VOTEBOT-7/OPEN-2 recurrence): run backfill-vote-person-resolution.py as a
+    Fargate task, the same way OPEN-268's openstates-backfill endpoint runs os-text-extract
+    subcommands -- a separate, small endpoint rather than a fourth allowed subcommand there,
+    since the vote-person backfill has a genuinely different CLI shape (no jurisdiction or
+    subcommand, just an optional --dry-run/--commit).
+
+    Returns 202 Accepted immediately, with a `run_id` that also appears in every structured
+    log line the job itself produces (vote_person_backfill.py) -- the correlation handle
+    between this immediate response and the job's eventual result, matching
+    trigger_openstates_backfill's own reasoning.
+
+    mode: dry-run (default) or commit
+    """
+    import uuid
+
+    from ddp_sync.pipelines.vote_person_backfill import (
+        ALLOWED_MODES,
+        run_vote_person_backfill_job,
+    )
+    from ddp_sync.scheduler import get_scheduler
+
+    if mode not in ALLOWED_MODES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown mode '{mode}'. Available: {sorted(ALLOWED_MODES)}",
+        )
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    run_id = f"vote-person-backfill-{mode}-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(
+        run_vote_person_backfill_job,
+        mode,
+        config=config,
+        run_id=run_id,
+    )
+    return {"status": "started", "run_id": run_id, "mode": mode}
