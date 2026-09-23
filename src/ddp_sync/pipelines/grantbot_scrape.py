@@ -27,12 +27,22 @@ analyze_bill tasks.
 """
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import structlog
 
 from ddp_sync.config import get_settings
 
 logger = structlog.get_logger()
+
+# pm-review: a single failed attempt used to be a wait-until-next-Monday cost;
+# now that the trigger is monthly, the same single failure costs roughly a
+# month instead of a week. A small bounded retry -- not a generic retry
+# framework, just enough to ride out CAMS being mid-`cams reload` -- is
+# proportionate here in a way it wasn't at weekly cadence.
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY_S = 30.0
 
 
 async def run_grantbot_scrape_job(
@@ -45,6 +55,11 @@ async def run_grantbot_scrape_job(
     established shape). `config` is accepted for parity with every other
     scheduled job's wrapper signature but currently unused -- there is no
     per-run parameter to pass; CAMS runs the same closure every time.
+
+    Retries a connection failure or a 5xx up to _MAX_ATTEMPTS times,
+    _RETRY_DELAY_S apart -- enough to survive CAMS being mid-restart, not a
+    general resilience mechanism. A 4xx (e.g. an auth misconfiguration) is
+    not retried; retrying it would just fail the same way three times.
     """
     settings = get_settings()
     if not settings.cams_api_token:
@@ -59,32 +74,54 @@ async def run_grantbot_scrape_job(
     url = f"{settings.cams_base_url.rstrip('/')}/api/v1/admin/scrape-funders"
     headers = {"Authorization": f"Bearer {settings.cams_api_token}"}
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, headers=headers)
-        response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "grantbot_scrape: CAMS returned an error",
-            trigger=trigger,
-            status_code=e.response.status_code,
-            body=e.response.text[:500],
-        )
-        return {
-            "success": False,
-            "error": "cams_error",
-            "status_code": e.response.status_code,
-        }
-    except httpx.RequestError as e:
-        logger.error(
-            "grantbot_scrape: could not reach CAMS", trigger=trigger, error=str(e),
-        )
-        return {"success": False, "error": "cams_unreachable", "detail": str(e)}
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        last_attempt = attempt == _MAX_ATTEMPTS
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code < 500 or last_attempt:
+                logger.error(
+                    "grantbot_scrape: CAMS returned an error",
+                    trigger=trigger,
+                    attempt=attempt,
+                    status_code=e.response.status_code,
+                    body=e.response.text[:500],
+                )
+                return {
+                    "success": False,
+                    "error": "cams_error",
+                    "status_code": e.response.status_code,
+                }
+            logger.warning(
+                "grantbot_scrape: CAMS returned a 5xx -- retrying",
+                trigger=trigger, attempt=attempt, status_code=e.response.status_code,
+            )
+            await asyncio.sleep(_RETRY_DELAY_S)
+            continue
+        except httpx.RequestError as e:
+            if last_attempt:
+                logger.error(
+                    "grantbot_scrape: could not reach CAMS",
+                    trigger=trigger, attempt=attempt, error=str(e),
+                )
+                return {"success": False, "error": "cams_unreachable", "detail": str(e)}
+            logger.warning(
+                "grantbot_scrape: could not reach CAMS -- retrying",
+                trigger=trigger, attempt=attempt, error=str(e),
+            )
+            await asyncio.sleep(_RETRY_DELAY_S)
+            continue
 
-    result = response.json()
-    logger.info(
-        "grantbot_scrape: dispatched to CAMS",
-        trigger=trigger,
-        status=result.get("status"),
-    )
-    return {"success": True, **result}
+        result = response.json()
+        logger.info(
+            "grantbot_scrape: dispatched to CAMS",
+            trigger=trigger,
+            attempt=attempt,
+            status=result.get("status"),
+        )
+        return {"success": True, **result}
+
+    # Unreachable: the loop above always returns on its last_attempt branch.
+    raise AssertionError("run_grantbot_scrape_job: retry loop exited without returning")
