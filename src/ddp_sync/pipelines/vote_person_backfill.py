@@ -126,6 +126,7 @@ async def run_fargate_script_job(
             "success": False,
             "error": f"unknown_job: {job} (allowed: {sorted(JOBS)})",
             "run_id": run_id,
+            "job": job,
             "duration_seconds": 0.0,
         }
     runner_script = JOBS[job]
@@ -135,6 +136,7 @@ async def run_fargate_script_job(
             "success": False,
             "error": f"unknown_mode: {mode} (allowed: {sorted(ALLOWED_MODES)})",
             "run_id": run_id,
+            "job": job,
             "duration_seconds": 0.0,
         }
 
@@ -144,7 +146,7 @@ async def run_fargate_script_job(
     if rds_error:
         error = f"cannot resolve an RDS target: {rds_error}"
         logger.error("fargate_script: fargate launch refused", run_id=run_id, job=job, error=error)
-        return {"success": False, "error": error, "run_id": run_id, "duration_seconds": 0.0}
+        return {"success": False, "error": error, "run_id": run_id, "job": job, "duration_seconds": 0.0}
 
     try:
         fargate_cfg = _fargate_config(config)
@@ -154,6 +156,7 @@ async def run_fargate_script_job(
             "success": False,
             "error": f"config_error: {e}",
             "run_id": run_id,
+            "job": job,
             "duration_seconds": 0.0,
         }
 
@@ -175,6 +178,7 @@ async def run_fargate_script_job(
             "success": False,
             "error": f"run_task_failed: {detail}",
             "run_id": run_id,
+            "job": job,
             "duration_seconds": duration,
         }
 
