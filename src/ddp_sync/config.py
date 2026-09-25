@@ -175,6 +175,7 @@ class SyncSettings:
     openstates_archive_enabled: bool = True
     mi_cookie_publish_enabled: bool = True
     session_pipeline_batch_enabled: bool = True
+    grantbot_scrape_enabled: bool = True
 
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
@@ -589,6 +590,7 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "openstates_archive_enabled": "OPENSTATES_ARCHIVE_ENABLED",
     "mi_cookie_publish_enabled": "MI_COOKIE_PUBLISH_ENABLED",
     "session_pipeline_batch_enabled": "SESSION_PIPELINE_BATCH_ENABLED",
+    "grantbot_scrape_enabled": "GRANTBOT_SCRAPE_ENABLED",
 }
 
 

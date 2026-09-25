@@ -1159,3 +1159,34 @@ async def trigger_vote_person_backfill(
         run_id=run_id,
     )
     return {"status": "started", "run_id": run_id, "mode": mode}
+
+
+@router.post("/trigger/grantbot-scrape-funders")
+async def trigger_grantbot_scrape_funders(token: str = Depends(api_key_auth)):
+    """Fire GrantBot's funder-scrape + Kindora enrichment job on demand (SYNC-36).
+
+    Mirrors the monthly scheduled job (scheduler.py's grantbot_scrape) --
+    same wrapper function, same CAMS endpoint, so an operator can trigger it
+    ad hoc without waiting for the 1st of the month. Synchronous, not
+    background-tasked: CAMS's own POST /api/v1/admin/scrape-funders already
+    returns 202 and runs the real work in ITS background, so this call
+    itself completes almost immediately either way.
+    """
+    from ddp_sync.pipelines.grantbot_scrape import run_grantbot_scrape_job
+
+    result = await run_grantbot_scrape_job(trigger="manual")
+    if result.get("success"):
+        return result
+
+    error = result.get("error")
+    if error == "cams_not_configured":
+        raise HTTPException(
+            status_code=503,
+            detail="CAMS_API_TOKEN not configured on this instance -- this "
+            "endpoint only works on the Mac Studio instance, co-located "
+            "with CAMS.",
+        )
+    if error == "cams_error":
+        raise HTTPException(status_code=502, detail=result)
+    # cams_unreachable, or any other value this wrapper might return in the future.
+    raise HTTPException(status_code=502, detail=result)

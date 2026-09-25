@@ -334,6 +334,9 @@ class UpdateScheduler:
         # --- Session-targeted BillArtifact batch job (SYNC-9) ---
         self._register_session_pipeline_batch_job()
 
+        # --- GrantBot funder scrape + Kindora enrichment (SYNC-36/AGENTS-54) ---
+        self._register_grantbot_scrape_job()
+
         self.scheduler.start()
         self._is_running = True
 
@@ -1256,6 +1259,52 @@ class UpdateScheduler:
             session_code=config.get("session_code"),
             artifact_types=config.get("artifact_types"),
             limit=config.get("limit"),
+        )
+
+    def _register_grantbot_scrape_job(self) -> None:
+        """Register GrantBot's monthly funder-scrape trigger (SYNC-36).
+
+        AGENTS-54 removes CAMS's own internal cron for this job; this is its
+        replacement, following the same YAML enabled/frequency/sync_time_utc
+        shape session_pipeline_batch and votebot_eval use for their own
+        required config. Unlike those two, every field here has a sensible
+        default -- this job takes no per-run parameters at all -- so there's
+        no required-key validation before registering, just the enabled gate.
+
+        Mac-Studio-only in effect, not in code: run_grantbot_scrape_job
+        itself logs and no-ops when CAMS_API_TOKEN isn't configured, so
+        registering this job on a host without CAMS is harmless -- it just
+        fires once a month and skips.
+        """
+        from ddp_sync.pipelines.grantbot_scrape import run_grantbot_scrape_job
+
+        config = self._sync_config.get("grantbot_scrape", {})
+        # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate.
+        if not (self.settings.grantbot_scrape_enabled and config.get("enabled", False)):
+            logger.info("grantbot_scrape: disabled — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "07:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        day_of_month = config.get("day_of_month", 1)
+
+        async def _grantbot_scrape_wrapper():
+            return await run_grantbot_scrape_job(config, trigger="scheduled")
+
+        self._add_job_replacing(
+            _grantbot_scrape_wrapper,
+            trigger=CronTrigger(day=day_of_month, hour=hour, minute=minute, timezone=_UTC),
+            id="grantbot_scrape",
+            name="GrantBot: funder scrape + Kindora enrichment (monthly)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            "grantbot_scrape: registered",
+            day_of_month=day_of_month,
+            sync_time=sync_time_str,
         )
 
     def stop(self) -> None:

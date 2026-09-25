@@ -910,3 +910,16 @@ session_pipeline_batch:
   include_org_research: false
   include_concept_statements: false
   limit: 10
+
+# SYNC-36/AGENTS-54: GrantBot's Notion funder-scrape + Kindora enrichment + shortlist job.
+# Used to self-schedule weekly entirely inside CAMS's own internal cron -- moved here to match
+# every other recurring pipeline's "ddp-sync schedules, the target service executes" convention,
+# and the cadence itself changed from weekly to monthly per Ramon's 2026-08-23 call. Mac-Studio-
+# only: only does anything when CAMS_API_TOKEN is configured on this host (see
+# pipelines/grantbot_scrape.py). This is a shared, checked-in flag -- every ddp-sync host picks
+# it up on next pull/restart unless it has its own GRANTBOT_SCRAPE_ENABLED=false in .env (SYNC-51).
+grantbot_scrape:
+  enabled: true
+  frequency: monthly
+  day_of_month: 1
+  sync_time_utc: "07:00"   # matches the old weekly cron's own 7am UTC (2am ET)
