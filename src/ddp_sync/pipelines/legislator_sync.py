@@ -20,6 +20,27 @@ logger = structlog.get_logger()
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent.parent / "config" / "sync_schedule.yaml"
 
 
+def _ocd_person_id(person_id: str) -> str:
+    """Normalize a bare CMS-stored UUID to OpenStates' ``ocd-person/`` format.
+
+    The Legislators CMS's ``openstatesid`` field stores a bare UUID, but
+    OpenStates always uses the full ``ocd-person/{uuid}`` form for person
+    IDs -- both in ``/people?id=`` lookups and every ``person.id``/
+    ``voter.id`` field in bill and vote data. Without this, every sponsor
+    lookup and vote-attribution comparison in this module silently fails
+    to match (OpenStates returns 200 with zero results rather than an
+    error). Mirrors the same fix already applied once in
+    ``scripts/backfill_legislator_party.py`` (commit 6a97206).
+
+    Idempotent: already-prefixed IDs pass through unchanged, so callers
+    that already hold a correctly-formatted ID (e.g. this module's own
+    tests) are unaffected.
+    """
+    if not person_id or person_id.startswith("ocd-person/"):
+        return person_id
+    return f"ocd-person/{person_id}"
+
+
 @dataclass
 class LegislatorSyncResult:
     """Result of syncing a single legislator's sponsored bills and votes."""
@@ -263,6 +284,10 @@ class LegislatorSyncService:
         """
         await self._apply_rate_limit()
 
+        # SYNC-77: OpenStates requires the full ocd-person/{uuid} form;
+        # the CMS stores a bare UUID.
+        person_id = _ocd_person_id(person_id)
+
         # Single person lookup by opaque OpenStates ID -- no jurisdiction is
         # available here to route to the local replica, so this always uses
         # the public API base.
@@ -326,6 +351,10 @@ class LegislatorSyncService:
         Returns:
             List of bill dicts from OpenStates
         """
+        # SYNC-77: normalize once so the sponsorship-match comparison below
+        # (against OpenStates' always-prefixed person.id) succeeds.
+        person_id = _ocd_person_id(person_id)
+
         # Get sponsor name if not provided
         if not sponsor_name:
             sponsor_name = await self._get_sponsor_name(person_id)
@@ -427,6 +456,11 @@ class LegislatorSyncService:
         Returns:
             List of LegislatorVote objects
         """
+        # SYNC-77: normalize once so _extract_legislator_votes_from_bill()'s
+        # voter_id == person_id comparison (against OpenStates' always-
+        # prefixed voter.id) succeeds.
+        person_id = _ocd_person_id(person_id)
+
         api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
 
         all_votes: list[LegislatorVote] = []
