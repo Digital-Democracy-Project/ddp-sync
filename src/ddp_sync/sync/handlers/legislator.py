@@ -153,8 +153,12 @@ class LegislatorHandler:
                 }
                 await self.webflow._build_jurisdiction_mapping(client, headers)
 
-            # Resolve jurisdiction using the mapping
-            jurisdiction = self.webflow._resolve_jurisdiction(jurisdiction_ref).lower()
+            # Resolve jurisdiction using the mapping (federal seat, if any,
+            # always wins over the raw jurisdiction ref -- see
+            # WebflowSource._resolve_jurisdiction()).
+            jurisdiction = self.webflow._resolve_jurisdiction(
+                jurisdiction_ref, seat=fields.get("seat")
+            ).lower()
 
             # Process the legislator item for Webflow content
             doc = self.webflow._process_legislator_item(item)
