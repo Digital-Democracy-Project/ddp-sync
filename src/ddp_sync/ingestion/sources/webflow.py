@@ -1,6 +1,6 @@
 """Webflow CMS data source connector."""
 
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import httpx
 import structlog
@@ -10,6 +10,7 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata, MetadataExtractor
 from ddp_sync.ingestion.pipeline import DocumentSource
 from ddp_sync.ingestion.sources.pdf import PDFSource
+from ddp_sync.pipelines.legislator_bio import _FEDERAL_SEAT_REF_IDS, _normalize_seat_refs
 
 logger = structlog.get_logger()
 
@@ -960,7 +961,7 @@ class WebflowSource:
 
         # Resolve jurisdiction reference to state code
         jurisdiction_ref = fields.get("jurisdiction")
-        state_code = self._resolve_jurisdiction(jurisdiction_ref)
+        state_code = self._resolve_jurisdiction(jurisdiction_ref, seat=fields.get("seat"))
 
         # Extract content from post-body (DDP scorecards)
         content = self._extract_legislator_content(fields)
@@ -998,16 +999,33 @@ class WebflowSource:
             metadata=metadata,
         )
 
-    def _resolve_jurisdiction(self, jurisdiction_ref: str | list | None) -> str:
+    def _resolve_jurisdiction(
+        self,
+        jurisdiction_ref: str | list | None,
+        seat: Any = None,
+    ) -> str:
         """
         Resolve a jurisdiction reference ID to a state code.
 
         Args:
             jurisdiction_ref: Reference ID, list of IDs, or state code string
+            seat: Raw ``seat`` multi-reference field from the same CMS
+                record, if available. A federal seat (``us-house``/
+                ``us-senate``, see ``_FEDERAL_SEAT_REF_IDS``) always
+                resolves to ``"US"`` regardless of ``jurisdiction_ref`` --
+                a federal member's CMS ``jurisdiction`` reference points at
+                their represented home state (e.g. "CA"), which is not
+                their OpenStates jurisdiction. Mirrors the federal
+                classification `legislator_bio.py`'s `CMSLegislator`
+                already uses.
 
         Returns:
-            State code (e.g., "FL", "WA") or "US" if not found
+            State code (e.g., "FL", "WA") or "US" if not found or federal
         """
+        seat_refs = _normalize_seat_refs(seat)
+        if any(r in _FEDERAL_SEAT_REF_IDS for r in seat_refs):
+            return "US"
+
         if not jurisdiction_ref:
             return "US"
 
