@@ -1,5 +1,5 @@
-"""Tests for SYNC-74: run_vote_person_backfill_job, the Fargate-launch path for
-backfill-vote-person-resolution.py (VOTEBOT-7/OPEN-2 recurrence).
+"""Tests for run_fargate_script_job, the generalized Fargate-launch path for registered
+one-off data-patch scripts (SYNC-74 / OPEN-304 recurrence).
 
 Reuses the same FakeEcsClient/FakeLogsClient shape test_openstates_backfill.py established for
 the identical purpose. _fetch_task_output itself is reused directly from openstates_backfill.py
@@ -85,6 +85,14 @@ _FARGATE_CFG = {
 }
 
 
+# ── JOBS registry ────────────────────────────────────────────────────────────────────────────
+
+
+def test_jobs_registry_has_both_registered_scripts():
+    assert vpb.JOBS["vote-person-backfill"] == "backfill-vote-person-resolution.py"
+    assert vpb.JOBS["open304-lis-identifiers"] == "open304-add-lis-identifiers.py"
+
+
 # ── _build_command ──────────────────────────────────────────────────────────────────────────
 
 
@@ -100,9 +108,21 @@ def test_build_command_commit():
 
 
 @pytest.mark.asyncio
+async def test_unknown_job_refused_without_touching_ecs():
+    ecs = FakeEcsClient()
+    result = await vpb.run_fargate_script_job(job="not-a-real-job", ecs_client=ecs)
+    assert result["success"] is False
+    assert "unknown_job" in result["error"]
+    assert ecs.run_task_calls == []
+    assert "run_id" in result
+
+
+@pytest.mark.asyncio
 async def test_unknown_mode_refused_without_touching_ecs():
     ecs = FakeEcsClient()
-    result = await vpb.run_vote_person_backfill_job(mode="delete-everything", ecs_client=ecs)
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill", mode="delete-everything", ecs_client=ecs
+    )
     assert result["success"] is False
     assert "unknown_mode" in result["error"]
     assert ecs.run_task_calls == []
@@ -112,8 +132,11 @@ async def test_unknown_mode_refused_without_touching_ecs():
 @pytest.mark.asyncio
 async def test_caller_supplied_run_id_is_honored_even_on_a_validation_failure():
     ecs = FakeEcsClient()
-    result = await vpb.run_vote_person_backfill_job(
-        mode="delete-everything", ecs_client=ecs, run_id="vote-person-backfill-dry-run-deadbeef0000"
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill",
+        mode="delete-everything",
+        ecs_client=ecs,
+        run_id="vote-person-backfill-dry-run-deadbeef0000",
     )
     assert result["run_id"] == "vote-person-backfill-dry-run-deadbeef0000"
 
@@ -126,8 +149,8 @@ async def test_unresolvable_rds_credential_refuses_without_touching_ecs(monkeypa
         lambda: (None, "RDS_CREDENTIALS_SECRET_ARN not set -- refusing to guess which secret to read"),
     )
     ecs = FakeEcsClient()
-    result = await vpb.run_vote_person_backfill_job(
-        config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
     )
     assert result["success"] is False
     assert "cannot resolve an RDS target" in result["error"]
@@ -139,7 +162,7 @@ async def test_unresolvable_rds_credential_refuses_without_touching_ecs(monkeypa
 async def test_missing_fargate_config_fails_without_touching_ecs(monkeypatch):
     monkeypatch.setattr(vpb, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient()
-    result = await vpb.run_vote_person_backfill_job(config={}, ecs_client=ecs)
+    result = await vpb.run_fargate_script_job(job="vote-person-backfill", config={}, ecs_client=ecs)
     assert result["success"] is False
     assert result["error"].startswith("config_error")
     assert ecs.run_task_calls == []
@@ -156,12 +179,17 @@ async def test_successful_dry_run_passes_runner_script_command_and_database_url(
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
     logs = FakeLogsClient(events=[{"message": "Dry run complete. Would resolve 19,803 records (3,244 still unresolvable)."}])
 
-    result = await vpb.run_vote_person_backfill_job(
-        mode="dry-run", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs, logs_client=logs,
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill",
+        mode="dry-run",
+        config={"cloud_path": {"fargate": _FARGATE_CFG}},
+        ecs_client=ecs,
+        logs_client=logs,
     )
 
     assert result["success"] is True
     assert result["mode"] == "dry-run"
+    assert result["job"] == "vote-person-backfill"
     assert "19,803" in result["output"]
     assert result["run_id"].startswith("vote-person-backfill-dry-run-")
 
@@ -174,14 +202,46 @@ async def test_successful_dry_run_passes_runner_script_command_and_database_url(
 
 
 @pytest.mark.asyncio
+async def test_open304_job_passes_its_own_runner_script(monkeypatch):
+    """The whole point of generalizing this pipeline (OPEN-304): a different job key launches a
+    different RUNNER_SCRIPT, everything else (command building, RDS resolution, wait/log-fetch)
+    identical."""
+    monkeypatch.setattr(vpb, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
+    ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
+    logs = FakeLogsClient(events=[{"message": "Dry run complete. Would add 14, 0 already present, 0 person not found, 0 lis conflicts."}])
+
+    result = await vpb.run_fargate_script_job(
+        job="open304-lis-identifiers",
+        mode="dry-run",
+        config={"cloud_path": {"fargate": _FARGATE_CFG}},
+        ecs_client=ecs,
+        logs_client=logs,
+    )
+
+    assert result["success"] is True
+    assert result["job"] == "open304-lis-identifiers"
+    assert result["run_id"].startswith("open304-lis-identifiers-dry-run-")
+
+    [call] = ecs.run_task_calls
+    override = call["overrides"]["containerOverrides"][0]
+    env = {e["name"]: e["value"] for e in override["environment"]}
+    assert env["RUNNER_SCRIPT"] == "open304-add-lis-identifiers.py"
+
+
+@pytest.mark.asyncio
 async def test_commit_mode_builds_empty_command(monkeypatch):
     monkeypatch.setattr(vpb, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=0)])
     logs = FakeLogsClient(events=[{"message": "Done. Resolved 19,803 records (3,244 still unresolvable)."}])
 
-    result = await vpb.run_vote_person_backfill_job(
-        mode="commit", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs, logs_client=logs,
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill",
+        mode="commit",
+        config={"cloud_path": {"fargate": _FARGATE_CFG}},
+        ecs_client=ecs,
+        logs_client=logs,
     )
 
     assert result["success"] is True
@@ -195,8 +255,8 @@ async def test_run_task_exception_fails_cleanly(monkeypatch):
     monkeypatch.setattr(vpb, "resolve_rds_database_url", lambda: ("postgresql://rds/openstates", ""))
     ecs = FakeEcsClient(run_task_error=RuntimeError("no capacity"))
 
-    result = await vpb.run_vote_person_backfill_job(
-        config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
     )
 
     assert result["success"] is False
@@ -211,8 +271,11 @@ async def test_nonzero_exit_code_reports_failure_with_whatever_output_exists(mon
     ecs = FakeEcsClient(run_task_response=_run_task_ok(), describe_responses=[_stopped(exit_code=1)])
     logs = FakeLogsClient(events=[{"message": "Traceback (most recent call last): ..."}])
 
-    result = await vpb.run_vote_person_backfill_job(
-        config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs, logs_client=logs,
+    result = await vpb.run_fargate_script_job(
+        job="vote-person-backfill",
+        config={"cloud_path": {"fargate": _FARGATE_CFG}},
+        ecs_client=ecs,
+        logs_client=logs,
     )
 
     assert result["success"] is False

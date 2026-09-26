@@ -1139,7 +1139,7 @@ async def trigger_vote_person_backfill(
 
     from ddp_sync.pipelines.vote_person_backfill import (
         ALLOWED_MODES,
-        run_vote_person_backfill_job,
+        run_fargate_script_job,
     )
     from ddp_sync.scheduler import get_scheduler
 
@@ -1153,7 +1153,62 @@ async def trigger_vote_person_backfill(
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
     run_id = f"vote-person-backfill-{mode}-{uuid.uuid4().hex[:12]}"
     background_tasks.add_task(
-        run_vote_person_backfill_job,
+        run_fargate_script_job,
+        "vote-person-backfill",
+        mode,
+        config=config,
+        run_id=run_id,
+    )
+    return {"status": "started", "run_id": run_id, "mode": mode}
+
+
+@router.post("/trigger/open304-lis-identifiers", status_code=202)
+async def trigger_open304_lis_identifiers(
+    background_tasks: BackgroundTasks,
+    mode: str = "dry-run",
+    token: str = Depends(api_key_auth),
+):
+    """OPEN-304: run open304-add-lis-identifiers.py as a Fargate task -- adds the 14 missing
+    `lis`-scheme PersonIdentifier rows for senators whose votes can't resolve to a person (and
+    so show as "Unknown" party in VoteBot) until this exists. Shares run_fargate_script_job with
+    /trigger/vote-person-backfill above (see that pipeline module's docstring for why this is a
+    registered `job` key rather than a third near-duplicate module) -- this endpoint just wires
+    up the "open304-lis-identifiers" key with its own dedicated, discoverable URL rather than a
+    generic `/trigger/fargate-script/{job}` route, matching every other one-off trigger in this
+    file.
+
+    Note: this only lets *future* scrapes resolve these 14 senators' votes correctly. It does not
+    retroactively fix votes already imported before these identifiers existed -- that needs a
+    follow-up run of /trigger/vote-person-backfill (safe to re-run any time; it only fills in
+    still-null voter_id values, using whatever identifiers exist in PersonIdentifier at the time
+    it runs).
+
+    Returns 202 Accepted immediately, with a `run_id` that also appears in every structured log
+    line the job itself produces, same correlation-handle reasoning as
+    trigger_vote_person_backfill above.
+
+    mode: dry-run (default) or commit
+    """
+    import uuid
+
+    from ddp_sync.pipelines.vote_person_backfill import (
+        ALLOWED_MODES,
+        run_fargate_script_job,
+    )
+    from ddp_sync.scheduler import get_scheduler
+
+    if mode not in ALLOWED_MODES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown mode '{mode}'. Available: {sorted(ALLOWED_MODES)}",
+        )
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    run_id = f"open304-lis-identifiers-{mode}-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(
+        run_fargate_script_job,
+        "open304-lis-identifiers",
         mode,
         config=config,
         run_id=run_id,
