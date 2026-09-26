@@ -145,7 +145,12 @@ async def test_fetch_legislator_votes_matches_voter_given_bare_uuid():
     assert votes[0].vote_option == "yes"
 
 
-def test_extract_legislator_votes_from_bill_matches_given_bare_uuid():
+def test_extract_legislator_votes_from_bill_matches_given_prefixed_id():
+    """`_extract_legislator_votes_from_bill` does no normalization itself --
+    callers (`fetch_legislator_votes`) are responsible for normalizing
+    first. This asserts the comparison itself works given the already-
+    prefixed form; `test_fetch_legislator_votes_matches_voter_given_bare_uuid`
+    above covers the bare-UUID case end-to-end through the real caller."""
     service = _make_service()
     bill = {
         "identifier": "HB 1",
@@ -164,3 +169,52 @@ def test_extract_legislator_votes_from_bill_matches_given_bare_uuid():
     votes = service._extract_legislator_votes_from_bill(bill, _PREFIXED_ID)
 
     assert len(votes) == 1
+
+
+# --- sync_legislator: persisted IDs stay bare, only the OpenStates request/match
+# boundary gets the ocd-person/ prefix -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_legislator_persists_bare_id_while_matching_via_prefixed_id():
+    """End-to-end: given a legislator dict with a bare CMS UUID,
+    sync_legislator() must (1) successfully match sponsorships from
+    OpenStates (which always returns prefixed person.id) and (2) still use
+    the bare UUID for the persisted document_id/legislator_id metadata --
+    changing that would alter existing Pinecone document IDs' shape and
+    orphan previously-ingested documents, which is explicitly out of scope
+    for this fix."""
+    service = _make_service(ddp_openstates_jurisdictions=[])
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(
+        {
+            "results": [
+                {
+                    "identifier": "HB 1",
+                    "sponsorships": [{"person": {"id": _PREFIXED_ID}}],
+                }
+            ],
+            "pagination": {"max_page": 1},
+        }
+    )
+
+    with _patch_async_client(mock_client), patch(
+        "ddp_sync.pipelines.legislator_sync.LegislatorSyncService._get_sponsor_name",
+        AsyncMock(return_value="Kelly"),
+    ), patch.object(
+        service.pipeline, "ingest_document", AsyncMock(
+            return_value=MagicMock(chunks_created=1)
+        ),
+    ) as mock_ingest:
+        result = await service.sync_legislator(
+            {"openstates_id": _BARE_ID, "name": "Test Rep", "jurisdiction": "us"}
+        )
+
+    assert result.success
+    assert result.bills_found == 1
+    assert result.legislator_id == _BARE_ID  # bare, not prefixed
+
+    _, ingest_kwargs = mock_ingest.call_args
+    metadata = ingest_kwargs["metadata"]
+    assert metadata.document_id == f"legislator-bills-{_BARE_ID}"
+    assert metadata.legislator_id == _BARE_ID
