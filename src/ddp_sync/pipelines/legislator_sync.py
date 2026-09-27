@@ -155,10 +155,9 @@ class LegislatorSyncService:
         v3.openstates.org API (SYNC-8), so the two services never diverge on
         which jurisdictions are "on the replica".
 
-        Only used by call sites that have a jurisdiction in scope
-        (fetch_sponsored_bills, fetch_legislator_votes) -- _get_sponsor_name()
-        looks up a single person by opaque OpenStates ID with no jurisdiction
-        available, so it always uses the public API base (see its docstring).
+        Used by every call site that has a jurisdiction in scope
+        (fetch_sponsored_bills, fetch_legislator_votes, and -- as of SYNC-78 --
+        _get_sponsor_name() when its caller passes one through).
 
         Args:
             jurisdiction: State code (e.g., 'fl', 'us', 'va')
@@ -271,7 +270,9 @@ class LegislatorSyncService:
         """
         await self.rate_limiter.apply()
 
-    async def _get_sponsor_name(self, person_id: str) -> str | None:
+    async def _get_sponsor_name(
+        self, person_id: str, jurisdiction: str | None = None
+    ) -> str | None:
         """
         Fetch the sponsor name format from OpenStates for bill filtering.
 
@@ -280,6 +281,17 @@ class LegislatorSyncService:
 
         Args:
             person_id: OpenStates person ID (e.g., "ocd-person/6a3fae94-...")
+            jurisdiction: Jurisdiction code (e.g., "fl", "us"), if known to
+                the caller. When given and covered by
+                settings.ddp_openstates_jurisdictions, routes to the local
+                OpenStates replica the same way fetch_sponsored_bills/
+                fetch_legislator_votes already do (SYNC-78) -- some
+                legislators (e.g. someone seated after the replica became
+                the source of truth for their jurisdiction) exist in the
+                replica but not yet in the public API, so a public-API-only
+                lookup fails for them even though their data is available.
+                When omitted (unknown to the caller), falls back to the
+                public API base as before.
 
         Returns:
             Family name for sponsor filtering, or None if not found
@@ -290,15 +302,13 @@ class LegislatorSyncService:
         # the CMS stores a bare UUID.
         person_id = _ocd_person_id(person_id)
 
-        # Single person lookup by opaque OpenStates ID -- no jurisdiction is
-        # available here to route to the local replica (SYNC-8), so this
-        # always uses the public API base.
+        if jurisdiction:
+            api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        else:
+            api_base, api_key, is_local_replica = self.settings.openstates_api_base, self.api_key, False
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                headers = {
-                    "accept": "application/json",
-                    "x-api-key": self.api_key,
-                }
                 # Include all available data for legislators
                 include_params = [
                     "other_names",
@@ -308,8 +318,17 @@ class LegislatorSyncService:
                     "offices",
                 ]
                 params = [("id", person_id)] + [("include", p) for p in include_params]
+                if is_local_replica:
+                    # Local api-v3's apikey_auth is a query param, not the
+                    # public API's x-api-key header (SYNC-8, mirrors
+                    # SYNC-6's routing).
+                    headers = {"accept": "application/json"}
+                    if api_key:
+                        params.append(("apikey", api_key))
+                else:
+                    headers = {"accept": "application/json", "x-api-key": api_key}
                 response = await client.get(
-                    f"{self.settings.openstates_api_base}/people",
+                    f"{api_base}/people",
                     headers=headers,
                     params=params,
                 )
@@ -359,7 +378,7 @@ class LegislatorSyncService:
 
         # Get sponsor name if not provided
         if not sponsor_name:
-            sponsor_name = await self._get_sponsor_name(person_id)
+            sponsor_name = await self._get_sponsor_name(person_id, jurisdiction=jurisdiction)
             if not sponsor_name:
                 logger.warning(f"Could not determine sponsor name for {person_id}")
                 return []
