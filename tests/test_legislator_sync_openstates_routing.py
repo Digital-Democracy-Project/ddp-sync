@@ -1,9 +1,11 @@
 """Tests for SYNC-8's jurisdiction-based OpenStates routing in LegislatorSyncService.
 
 Mirrors tests/test_bill_sync_openstates_routing.py's structure (SYNC-6), adapted to
-LegislatorSyncService's call sites: fetch_sponsored_bills/fetch_legislator_votes
-(jurisdiction known -> can route) vs _get_sponsor_name (opaque-ID lookup, no
-jurisdiction -> always public API).
+LegislatorSyncService's call sites: fetch_sponsored_bills/fetch_legislator_votes, and
+(as of SYNC-78) _get_sponsor_name() too when its caller passes a jurisdiction through --
+previously _get_sponsor_name() always used the public API regardless, which meant a
+legislator present in the RDS replica but not yet in the public API (e.g. someone seated
+after the replica became the source of truth for their jurisdiction) could never resolve.
 """
 
 from __future__ import annotations
@@ -139,11 +141,13 @@ async def test_fetch_legislator_votes_routes_non_flipped_jurisdiction_to_public_
     assert list_call[1]["headers"]["x-api-key"] == "public-key"
 
 
-# --- _get_sponsor_name: always public (no jurisdiction) -----------------------
+# --- _get_sponsor_name: with no jurisdiction argument, unchanged public-API fallback --
 
 
 @pytest.mark.asyncio
-async def test_get_sponsor_name_always_uses_public_api_even_when_jurisdictions_flipped():
+async def test_get_sponsor_name_without_jurisdiction_arg_falls_back_to_public_api():
+    """No jurisdiction passed at all (jurisdiction=None, the default) -- preserves
+    the exact pre-SYNC-78 behavior for any caller that doesn't have one."""
     service = _make_service(ddp_openstates_jurisdictions=["US", "VA"])
     mock_client = AsyncMock()
     mock_client.get.return_value = _mock_response(
@@ -157,6 +161,64 @@ async def test_get_sponsor_name_always_uses_public_api_even_when_jurisdictions_f
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "https://v3.openstates.org/people"
     assert called_kwargs["headers"]["x-api-key"] == "public-key"
+
+
+# --- _get_sponsor_name: with a jurisdiction argument (SYNC-78) -----------------
+
+
+@pytest.mark.asyncio
+async def test_get_sponsor_name_with_flipped_jurisdiction_routes_to_local_replica():
+    service = _make_service(ddp_openstates_jurisdictions=["US"])
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(
+        {"results": [{"family_name": "Gallagher"}]}
+    )
+
+    with _patch_async_client(mock_client):
+        name = await service._get_sponsor_name("ocd-person/123", jurisdiction="us")
+
+    assert name == "Gallagher"
+    called_url, called_kwargs = mock_client.get.call_args
+    assert called_url[0] == "http://localhost:8002/people"
+    assert "x-api-key" not in called_kwargs["headers"]
+    assert ("apikey", "local-key") in called_kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_get_sponsor_name_with_non_flipped_jurisdiction_routes_to_public_api():
+    service = _make_service(ddp_openstates_jurisdictions=["US"])
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(
+        {"results": [{"family_name": "Smith"}]}
+    )
+
+    with _patch_async_client(mock_client):
+        name = await service._get_sponsor_name("ocd-person/123", jurisdiction="fl")
+
+    assert name == "Smith"
+    called_url, called_kwargs = mock_client.get.call_args
+    assert called_url[0] == "https://v3.openstates.org/people"
+    assert called_kwargs["headers"]["x-api-key"] == "public-key"
+
+
+@pytest.mark.asyncio
+async def test_fetch_sponsored_bills_routes_its_own_sponsor_name_lookup_to_local_replica():
+    """Integration-level check: fetch_sponsored_bills (no sponsor_name given) must
+    pass its own jurisdiction through to _get_sponsor_name, not just to the bills
+    fetch itself -- this is the actual SYNC-78 bug (Gallagher/Graham's sponsor-name
+    lookup failing on the public API despite the replica already having them)."""
+    service = _make_service(ddp_openstates_jurisdictions=["US"])
+    mock_client = AsyncMock()
+    sponsor_response = _mock_response({"results": [{"family_name": "Gallagher"}]})
+    bills_response = _mock_response({"results": [], "pagination": {"max_page": 1}})
+    mock_client.get.side_effect = [sponsor_response, bills_response]
+
+    with _patch_async_client(mock_client):
+        await service.fetch_sponsored_bills("ocd-person/123", "us")
+
+    sponsor_call, bills_call = mock_client.get.call_args_list
+    assert sponsor_call[0][0] == "http://localhost:8002/people"
+    assert bills_call[0][0] == "http://localhost:8002/bills"
 
 
 # --- _get_api_base_and_key helper directly -----------------------------------
