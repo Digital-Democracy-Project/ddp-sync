@@ -37,8 +37,10 @@ def _reset_session_pipeline_semaphore():
     teardown ordering relative to other fixtures ever changes.
     """
     session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._session_pipeline_active_holders = 0
     yield
     session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._session_pipeline_active_holders = 0
 
 _CANDIDATE = {
     "gov_id": "SJR 2F",
@@ -2000,6 +2002,55 @@ async def test_concurrency_is_capped_at_session_pipeline_concurrency():
         )
 
     assert max_seen["value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_semaphore_acquire_and_release_log_real_concurrent_holder_count():
+    """SYNC-79: session_pipeline_semaphore_acquired/_released must report the
+    actual number of bills concurrently holding the semaphore at that instant
+    -- the missing signal that made a real summed-duration-vs-wall-clock
+    anomaly (a 2026-09-27 MI run) unexplainable from logs alone. Reuses
+    test_concurrency_is_capped_at_session_pipeline_concurrency's own
+    tracking-coverage-stub setup, asserting on the logged holder counts
+    instead of the in-flight counter directly."""
+    candidates = _make_candidates(6)
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        await asyncio.sleep(0.05)
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(2), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.logger"
+    ) as mock_logger:
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    acquired = [
+        call for call in mock_logger.info.call_args_list
+        if call.args and call.args[0] == "session_pipeline_semaphore_acquired"
+    ]
+    released = [
+        call for call in mock_logger.info.call_args_list
+        if call.args and call.args[0] == "session_pipeline_semaphore_released"
+    ]
+    assert len(acquired) == 6
+    assert len(released) == 6
+
+    acquired_holders = [call.kwargs["active_holders"] for call in acquired]
+    released_holders = [call.kwargs["active_holders"] for call in released]
+    # Cap is 2 -- the acquired count must never exceed it, and this run's
+    # real concurrency (proven by test_concurrency_is_capped_at_session_
+    # pipeline_concurrency above) does reach 2, so it must show up here too.
+    assert all(1 <= h <= 2 for h in acquired_holders)
+    assert max(acquired_holders) == 2
+    assert all(0 <= h <= 1 for h in released_holders)
+    assert all(call.kwargs["configured_concurrency"] == 2 for call in acquired)
 
 
 @pytest.mark.asyncio
