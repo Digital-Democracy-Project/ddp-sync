@@ -160,6 +160,56 @@ specific connection-failure mode that was confirmed transient in production. **I
 this function, remember `None` and `[]` mean different things to every caller — don't
 special-case "falsy" without checking which one you actually got.**
 
+**SYNC-79 (2026-09-27): `get_session_pipeline_semaphore()`'s acquire/release is now
+logged** (`session_pipeline_semaphore_acquired`/`_releasing` in `_process_bill_bounded`,
+each carrying the real, process-wide `active_holders` count and `configured_concurrency`
+at that instant). Added to answer a real, still-partially-unresolved anomaly: a completed
+MI run's summed per-bill `duration_seconds` (95,530s) exceeded the run's own real
+wall-clock (56,812.8s) by ~10.75 hours, but CAMS's own `mlx_gate` admission log never
+showed 2 workers active across the run's full 771 checked admission-decision lines — hard
+evidence against "2 bills really ran concurrently" that the semaphore itself had no way to
+confirm or refute. If a similar "concurrency looks wrong" question comes up again, check
+these two log lines first before re-deriving evidence from CAMS's own logs the way SYNC-79
+originally had to.
+
+## legislator_sync's RDS-replica routing (SYNC-6/7/8/75/76/77/78) has an unresolved gap (SYNC-80)
+
+`legislator_sync.py`, `bill_sync.py`, `openstates_people.py`, and a few other ingestion
+call sites each have their own `_get_api_base_and_key(jurisdiction)` helper (SYNC-6/8's
+pattern, catalogued per call site in `primitives.md`) that routes to the DDP-tracked RDS
+replica (`local_openstates_api_base`/`local_openstates_api_key`) instead of the public
+OpenStates API when `jurisdiction` is in `settings.ddp_openstates_jurisdictions`. This
+whole effort is epic **SYNC-7** ("Production switchover to ddp-open-states replica") — if
+you're touching any OpenStates-fetching code path, check whether it already has (or
+should have) this same routing before assuming the public API is the only option, and
+file any new ticket in this lineage under that epic with the `local-openstates-migration`
+label rather than leaving it unparented (SYNC-75/76/77/78/80 all originally shipped
+without one — an oversight fixed retroactively 2026-09-27, not a deliberate choice).
+
+Three real, independent bugs in this specific lineage were found and fixed 2026-09-26/27:
+**SYNC-76** (federal Congress members routed by home state instead of `us`, causing
+~30K/week unneeded public-API calls), **SYNC-77** (a separate, ~8-month-old
+`ocd-person/`-prefix mismatch silently zeroing out every legislator's bill/vote match,
+unrelated to RDS routing at all — present since this codebase's first commit), and
+**SYNC-78** (`_get_sponsor_name()` never passed `jurisdiction` through to the routing
+helper it already had access to). Full writeups: `notes/ops-handoff` branch.
+
+**Still open as of 2026-09-27 (SYNC-80): `fetch_sponsored_bills()` returns 0 bills for
+every RDS-routed federal legislator, prolific or not** — confirmed against five
+long-serving sponsors (Grassley, Pelosi, DeLauro, McConnell, Blumenthal), not just
+recently-seated ones, ruling out "too new to have sponsored anything." The replica's
+`/bills` endpoint carries sponsor info as `extras.sponsor_bioguides` (bioguide ID
+strings), not the `sponsorships[].person.id` shape the public API returns and this code's
+post-filter is written against — and the replica silently ignores the unsupported
+`sponsor=<name>` query param rather than erroring, so the failure is a silent empty list,
+not a visible one. **Do not assume SYNC-76/77/78 landing means legislator_sync's RDS
+routing is fully working end-to-end** — sponsor-name resolution and jurisdiction routing
+are fixed, but bill-level sponsor attribution through this path is still broken for every
+RDS-routed jurisdiction. `fetch_legislator_votes` has not been confirmed to have the same
+problem (SYNC-76/77's validation reported a real `total_votes=3` working), but that's an
+assumption worth verifying, not trusting, given how wrong "the replica has full data so
+lookups must work" turned out to be for bills.
+
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
 Every recurring/scheduled pipeline in this stack is meant to be scheduled by **ddp-sync's own
