@@ -103,6 +103,17 @@ logger = structlog.get_logger()
 # same time (e.g. two jurisdictions' scheduled batch runs overlapping).
 _session_pipeline_semaphore: asyncio.Semaphore | None = None
 
+# SYNC-79: a plain module-level int, incremented/decremented around the
+# semaphore's own acquire/release in _process_bill_bounded below -- not an
+# asyncio.Lock-guarded counter, because (like _session_pipeline_semaphore
+# itself) every mutation here happens with no `await` between the check and
+# the update, so nothing can interleave on asyncio's single-threaded event
+# loop. Exists to answer, from real logs, a question the semaphore alone
+# can't: whether 2 bills' worth of work were ever ACTUALLY in flight at
+# once, or whether real concurrency stayed at 1 despite session_pipeline_
+# concurrency=2 (the still-open question SYNC-79 was filed to resolve).
+_session_pipeline_active_holders = 0
+
 
 def get_session_pipeline_semaphore() -> asyncio.Semaphore:
     """The single, process-wide gate on how many _process_bill calls can be
@@ -1260,20 +1271,59 @@ async def run_legbot_pipeline(
     semaphore = get_session_pipeline_semaphore()
 
     async def _process_bill_bounded(candidate: dict) -> dict:
+        global _session_pipeline_active_holders
         async with semaphore:
-            bill_result = await _process_bill(
-                candidate,
-                jurisdiction_iso2=jurisdiction_iso2,
-                session_code=session_code,
-                artifact_types=artifact_types,
-                include_org_research=include_org_research,
-                include_concept_statements=include_concept_statements,
-                dry_run=dry_run,
-                retry_failed=retry_failed,
-                run_id=run_id,
-                broker_api_base=broker_api_base,
-                broker_api_token=broker_api_token,
-            )
+            # SYNC-79: log the real concurrent-holder count at the instant
+            # this bill is admitted -- the only way to tell, from logs
+            # alone, whether session_pipeline_concurrency=2 ever actually
+            # granted 2 bills' worth of work in flight at once, versus real
+            # concurrency silently staying at 1 for some other reason.
+            #
+            # active_holders is process-wide, the same as the semaphore
+            # itself (SYNC-72) -- it is NOT scoped to this run_id. Two
+            # overlapping jurisdiction runs sharing the one global budget
+            # can each log active_holders=2 while holding only 1 of those
+            # 2 slots themselves; that's expected, not a bug, and matches
+            # get_session_pipeline_semaphore()'s own docstring.
+            #
+            # Both the increment and the decrement live inside this single
+            # try/finally (started before the acquire log, not after it) so
+            # a failure in the log call itself can never leave the counter
+            # incremented forever with no matching decrement.
+            try:
+                _session_pipeline_active_holders += 1
+                logger.info(
+                    "session_pipeline_semaphore_acquired",
+                    run_id=run_id,
+                    active_holders=_session_pipeline_active_holders,
+                    configured_concurrency=get_settings().session_pipeline_concurrency,
+                )
+                bill_result = await _process_bill(
+                    candidate,
+                    jurisdiction_iso2=jurisdiction_iso2,
+                    session_code=session_code,
+                    artifact_types=artifact_types,
+                    include_org_research=include_org_research,
+                    include_concept_statements=include_concept_statements,
+                    dry_run=dry_run,
+                    retry_failed=retry_failed,
+                    run_id=run_id,
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
+                )
+            finally:
+                # Named "releasing", not "released" -- this still runs
+                # inside the semaphore's own `async with` block, before its
+                # __aexit__ actually frees the slot. No `await` separates
+                # this from that real release, so no other task can ever
+                # observe the gap, but the event name says what's true.
+                _session_pipeline_active_holders -= 1
+                logger.info(
+                    "session_pipeline_semaphore_releasing",
+                    run_id=run_id,
+                    active_holders=_session_pipeline_active_holders,
+                    configured_concurrency=get_settings().session_pipeline_concurrency,
+                )
         # Outside the semaphore's `async with` -- release this bill's slot
         # for the next queued one as soon as the real work finishes, rather
         # than holding it through this log call too.

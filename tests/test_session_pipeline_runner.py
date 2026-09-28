@@ -37,8 +37,10 @@ def _reset_session_pipeline_semaphore():
     teardown ordering relative to other fixtures ever changes.
     """
     session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._session_pipeline_active_holders = 0
     yield
     session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._session_pipeline_active_holders = 0
 
 _CANDIDATE = {
     "gov_id": "SJR 2F",
@@ -2000,6 +2002,95 @@ async def test_concurrency_is_capped_at_session_pipeline_concurrency():
         )
 
     assert max_seen["value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_semaphore_acquire_and_release_log_real_concurrent_holder_count():
+    """SYNC-79: session_pipeline_semaphore_acquired/_releasing must report the
+    actual number of bills concurrently holding the semaphore at that instant
+    -- the missing signal that made a real summed-duration-vs-wall-clock
+    anomaly (a 2026-09-27 MI run) unexplainable from logs alone. Reuses
+    test_concurrency_is_capped_at_session_pipeline_concurrency's own
+    tracking-coverage-stub setup, replaying the logged events IN ORDER to
+    check every acquire/release transition (not just min/max), and asserting
+    the module counter itself is back to zero once the run completes --
+    /pm-review's own concern that a leaked increment could go unnoticed by a
+    range-only assertion."""
+    candidates = _make_candidates(6)
+
+    async def _tracking_coverage(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        await asyncio.sleep(0.05)
+        return None
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_tracking_coverage),
+    ), _patch_version(), _patch_settings(2), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.logger"
+    ) as mock_logger:
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    running = 0
+    max_seen = 0
+    acquired_count = 0
+    released_count = 0
+    for call in mock_logger.info.call_args_list:
+        if not call.args:
+            continue
+        name = call.args[0]
+        if name == "session_pipeline_semaphore_acquired":
+            running += 1
+            acquired_count += 1
+        elif name == "session_pipeline_semaphore_releasing":
+            running -= 1
+            released_count += 1
+        else:
+            continue
+        # Every event's own logged active_holders must match the replayed
+        # running total exactly -- not just fall within some plausible
+        # range -- and the cap of 2 must never be exceeded or go negative.
+        assert call.kwargs["active_holders"] == running
+        assert call.kwargs["configured_concurrency"] == 2
+        assert 0 <= running <= 2
+        max_seen = max(max_seen, running)
+
+    assert acquired_count == 6
+    assert released_count == 6
+    assert max_seen == 2, "never observed real concurrency reach the configured cap"
+    assert running == 0, "acquire/release events were unbalanced"
+    assert session_pipeline_runner._session_pipeline_active_holders == 0
+
+
+@pytest.mark.asyncio
+async def test_a_bills_own_failure_still_decrements_the_holder_counter():
+    """SYNC-79 regression coverage for the leak /pm-review flagged: if the
+    increment+acquire-log had lived OUTSIDE the try/finally (as this fix's
+    first draft had it), an exception raised between them would propagate
+    through the semaphore's own real release (unaffected, pre-existing
+    behavior) while leaving this counter incremented forever. concurrency=1
+    keeps this deterministic -- a single bill, no interleaving to reason
+    about."""
+    candidates = _make_candidates(1)
+
+    async def _boom(*, jurisdiction, session_code, gov_id, broker_api_base=None, broker_api_token=None):
+        raise RuntimeError("boom")
+
+    with _patch_lister(candidates), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts",
+        new=AsyncMock(side_effect=_boom),
+    ), _patch_version(), _patch_settings(1):
+        with pytest.raises(RuntimeError, match="boom"):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10, dry_run=True,
+                include_concept_statements=False,
+                retry_failed=False,
+            )
+
+    assert session_pipeline_runner._session_pipeline_active_holders == 0
 
 
 @pytest.mark.asyncio
