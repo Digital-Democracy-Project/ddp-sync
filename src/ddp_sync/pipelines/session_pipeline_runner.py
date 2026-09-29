@@ -86,7 +86,7 @@ from ddp_sync.services.broker_client import (
     get_bill_artifact_coverage_all_versions,
     get_bill_artifacts,
     get_bill_organization_positions_status,
-    get_concept_statement_set,
+    get_concept_statement_statuses,
 )
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
@@ -854,13 +854,15 @@ async def _process_bill_inner(
     # `version` dependency at all -- unlike every other artifact_type/org
     # research above, a ConceptStatementSet row has no BillVersion FK, so
     # this never needs get_current_version_identity to have resolved
-    # anything. Its own dedup check (get_concept_statement_set) is
-    # deliberately coarser than get_bill_artifacts' -- "does a *published*
-    # set exist at all," with no version-currency concept -- and preserved
-    # exactly as concept_statement_dispatch.py's own standalone job already
-    # implemented it, per this ticket's own "relocation, not a rewrite"
-    # scope. There is also no "failed" ConceptStatementSet status to skip on
-    # a later run -- insufficient_information (or no archived text at all)
+    # anything. Its own dedup check (get_concept_statement_statuses) is
+    # deliberately coarser than get_bill_artifacts' -- "does a non-rejected
+    # set exist at all," with no version-currency concept. SYNC-85: it used
+    # to ask only "is there a *published* set" (carried over unchanged from
+    # the retired standalone job), which never saw a pending one -- so with
+    # review on, every re-run wrote another duplicate pending set per bill.
+    # A pending or published set now skips (distinct reasons); a bill whose
+    # only sets are rejected is still regenerated. There is also no "failed"
+    # ConceptStatementSet status to skip on a later run -- insufficient_information (or no archived text at all)
     # means dispatch_and_store_concept_statements wrote nothing, recorded
     # here as concept_statements_skipped_reason="nothing_to_publish", not as
     # a member of artifacts_failed (which is BillArtifact-status-shaped).
@@ -877,7 +879,7 @@ async def _process_bill_inner(
     # publish" without string-matching concept_statements_skipped_reason's contents.
     if include_concept_statements:
         try:
-            existing_concept_set = await get_concept_statement_set(
+            existing_concept_statuses = await get_concept_statement_statuses(
                 gov_id=gov_id,
                 jurisdiction_iso2=jurisdiction_iso2,
                 session_code=session_code,
@@ -888,8 +890,10 @@ async def _process_bill_inner(
             result["concept_statements_skipped_reason"] = f"status_check_failed: {exc}"
             result["concept_statements_failed"] = True
         else:
-            if existing_concept_set is not None:
+            if "published" in existing_concept_statuses:
                 result["concept_statements_skipped_reason"] = "already_published"
+            elif "pending" in existing_concept_statuses:
+                result["concept_statements_skipped_reason"] = "already_exists_pending"
             elif dry_run:
                 result["concept_statements_dispatched"] = True
             else:
@@ -931,7 +935,7 @@ async def _process_bill_inner(
     # answer matters. Every *contained* concept failure is caught above
     # (BrokerClientError on the status check, broad Exception on the dispatch),
     # and phase 2 still runs; there is a test for exactly that. The only escape
-    # is an unexpected exception from get_concept_statement_set, which
+    # is an unexpected exception from get_concept_statement_statuses, which
     # propagates out of _process_bill, out of asyncio.gather (no
     # return_exceptions) and ends the entire run -- at which point whether this
     # one bill's changelog was written before everything stopped is not a

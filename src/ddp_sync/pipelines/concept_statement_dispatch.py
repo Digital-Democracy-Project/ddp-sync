@@ -38,12 +38,12 @@ directly by `session_pipeline_runner.py`'s own per-bill batch instead
 candidate enumeration, `ensure_bill_exists()` on-demand Bill-stub creation,
 and coverage/dedup conventions rather than this module's own separate
 copies of the same three jobs. The dedup rule this removed job implemented
--- skip a bill with an existing *published* `ConceptStatementSet`, checked
-via `get_concept_statement_set` (published-only, per §0.3's public-read
-rule; a bill with an existing *pending* or *rejected* set is not separately
-detected, an accepted, reviewable, harmless admin-side duplicate, not
-silently-wrong data) -- was carried over unchanged into
-session_pipeline_runner.py's own equivalent check, not rewritten.
+-- skip a bill with an existing *published* `ConceptStatementSet` -- was
+carried over unchanged into session_pipeline_runner.py at first, and turned
+out to regenerate a duplicate *pending* set for every bill on every re-run
+(the published-only read never sees one). SYNC-85: it now asks
+`get_concept_statement_statuses` (every status) and skips on pending or
+published; a bill with only `rejected` sets is still regenerated.
 """
 
 from __future__ import annotations

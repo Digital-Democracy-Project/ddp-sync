@@ -734,9 +734,9 @@ async def get_concept_statement_set(
         This does NOT mean "never dispatched" — a set can also exist in
         `pending` or `rejected` status, neither of which this endpoint
         ever surfaces (§0.3's public-read rule: only published sets are
-        ever returned publicly). See
-        ddp_sync.pipelines.concept_statement_dispatch's own docstring for
-        what that means for the batch job's dedup logic. Otherwise, the
+        ever returned publicly). Do NOT use this for dedup: use
+        get_concept_statement_statuses, which sees every status (SYNC-85).
+        Otherwise, the
         resolved set's fields as ddp-broker-py's API reports them
         (including its own `id`, `statements`, vote tallies, etc).
 
@@ -778,6 +778,99 @@ async def get_concept_statement_set(
     if not result.pop("found", False):
         return None
     return result
+
+
+# SYNC-85: process-wide, so the "broker predates /status/" fallback below logs
+# once per process rather than once per bill (a run checks thousands).
+_concept_status_endpoint_missing_logged = False
+
+
+async def get_concept_statement_statuses(
+    *,
+    gov_id: str,
+    jurisdiction_iso2: str,
+    session_code: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> list[str]:
+    """Statuses of every ConceptStatementSet that exists for a bill, in any
+    state -- ``[]`` when none does (SYNC-85).
+
+    The dedup counterpart of get_bill_artifacts for concept sets: calls
+    GET /api/concept-statements/status/ (service-token-authenticated, ddp-
+    broker-py), NOT the public GET /api/concept-statements/ that
+    get_concept_statement_set reads. That one only ever returns a *published*
+    set, so on a broker with review enabled (CONCEPT_STATEMENT_REQUIRE_REVIEW,
+    the default) a bill whose sets are all still ``pending`` looked identical
+    to one never dispatched, and every pipeline re-run wrote another pending
+    set for it.
+
+    Older-broker fallback: a 404 means the broker predates that endpoint (it
+    returns ``{"found": false}`` with a 200 for a bill with no sets). Falls
+    back to get_concept_statement_set's published-only check -- exactly the
+    pre-SYNC-85 behavior, so a not-yet-upgraded broker degrades to the old
+    duplicate-pending-set problem rather than breaking the run -- and logs a
+    warning once per process.
+
+    Returns:
+        Distinct statuses (``"pending"``/``"published"``/``"rejected"``).
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the request or was
+            unreachable -- a real failure, distinct from "no sets."
+    """
+    global _concept_status_endpoint_missing_logged
+
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError(
+            "DDP_BROKER_API_BASE is not configured — cannot read ConceptStatementSet status."
+        )
+
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{resolved_api_base}/api/concept-statements/status/",
+                headers=headers,
+                params={
+                    "gov_id": gov_id,
+                    "jurisdiction": jurisdiction_iso2,
+                    "session": session_code,
+                },
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code == 404:
+        if not _concept_status_endpoint_missing_logged:
+            _concept_status_endpoint_missing_logged = True
+            logger.warning(
+                "concept_statement_status_endpoint_missing_falling_back_to_published_only",
+                broker_api_base=resolved_api_base,
+            )
+        published = await get_concept_statement_set(
+            gov_id=gov_id,
+            jurisdiction_iso2=jurisdiction_iso2,
+            session_code=session_code,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        return [] if published is None else ["published"]
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the ConceptStatementSet status read "
+            f"({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    if not result.get("found", False):
+        return []
+    return list(result.get("statuses", []))
 
 
 async def create_concept_statement_set(

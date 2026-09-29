@@ -80,9 +80,18 @@ def _patch_org_status(result):
 
 
 def _patch_concept_set(result=None, side_effect=None):
+    """SYNC-85: the runner's dedup now reads every status via
+    get_concept_statement_statuses. `result` keeps its old meaning (None =
+    no set; a dict = an existing set, taken from its own "status" key) so
+    existing call sites read unchanged; a list is passed through as-is."""
+    if isinstance(result, dict):
+        result = [result["status"]]
     return patch(
-        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_set",
-        new=AsyncMock(return_value=result, side_effect=side_effect),
+        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_statuses",
+        new=AsyncMock(
+            return_value=[] if result is None else result,
+            side_effect=side_effect,
+        ),
     )
 
 
@@ -1402,7 +1411,7 @@ async def test_concept_statements_not_requested_is_never_checked():
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
         new=AsyncMock(return_value={"id": 1, "status": "complete"}),
     ), patch(
-        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_set",
+        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_statuses",
         new=AsyncMock(),
     ) as mock_get_concept_set:
         result = await run_legbot_pipeline(
@@ -1471,6 +1480,111 @@ async def test_concept_statements_dispatched_when_not_yet_published():
     assert bill_result["concept_statements_skipped_reason"] is None
     # SYNC-52: a successful dispatch is obviously not a failure.
     assert bill_result["concept_statements_failed"] is False
+
+
+@pytest.mark.asyncio
+async def test_concept_statements_skipped_when_a_pending_set_exists():
+    """SYNC-85: with review on, a set sits `pending` and the old published-
+    only check never saw it, so every re-run wrote a duplicate."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_concept_set(["pending"]), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
+        new=AsyncMock(),
+    ) as mock_dispatch:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=True,
+            retry_failed=False,
+        )
+
+    mock_dispatch.assert_not_awaited()
+    bill_result = result["results"][0]
+    assert bill_result["concept_statements_dispatched"] is False
+    assert bill_result["concept_statements_skipped_reason"] == "already_exists_pending"
+    assert bill_result["concept_statements_failed"] is False
+
+
+@pytest.mark.asyncio
+async def test_concept_statements_published_wins_over_pending_in_skip_reason():
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_concept_set(["pending", "published"]), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
+        new=AsyncMock(),
+    ):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=True,
+            retry_failed=False,
+        )
+
+    assert result["results"][0]["concept_statements_skipped_reason"] == "already_published"
+
+
+@pytest.mark.asyncio
+async def test_concept_statements_regenerated_when_only_rejected_sets_exist():
+    """SYNC-85: a rejected set means a reviewer said no; a fresh attempt is
+    still wanted (confirmed by Ramon, 2026-09-29)."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), \
+         _patch_concept_set(["rejected"]), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
+        new=AsyncMock(return_value={"id": 9, "status": "pending"}),
+    ) as mock_dispatch:
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=10,
+            include_concept_statements=True,
+            retry_failed=False,
+        )
+
+    mock_dispatch.assert_awaited_once()
+    assert result["results"][0]["concept_statements_dispatched"] is True
+
+
+@pytest.mark.asyncio
+async def test_second_run_writes_no_new_concept_sets_when_first_run_sets_are_pending():
+    """SYNC-85 headline: stateful fake broker, so run 1's pending set is what
+    run 2's dedup sees -- not a canned return value."""
+    broker_sets: dict[str, list[str]] = {}
+
+    async def fake_statuses(*, gov_id, **_):
+        return sorted(set(broker_sets.get(gov_id, [])))
+
+    async def fake_create(*, gov_id, **_):
+        broker_sets.setdefault(gov_id, []).append("pending")
+        return {"id": len(broker_sets), "status": "pending"}
+
+    async def run_once():
+        with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
+            "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_statuses",
+            new=AsyncMock(side_effect=fake_statuses),
+        ), patch(
+            "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+            new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+        ), patch(
+            "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
+            new=AsyncMock(side_effect=fake_create),
+        ):
+            return await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=10,
+                include_concept_statements=True,
+                retry_failed=False,
+            )
+
+    first = await run_once()
+    second = await run_once()
+
+    assert first["results"][0]["concept_statements_dispatched"] is True
+    assert second["results"][0]["concept_statements_dispatched"] is False
+    assert second["results"][0]["concept_statements_skipped_reason"] == "already_exists_pending"
+    assert sum(len(v) for v in broker_sets.values()) == 1
 
 
 _ALREADY_COVERED = {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
@@ -1587,8 +1701,8 @@ async def test_concept_statements_does_not_need_version_identity():
 @pytest.mark.asyncio
 async def test_concept_statements_broker_override_threads_through():
     with _patch_lister([_CANDIDATE]), _patch_coverage(_ALREADY_COVERED), patch(
-        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_set",
-        new=AsyncMock(return_value=None),
+        "ddp_sync.pipelines.session_pipeline_runner.get_concept_statement_statuses",
+        new=AsyncMock(return_value=[]),
     ) as mock_get_concept_set, patch(
         "ddp_sync.pipelines.session_pipeline_runner.dispatch_and_store_concept_statements",
         new=AsyncMock(return_value={"id": 9}),

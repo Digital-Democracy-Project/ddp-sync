@@ -16,6 +16,7 @@ from ddp_sync.services.broker_client import (
     get_bill_artifacts,
     get_bill_organization_positions_status,
     get_concept_statement_set,
+    get_concept_statement_statuses,
     get_latest_bill_version,
     write_bill_artifact,
     write_bill_organization_position,
@@ -744,6 +745,98 @@ async def test_get_concept_statement_set_raises_on_error_status():
             await get_concept_statement_set(
                 gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
             )
+
+
+def _status_response(status_code, body=None, text=""):
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = body
+    response.text = text
+    return response
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_statuses_returns_every_status_and_authenticates():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(
+        return_value=_status_response(200, {"found": True, "statuses": ["pending", "published"]})
+    )
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_concept_statement_statuses(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+
+    assert result == ["pending", "published"]
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/concept-statements/status/"
+    assert call.kwargs["params"] == {
+        "gov_id": "abc", "jurisdiction": "FL", "session": "2026",
+    }
+    # Same SYNC-40 lesson as the published read: prod sits behind ddp-api.
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_statuses_empty_when_not_found():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_status_response(200, {"found": False}))
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_concept_statement_statuses(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_statuses_falls_back_to_published_read_on_older_broker():
+    """A broker predating /status/ 404s it; degrade to the pre-SYNC-85
+    published-only check rather than failing every bill."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[
+        _status_response(404, text="Not Found"),
+        _status_response(200, {"found": True, "id": 7}),
+        _status_response(404, text="Not Found"),
+        _status_response(200, {"found": False}),
+    ])
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        published = await get_concept_statement_statuses(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+        none_found = await get_concept_statement_statuses(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
+
+    assert published == ["published"]
+    assert none_found == []
+    urls = [c.args[0] for c in mock_client.get.await_args_list]
+    assert urls[1] == "http://localhost:8080/api/concept-statements/"
+
+
+@pytest.mark.asyncio
+async def test_get_concept_statement_statuses_raises_on_error_status():
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=_status_response(500, text="boom"))
+
+    with patch(
+        "ddp_sync.services.broker_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), pytest.raises(BrokerClientError, match="500"):
+        await get_concept_statement_statuses(
+            gov_id="abc", jurisdiction_iso2="FL", session_code="2026",
+        )
 
 
 @pytest.mark.asyncio
