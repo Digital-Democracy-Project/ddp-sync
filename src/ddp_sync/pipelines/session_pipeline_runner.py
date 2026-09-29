@@ -861,8 +861,8 @@ async def _process_bill_inner(
     # the retired standalone job), which never saw a pending one -- so with
     # review on, every re-run wrote another duplicate pending set per bill.
     # A pending or published set now skips (distinct reasons); a bill whose
-    # only sets are rejected is still regenerated. There is also no "failed" ConceptStatementSet status to skip on
-    # a later run -- insufficient_information (or no archived text at all)
+    # only sets are rejected is still regenerated. There is also no "failed"
+    # ConceptStatementSet status to skip on a later run -- insufficient_information (or no archived text at all)
     # means dispatch_and_store_concept_statements wrote nothing, recorded
     # here as concept_statements_skipped_reason="nothing_to_publish", not as
     # a member of artifacts_failed (which is BillArtifact-status-shaped).
