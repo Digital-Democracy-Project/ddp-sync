@@ -1049,3 +1049,99 @@ async def resolve_touched_sessions(
             )
 
     return session_codes
+
+
+# SYNC-83: the embedding hook's reads. A bill's detail response carries every version's
+# archived text plus its votes, so it is far bigger than the calls above.
+_EMBEDDING_READ_TIMEOUT_SECONDS = 120.0
+
+
+async def _get_json_with_retry(url: str, params, headers: dict, log_ctx: dict) -> dict | None:
+    """GET `url` and return the parsed JSON object, or None after `_RESOLVE_SESSIONS_MAX_ATTEMPTS`
+    connection failures / any 4xx-5xx / a body that is not a JSON object. Never raises."""
+    for attempt in range(1, _RESOLVE_SESSIONS_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=_EMBEDDING_READ_TIMEOUT_SECONDS) as client:
+                resp = await client.get(url, params=params, headers=headers)
+        except httpx.RequestError as exc:
+            logger.warning("api-v3 unreachable", attempt=attempt, error=str(exc), **log_ctx)
+            if attempt < _RESOLVE_SESSIONS_MAX_ATTEMPTS:
+                await asyncio.sleep(_RESOLVE_SESSIONS_RETRY_BACKOFF_SECONDS)
+            continue
+        if resp.status_code >= 400:
+            logger.warning("api-v3 rejected the read", status_code=resp.status_code, **log_ctx)
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("api-v3 returned a non-JSON body", **log_ctx)
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
+async def list_touched_bill_ids(
+    jurisdiction_iso2: str,
+    *,
+    since: datetime,
+    max_bills: int,
+    api_base: str,
+    api_key: str = "",
+) -> tuple[list[str], bool] | None:
+    """SYNC-83: bare `ocd_bill_id`s (no `ocd-bill/` prefix) of every bill in the jurisdiction
+    whose archived documents changed since `since` (api-v3 `document_updated_since`, the same
+    param the SYNC-65 LegBot hook reads).
+
+    Returns `(ids, complete)`: `complete` is False when a later page failed or `max_bills`
+    (0 = unlimited) cut the scan short, so the caller must not advance its watermark. Returns
+    `None` when nothing could be read at all. Never raises.
+    """
+    if not api_base:
+        return None
+    url = f"{api_base}/bills"
+    headers = {"x-api-key": api_key} if api_key else {}
+    ids: list[str] = []
+    seen: set[str] = set()
+    page = 1
+    while True:
+        params = {
+            "jurisdiction": jurisdiction_iso2.upper(),
+            "document_updated_since": since.isoformat(),
+            "per_page": str(_API_V3_MAX_PER_PAGE),
+            "page": str(page),
+        }
+        data = await _get_json_with_retry(
+            url, params, headers, {"jurisdiction": jurisdiction_iso2, "page": page}
+        )
+        results = data.get("results") if data else None
+        if not isinstance(results, list):
+            return (ids, False) if ids else None
+        for bill in results:
+            raw_id = bill.get("id") if isinstance(bill, dict) else None
+            if not raw_id:
+                continue
+            bare = raw_id.removeprefix("ocd-bill/")
+            if bare not in seen:
+                seen.add(bare)
+                ids.append(bare)
+        max_page = (data.get("pagination") or {}).get("max_page", page)
+        if page >= max_page or not results:
+            return ids, True
+        if max_bills and len(ids) >= max_bills:
+            return ids[:max_bills], False
+        page += 1
+
+
+async def fetch_bill_for_embedding(
+    ocd_bill_id: str, *, api_base: str, api_key: str = ""
+) -> dict | None:
+    """SYNC-83: one bill's detail with versions (ordered by api-v3, each with its archived text,
+    `diff_from_previous_version`, `archived_document_id`, `version_stage`, `version_ordinal`),
+    votes and sources. None on any failure or a 404. Never raises."""
+    if not api_base:
+        return None
+    headers = {"x-api-key": api_key} if api_key else {}
+    params = [("include", "versions"), ("include", "votes"), ("include", "sources")]
+    return await _get_json_with_retry(
+        f"{api_base}/bills/ocd-bill/{ocd_bill_id}", params, headers, {"ocd_bill_id": ocd_bill_id}
+    )
