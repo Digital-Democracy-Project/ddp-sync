@@ -5,6 +5,7 @@ Priority: AWS Secrets Manager -> .env file -> defaults.
 Production uses Secrets Manager. Local dev uses .env.
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -92,6 +93,12 @@ class SyncSettings:
     pinecone_environment: str = "us-east-1"
     pinecone_index_name: str = "votebot-large"
     pinecone_namespace: str = "default"
+    # SYNC-89 (PLAN-enterprise-search.md §5.6): index for the NEW embedding path
+    # (`pipelines/knowledge_base_embedding.py`), deliberately separate from
+    # `pinecone_index_name` above so the legacy path keeps writing `votebot-large` untouched.
+    # Empty (the default) means the new path is disabled. The namespace is shared with the
+    # legacy setting: the two indexes are separate, so the same name cannot collide.
+    knowledge_base_index_name: str = ""
 
     # External APIs
     openstates_api_key: str = ""
@@ -609,6 +616,7 @@ def _load_from_env() -> dict:
         "pinecone_environment": os.getenv("PINECONE_ENVIRONMENT", "us-east-1"),
         "pinecone_index_name": os.getenv("PINECONE_INDEX_NAME", "votebot-large"),
         "pinecone_namespace": os.getenv("PINECONE_NAMESPACE", "default"),
+        "knowledge_base_index_name": os.getenv("KNOWLEDGE_BASE_INDEX_NAME", ""),
         "openstates_api_key": os.getenv("OPENSTATES_API_KEY", ""),
         "congress_api_key": os.getenv("CONGRESS_API_KEY", ""),
         "openstates_api_base": os.getenv("OPENSTATES_API_BASE", "https://v3.openstates.org"),
@@ -858,7 +866,32 @@ def get_settings() -> SyncSettings:
             env_legbot_trigger_lock_renewal_seconds
         )
 
+    # SYNC-89: same SYNC-51/OPEN-193 gap, pre-empted rather than found live -- which index the
+    # new embedding path writes is per-host (the votebot/ddp-api EC2 instance must never
+    # enable it), so the process environment must win over the shared secret.
+    env_knowledge_base_index_name = os.getenv("KNOWLEDGE_BASE_INDEX_NAME")
+    if env_knowledge_base_index_name is not None:
+        filtered["knowledge_base_index_name"] = env_knowledge_base_index_name.strip()
+
     return SyncSettings(**filtered)
+
+
+_LEGACY_INDEX_NAME = "votebot-large"  # never a valid knowledge-base target, whatever pinecone_index_name says
+
+
+def knowledge_base_settings(settings: SyncSettings) -> SyncSettings:
+    """SYNC-89: a copy of `settings` whose `pinecone_index_name` is the new knowledge-base
+    index, for handing to `IngestionPipeline` / `VectorStoreService` (which read only
+    `pinecone_index_name`). Refuses to build when the new setting is unset or equals the
+    legacy index, so the new path can never silently write `votebot-large`."""
+    name = (settings.knowledge_base_index_name or "").strip()
+    if not name:
+        raise ValueError("knowledge_base_index_name is unset; the knowledge-base path is disabled")
+    if name == settings.pinecone_index_name or name == _LEGACY_INDEX_NAME:
+        raise ValueError(
+            f"knowledge_base_index_name must not be the legacy index ({name!r})"
+        )
+    return dataclasses.replace(settings, pinecone_index_name=name)
 
 
 def get_config_source() -> str:
