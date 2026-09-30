@@ -341,3 +341,27 @@ def test_knowledge_base_settings_swaps_only_the_index_name():
         knowledge_base_settings(SyncSettings())
     with pytest.raises(ValueError):
         knowledge_base_settings(SyncSettings(knowledge_base_index_name="votebot-large"))
+
+
+def test_knowledge_base_settings_refuses_votebot_large_even_if_the_legacy_setting_moves():
+    import pytest
+
+    from ddp_sync.config import SyncSettings, knowledge_base_settings
+
+    with pytest.raises(ValueError):
+        knowledge_base_settings(
+            SyncSettings(pinecone_index_name="something-else", knowledge_base_index_name="votebot-large")
+        )
+
+
+def test_secrets_manager_value_is_used_when_the_env_var_is_absent(monkeypatch):
+    """The empty default _load_from_env() emits must not mask a Secrets Manager value."""
+    get_settings.cache_clear()
+    monkeypatch.delenv("KNOWLEDGE_BASE_INDEX_NAME", raising=False)
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={"knowledge_base_index_name": "ddp-knowledge-base"},
+    ):
+        settings = get_settings()
+    get_settings.cache_clear()
+    assert settings.knowledge_base_index_name == "ddp-knowledge-base"

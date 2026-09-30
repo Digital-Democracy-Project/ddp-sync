@@ -876,6 +876,9 @@ def get_settings() -> SyncSettings:
     return SyncSettings(**filtered)
 
 
+_LEGACY_INDEX_NAME = "votebot-large"  # never a valid knowledge-base target, whatever pinecone_index_name says
+
+
 def knowledge_base_settings(settings: SyncSettings) -> SyncSettings:
     """SYNC-89: a copy of `settings` whose `pinecone_index_name` is the new knowledge-base
     index, for handing to `IngestionPipeline` / `VectorStoreService` (which read only
@@ -884,9 +887,9 @@ def knowledge_base_settings(settings: SyncSettings) -> SyncSettings:
     name = (settings.knowledge_base_index_name or "").strip()
     if not name:
         raise ValueError("knowledge_base_index_name is unset; the knowledge-base path is disabled")
-    if name == settings.pinecone_index_name:
+    if name == settings.pinecone_index_name or name == _LEGACY_INDEX_NAME:
         raise ValueError(
-            f"knowledge_base_index_name must differ from pinecone_index_name ({name!r})"
+            f"knowledge_base_index_name must not be the legacy index ({name!r})"
         )
     return dataclasses.replace(settings, pinecone_index_name=name)
 

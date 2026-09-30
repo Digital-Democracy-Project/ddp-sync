@@ -7,7 +7,13 @@ KNOWLEDGE_BASE_INDEX_NAME, prints/writes the measurements, and (with --cleanup) 
 the vectors it wrote, by id list. It refuses to run against the legacy index.
 
 Required env: OPENSTATES_MEASURE_DSN (read-only use), OPENAI_API_KEY, PINECONE_API_KEY,
-KNOWLEDGE_BASE_INDEX_NAME. Never prints keys. Does not touch Redis or send alerts.
+KNOWLEDGE_BASE_INDEX_NAME. Never prints keys. Does not touch Redis or send alerts. Builds its
+settings from the environment on purpose instead of calling get_settings(), which would try AWS
+Secrets Manager first: a measurement run must not depend on (or pick up) a host's credentials.
+
+Refuses to start unless the target index is empty, because --cleanup deletes the ids this run
+wrote and those ids are deterministic (an existing vector with the same id would be overwritten
+and then deleted). The full list of ids is written to --ids-file before anything can go wrong.
 
     OPENSTATES_MEASURE_DSN=postgresql://... KNOWLEDGE_BASE_INDEX_NAME=ddp-knowledge-base \
       python scripts/measure_kb_embedding_throughput.py --docs 1000 --sequential 300 \
@@ -181,6 +187,8 @@ async def main() -> None:
     instrument(pipeline, kb, c)
     idx = pipeline.vector_store.index
     before = idx.describe_index_stats().total_vector_count
+    if before:
+        raise SystemExit(f"{kb.pinecone_index_name} already holds {before} vectors; refusing to measure")
 
     results: list[dict] = []
     phases = {}
