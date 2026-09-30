@@ -837,7 +837,6 @@ async def _maybe_embed_knowledge_base(
         settings=settings,
         api_base=api_base,
         api_key=api_key,
-        max_bills=int(((config or {}).get("knowledge_base_embedding") or {}).get("max_bills_per_run", 0)),
     )
 
 

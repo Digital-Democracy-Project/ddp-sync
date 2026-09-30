@@ -1084,7 +1084,6 @@ async def list_touched_bill_ids(
     jurisdiction_iso2: str,
     *,
     since: datetime,
-    max_bills: int,
     api_base: str,
     api_key: str = "",
 ) -> tuple[list[str], bool] | None:
@@ -1092,9 +1091,10 @@ async def list_touched_bill_ids(
     whose archived documents changed since `since` (api-v3 `document_updated_since`, the same
     param the SYNC-65 LegBot hook reads).
 
-    Returns `(ids, complete)`: `complete` is False when a later page failed or `max_bills`
-    (0 = unlimited) cut the scan short, so the caller must not advance its watermark. Returns
-    `None` when nothing could be read at all. Never raises.
+    Returns `(ids, complete)`: `complete` is False when a later page failed, so the caller must
+    not advance its watermark. Returns `None` when nothing could be read at all. Never raises.
+    There is deliberately no cap: a cap would keep re-listing the same first bills (the ones
+    already embedded) and never reach the rest.
     """
     if not api_base:
         return None
@@ -1127,8 +1127,6 @@ async def list_touched_bill_ids(
         max_page = (data.get("pagination") or {}).get("max_page", page)
         if page >= max_page or not results:
             return ids, True
-        if max_bills and len(ids) >= max_bills:
-            return ids[:max_bills], False
         page += 1
 
 

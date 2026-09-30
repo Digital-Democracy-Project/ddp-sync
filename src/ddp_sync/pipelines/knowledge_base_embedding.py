@@ -271,7 +271,6 @@ async def embed_archived_bills(
     settings: SyncSettings,
     api_base: str,
     api_key: str = "",
-    max_bills: int = 0,
     embedder: KnowledgeBaseEmbedder | None = None,
 ) -> dict:
     """Embed every bill whose archived documents changed since the last run that left nothing
@@ -298,7 +297,7 @@ async def embed_archived_bills(
             logger.warning("knowledge_base_embedding_bad_watermark", value=previous)
 
     listed = await local_openstates_client.list_touched_bill_ids(
-        jurisdiction, since=since, max_bills=max_bills, api_base=api_base, api_key=api_key
+        jurisdiction, since=since, api_base=api_base, api_key=api_key
     )
     if listed is None:
         logger.warning("knowledge_base_embedding_work_left_undone", jurisdiction=jurisdiction,

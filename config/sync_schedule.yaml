@@ -776,12 +776,10 @@ openstates_archive:
   # `ddp-knowledge-base` Pinecone index (bill text per version, version diffs, votes). Off until
   # BOTH `enabled` is true here AND the host's KNOWLEDGE_BASE_INDEX_NAME is set (SYNC-89) -- and the
   # api-v3 it reads must expose archived_document_id/version_stage/version_ordinal. The legacy
-  # votebot-large path is unaffected either way. `max_bills_per_run: 0` means unlimited; a run that
-  # hits a cap resumes on the next archive run.
+  # votebot-large path is unaffected either way.
   knowledge_base_embedding:
     enabled: false
     jurisdictions: [fl, us, va, mi, wa, az, ut]
-    max_bills_per_run: 0
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
                            # 01:00-03:00 scrape-job start times, though overlap with a live

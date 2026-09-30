@@ -366,7 +366,7 @@ async def test_eligibility_is_yaml_policy_default_off():
     assert not _knowledge_base_embedding_eligible("va", cfg)
 
 
-_CFG = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], "max_bills_per_run": 7}}
+_CFG = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"]}}
 _STARTED = datetime(2026, 9, 30, 5, 0, tzinfo=timezone.utc)
 
 
@@ -389,7 +389,7 @@ async def test_hook_runs_with_local_api_on_the_mac_and_rds_api_elsewhere():
              patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock()) as run:
             await _maybe_embed_knowledge_base("fl", _STARTED, _CFG)
         kwargs = run.await_args.kwargs
-        assert (kwargs["api_base"], kwargs["api_key"], kwargs["max_bills"]) == (base, key, 7)
+        assert (kwargs["api_base"], kwargs["api_key"]) == (base, key)
 
 
 async def test_archive_wrapper_runs_both_hooks_independently_and_never_changes_the_result():
@@ -432,23 +432,51 @@ async def test_list_touched_bill_ids_paginates_dedups_and_strips_prefix():
     ]
     get = AsyncMock(side_effect=pages)
     with patch.object(c, "_get_json_with_retry", get):
-        out = await c.list_touched_bill_ids("fl", since=_STARTED, max_bills=0, api_base="http://api")
+        out = await c.list_touched_bill_ids("fl", since=_STARTED, api_base="http://api")
     assert out == (["aaa", "bbb", "ccc"], True)
     first = get.await_args_list[0].args[1]
     assert first["jurisdiction"] == "FL" and "document_updated_since" in first
 
 
-async def test_list_touched_bill_ids_cap_and_failure_semantics():
+async def test_list_touched_bill_ids_failure_semantics():
     from ddp_sync.services import local_openstates_client as c
 
     page1 = {"results": [{"id": "ocd-bill/a"}, {"id": "ocd-bill/b"}], "pagination": {"max_page": 9}}
-    with patch.object(c, "_get_json_with_retry", AsyncMock(return_value=page1)):
-        assert await c.list_touched_bill_ids("fl", since=_STARTED, max_bills=2, api_base="x") == (["a", "b"], False)
     with patch.object(c, "_get_json_with_retry", AsyncMock(side_effect=[page1, None])):
-        assert await c.list_touched_bill_ids("fl", since=_STARTED, max_bills=0, api_base="x") == (["a", "b"], False)
+        # a later page failing keeps what was read but reports the listing incomplete
+        assert await c.list_touched_bill_ids("fl", since=_STARTED, api_base="x") == (["a", "b"], False)
     with patch.object(c, "_get_json_with_retry", AsyncMock(return_value=None)):
-        assert await c.list_touched_bill_ids("fl", since=_STARTED, max_bills=0, api_base="x") is None
-    assert await c.list_touched_bill_ids("fl", since=_STARTED, max_bills=0, api_base="") is None
+        assert await c.list_touched_bill_ids("fl", since=_STARTED, api_base="x") is None
+    assert await c.list_touched_bill_ids("fl", since=_STARTED, api_base="") is None
+
+
+async def test_legacy_shaped_cache_entry_is_ignored_not_trusted():
+    """The legacy webflow-keyed entries share the ddp:bill_version: prefix but not the key space
+    (webflow ids vs ocd uuids); an entry without schema 2 is treated as never embedded."""
+    emb, redis, pipe = _embedder()
+    redis.versions[OCD] = {"version_date": "2026-01-01", "version_note": "Introduced", "chunk_count": 99}
+    await emb.embed_bill(OCD, "fl", _bill([_version(11, "Introduced", "introduced", 0, TEXT_A)]))
+    assert pipe.keys == [f"bill-text:{OCD}:11"]
+    assert redis.versions[OCD]["schema"] == kb.CACHE_SCHEMA
+
+
+async def test_real_pipeline_chunk_ids_use_the_full_document_key_despite_the_metadata_override():
+    from ddp_sync.ingestion.pipeline import IngestionPipeline
+
+    real = IngestionPipeline(
+        SyncSettings(pinecone_index_name="ddp-knowledge-base", openai_api_key="test-not-a-real-key")
+    )
+    upserted = []
+
+    async def fake_upsert(documents, batch_size=100):
+        upserted.extend(documents)
+        return len(documents)
+
+    real.vector_store.upsert_documents = fake_upsert
+    emb = kb.KnowledgeBaseEmbedder(_settings(), pipeline=real, votes_formatter=_votes_formatter, redis_store=FakeRedis())
+    await emb.embed_bill(OCD, "fl", _bill([_version(11, "Introduced", "introduced", 0, TEXT_A)]))
+    assert upserted and upserted[0].id == f"bill-text:{OCD}:11-chunk-0"
+    assert upserted[0].metadata["document_id"] == "11"  # archive id, as retrieval filters expect
 
 
 async def test_fetch_bill_for_embedding_requests_versions_votes_sources():

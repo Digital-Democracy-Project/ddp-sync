@@ -306,7 +306,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 |---|---|---|
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
-| `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` / `.max_bills_per_run` | `false` / `[fl, us, va, mi, wa, az, ut]` / `0` (unlimited) | SYNC-83 embedding hook on/off, enrolled jurisdictions, per-run cap |
+| `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |
