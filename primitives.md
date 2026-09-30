@@ -25,6 +25,7 @@ grep -rn "class <Name>\|def <name>" src/ddp_sync/
 - **`Document`** — `id, content, metadata, embedding`
 - **`SearchResult`** — `id, content, score, metadata`
 - **`VectorStoreServiceFactory.get_instance()`** — singleton accessor
+- **Two indexes, two settings (SYNC-89, `PLAN-enterprise-search.md` §5.6).** `pinecone_index_name` (`votebot-large`) is the legacy path and is never changed by the new work. `knowledge_base_index_name` (env `KNOWLEDGE_BASE_INDEX_NAME`, default unset = new path disabled) names the NEW index `ddp-knowledge-base`. `config.knowledge_base_settings(settings)` returns a copy whose `pinecone_index_name` is the new index — hand *that* to `IngestionPipeline`/`VectorStoreService` for the new path; it raises if the setting is unset or equals the legacy index. `scripts/measure_kb_embedding_throughput.py` embeds N real archived documents into the new index only and deletes exactly what it wrote.
 
 ## Ingestion pipeline (`ingestion/pipeline.py`)
 
