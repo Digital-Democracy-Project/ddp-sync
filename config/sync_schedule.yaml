@@ -772,6 +772,14 @@ openstates_archive:
       memory_bucket: "ddp-openstates-scraper-memory"
       memory_prefix: "prod"
       max_wait_seconds: 43200   # 12h backstop, same reasoning as the scrape block's
+  # SYNC-83 (PLAN-enterprise-search.md 5.6): embed the bills this archive run touched into the NEW
+  # `ddp-knowledge-base` Pinecone index (bill text per version, version diffs, votes). Off until
+  # BOTH `enabled` is true here AND the host's KNOWLEDGE_BASE_INDEX_NAME is set (SYNC-89) -- and the
+  # api-v3 it reads must expose archived_document_id/version_stage/version_ordinal. The legacy
+  # votebot-large path is unaffected either way.
+  knowledge_base_embedding:
+    enabled: false
+    jurisdictions: [fl, us, va, mi, wa, az, ut]
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
                            # 01:00-03:00 scrape-job start times, though overlap with a live

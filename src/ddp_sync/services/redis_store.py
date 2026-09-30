@@ -23,6 +23,10 @@ SYNC_CHECKPOINT_PREFIX = "ddp:sync:checkpoint:"
 SYNC_CHECKPOINT_TTL = 86400  # 24 hours
 BILL_VERSION_PREFIX = "ddp:bill_version:"
 BILL_VERSION_TTL = 86400 * 90  # 90 days
+# SYNC-83: per-jurisdiction watermark of the last knowledge-base embedding run that left no
+# work undone (an ISO timestamp); the next run rescans from there, which is the repair path.
+KB_EMBED_WATERMARK_PREFIX = "ddp:kb_embed:since:"
+KB_EMBED_WATERMARK_TTL = 86400 * 30  # 30 days
 BILL_STATUS_PREFIX = "ddp:bill_status:"
 BILL_STATUS_TTL = 86400 * 90  # 90 days
 FLOW_STATUS_PREFIX = "ddp:flow:"
@@ -278,23 +282,29 @@ class RedisStore:
 
     # -- Bill version tracking --
 
-    async def set_bill_version(self, webflow_id: str, version_data: dict):
+    async def set_bill_version(self, webflow_id: str, version_data: dict) -> bool:
         """Store last-ingested version info for a bill.
 
         Args:
-            webflow_id: Webflow item ID for the bill
+            webflow_id: cache key suffix -- the Webflow item ID for the legacy path, the bare
+                `ocd_bill_id` for the SYNC-83 knowledge-base path (same prefix, disjoint keys)
             version_data: Dict with version_date, version_note, text_url, media_type, last_checked
+
+        Returns True when the value was written; False when Redis is down or the write failed
+        (legacy callers ignore it; SYNC-83 needs to know).
         """
         if not self._client:
-            return
+            return False
         try:
             await self._client.set(
                 f"{BILL_VERSION_PREFIX}{webflow_id}",
                 json.dumps(version_data),
                 ex=BILL_VERSION_TTL,
             )
+            return True
         except Exception as e:
             logger.error("Redis: failed to set bill version", webflow_id=webflow_id, error=str(e))
+            return False
 
     async def get_bill_version(self, webflow_id: str) -> dict | None:
         """Retrieve last-ingested version info for a bill.
@@ -314,6 +324,33 @@ class RedisStore:
         except Exception as e:
             logger.error("Redis: failed to get bill version", webflow_id=webflow_id, error=str(e))
         return None
+
+    # -- Knowledge-base embedding watermark (SYNC-83) --
+
+    async def get_kb_embed_watermark(self, jurisdiction: str) -> str | None:
+        """ISO timestamp of the last embedding run for `jurisdiction` that left nothing undone."""
+        if not self._client:
+            return None
+        try:
+            value = await self._client.get(f"{KB_EMBED_WATERMARK_PREFIX}{jurisdiction.lower()}")
+            return value.decode() if isinstance(value, bytes) else value
+        except Exception as e:
+            logger.error("Redis: failed to get kb embed watermark", jurisdiction=jurisdiction, error=str(e))
+            return None
+
+    async def set_kb_embed_watermark(self, jurisdiction: str, iso_timestamp: str) -> bool:
+        if not self._client:
+            return False
+        try:
+            await self._client.set(
+                f"{KB_EMBED_WATERMARK_PREFIX}{jurisdiction.lower()}",
+                iso_timestamp,
+                ex=KB_EMBED_WATERMARK_TTL,
+            )
+            return True
+        except Exception as e:
+            logger.error("Redis: failed to set kb embed watermark", jurisdiction=jurisdiction, error=str(e))
+            return False
 
     # -- Bill status cache (Flow 1: OpenStates → Webflow CMS) --
 

@@ -792,6 +792,54 @@ async def _maybe_trigger_legbot_for_archive(
         )
 
 
+def _knowledge_base_embedding_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """OPEN-124's rule: which jurisdictions are enrolled is scheduler policy and lives in
+    sync_schedule.yaml (`openstates_archive.knowledge_base_embedding`), read by a small
+    `_*_eligible()` helper -- never a $STATE test in a script. Same shape as `_scrapebot_eligible`."""
+    block = (config or {}).get("knowledge_base_embedding") or {}
+    if not block.get("enabled", False):
+        return False
+    return jurisdiction.lower() in {str(j).lower() for j in block.get("jurisdictions", [])}
+
+
+async def _maybe_embed_knowledge_base(
+    jurisdiction: str,
+    archive_started_at: datetime,
+    config: dict | None,
+) -> None:
+    """SYNC-83 (PLAN-enterprise-search.md 5.6): post-archive hook that embeds the bills this
+    archive run touched into the NEW `ddp-knowledge-base` index. Independent of the LegBot hook
+    above: its own gate (the yaml block AND `knowledge_base_index_name` being set, both default
+    off), its own failure handling, no ordering dependency. Writes only to the new index; the
+    legacy votebot-large path is untouched. Log-and-continue like every other post-success hook.
+    """
+    if not _knowledge_base_embedding_eligible(jurisdiction, config):
+        return
+    settings = get_settings()
+    if not settings.knowledge_base_index_name:
+        logger.warning("knowledge_base_embedding_enrolled_but_index_unset", jurisdiction=jurisdiction)
+        return
+
+    # Same Mac-vs-EC2 read split as the LegBot hook: only the Mac reaches the local api-v3.
+    if _mac_capable():
+        api_base, api_key = settings.local_openstates_api_base, settings.local_openstates_api_key
+    else:
+        api_base, api_key = settings.rds_openstates_api_base, settings.rds_openstates_api_key
+    if not api_base:
+        logger.warning("knowledge_base_embedding_read_path_not_configured", jurisdiction=jurisdiction)
+        return
+
+    from ddp_sync.pipelines.knowledge_base_embedding import embed_archived_bills
+
+    await embed_archived_bills(
+        jurisdiction,
+        archive_started_at,
+        settings=settings,
+        api_base=api_base,
+        api_key=api_key,
+    )
+
+
 async def _acquire_archive_debounce(jurisdiction: str) -> bool:
     """OPEN-291: True means this call may proceed, False means skip -- another archive
     attempt for this jurisdiction already claimed the debounce window and should be
@@ -912,8 +960,8 @@ async def _run_archive_with_hook(
     openstates_root: str | None = None,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) uniformly
-    over both archive branches (local run-archive.sh and Fargate cloud_archiver.py)
+    """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) and the independent
+    knowledge-base embedding hook (SYNC-83) uniformly over both archive branches (local run-archive.sh and Fargate cloud_archiver.py)
     -- neither run_archive_jobs() nor run_single_archive_job() needs its own copy.
 
     OPEN-291: also the debounce choke point for the new scrape-completion-triggers-
@@ -953,6 +1001,14 @@ async def _run_archive_with_hook(
         except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
             logger.error(
                 "archiver_triggered_legbot_hook_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+        try:
+            await _maybe_embed_knowledge_base(jurisdiction, archive_started_at, config)
+        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+            logger.error(
+                "archiver_triggered_knowledge_base_hook_failed",
                 jurisdiction=jurisdiction,
                 error=str(e),
             )

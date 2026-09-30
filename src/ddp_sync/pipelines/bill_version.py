@@ -80,6 +80,52 @@ class VersionSyncBatchResult:
     errors: list[str] = field(default_factory=list)
 
 
+async def delete_surplus_chunks(
+    settings: Settings,
+    document_id: str,
+    old_chunk_count: int | None,
+    new_chunk_count: int,
+) -> int:
+    """Delete chunk IDs from new_chunk_count up to old_chunk_count - 1.
+
+    Uses exact ID deletion (no metadata scan) against the index `settings` names. Guards
+    against a missing or implausibly large cached value to avoid wiping valid new chunks.
+    Module-level so the SYNC-83 knowledge-base hook reuses it with its own settings copy
+    instead of re-implementing the guard.
+
+    Returns number of chunks deleted (0 if no-op).
+    """
+    if not old_chunk_count:
+        return 0
+    if old_chunk_count > new_chunk_count * 4:
+        logger.warning(
+            "Skipping surplus chunk deletion — old_chunk_count implausibly large",
+            document_id=document_id,
+            old_chunk_count=old_chunk_count,
+            new_chunk_count=new_chunk_count,
+        )
+        return 0
+    if old_chunk_count <= new_chunk_count:
+        return 0
+
+    from ddp_sync.services.vector_store import VectorStoreService
+
+    vector_store = VectorStoreService(settings)
+    ids_to_delete = [
+        f"{document_id}-chunk-{i}"
+        for i in range(new_chunk_count, old_chunk_count)
+    ]
+    await vector_store.delete(ids=ids_to_delete)
+    logger.info(
+        "Surplus bill chunks deleted",
+        document_id=document_id,
+        deleted_count=len(ids_to_delete),
+        old_chunk_count=old_chunk_count,
+        new_chunk_count=new_chunk_count,
+    )
+    return len(ids_to_delete)
+
+
 class BillVersionSyncService:
     """Service for detecting and syncing newer bill text versions.
 
@@ -1036,40 +1082,12 @@ class BillVersionSyncService:
     ) -> int:
         """Delete chunk IDs from new_chunk_count up to old_chunk_count - 1.
 
-        Uses exact ID deletion (no metadata scan). Guards against a missing or
-        implausibly large cached value to avoid wiping valid new chunks.
-
-        Returns number of chunks deleted (0 if no-op).
+        See module-level `delete_surplus_chunks` (shared with the knowledge-base embedding
+        hook, SYNC-83). Returns number of chunks deleted (0 if no-op).
         """
-        if not old_chunk_count:
-            return 0
-        if old_chunk_count > new_chunk_count * 4:
-            logger.warning(
-                "Skipping surplus chunk deletion — old_chunk_count implausibly large",
-                document_id=document_id,
-                old_chunk_count=old_chunk_count,
-                new_chunk_count=new_chunk_count,
-            )
-            return 0
-        if old_chunk_count <= new_chunk_count:
-            return 0
-
-        from ddp_sync.services.vector_store import VectorStoreService
-
-        vector_store = VectorStoreService(self.settings)
-        ids_to_delete = [
-            f"{document_id}-chunk-{i}"
-            for i in range(new_chunk_count, old_chunk_count)
-        ]
-        await vector_store.delete(ids=ids_to_delete)
-        logger.info(
-            "Surplus bill chunks deleted",
-            document_id=document_id,
-            deleted_count=len(ids_to_delete),
-            old_chunk_count=old_chunk_count,
-            new_chunk_count=new_chunk_count,
+        return await delete_surplus_chunks(
+            self.settings, document_id, old_chunk_count, new_chunk_count
         )
-        return len(ids_to_delete)
 
     async def _ingest_bill_history(
         self,

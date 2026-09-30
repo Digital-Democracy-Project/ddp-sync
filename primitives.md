@@ -60,10 +60,23 @@ grep -rn "class <Name>\|def <name>" src/ddp_sync/
 | `legislator-votes` | `legislator-votes-{person_uuid}` | `LegislatorVotesBuilder` |
 | `organization` | `organization-{webflow_id}` | `WebflowSource._process_organization_item()` |
 | `training` | `training-{filename_stem}` | `IngestionPipeline._ingest_training_docs()` |
+| `bill-text` (new index only) | `bill-text:{ocd_bill_id}:{archived_document_id}` — one per version | `KnowledgeBaseEmbedder.embed_bill()` (SYNC-83) |
+| `bill-version-diff` (new index only) | `bill-version-diff:{ocd_bill_id}:{archived_document_id}` | `KnowledgeBaseEmbedder.embed_bill()` — api-v3's `diff_from_previous_version`, verbatim |
+| `bill-votes` (new index only) | `bill-votes:{ocd_bill_id}` | `KnowledgeBaseEmbedder.embed_bill()` — reuses `BillSyncService.format_bill_votes_chunk` |
 
 **Retrieval isolation**: `bill-text-history` and `bill-changelog` are structurally invisible to VoteBot's normal retrieval phases (which filter by explicit `document_type`). Do not add unfiltered fallback queries.
 
 **LegBot's `BillArtifact` generation does NOT use this pipeline** (`pipelines/bill_artifact_generation.py` — `generate_and_store_bill_artifact`/`generate_and_store_bill_changelog`, ddp-infra's `PLAN-bill-document-provenance.md` Phase 8). Decided 2026-08-10 (Ramon): LegBot's output already lands in queryable `BillArtifact` rows VoteBot can read directly, so re-embedding LegBot's own summary into Pinecone would duplicate the original "embed the full bill document" design intent for a different purpose (deep full-text query, not structured artifact lookup) without serving either well. These two functions used to call `IngestionPipeline`/`DocumentMetadata` directly (document types `bill-artifact-{artifact_type}` / `bill-artifact-bill_changelog`, never added to the table above) — removed, not just made optional. If VoteBot needs full-bill-text Pinecone search over archived bill text, that belongs in a new task or an extension of `ddp-open-states`' bill archiver (which already owns the full archived text), reusing `IngestionPipeline`/`DocumentMetadata` below — not revived inside LegBot's artifact-generation path.
+
+## Knowledge-base embedding hook (`pipelines/knowledge_base_embedding.py`, SYNC-83)
+
+Post-archive hook, independent of the LegBot one: `openstates_archive._maybe_embed_knowledge_base` (gated by `openstates_archive.knowledge_base_embedding` in `sync_schedule.yaml`, default `enabled: false`, **and** `knowledge_base_index_name` being set) → `embed_archived_bills(jurisdiction, archive_started_at, ...)` → `KnowledgeBaseEmbedder.embed_bill(ocd_bill_id, jurisdiction, bill)`. Writes ONLY the new index (its settings come from `knowledge_base_settings`). Reads api-v3 (`local_openstates_client.list_touched_bill_ids` / `fetch_bill_for_embedding`), never a live URL, and never classifies, sorts or diffs — it carries api-v3's `version_stage`, `version_ordinal`, array order and `diff_from_previous_version`. Needs an api-v3 that exposes `archived_document_id` (companion change; without it the hook logs `knowledge_base_embedding_work_left_undone` and embeds nothing for that version).
+
+- Cache `ddp:bill_version:{ocd_bill_id}` (`schema` 2: per-document `text_hash`/`chunks`/`diff_hash`/`diff_chunks`, plus `votes: {fingerprint, chunks}`) — same prefix as the legacy webflow-keyed entries, disjoint keys. Written only after every Pinecone write for the bill succeeded (`RedisStore.set_bill_version` now returns a bool).
+- Per-jurisdiction watermark `ddp:kb_embed:since:{jur}` (`RedisStore.get/set_kb_embed_watermark`): advanced only by a run that left nothing undone, so the next run rescans from it -- the repair path.
+- Surplus chunks: `bill_version.delete_surplus_chunks(settings, document_id, old, new)` (module-level; `BillVersionSyncService._delete_surplus_chunks` delegates to it).
+- Always `skip_duplicates=False`: a content-hash skip would leave a version with no vectors while the cache says it is embedded.
+- Not embedded: any LegBot/`BillArtifact` output, `bill-changelog`. Not yet written: `is_ddp_curated` / `ddp_url` (needs a ddp-broker-py read).
 
 ## Bill version pipeline (`pipelines/bill_version.py`)
 
@@ -293,6 +306,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 |---|---|---|
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
+| `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |
