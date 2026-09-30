@@ -301,3 +301,43 @@ def test_legbot_scrape_completion_trigger_artifact_types_env_ignores_empty_entri
         ]
     finally:
         get_settings.cache_clear()
+
+
+# --- SYNC-89: knowledge_base_index_name ------------------------------------------------------
+
+
+def test_knowledge_base_index_name_defaults_to_unset(monkeypatch):
+    """SYNC-89: unset means the new embedding path is disabled; the legacy setting is untouched."""
+    monkeypatch.delenv("KNOWLEDGE_BASE_INDEX_NAME", raising=False)
+    raw = _load_from_env()
+    assert raw["knowledge_base_index_name"] == ""
+    assert raw["pinecone_index_name"] == "votebot-large"
+
+
+def test_get_settings_env_override_wins_over_secrets_manager(monkeypatch):
+    """SYNC-51 bug class: on a host where Secrets Manager succeeds, the process environment
+    must still win for this per-host setting."""
+    get_settings.cache_clear()
+    monkeypatch.setenv("KNOWLEDGE_BASE_INDEX_NAME", " ddp-knowledge-base ")
+    with patch("ddp_sync.config._load_from_secrets_manager", return_value={"pinecone_index_name": "votebot-large"}):
+        settings = get_settings()
+    get_settings.cache_clear()
+    assert settings.knowledge_base_index_name == "ddp-knowledge-base"
+    assert settings.pinecone_index_name == "votebot-large"
+
+
+def test_knowledge_base_settings_swaps_only_the_index_name():
+    import pytest
+
+    from ddp_sync.config import SyncSettings, knowledge_base_settings
+
+    base = SyncSettings(knowledge_base_index_name="ddp-knowledge-base")
+    kb = knowledge_base_settings(base)
+    assert kb.pinecone_index_name == "ddp-knowledge-base"
+    assert base.pinecone_index_name == "votebot-large"  # original object untouched
+    assert kb.pinecone_namespace == base.pinecone_namespace
+
+    with pytest.raises(ValueError):
+        knowledge_base_settings(SyncSettings())
+    with pytest.raises(ValueError):
+        knowledge_base_settings(SyncSettings(knowledge_base_index_name="votebot-large"))
