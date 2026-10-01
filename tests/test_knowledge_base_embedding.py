@@ -631,3 +631,57 @@ async def test_list_touched_bill_ids_passes_the_session_filter():
         await c.list_touched_bill_ids("fl", since=_STARTED, api_base="http://api")
     assert get.await_args_list[0].args[1]["session"] == "2026"
     assert "session" not in get.await_args_list[1].args[1]
+
+
+class _BlipRedis(FakeRedis):
+    """`get_bill_version` returns None (what a Redis error looks like) on the read numbers in `blips`."""
+
+    def __init__(self, blips):
+        super().__init__()
+        self.blips = set(blips)
+        self.reads = 0
+
+    async def get_bill_version(self, key):
+        self.reads += 1
+        if self.reads in self.blips:
+            return None
+        return self.versions.get(key)
+
+
+def _prior_cache():
+    return {"schema": kb.CACHE_SCHEMA, "votes": {},
+            "documents": {"1": {"text_hash": kb.content_hash(TEXT_A), "chunks": 1}}}
+
+
+async def test_a_redis_blip_before_the_write_is_undone_not_raced():
+    """The guard's read returning None for an entry that existed must not look like another writer:
+    that would silently skip a changed version (and let the watermark advance past it)."""
+    redis = _BlipRedis(blips={2})
+    redis.versions[OCD] = _prior_cache()
+    emb, redis, _ = _embedder(redis=redis)
+    with capture_logs() as logs:
+        stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
+                                     kb.EmbedScope(text="all", diffs=False, votes=False))
+    assert stats["raced"] == 0
+    assert any("unreadable before write" in u for u in stats["undone"])
+    assert any(e["event"] == "knowledge_base_embedding_work_left_undone" for e in logs)
+    assert redis.versions[OCD] == _prior_cache()  # cache untouched: the next run redoes it
+
+
+async def test_a_redis_blip_at_the_final_write_does_not_erase_the_other_entries():
+    emb, redis, _ = _embedder(redis=_BlipRedis(blips={4}))  # read 1 start, 2-3 guards (docs 2, 3), 4 final
+    redis.versions[OCD] = _prior_cache()
+    with capture_logs() as logs:
+        stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
+                                     kb.EmbedScope(text="all", diffs=False, votes=False))
+    assert any("unreadable at write" in u for u in stats["undone"])
+    assert any(e["event"] == "knowledge_base_embedding_work_left_undone" for e in logs)
+    assert redis.versions[OCD] == _prior_cache()  # not replaced by a cache holding only this call's documents
+    assert redis.set_calls == 0
+
+
+async def test_no_cache_at_start_is_not_mistaken_for_a_blip():
+    emb, _, pipe = _embedder(redis=_BlipRedis(blips=set()))
+    stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
+                                 kb.EmbedScope(text="all", diffs=False, votes=False))
+    assert stats["undone"] == [] and stats["raced"] == 0 and len(pipe.keys) == 3

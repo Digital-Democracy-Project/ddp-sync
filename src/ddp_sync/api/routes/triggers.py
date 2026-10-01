@@ -1141,7 +1141,7 @@ async def trigger_knowledge_base_backfill(
     knowledge_base_embedding.jurisdictions`; 503 when `KNOWLEDGE_BASE_INDEX_NAME` or the read api
     is not configured on this host; 409 when a backfill of this jurisdiction is already running.
     """
-    from ddp_sync.config import get_settings
+    from ddp_sync.config import get_settings, knowledge_base_settings
     from ddp_sync.pipelines.knowledge_base_backfill import (
         STAGES,
         lock_holder,
@@ -1167,6 +1167,10 @@ async def trigger_knowledge_base_backfill(
     settings = get_settings()
     if not settings.knowledge_base_index_name:
         raise HTTPException(status_code=503, detail="KNOWLEDGE_BASE_INDEX_NAME is not set on this host")
+    try:
+        knowledge_base_settings(settings)  # refuses the legacy index here, not silently in the background
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     api_base, api_key = read_target(settings, mac_capable=_mac_capable())
     if not api_base:
         raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")

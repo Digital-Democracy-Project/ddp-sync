@@ -255,6 +255,49 @@ async def test_a_failed_bill_is_retried_first_and_keeps_the_stage_open():
     assert cp["failed_ids"] == [] and cp["done"] is True
 
 
+async def test_an_interrupted_retry_keeps_the_failures_it_had_not_retried_yet():
+    """The reviewer's case: checkpoint {last=C, failed=[A,B]}, interrupted while retrying B. The
+    failure list must survive the interrupt, or B sits below `last`, is never walked again, and the
+    stage finishes done with a bill silently undone."""
+    env = Env()
+    env.redis.checkpoints[("fl", "history")] = {
+        "last_bill_id": C, "failed_ids": [A, B], "done": False, "totals": {},
+    }
+
+    def interrupt(ocd):
+        if ocd == B:
+            raise asyncio.CancelledError()
+
+    env.fetch_hook = interrupt
+    with patch.object(bf, "CHECKPOINT_EVERY", 1), pytest.raises(asyncio.CancelledError):
+        await env.run(["history"])
+    saved = env.redis.checkpoints[("fl", "history")]
+    assert saved["failed_ids"] == [B] and saved["done"] is False  # A was retried; B is still owed
+
+    env.fetch_hook, env.fetched = None, []
+    result = await env.run(["history"])
+    assert env.fetched == [B]  # not skipped, not forgotten
+    assert result["status"] == "complete"
+    assert env.redis.checkpoints[("fl", "history")]["failed_ids"] == []
+
+
+async def test_a_carried_over_failure_that_fails_again_stays_on_the_list_exactly_once():
+    env = Env()
+    env.redis.checkpoints[("fl", "history")] = {"last_bill_id": C, "failed_ids": [B], "done": False, "totals": {}}
+    env.pipe.fail_keys = {_t(B, 4)}
+    result = await env.run(["history"])
+    assert result["status"] == "incomplete"
+    assert env.redis.checkpoints[("fl", "history")]["failed_ids"] == [B]
+
+
+async def test_a_malformed_blackout_window_fails_fast_before_taking_the_lock():
+    env = Env()
+    cfg = {"knowledge_base_embedding": {"backfill": {"blackout_start_utc": "late", "blackout_end_utc": "07:00"}}}
+    result = await env.run(["votes"], config=cfg)
+    assert result["status"] == "error" and result["error"] == "bad_blackout_config"
+    assert env.pipe.keys == [] and env.fetched == [] and env.redis._client.kv == {}
+
+
 async def test_a_broken_stage_aborts_instead_of_walking_the_whole_corpus():
     env = Env()
     env.pipe.fail_keys = {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7)}
@@ -470,6 +513,13 @@ async def test_route_rejects_unknown_stage_and_unenrolled_jurisdiction():
     assert resp.status_code == 404 and "Unknown stage" in resp.text
     resp, run = _route("/trigger/knowledge-base-backfill/ca")
     assert resp.status_code == 404 and "not enrolled" in resp.text
+    run.assert_not_awaited()
+
+
+async def test_route_refuses_the_legacy_index_with_a_503_not_a_silent_background_failure():
+    resp, run = _route("/trigger/knowledge-base-backfill/fl", settings=SyncSettings(
+        knowledge_base_index_name="votebot-large", local_openstates_api_base="http://local"))
+    assert resp.status_code == 503 and "legacy index" in resp.text
     run.assert_not_awaited()
 
 

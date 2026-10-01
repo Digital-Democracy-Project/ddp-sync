@@ -186,18 +186,22 @@ async def backfill_stage(
     checkpoint = checkpoint or {}
     last = checkpoint.get("last_bill_id") or ""
     retry_first = list(checkpoint.get("failed_ids") or [])
-    todo = retry_first + [i for i in ids if i > last and i not in set(retry_first)]
+    retry_set = set(retry_first)
+    todo = retry_first + [i for i in ids if i > last and i not in retry_set]
     if dry_run:
         return {"stage": stage, "status": "dry_run", "bills_in_stage": len(ids), "bills_remaining": len(todo)}
 
     totals: dict[str, Any] = {k: 0 for k in ("bills", "documents", "diffs", "votes", "chunks", "chars",
                                              "raced", "failed_bills")}
     totals.update(checkpoint.get("totals") or {})
-    failed_ids: list[str] = []
+    failed_ids: list[str] = []  # bills that failed during THIS run
+    retry_left = list(retry_first)  # carried-over failures not yet retried this run
 
     async def save(done: bool) -> None:
+        # Every save keeps the carried-over failures that have not been retried yet: they sit below
+        # `last`, so dropping them on an interrupted run would lose them for good.
         await redis.set_kb_backfill_checkpoint(jurisdiction, stage, {
-            "last_bill_id": last, "failed_ids": failed_ids, "done": done, "totals": totals,
+            "last_bill_id": last, "failed_ids": failed_ids + retry_left, "done": done, "totals": totals,
             "updated_at": _utcnow().isoformat(),
         })
 
@@ -215,6 +219,8 @@ async def backfill_stage(
             logger.warning("knowledge_base_backfill_bill_undone", run_id=run_id, jurisdiction=jurisdiction,
                            stage=stage, ocd_bill_id=ocd_bill_id, error=str(e))
         totals["bills"] += 1
+        if ocd_bill_id in retry_left:
+            retry_left.remove(ocd_bill_id)  # retried now; it re-enters failed_ids below if it fails again
         if stats is not None:
             for k in ("documents", "diffs", "votes", "chunks", "chars", "raced"):
                 totals[k] += stats[k]
@@ -234,7 +240,7 @@ async def backfill_stage(
                         stage=stage, remaining=len(todo) - count,
                         approx_tokens=totals["chars"] // 4, **totals)
 
-    done = not failed_ids
+    done = not failed_ids and not retry_left
     await save(done)
     log = logger.info if done else logger.warning
     log("knowledge_base_backfill_stage_complete" if done else "knowledge_base_backfill_stage_incomplete",
@@ -270,6 +276,12 @@ async def run_knowledge_base_backfill(
                     stages=results)
         return {"status": "dry_run", "run_id": run_id, "stages": results}
 
+    try:  # fail fast: a malformed window would otherwise crash the first bill, hours into the run
+        _blackout_seconds_left(_utcnow(), config)
+    except (ValueError, TypeError) as e:
+        logger.error("knowledge_base_backfill_failed", run_id=run_id, jurisdiction=jurisdiction,
+                     error=f"malformed blackout window in knowledge_base_embedding.backfill: {e}")
+        return {"status": "error", "error": "bad_blackout_config", "run_id": run_id}
     redis = get_redis_store()
     if not redis.is_available:
         logger.error("knowledge_base_backfill_failed", run_id=run_id, jurisdiction=jurisdiction,
