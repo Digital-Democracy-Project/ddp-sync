@@ -28,6 +28,7 @@ watermark is not advanced either), and a WARNING names what was left undone.
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -147,7 +148,7 @@ class KnowledgeBaseEmbedder:
         self, key: str, content: str, metadata: DocumentMetadata, *, dry_run: bool = False
     ) -> str:
         """SYNC-91: embed one standalone document (a legislator or an organization) unless its
-        cached content hash already matches. Returns "written", "unchanged", "would_write" (dry
+        cached digest (content plus metadata) already matches. Returns "written", "unchanged", "would_write" (dry
         run: nothing is written, not even the cache) or "undone:<why>". The cache entry is stored
         under the document id itself (`ddp:bill_version:legislator-<uuid>`,
         `ddp:bill_version:organization:<id>`), which cannot collide with a bare ocd bill id or a
@@ -155,7 +156,11 @@ class KnowledgeBaseEmbedder:
         cache = await self.redis.get_bill_version(key) or {}
         if cache.get("schema") != CACHE_SCHEMA:
             cache = {}
-        digest = content_hash(content)
+        # The digest covers the metadata too (it is stored with every vector): a changed slug, url or
+        # type must re-embed even when the rendered text is identical. The two timestamps
+        # `to_dict()` stamps with "now" are left out, or nothing would ever look unchanged.
+        stable = {k: v for k, v in metadata.to_dict().items() if k not in ("created_at", "updated_at")}
+        digest = content_hash(content + "\n" + json.dumps(stable, sort_keys=True, default=str))
         if cache.get("hash") == digest:
             return "unchanged"
         if dry_run:

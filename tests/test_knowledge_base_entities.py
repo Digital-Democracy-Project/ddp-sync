@@ -268,14 +268,25 @@ async def test_a_detail_read_failure_is_counted_and_the_rest_continue():
     assert "knowledge_base_entity_undone" in _events(logs)
 
 
-async def test_an_organization_dry_run_lists_but_never_fetches_details_or_writes():
+async def test_an_organization_dry_run_reads_details_for_real_counts_but_writes_nothing():
     emb, redis, pipe = _embedder()
-    lst, det = _patch_broker([_page([1, 2, 3])], {})
+    details = {1: _org(1), 2: _org(2, description="", focus=""), 3: _org(3)}
+    lst, det = _patch_broker([_page([1, 2, 3])], details)
     with lst, det as detail:
         totals = await ent.embed_organizations(settings=_settings(), embedder=emb, dry_run=True)
-    assert totals["listed"] == 3 and totals["complete"] is True
-    detail.assert_not_awaited()
+    assert (totals["listed"], totals["would_write"], totals["skipped_no_content"], totals["written"]) == (3, 2, 1, 0)
+    assert totals["complete"] is True and detail.await_count == 3
     assert pipe.keys == [] and redis.versions == {}
+
+
+async def test_a_partial_organization_listing_still_embeds_the_pages_it_got_but_is_incomplete():
+    emb, _, pipe = _embedder()
+    pages = [_page([1], more=True), BrokerClientError("page 2 failed")]
+    lst, det = _patch_broker(pages, {1: _org(1)})
+    with lst, det, capture_logs() as logs:
+        totals = await ent.embed_organizations(settings=_settings(), embedder=emb)
+    assert pipe.keys == ["organization:1"] and totals["complete"] is False
+    assert "knowledge_base_entities_list_failed" in _events(logs)
 
 
 # --- the hook ---------------------------------------------------------------------------------------------
@@ -348,6 +359,73 @@ async def test_list_people_failure_semantics():
     with patch.object(osc, "_get_json_with_retry", AsyncMock(return_value=None)):
         assert await osc.list_people("fl", api_base="x") is None
     assert await osc.list_people("fl", api_base="") is None
+
+
+# --- review additions: metadata in the digest, per-entity isolation, cache and chunk edge cases ----------
+
+
+async def test_a_metadata_only_change_rewrites_once_and_is_then_unchanged():
+    emb, _, pipe = _embedder()
+    lst, det = _patch_broker([_page([7])], {7: _org(7)})
+    with lst, det:
+        await ent.embed_organizations(settings=_settings(), embedder=emb)
+    renamed_slug = _org(7, url="/organizations/7-new")  # same text, different ddp_url metadata
+    lst, det = _patch_broker([_page([7])], {7: renamed_slug})
+    with lst, det:
+        changed = await ent.embed_organizations(settings=_settings(), embedder=emb)
+    lst, det = _patch_broker([_page([7])], {7: renamed_slug})
+    with lst, det:
+        settled = await ent.embed_organizations(settings=_settings(), embedder=emb)
+    assert pipe.keys == ["organization:7", "organization:7"]  # initial write, then exactly one rewrite
+    assert (changed["written"], settled["written"], settled["unchanged"]) == (1, 0, 1)
+
+
+async def test_a_malformed_record_is_counted_failed_and_the_rest_continue():
+    bad = _person(U1, "Jane Roe")
+    bad["offices"] = ["not-a-dict"]  # the content builder cannot read this
+    emb, _, pipe = _embedder()
+    with _patch_people(([bad, _person(U2, "John Doe")], True)), capture_logs() as logs:
+        totals = await ent.embed_legislators("fl", settings=_settings(), api_base="x", embedder=emb)
+    assert pipe.keys == [f"legislator-{U2}"] and (totals["failed"], totals["written"], totals["complete"]) == (1, 1, False)
+    assert "knowledge_base_entity_undone" in _events(logs)
+
+
+async def test_a_malformed_organization_is_counted_failed_and_the_rest_continue():
+    emb, _, pipe = _embedder()
+    broken = _org(1, chapters=["not-a-dict-is-fine"], parent="also-fine")  # tolerated, not a crash
+    lst, det = _patch_broker([_page([1, 2])], {1: broken, 2: None})  # None: organization_document(None) raises
+    with lst, det:
+        totals = await ent.embed_organizations(settings=_settings(), embedder=emb)
+    assert pipe.keys == ["organization:1"] and (totals["failed"], totals["written"]) == (1, 1)
+
+
+async def test_a_cache_write_failure_after_a_good_ingest_is_undone_and_rewritten_next_time():
+    class _NoWrite(FakeRedis):
+        async def set_bill_version(self, key, data):
+            return False
+
+    emb, _, pipe = _embedder(redis=_NoWrite())
+    with _patch_people(([_person(U1, "Jane Roe")], True)):
+        totals = await ent.embed_legislators("fl", settings=_settings(), api_base="x", embedder=emb)
+        again = await ent.embed_legislators("fl", settings=_settings(), api_base="x", embedder=emb)
+    assert (totals["failed"], again["failed"]) == (1, 1) and len(pipe.keys) == 2  # the documented caveat
+
+
+async def test_a_shrinking_entity_deletes_its_surplus_chunks():
+    emb, redis, _ = _embedder()
+    long_org = _org(5, description="x" * 700)  # chunks in the fake: one per 100 characters
+    lst, det = _patch_broker([_page([5])], {5: long_org})
+    with lst, det:
+        await ent.embed_organizations(settings=_settings(), embedder=emb)
+    first_chunks = redis.versions["organization:5"]["chunks"]
+    vs = MagicMock()
+    vs.delete = AsyncMock()
+    lst, det = _patch_broker([_page([5])], {5: _org(5, description="x" * 200)})
+    with lst, det, patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        await ent.embed_organizations(settings=_settings(), embedder=emb)
+    vs.delete.assert_awaited_once()
+    deleted = vs.delete.await_args.kwargs["ids"]
+    assert deleted[0].startswith("organization:5-chunk-") and len(deleted) == first_chunks - redis.versions["organization:5"]["chunks"]
 
 
 class _Settings:

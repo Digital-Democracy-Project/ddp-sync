@@ -175,12 +175,17 @@ async def embed_legislators(
     source = OpenStatesSource(settings)
     totals["listed"] = len(people)
     for person in people:
-        document = legislator_document(person, jurisdiction, source)
-        if document is None:
-            totals["skipped_no_content"] += 1
-            continue
-        key, content, metadata = document
-        _record(totals, await embedder.embed_entity(key, content, metadata, dry_run=dry_run), key)
+        key = str(person.get("id"))
+        try:
+            document = legislator_document(person, jurisdiction, source)
+            if document is None:
+                totals["skipped_no_content"] += 1
+                continue
+            key, content, metadata = document
+            outcome = await embedder.embed_entity(key, content, metadata, dry_run=dry_run)
+        except Exception as e:  # noqa: BLE001 -- one malformed record must not stop the run
+            outcome = f"undone:{e}"
+        _record(totals, outcome, key)
     return _finish(totals, complete)
 
 
@@ -192,8 +197,9 @@ async def embed_organizations(
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict[str, Any]:
-    """Embed every public organization ddp-broker-py lists. A dry run only counts the list (the
-    descriptive text is on the per-organization detail read, which a dry run does not spend).
+    """Embed every public organization ddp-broker-py lists. A dry run does everything but write:
+    it reads each organization's detail (the descriptive text is only there) so the counts of
+    would-write, unchanged and skipped are real, which costs one broker read per organization.
     Never raises: a broker that predates BROKER-144 answers 404 and the run reports incomplete."""
     totals = _totals("organizations")
     ids: list[Any] = []
@@ -216,26 +222,23 @@ async def embed_organizations(
         complete = False
         logger.warning("knowledge_base_entities_list_failed", entity="organizations", error=str(e))
     totals["listed"] = len(ids)
-    if dry_run:
-        return _finish(totals, complete)
 
     embedder = embedder or KnowledgeBaseEmbedder(settings)
     for org_id in ids:
+        key = organization_key(org_id)
         try:
             org = await broker_client.get_organization(
                 org_id, broker_api_base=broker_api_base, broker_api_token=broker_api_token
             )
-        except BrokerClientError as e:
-            totals["failed"] += 1
-            logger.warning("knowledge_base_entity_undone", entity="organizations",
-                           key=organization_key(org_id), reason=str(e))
-            continue
-        document = organization_document(org)
-        if document is None:
-            totals["skipped_no_content"] += 1
-            continue
-        key, content, metadata = document
-        _record(totals, await embedder.embed_entity(key, content, metadata), key)
+            document = organization_document(org)
+            if document is None:
+                totals["skipped_no_content"] += 1
+                continue
+            key, content, metadata = document
+            outcome = await embedder.embed_entity(key, content, metadata, dry_run=dry_run)
+        except Exception as e:  # noqa: BLE001 -- a failed read or a malformed record must not stop the run
+            outcome = f"undone:{e}"
+        _record(totals, outcome, key)
     return _finish(totals, complete)
 
 
