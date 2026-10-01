@@ -780,6 +780,12 @@ openstates_archive:
   knowledge_base_embedding:
     enabled: false
     jurisdictions: [fl, us, va, mi, wa, az, ut]
+    # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
+    # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
+    # It pauses through this UTC window so it stays out of the 05:00 UTC archive start.
+    backfill:
+      blackout_start_utc: "04:45"
+      blackout_end_utc: "07:00"
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
                            # 01:00-03:00 scrape-job start times, though overlap with a live

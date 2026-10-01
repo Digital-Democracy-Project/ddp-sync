@@ -78,6 +78,11 @@ Post-archive hook, independent of the LegBot one: `openstates_archive._maybe_emb
 - Always `skip_duplicates=False`: a content-hash skip would leave a version with no vectors while the cache says it is embedded.
 - Not embedded: any LegBot/`BillArtifact` output, `bill-changelog`. Not yet written: `is_ddp_curated` / `ddp_url` (needs a ddp-broker-py read).
 
+
+## Knowledge-base backfill (`pipelines/knowledge_base_backfill.py`, SYNC-90)
+
+Walks a jurisdiction's whole archived corpus into the new index through the SAME `KnowledgeBaseEmbedder.embed_bill` the live hook uses, narrowed by `knowledge_base_embedding.EmbedScope(text="all"|"current"|None, diffs, votes)` (default = everything, i.e. unchanged live behavior). **Do not write a second embedding path**: add a stage as a new `STAGE_SCOPES` entry. Stages in order (`STAGES`): `current` (current-session bills' current version), `votes`, `diffs`, `prior-sessions` (prior-session bills' current version), `history` (every older version). Bills are listed with `local_openstates_client.list_touched_bill_ids(since=epoch, session=...)`, the current session comes from `OpenStatesSource.get_current_session_identifier`. Resumable via a Redis checkpoint per jurisdiction and stage (`redis_store.get/set/delete_kb_backfill_checkpoint`: last bill id, failed ids retried first, cumulative totals, `done`); a done stage is a no-op unless `restart`; one run per jurisdiction via a renewed lease (`scraper_triggered_legbot._lock_heartbeat_loop`); sequential; pauses through the UTC blackout window `openstates_archive.knowledge_base_embedding.backfill` (default 04:45-07:00); aborts a stage after 200 failed bills. `embed_bill` re-reads a document's cache entry right before writing it and skips (`raced`) one another writer changed, and merges its cache write onto a fresh read, so a backfill never overwrites a live write. Manual entry: `POST /trigger/knowledge-base-backfill/{jurisdiction}?stage=&dry_run=true&restart=false` (202, results in the log: `knowledge_base_backfill_dry_run` / `_progress` / `_stage_complete` / `_stage_incomplete` / `_aborted`). Needs `KNOWLEDGE_BASE_INDEX_NAME`, an api-v3 exposing the OPEN-311 fields, and the jurisdiction in `knowledge_base_embedding.jurisdictions` (the `enabled` flag only gates the live hook).
+
 ## Bill version pipeline (`pipelines/bill_version.py`)
 
 The daily bill sync entry point. **Do not reinvent these methods.**
@@ -307,6 +312,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
 | `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions |
+| `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (the 05:00 archive start) |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |

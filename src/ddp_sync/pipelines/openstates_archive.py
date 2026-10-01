@@ -821,15 +821,15 @@ async def _maybe_embed_knowledge_base(
         return
 
     # Same Mac-vs-EC2 read split as the LegBot hook: only the Mac reaches the local api-v3.
-    if _mac_capable():
-        api_base, api_key = settings.local_openstates_api_base, settings.local_openstates_api_key
-    else:
-        api_base, api_key = settings.rds_openstates_api_base, settings.rds_openstates_api_key
+    from ddp_sync.pipelines.knowledge_base_embedding import (
+        embed_archived_bills,
+        read_target,
+    )
+
+    api_base, api_key = read_target(settings, mac_capable=_mac_capable())
     if not api_base:
         logger.warning("knowledge_base_embedding_read_path_not_configured", jurisdiction=jurisdiction)
         return
-
-    from ddp_sync.pipelines.knowledge_base_embedding import embed_archived_bills
 
     await embed_archived_bills(
         jurisdiction,

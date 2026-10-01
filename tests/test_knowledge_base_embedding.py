@@ -505,3 +505,129 @@ async def test_redis_store_set_bill_version_reports_success_and_watermark_roundt
     assert await store.get_kb_embed_watermark("FL") == "2026-09-30T05:00:00+00:00"
     client.set = AsyncMock(side_effect=RuntimeError("down"))
     assert await store.set_bill_version("k", {}) is False
+
+
+# --- SYNC-90: EmbedScope, the cache-race guard, merge-on-write ------------------------------------
+
+TEXT_C = "enrolled text " * 25
+DIFF_C = "--- c\n+++ d\n" + "@@ more @@\n" * 10
+_VOTES = [{"start_date": "2026-02-01"}]
+
+
+def _three_versions():
+    return [
+        _version(1, "Filed", "introduced", 0, TEXT_A),
+        _version(2, "Amended", "amendment", 1, TEXT_B, diff=DIFF_B),
+        _version(3, "Enrolled", "enacted", 2, TEXT_C, diff=DIFF_C),
+    ]
+
+
+def _text(n):
+    return kb.text_document_key(OCD, n)
+
+
+def _diff(n):
+    return kb.diff_document_key(OCD, n)
+
+
+async def test_scope_current_embeds_only_the_current_version_text():
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
+                         kb.EmbedScope(text="current", diffs=False, votes=False))
+    assert pipe.keys == [_text(3)]
+
+
+async def test_scope_votes_only_and_diffs_only():
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
+                         kb.EmbedScope(text=None, diffs=False, votes=True))
+    assert pipe.keys == [kb.votes_document_key(OCD)]
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
+                         kb.EmbedScope(text=None, diffs=True, votes=False))
+    assert pipe.keys == [_diff(2), _diff(3)]
+
+
+async def test_scope_all_text_embeds_every_version_and_nothing_else():
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
+                         kb.EmbedScope(text="all", diffs=False, votes=False))
+    assert pipe.keys == [_text(1), _text(2), _text(3)]
+
+
+async def test_default_scope_is_everything_unchanged_for_the_live_hook():
+    emb, _, pipe = _embedder()
+    stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES))
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3), kb.votes_document_key(OCD)])
+    assert stats["chars"] > 0 and stats["raced"] == 0
+
+
+async def test_stage_unknown_is_never_the_current_version():
+    unknown_only = [_version(7, "Mystery", "unknown", None, TEXT_A, unknown=True)]
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(unknown_only), kb.EmbedScope(text="current", diffs=False, votes=False))
+    assert pipe.keys == []
+    mixed = unknown_only + [_version(8, "Filed", "introduced", 0, TEXT_B)]
+    emb, _, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _bill(mixed), kb.EmbedScope(text="current", diffs=False, votes=False))
+    assert pipe.keys == [_text(8)]
+
+
+async def test_a_narrow_pass_then_a_full_pass_never_rewrites_what_the_first_wrote():
+    emb, _, pipe = _embedder()
+    bill = _bill(_three_versions(), _VOTES)
+    await emb.embed_bill(OCD, "fl", bill, kb.EmbedScope(text="current", diffs=False, votes=False))
+    first = list(pipe.keys)
+    await emb.embed_bill(OCD, "fl", bill)
+    assert first == [_text(3)]
+    assert pipe.keys.count(_text(3)) == 1  # not re-embedded by the full pass
+    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2), _diff(2), _diff(3), kb.votes_document_key(OCD)])
+    again = len(pipe.keys)
+    stats = await emb.embed_bill(OCD, "fl", bill)
+    assert len(pipe.keys) == again and stats["documents"] == stats["diffs"] == stats["votes"] == 0
+
+
+class _RacingRedis(FakeRedis):
+    """After this call's first read, another writer records document 1 as embedded with newer text."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    async def get_bill_version(self, key):
+        self.reads += 1
+        if self.reads == 2:  # the guard's read, just before the first upsert
+            self.versions[key] = {"schema": kb.CACHE_SCHEMA, "votes": {},
+                                  "documents": {"1": {"text_hash": "live-newer", "chunks": 9}}}
+        return self.versions.get(key)
+
+
+async def test_a_document_changed_by_another_writer_is_skipped_and_its_entry_survives():
+    redis = _RacingRedis()
+    emb, redis, pipe = _embedder(redis=redis)
+    stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
+                                 kb.EmbedScope(text="all", diffs=False, votes=False))
+    assert _text(1) not in pipe.keys  # the older text never overwrote the newer live write
+    assert _text(2) in pipe.keys and _text(3) in pipe.keys
+    assert stats["raced"] == 1 and stats["undone"] == []
+    docs = redis.versions[OCD]["documents"]
+    assert docs["1"]["text_hash"] == "live-newer"  # kept, not clobbered by our cache write
+    assert "text_hash" in docs["2"] and "text_hash" in docs["3"]
+
+
+async def test_read_target_follows_the_mac_split():
+    mac = SyncSettings(local_openstates_api_base="http://local", local_openstates_api_key="lk",
+                       rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    assert kb.read_target(mac, mac_capable=True) == ("http://local", "lk")
+    assert kb.read_target(mac, mac_capable=False) == ("http://rds", "rk")
+
+
+async def test_list_touched_bill_ids_passes_the_session_filter():
+    from ddp_sync.services import local_openstates_client as c
+
+    get = AsyncMock(return_value={"results": [{"id": "ocd-bill/aaa"}], "pagination": {"max_page": 1}})
+    with patch.object(c, "_get_json_with_retry", get):
+        await c.list_touched_bill_ids("fl", since=_STARTED, api_base="http://api", session="2026")
+        await c.list_touched_bill_ids("fl", since=_STARTED, api_base="http://api")
+    assert get.await_args_list[0].args[1]["session"] == "2026"
+    assert "session" not in get.await_args_list[1].args[1]

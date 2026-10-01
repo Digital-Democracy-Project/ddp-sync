@@ -1116,6 +1116,91 @@ async def trigger_openstates_backfill(
     }
 
 
+@router.post("/trigger/knowledge-base-backfill/{jurisdiction}", status_code=202)
+async def trigger_knowledge_base_backfill(
+    jurisdiction: str,
+    background_tasks: BackgroundTasks,
+    stage: str | None = None,
+    dry_run: bool = True,
+    restart: bool = False,
+    token: str = Depends(api_key_auth),
+):
+    """SYNC-90: backfill the `ddp-knowledge-base` index for one jurisdiction (PLAN-enterprise-
+    search.md 5.6), through the same embedding code as the post-archive hook.
+
+    Returns 202 at once with a `run_id` that appears in every structured log line the run writes;
+    like OPEN-268's backfill, the dry run's result (bills per stage and how many remain) lands in
+    the log line `knowledge_base_backfill_dry_run`, not in this response, because a real run lasts
+    hours. Defaults to `dry_run=true`.
+
+    stage: one of current, votes, diffs, prior-sessions, history; omit to run them all in order
+    (finished stages are skipped, interrupted ones resume from their checkpoint).
+    restart: forget the checkpoint(s) and walk from the start.
+
+    404 for an unknown stage or a jurisdiction not enrolled in `openstates_archive.
+    knowledge_base_embedding.jurisdictions`; 503 when `KNOWLEDGE_BASE_INDEX_NAME` or the read api
+    is not configured on this host; 409 when a backfill of this jurisdiction is already running.
+    """
+    from ddp_sync.config import get_settings
+    from ddp_sync.pipelines.knowledge_base_backfill import (
+        STAGES,
+        lock_holder,
+        run_knowledge_base_backfill,
+    )
+    from ddp_sync.pipelines.knowledge_base_embedding import read_target
+    from ddp_sync.pipelines.openstates_archive import _mac_capable
+    from ddp_sync.scheduler import get_scheduler
+
+    if stage is not None and stage not in STAGES:
+        raise HTTPException(status_code=404, detail=f"Unknown stage '{stage}'. Available: {list(STAGES)}")
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    block = (config.get("knowledge_base_embedding") or {})
+    enrolled = {str(j).lower() for j in block.get("jurisdictions", [])}
+    if jurisdiction.lower() not in enrolled:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{jurisdiction}' is not enrolled in knowledge_base_embedding.jurisdictions: {sorted(enrolled)}",
+        )
+
+    settings = get_settings()
+    if not settings.knowledge_base_index_name:
+        raise HTTPException(status_code=503, detail="KNOWLEDGE_BASE_INDEX_NAME is not set on this host")
+    api_base, api_key = read_target(settings, mac_capable=_mac_capable())
+    if not api_base:
+        raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")
+
+    if not dry_run:
+        holder = await lock_holder(jurisdiction)
+        if holder:
+            raise HTTPException(status_code=409, detail={"error": "already_running", "current_run_id": holder})
+
+    import uuid
+
+    run_id = f"{jurisdiction}-kb-backfill-{'dry' if dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(
+        run_knowledge_base_backfill,
+        jurisdiction,
+        [stage] if stage else None,
+        settings=settings,
+        api_base=api_base,
+        api_key=api_key,
+        config=config,
+        dry_run=dry_run,
+        restart=restart,
+        run_id=run_id,
+    )
+    return {
+        "status": "started",
+        "run_id": run_id,
+        "jurisdiction": jurisdiction,
+        "stages": [stage] if stage else list(STAGES),
+        "dry_run": dry_run,
+        "restart": restart,
+    }
+
+
 @router.post("/trigger/vote-person-backfill", status_code=202)
 async def trigger_vote_person_backfill(
     background_tasks: BackgroundTasks,
