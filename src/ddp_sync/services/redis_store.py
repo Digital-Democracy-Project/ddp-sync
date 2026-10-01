@@ -27,6 +27,9 @@ BILL_VERSION_TTL = 86400 * 90  # 90 days
 # work undone (an ISO timestamp); the next run rescans from there, which is the repair path.
 KB_EMBED_WATERMARK_PREFIX = "ddp:kb_embed:since:"
 KB_EMBED_WATERMARK_TTL = 86400 * 30  # 30 days
+# SYNC-90: per-jurisdiction-and-stage checkpoint of the knowledge-base backfill (a JSON object).
+KB_BACKFILL_CHECKPOINT_PREFIX = "ddp:kb_backfill:"
+KB_BACKFILL_CHECKPOINT_TTL = 86400 * 90  # 90 days
 BILL_STATUS_PREFIX = "ddp:bill_status:"
 BILL_STATUS_TTL = 86400 * 90  # 90 days
 FLOW_STATUS_PREFIX = "ddp:flow:"
@@ -350,6 +353,50 @@ class RedisStore:
             return True
         except Exception as e:
             logger.error("Redis: failed to set kb embed watermark", jurisdiction=jurisdiction, error=str(e))
+            return False
+
+    # -- Knowledge-base backfill checkpoint (SYNC-90) --
+
+    async def get_kb_backfill_checkpoint(self, jurisdiction: str, stage: str) -> dict | None:
+        """The stored checkpoint for one jurisdiction and backfill stage, or None."""
+        if not self._client:
+            return None
+        try:
+            value = await self._client.get(f"{KB_BACKFILL_CHECKPOINT_PREFIX}{jurisdiction.lower()}:{stage}")
+            if value is None:
+                return None
+            data = json.loads(value.decode() if isinstance(value, bytes) else value)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.error("Redis: failed to get kb backfill checkpoint", jurisdiction=jurisdiction,
+                         stage=stage, error=str(e))
+            return None
+
+    async def set_kb_backfill_checkpoint(self, jurisdiction: str, stage: str, data: dict) -> bool:
+        if not self._client:
+            return False
+        try:
+            await self._client.set(
+                f"{KB_BACKFILL_CHECKPOINT_PREFIX}{jurisdiction.lower()}:{stage}",
+                json.dumps(data),
+                ex=KB_BACKFILL_CHECKPOINT_TTL,
+            )
+            return True
+        except Exception as e:
+            logger.error("Redis: failed to set kb backfill checkpoint", jurisdiction=jurisdiction,
+                         stage=stage, error=str(e))
+            return False
+
+    async def delete_kb_backfill_checkpoint(self, jurisdiction: str, stage: str) -> bool:
+        """Forget a stage's checkpoint, so the next run walks it from the start (`restart`)."""
+        if not self._client:
+            return False
+        try:
+            await self._client.delete(f"{KB_BACKFILL_CHECKPOINT_PREFIX}{jurisdiction.lower()}:{stage}")
+            return True
+        except Exception as e:
+            logger.error("Redis: failed to delete kb backfill checkpoint", jurisdiction=jurisdiction,
+                         stage=stage, error=str(e))
             return False
 
     # -- Bill status cache (Flow 1: OpenStates → Webflow CMS) --
