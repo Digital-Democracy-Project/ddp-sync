@@ -412,9 +412,12 @@ The legislator text is the OpenStates record, not the Webflow bio the legacy doc
 ddp-sync's Redis (`redis://localhost:6379/0`) is the same `ddp-agents-redis-1` container CAMS uses.
 When it restarts, `/health` reports `redis: error`, ddp-sync logs `Redis is loading the dataset in
 memory`, and everything that is built to fail soft does (lock renewals, LegBot task records, version
-caches), but a long restart can let a run's overlap-lock lease lapse. Observed twice on 2026-09-30/10-01,
-reloading a snapshot that reported about 8 GB of memory: see the `notes/ops-handoff` session note for
-the open question. Before concluding a pipeline "stopped", check the Redis container first.
+caches), but a long restart can let a run's overlap-lock lease lapse. Observed twice on 2026-09-30/10-01
+(each reload took about 25 seconds). At that point the instance held about 8 GB across 518,649 keys,
+nearly all `cams:state:*` (CAMS's own state), only 3,430 of them with an expiry, and `maxmemory` unset;
+why the container keeps restarting is an open question, recorded in the `notes/ops-handoff` session
+note (it is not ddp-sync's data, so not ddp-sync's to fix). Before concluding a pipeline "stopped",
+check the Redis container first (`docker ps`, `docker logs ddp-agents-redis-1`).
 
 ## Dev/prod checkout discipline
 
