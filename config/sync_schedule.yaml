@@ -793,7 +793,7 @@ openstates_archive:
   # archives, and that instance must be able to reach RDS_OPENSTATES_API_BASE (a deploy check).
   # Enroll the 8 jurisdictions search covers (OPEN-310): US, FL, MI, AZ, VA, WA, UT, NC.
   bill_search_refresh:
-    enabled: false
+    enabled: true
     jurisdictions: [us, fl, mi, az, va, wa, ut, nc]
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the

@@ -56,3 +56,6 @@ Thumbs.db
 # Scratch file written by sandboxed tooling to test write access (SYNC-41:
 # one was committed by accident). Never part of the source tree.
 .sandbox-write-probe
+
+# OPEN-193: host-specific identifiers for infrastructure/render-env.sh (never commit)
+infrastructure/render-env.local

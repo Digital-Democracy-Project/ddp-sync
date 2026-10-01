@@ -1,17 +1,32 @@
+# OPEN-193: replaces the earlier bare venv+uvicorn unit (User=ubuntu, /home/ubuntu/ddp-sync --
+# never matched this host's actual layout) with the same Docker-Compose-oneshot pattern
+# ddp-broker-py already uses (infra/systemd/ddp-broker.service), so all three services on this
+# host end up managed the same way: `systemctl start/stop/status ddp-sync`.
+#
+# Requires ddp-broker.service specifically, not just docker.service -- ddp-sync joins its
+# `ddp-broker-py_default` network externally and talks to its Redis container directly (a
+# separate logical DB, see docker-compose.prod.yml), so that network must already exist.
+#
+# Install: sudo cp infrastructure/ddp-sync.service /etc/systemd/system/ddp-sync.service
+#          sudo systemctl daemon-reload
 [Unit]
-Description=DDP Sync Service
-After=network.target redis-server.service
-Wants=redis-server.service
+Description=DDP Sync service (docker compose, prod)
+Documentation=https://github.com/Digital-Democracy-Project/ddp-sync
+Requires=docker.service ddp-broker.service
+After=docker.service ddp-broker.service network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/ddp-sync
-Environment=PATH=/home/ubuntu/ddp-sync/.venv/bin:/usr/bin
-ExecStart=/home/ubuntu/ddp-sync/.venv/bin/uvicorn ddp_sync.app:app --host 0.0.0.0 --port 8001 --workers 1
-Restart=on-failure
-RestartSec=10
-MemoryMax=2G
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ddp-sync
+# Re-resolves secrets from Secrets Manager on every start/restart rather than trusting a
+# possibly-stale .env -- cheap (two GetSecretValue calls) and means a rotated credential takes
+# effect on the next restart with no separate step to remember.
+ExecStartPre=/opt/ddp-sync/infrastructure/render-env.sh
+ExecStart=/usr/bin/docker compose -p ddp-sync -f /opt/ddp-sync/infrastructure/docker-compose.prod.yml up -d --build
+ExecStop=/usr/bin/docker compose -p ddp-sync -f /opt/ddp-sync/infrastructure/docker-compose.prod.yml stop
+TimeoutStartSec=600
 
 [Install]
 WantedBy=multi-user.target
