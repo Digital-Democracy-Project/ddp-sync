@@ -780,6 +780,15 @@ openstates_archive:
   knowledge_base_embedding:
     enabled: false
     jurisdictions: [fl, us, va, mi, wa, az, ut]
+  # SYNC-87 (PLAN-enterprise-search.md 4.5.5): after each enrolled jurisdiction's archive, refresh the
+  # api-v3 `ddp_bill_search` projection (POST /ddp/search/refresh) so search sees new and changed bills.
+  # Always calls the RDS-backed api-v3 (`RDS_OPENSTATES_API_BASE`), never the Mac's local one: the
+  # projection table exists only there. Off until enabled here on each instance that dispatches
+  # archives, and that instance must be able to reach RDS_OPENSTATES_API_BASE (a deploy check).
+  # Enroll the 8 jurisdictions search covers (OPEN-310): US, FL, MI, AZ, VA, WA, UT, NC.
+  bill_search_refresh:
+    enabled: false
+    jurisdictions: [us, fl, mi, az, va, wa, ut, nc]
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
                            # 01:00-03:00 scrape-job start times, though overlap with a live
