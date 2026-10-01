@@ -28,6 +28,7 @@ watermark is not advanced either), and a WARNING names what was left undone.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -81,6 +82,35 @@ def version_text(version: dict) -> str:
         if link.get("raw_text"):
             return link["raw_text"]
     return version.get("archived_raw_text") or ""
+
+
+@dataclass(frozen=True)
+class EmbedScope:
+    """Which parts of a bill `embed_bill` writes. The default is everything, which is what the
+    live post-archive hook uses; the SYNC-90 backfill narrows it stage by stage so that live and
+    backfill writes go through the SAME code and cannot diverge.
+
+    text: "all" (every version), "current" (only the bill's current version, i.e. the highest
+    `version_ordinal` among classifiable versions; stage-unknown versions are never current), or
+    None (no text documents). diffs / votes: whether to write those documents."""
+
+    text: str | None = "all"
+    diffs: bool = True
+    votes: bool = True
+
+
+SCOPE_ALL = EmbedScope()
+
+_UNREADABLE = object()  # a cache entry that existed when embed_bill started can no longer be read
+
+
+def read_target(settings: SyncSettings, *, mac_capable: bool) -> tuple[str, str]:
+    """`(api_base, api_key)` of the api-v3 the embedding reads: the Mac's local instance on the Mac,
+    the RDS-backed one elsewhere (same split as the LegBot hook). Shared by the live hook and the
+    SYNC-90 backfill so both read the same data."""
+    if mac_capable:
+        return settings.local_openstates_api_base, settings.local_openstates_api_key
+    return settings.rds_openstates_api_base, settings.rds_openstates_api_key
 
 
 class KnowledgeBaseEmbedder:
@@ -143,27 +173,61 @@ class KnowledgeBaseEmbedder:
             extra=extra,
         )
 
-    async def embed_bill(self, ocd_bill_id: str, jurisdiction: str, bill: dict) -> dict:
+    async def _cached_field(
+        self, ocd_bill_id: str, archive_id: str | None, field: str, *, expect_cache: bool
+    ) -> Any:
+        """Fresh read of one cached value: a document's `field`, or (archive_id None) the votes
+        fingerprint. None when nothing is cached (or the entry is not this path's schema).
+        `get_bill_version` returns None both for "no entry" and for a Redis error, so when an entry
+        existed at the start of the call (`expect_cache`) a None now is `_UNREADABLE`: most likely a
+        blip, never evidence that another writer changed the document."""
+        fresh = await self.redis.get_bill_version(ocd_bill_id)
+        if fresh is None:
+            return _UNREADABLE if expect_cache else None
+        if fresh.get("schema") != CACHE_SCHEMA:
+            return None
+        if archive_id is None:
+            return (fresh.get("votes") or {}).get("fingerprint")
+        return ((fresh.get("documents") or {}).get(archive_id) or {}).get(field)
+
+    async def embed_bill(
+        self, ocd_bill_id: str, jurisdiction: str, bill: dict, scope: EmbedScope = SCOPE_ALL
+    ) -> dict:
         """Embed whatever of `bill` (an api-v3 detail response with versions, votes, sources) is
-        not yet embedded. Returns a stats dict; `undone` lists what could not be finished, and
-        when it is non-empty the Redis cache was NOT advanced."""
+        not yet embedded, limited to `scope`. Returns a stats dict; `undone` lists what could not
+        be finished, and when it is non-empty the Redis cache was NOT advanced. `raced` counts
+        documents skipped because another writer (the live hook or a backfill) changed their cache
+        entry after this call read it; they are left to that writer, never overwritten (SYNC-90).
+        The re-read narrows that race to the moment between it and the upsert; it is not atomic
+        across Pinecone and Redis, and a residual mismatch is healed by the next pass, which compares
+        the cached hash with api-v3's current text."""
         stats: dict[str, Any] = {
             "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0, "votes": 0,
-            "chunks": 0, "no_text_yet": 0, "undone": [],
+            "chunks": 0, "chars": 0, "no_text_yet": 0, "raced": 0, "undone": [],
         }
         cache = await self.redis.get_bill_version(ocd_bill_id) or {}
         if cache.get("schema") != CACHE_SCHEMA:
             cache = {}
+        had_cache = bool(cache)  # an entry exists now; losing sight of it later is a blip, not a race
         docs: dict[str, dict] = {k: dict(v) for k, v in (cache.get("documents") or {}).items()}
         votes_cache: dict = dict(cache.get("votes") or {})
+        updates: dict[str, dict] = {}  # archive id -> the cache fields THIS call set
+        votes_update: dict | None = None
 
         base = self._base_extra(bill, ocd_bill_id)
         gov_id = bill.get("identifier") or ocd_bill_id
         bill_title = bill.get("title") or ""
-        changed = False
         previous: dict | None = None  # the last classifiable version seen, for diff labels
+        versions = bill.get("versions") or []
+        # The current version is the last classifiable one in api-v3's own order (never re-derived).
+        current_ordinal = max(
+            (v["version_ordinal"] for v in versions
+             if v.get("version_ordinal") is not None
+             and (v.get("version_stage") or STAGE_UNKNOWN) != STAGE_UNKNOWN),
+            default=None,
+        )
 
-        for version in bill.get("versions") or []:
+        for version in versions:
             note, date = version.get("note") or "", version.get("date") or ""
             stage = version.get("version_stage") or STAGE_UNKNOWN
             text = version_text(version)
@@ -174,92 +238,128 @@ class KnowledgeBaseEmbedder:
             if archive_id is None:
                 stats["undone"].append(f"'{note}': api-v3 sent text but no archived_document_id")
                 continue
+            aid = str(archive_id)
 
             label = {
-                "document_id": str(archive_id), "version_note": note, "version_date": date,
+                "document_id": aid, "version_note": note, "version_date": date,
                 "version_stage": stage, "version_ordinal": version.get("version_ordinal"),
             }
-            entry = docs.setdefault(str(archive_id), {})
+            entry = docs.get(aid, {})
 
+            wanted = scope.text == "all" or (
+                scope.text == "current" and stage != STAGE_UNKNOWN
+                and version.get("version_ordinal") == current_ordinal
+            )
             h = content_hash(text)
-            if entry.get("text_hash") != h:
+            if wanted and entry.get("text_hash") != h:
                 key = text_document_key(ocd_bill_id, archive_id)
-                meta = self._metadata(key, DOCUMENT_TYPE_TEXT, f"{gov_id} - {note}", jurisdiction,
-                                      ocd_bill_id, {**base, **label})
-                try:
-                    n = await self._ingest(key, text, meta, entry.get("chunks", 0))
-                except Exception as e:  # noqa: BLE001 -- recorded as undone, never aborts the bill
-                    stats["undone"].append(f"{key}: {e}")
+                current = await self._cached_field(ocd_bill_id, aid, "text_hash", expect_cache=had_cache)
+                if current is _UNREADABLE:
+                    stats["undone"].append(f"{key}: version cache unreadable before write")
+                elif current != entry.get("text_hash"):
+                    stats["raced"] += 1  # someone wrote this document since we read the cache
                 else:
-                    entry.update(text_hash=h, chunks=n)
-                    stats["documents"] += 1
-                    stats["chunks"] += n
-                    changed = True
+                    meta = self._metadata(key, DOCUMENT_TYPE_TEXT, f"{gov_id} - {note}", jurisdiction,
+                                          ocd_bill_id, {**base, **label})
+                    try:
+                        n = await self._ingest(key, text, meta, entry.get("chunks", 0))
+                    except Exception as e:  # noqa: BLE001 -- recorded as undone, never aborts the bill
+                        stats["undone"].append(f"{key}: {e}")
+                    else:
+                        fields = {"text_hash": h, "chunks": n}
+                        docs.setdefault(aid, {}).update(fields)
+                        updates.setdefault(aid, {}).update(fields)
+                        stats["documents"] += 1
+                        stats["chunks"] += n
+                        stats["chars"] += len(text)
 
             diff = version.get("diff_from_previous_version")
-            if diff and stage != STAGE_UNKNOWN:
+            if scope.diffs and diff and stage != STAGE_UNKNOWN:
                 dh = content_hash(diff)
                 if entry.get("diff_hash") != dh:
                     key = diff_document_key(ocd_bill_id, archive_id)
-                    from_label = {
-                        "from_document_id": str(previous["archive_id"]) if previous else None,
-                        "from_version_note": previous["note"] if previous else None,
-                        "from_version_date": previous["date"] if previous else None,
-                    }
-                    meta = self._metadata(key, DOCUMENT_TYPE_DIFF, f"{gov_id} - changes in {note}",
-                                          jurisdiction, ocd_bill_id, {**base, **label, **from_label})
-                    try:
-                        n = await self._ingest(key, diff, meta, entry.get("diff_chunks", 0))
-                    except Exception as e:  # noqa: BLE001
-                        stats["undone"].append(f"{key}: {e}")
+                    current = await self._cached_field(ocd_bill_id, aid, "diff_hash", expect_cache=had_cache)
+                    if current is _UNREADABLE:
+                        stats["undone"].append(f"{key}: version cache unreadable before write")
+                    elif current != entry.get("diff_hash"):
+                        stats["raced"] += 1
                     else:
-                        entry.update(diff_hash=dh, diff_chunks=n)
-                        stats["diffs"] += 1
-                        stats["chunks"] += n
-                        changed = True
+                        from_label = {
+                            "from_document_id": str(previous["archive_id"]) if previous else None,
+                            "from_version_note": previous["note"] if previous else None,
+                            "from_version_date": previous["date"] if previous else None,
+                        }
+                        meta = self._metadata(key, DOCUMENT_TYPE_DIFF, f"{gov_id} - changes in {note}",
+                                              jurisdiction, ocd_bill_id, {**base, **label, **from_label})
+                        try:
+                            n = await self._ingest(key, diff, meta, entry.get("diff_chunks", 0))
+                        except Exception as e:  # noqa: BLE001
+                            stats["undone"].append(f"{key}: {e}")
+                        else:
+                            fields = {"diff_hash": dh, "diff_chunks": n}
+                            docs.setdefault(aid, {}).update(fields)
+                            updates.setdefault(aid, {}).update(fields)
+                            stats["diffs"] += 1
+                            stats["chunks"] += n
+                            stats["chars"] += len(diff)
             if stage != STAGE_UNKNOWN:
                 previous = {"archive_id": archive_id, "note": note, "date": date}
 
         votes = bill.get("votes") or []
         fingerprint = vote_fingerprint(votes)
-        if fingerprint and fingerprint != votes_cache.get("fingerprint"):
+        if scope.votes and fingerprint and fingerprint != votes_cache.get("fingerprint"):
             key = votes_document_key(ocd_bill_id)
             formatted = self._format_votes(bill)
             if formatted:
-                content, ids = formatted
-                meta = self._metadata(
-                    key, DOCUMENT_TYPE_VOTES, f"{gov_id} - {bill_title} - Voting Record", jurisdiction,
-                    ocd_bill_id,
-                    {**base, "vote_count": len(votes), "voter_count": ids.get("voter_count", 0),
-                     "voter_person_ids": ids.get("voter_person_ids", [])},
-                )
-                try:
-                    n = await self._ingest(key, content, meta, votes_cache.get("chunks", 0))
-                except Exception as e:  # noqa: BLE001
-                    stats["undone"].append(f"{key}: {e}")
+                current = await self._cached_field(ocd_bill_id, None, "fingerprint", expect_cache=had_cache)
+                if current is _UNREADABLE:
+                    stats["undone"].append(f"{key}: version cache unreadable before write")
+                elif current != votes_cache.get("fingerprint"):
+                    stats["raced"] += 1
                 else:
-                    votes_cache = {"fingerprint": fingerprint, "chunks": n}
-                    stats["votes"] += 1
-                    stats["chunks"] += n
-                    changed = True
+                    content, ids = formatted
+                    meta = self._metadata(
+                        key, DOCUMENT_TYPE_VOTES, f"{gov_id} - {bill_title} - Voting Record", jurisdiction,
+                        ocd_bill_id,
+                        {**base, "vote_count": len(votes), "voter_count": ids.get("voter_count", 0),
+                         "voter_person_ids": ids.get("voter_person_ids", [])},
+                    )
+                    try:
+                        n = await self._ingest(key, content, meta, votes_cache.get("chunks", 0))
+                    except Exception as e:  # noqa: BLE001
+                        stats["undone"].append(f"{key}: {e}")
+                    else:
+                        votes_update = {"fingerprint": fingerprint, "chunks": n}
+                        votes_cache = votes_update
+                        stats["votes"] += 1
+                        stats["chunks"] += n
+                        stats["chars"] += len(content)
 
+        if not stats["undone"] and (updates or votes_update is not None):
+            # Advanced last: every Pinecone write for this bill has succeeded. Merged onto a fresh
+            # read so another writer's entries for OTHER documents are kept, not clobbered.
+            latest = await self.redis.get_bill_version(ocd_bill_id)
+            if latest is None and had_cache:
+                # Unreadable (or gone) since we started: writing only our documents would erase the
+                # others' entries. Leave the cache alone; the next pass re-embeds (idempotent).
+                stats["undone"].append("version cache unreadable at write")
+            else:
+                latest = latest if latest and latest.get("schema") == CACHE_SCHEMA else {}
+                merged_docs = {k: dict(v) for k, v in (latest.get("documents") or {}).items()}
+                for aid, fields in updates.items():
+                    merged_docs.setdefault(aid, {}).update(fields)
+                written = await self.redis.set_bill_version(ocd_bill_id, {
+                    "schema": CACHE_SCHEMA, "documents": merged_docs,
+                    "votes": votes_update if votes_update is not None else dict(latest.get("votes") or {}),
+                    "last_checked": datetime.now(timezone.utc).isoformat(),
+                })
+                if not written:
+                    stats["undone"].append("version cache not written (Redis)")
         if stats["undone"]:
             logger.warning(
                 "knowledge_base_embedding_work_left_undone",
                 ocd_bill_id=ocd_bill_id, jurisdiction=jurisdiction, undone=stats["undone"],
             )
-        elif changed:
-            # Advanced last: every Pinecone write for this bill has succeeded.
-            written = await self.redis.set_bill_version(ocd_bill_id, {
-                "schema": CACHE_SCHEMA, "documents": docs, "votes": votes_cache,
-                "last_checked": datetime.now(timezone.utc).isoformat(),
-            })
-            if not written:
-                stats["undone"].append("version cache not written (Redis)")
-                logger.warning(
-                    "knowledge_base_embedding_work_left_undone",
-                    ocd_bill_id=ocd_bill_id, jurisdiction=jurisdiction, undone=stats["undone"],
-                )
         self.pipeline.reset_hash_cache()
         return stats
 

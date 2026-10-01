@@ -1086,6 +1086,7 @@ async def list_touched_bill_ids(
     since: datetime,
     api_base: str,
     api_key: str = "",
+    session: str | None = None,
 ) -> tuple[list[str], bool] | None:
     """SYNC-83: bare `ocd_bill_id`s (no `ocd-bill/` prefix) of every bill in the jurisdiction
     whose archived documents changed since `since` (api-v3 `document_updated_since`, the same
@@ -1095,6 +1096,10 @@ async def list_touched_bill_ids(
     not advance its watermark. Returns `None` when nothing could be read at all. Never raises.
     There is deliberately no cap: a cap would keep re-listing the same first bills (the ones
     already embedded) and never reach the rest.
+
+    `session` (SYNC-90): restrict to one legislative session identifier (api-v3's own `session`
+    filter, which requires the jurisdiction, always given here). A bare epoch `since` lists every
+    bill that has any archived document, which is how the backfill enumerates a jurisdiction.
     """
     if not api_base:
         return None
@@ -1110,6 +1115,8 @@ async def list_touched_bill_ids(
             "per_page": str(_API_V3_MAX_PER_PAGE),
             "page": str(page),
         }
+        if session:
+            params["session"] = session
         data = await _get_json_with_retry(
             url, params, headers, {"jurisdiction": jurisdiction_iso2, "page": page}
         )
