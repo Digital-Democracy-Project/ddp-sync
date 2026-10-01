@@ -23,6 +23,17 @@ window around the 05:00 archive start. One backfill per jurisdiction at a time, 
 lease (the SYNC-48/OPEN-292 helper). It may run alongside the live hook: `embed_bill` re-reads a
 document's cache entry right before writing it and leaves it alone if another writer changed it.
 
+What that guard does and does not promise: it narrows the window in which a backfill write can
+land on a document a live write just changed to the gap between that re-read and the upsert (a
+moment, not the seconds a whole bill takes). It is not atomic across Pinecone and Redis and does not
+try to be. Any residual mismatch heals itself, because every later pass compares the cache hash with
+api-v3's current text and re-embeds on a difference, and the blackout window keeps the backfill away
+from the archive runs that trigger live writes. Other limits, on purpose: the blackout stops NEW bill
+starts, not one already in flight; a bill that first appears below a resumed run's cursor is left
+to the live hook (the backfill is the historical corpus, the hook handles new and changed bills);
+`history` embeds every version but skips what stages 1 and 4 already wrote (same content hash), and
+is correct on its own if they were never run.
+
 Deliberately NOT here: DDP-curated-bills-first ordering (needs a ddp-broker-py read ddp-sync has no
 client for), and BROKER-161's Pinecone presence check (a separate script, pointed at the new index).
 """

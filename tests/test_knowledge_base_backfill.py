@@ -266,6 +266,28 @@ async def test_a_broken_stage_aborts_instead_of_walking_the_whole_corpus():
     assert result["status"] == "incomplete"
 
 
+async def test_restart_forgets_the_stored_checkpoint_before_any_bill_work():
+    env = Env(listing={None: None, "2026": None})  # the run dies at listing, before touching a bill
+    env.redis.checkpoints[("fl", "votes")] = {"last_bill_id": C, "failed_ids": [], "done": True, "totals": {}}
+    result = await env.run(["votes"], restart=True)
+    assert result["stages"][0]["status"] == "error"
+    assert ("fl", "votes") not in env.redis.checkpoints  # a crash now cannot resurrect the old position
+
+
+async def test_an_api_v3_without_the_archive_ids_aborts_the_stage_instead_of_walking_it():
+    """Until OPEN-315 deploys the new api-v3 fields, every version arrives without archived_document_id."""
+    world = _world()
+    for bill in world.values():
+        for v in bill["versions"]:
+            v.pop("archived_document_id")
+    env = Env(world=world)
+    with patch.object(bf, "MAX_FAILED_BILLS", 1):
+        result = await env.run(["history"])
+    assert result["stages"][0]["status"] == "aborted"
+    assert env.pipe.keys == []  # nothing half-written to the index
+    assert env.redis.checkpoints[("fl", "history")]["done"] is False
+
+
 async def test_totals_accumulate_across_resumed_runs_and_report_chars():
     env = Env()
     env.pipe.fail_keys = {_t(B, 5)}

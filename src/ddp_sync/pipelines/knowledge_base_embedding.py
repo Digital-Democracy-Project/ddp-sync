@@ -188,7 +188,10 @@ class KnowledgeBaseEmbedder:
         not yet embedded, limited to `scope`. Returns a stats dict; `undone` lists what could not
         be finished, and when it is non-empty the Redis cache was NOT advanced. `raced` counts
         documents skipped because another writer (the live hook or a backfill) changed their cache
-        entry after this call read it; they are left to that writer, never overwritten (SYNC-90)."""
+        entry after this call read it; they are left to that writer, never overwritten (SYNC-90).
+        The re-read narrows that race to the moment between it and the upsert; it is not atomic
+        across Pinecone and Redis, and a residual mismatch is healed by the next pass, which compares
+        the cached hash with api-v3's current text."""
         stats: dict[str, Any] = {
             "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0, "votes": 0,
             "chunks": 0, "chars": 0, "no_text_yet": 0, "raced": 0, "undone": [],
