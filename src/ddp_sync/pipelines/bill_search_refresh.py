@@ -35,8 +35,8 @@ BUSY_MAX_ATTEMPTS = 3  # SYNC-87: retries of a `busy` response, per call
 BUSY_BACKOFF_SECONDS = 20.0
 # A call is bounded to ~20 s server-side but the statement itself can run longer on RDS.
 _REQUEST_TIMEOUT_SECONDS = 120.0
-# Ceiling on calls per run so a misbehaving endpoint that always says `more` cannot loop forever.
-# The measured first build of the largest jurisdiction (US, ~38k bills) took about 50 calls.
+# Ceiling on POSTs per run (every attempt counts, busy ones too) so a misbehaving endpoint cannot
+# loop forever. The measured first build of the largest jurisdiction (US, ~38k bills) took ~50.
 MAX_CALLS_PER_RUN = 200
 
 
@@ -47,6 +47,7 @@ async def refresh_bill_search(
     api_key: str = "",
 ) -> dict[str, Any]:
     """Refresh one jurisdiction's `ddp_bill_search` rows until api-v3 says nothing is left.
+    `calls` in the totals counts every POST, including busy ones.
 
     Never raises. Returns run totals with `drained`: True only when the last call reported neither
     `more` nor `busy`. When it is False, logs WARNING `bill_search_refresh_incomplete` with the
@@ -70,9 +71,12 @@ async def _loop(jurisdiction: str, api_base: str, api_key: str, totals: dict[str
     params = {"jurisdiction": jurisdiction.lower(), "limit": str(REFRESH_LIMIT)}
     url = f"{api_base}{REFRESH_PATH}"
 
-    while totals["calls"] < MAX_CALLS_PER_RUN:
+    while True:
         result = None
         for attempt in range(1, BUSY_MAX_ATTEMPTS + 1):
+            if totals["calls"] >= MAX_CALLS_PER_RUN:
+                return f"stopped after {MAX_CALLS_PER_RUN} calls"
+            totals["calls"] += 1
             try:
                 async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
                     resp = await client.post(url, params=params, headers=headers)
@@ -94,16 +98,15 @@ async def _loop(jurisdiction: str, api_base: str, api_key: str, totals: dict[str
         if result is None:
             return f"jurisdiction still busy after {BUSY_MAX_ATTEMPTS} attempts"
 
-        totals["calls"] += 1
-        progress = 0
-        for key in ("refreshed", "with_text", "orphans_removed"):
-            value = int(result.get(key) or 0)
+        try:
+            counts = {k: int(result.get(k) or 0) for k in ("refreshed", "with_text", "orphans_removed")}
+        except (TypeError, ValueError):
+            return "api-v3 returned non-numeric counters"
+        for key, value in counts.items():
             totals[key] += value
-            if key != "with_text":
-                progress += value
+        progress = counts["refreshed"] + counts["orphans_removed"]
         if not result.get("more"):
             return None
         if progress == 0:
             return "api-v3 reports more work but made no progress"
-    return f"stopped after {MAX_CALLS_PER_RUN} calls"
 

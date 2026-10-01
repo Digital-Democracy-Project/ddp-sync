@@ -116,11 +116,12 @@ async def test_busy_is_retried_20_seconds_apart_then_succeeds():
 
 async def test_busy_three_times_is_incomplete_and_stops():
     totals, post, sleeps, logs = await _run(_ok(busy=True), _ok(busy=True), _ok(busy=True))
-    assert post.await_count == 3
+    assert post.await_count == 3 and totals["calls"] == 3
     assert sleeps == [20.0, 20.0]  # no sleep after the last attempt
     assert totals["drained"] is False
     incomplete = [e for e in logs if e["event"] == "bill_search_refresh_incomplete"]
     assert len(incomplete) == 1 and "busy" in incomplete[0]["reason"]
+    assert incomplete[0]["jurisdiction"] == "FL"
 
 
 async def test_busy_in_a_later_call_keeps_the_earlier_progress():
@@ -167,6 +168,22 @@ async def test_more_with_no_progress_stops_instead_of_looping_forever():
     assert "no progress" in next(e for e in logs if e["event"] == "bill_search_refresh_incomplete")["reason"]
 
 
+async def test_non_numeric_counters_are_incomplete_not_raised():
+    totals, _, _, logs = await _run(_resp({"refreshed": "lots", "more": False, "busy": False}))
+    assert totals["drained"] is False
+    assert "non-numeric" in next(e for e in logs if e["event"] == "bill_search_refresh_incomplete")["reason"]
+
+
+async def test_busy_attempts_count_toward_the_ceiling():
+    """busy, busy, ok(more) repeated: 3 POSTs per round; the ceiling is strict, so 5 means exactly 5."""
+    rounds = [_ok(busy=True), _ok(busy=True), _ok(refreshed=1, more=True)] * 3
+    with patch.object(bsr, "MAX_CALLS_PER_RUN", 5):
+        totals, post, _, logs = await _run(*rounds)
+    assert post.await_count == 5 and totals["calls"] == 5
+    assert totals["drained"] is False
+    assert "stopped after 5 calls" in next(e for e in logs if e["event"] == "bill_search_refresh_incomplete")["reason"]
+
+
 async def test_call_ceiling_stops_a_runaway_loop():
     with patch.object(bsr, "MAX_CALLS_PER_RUN", 3):
         totals, post, _, logs = await _run(*[_ok(refreshed=1, more=True) for _ in range(5)])
@@ -201,8 +218,10 @@ async def test_hook_always_uses_the_rds_api_even_where_a_local_api_exists():
     assert (run.await_args.kwargs["api_base"], run.await_args.kwargs["api_key"]) == ("http://rds", "rk")
 
 
-async def test_hook_warns_and_skips_when_the_rds_base_is_not_configured():
-    settings = SyncSettings(local_openstates_api_base="http://local", rds_openstates_api_base="")
+@pytest.mark.parametrize("base, key", [("", "rk"), ("http://rds", "")])
+async def test_hook_warns_and_skips_when_the_rds_base_or_key_is_not_configured(base, key):
+    settings = SyncSettings(local_openstates_api_base="http://local",
+                            rds_openstates_api_base=base, rds_openstates_api_key=key)
     with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
          patch("ddp_sync.pipelines.bill_search_refresh.refresh_bill_search", new=AsyncMock()) as run, \
          capture_logs() as logs:
@@ -212,7 +231,7 @@ async def test_hook_warns_and_skips_when_the_rds_base_is_not_configured():
 
 
 async def test_hook_does_nothing_when_not_enrolled():
-    settings = SyncSettings(rds_openstates_api_base="http://rds")
+    settings = SyncSettings(rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
     with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
          patch("ddp_sync.pipelines.bill_search_refresh.refresh_bill_search", new=AsyncMock()) as run:
         await _maybe_refresh_bill_search("fl", None)

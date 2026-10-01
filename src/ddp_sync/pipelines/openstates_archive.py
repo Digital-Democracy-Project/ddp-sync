@@ -857,7 +857,8 @@ async def _maybe_refresh_bill_search(jurisdiction: str, config: dict | None) -> 
     if not _bill_search_refresh_eligible(jurisdiction, config):
         return
     settings = get_settings()
-    if not settings.rds_openstates_api_base:
+    # api-v3 refuses a refresh without a key (403), so an unset key can only ever fail: skip loudly.
+    if not settings.rds_openstates_api_base or not settings.rds_openstates_api_key:
         logger.warning("bill_search_refresh_read_path_not_configured", jurisdiction=jurisdiction)
         return
 
