@@ -1150,3 +1150,44 @@ async def fetch_bill_for_embedding(
     return await _get_json_with_retry(
         f"{api_base}/bills/ocd-bill/{ocd_bill_id}", params, headers, {"ocd_bill_id": ocd_bill_id}
     )
+
+
+_API_V3_PEOPLE_PER_PAGE = 50  # /people's own page cap (api/people.py); /bills is capped at 20
+
+
+async def list_people(
+    jurisdiction_iso2: str,
+    *,
+    api_base: str,
+    api_key: str = "",
+) -> tuple[list[dict], bool] | None:
+    """SYNC-91: every person api-v3 holds for a jurisdiction (current and former), with the
+    includes the legislator document needs, read page by page (api-v3 caps a page at 50).
+
+    Returns `(people, complete)`: `complete` is False when a later page failed, so the caller
+    must not treat the run as finished. Returns `None` when nothing could be read at all.
+    Never raises. The same read path and `x-api-key` header as `list_touched_bill_ids`."""
+    if not api_base:
+        return None
+    url = f"{api_base}/people"
+    headers = {"x-api-key": api_key} if api_key else {}
+    people: list[dict] = []
+    page = 1
+    while True:
+        params = [
+            ("jurisdiction", jurisdiction_iso2.lower()),
+            ("per_page", str(_API_V3_PEOPLE_PER_PAGE)),
+            ("page", str(page)),
+            ("include", "other_names"), ("include", "links"), ("include", "offices"),
+        ]
+        data = await _get_json_with_retry(
+            url, params, headers, {"jurisdiction": jurisdiction_iso2, "page": page}
+        )
+        results = data.get("results") if data else None
+        if not isinstance(results, list):
+            return (people, False) if people else None
+        people.extend(p for p in results if isinstance(p, dict))
+        max_page = (data.get("pagination") or {}).get("max_page", page)
+        if page >= max_page or not results:
+            return people, True
+        page += 1

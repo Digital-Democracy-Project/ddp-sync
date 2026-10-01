@@ -956,6 +956,74 @@ async def create_concept_statement_set(
     return result
 
 
+async def list_organizations(
+    *,
+    page: int = 1,
+    page_size: int = 200,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """One page of ddp-broker-py's public organization list (BROKER-144's
+    GET /api/organizations/, DRF page-number pagination: `count`, `next`, `previous`,
+    `results`). SYNC-91 reads organizations from here, never from Webflow. Each result carries
+    only `id`, `name`, `slug`, `org_type`, `website`, `url`; the descriptive fields are on the
+    detail read (`get_organization`). Sends the Bearer token like every call in this module
+    (production reaches the broker through ddp-api, which authenticates every path, SYNC-40).
+
+    Raises:
+        BrokerClientError: not configured, unreachable, a non-2xx (a broker that predates
+            BROKER-144 answers 404), or a body that is not a page.
+    """
+    return await _get_organization_json(
+        "/api/organizations/", {"page": page, "page_size": page_size},
+        broker_api_base, broker_api_token,
+    )
+
+
+async def get_organization(
+    organization_id: int | str,
+    *,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """The public profile of one organization (GET /api/organizations/<pk>/): the list fields
+    plus `description`, `policy_focus_areas`, `funding`, `affiliates`, `email`,
+    `contact_page_url`, `also_known_as`, `parent`, `chapters`. Same errors as
+    `list_organizations`; a stub that is not public yet is a 404 (a BrokerClientError)."""
+    return await _get_organization_json(
+        f"/api/organizations/{organization_id}/", None, broker_api_base, broker_api_token
+    )
+
+
+async def _get_organization_json(
+    path: str, params: dict | None, broker_api_base: str | None, broker_api_token: str | None
+) -> dict:
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError("DDP_BROKER_API_BASE is not configured — cannot read organizations.")
+
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(f"{resolved_api_base}{path}", headers=headers, params=params)
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the organization read ({resp.status_code}): {resp.text}"
+        )
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise BrokerClientError("ddp-broker-py returned a non-JSON organization body") from exc
+    if not isinstance(body, dict):
+        raise BrokerClientError("ddp-broker-py returned an unexpected organization body")
+    return body
+
+
 async def get_bill_artifacts(
     *,
     jurisdiction: str,
