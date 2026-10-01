@@ -339,6 +339,83 @@ POST /trigger/bill-artifact-generation
 select or truncate `bill_candidates` in this mode — every supplied entry is
 processed regardless of what `limit` is set to; pass any positive integer.
 
+## Concept-statement dedup reads every status, not just published (SYNC-85, 2026-09-29)
+
+`session_pipeline_runner.py`'s concept-statement step used to skip a bill only if
+`get_concept_statement_set` found a **published** set. That read is the broker's public
+`GET /api/concept-statements/`, which resolves `ConceptStatementSet.objects.current()`, i.e.
+published only. With `CONCEPT_STATEMENT_REQUIRE_REVIEW` on (the default, and prod), every set sits
+`pending`, so every re-run wrote another duplicate pending set per bill (US/119: about 3,860
+duplicates before the fix, and ~30 hours of MLX time being re-spent).
+
+The dedup now calls `broker_client.get_concept_statement_statuses()`, which reads ddp-broker-py's
+service-token-only `GET /api/concept-statements/status/` (broker PR #378, the ConceptStatementSet
+counterpart of `/api/bill-artifacts/status/`): `published` skips as `already_published`, `pending`
+as `already_exists_pending`, and a bill with only `rejected` sets is still regenerated.
+
+- **Do not use `get_concept_statement_set` for dedup**, and do not widen the public endpoint
+  (it is unauthenticated; pending sets must stay staff-only). It is only a published-set read.
+- **Broker first, then ddp-sync.** Against a broker without the route, a 404 falls back to the old
+  published-only check and logs `concept_statement_status_endpoint_missing_falling_back_to_published_only`
+  once per process. If that line appears after a deploy, the fix is **not active** and duplicates are
+  being written again; check the route through the real proxy with the service token first.
+- **Do not turn off `CONCEPT_STATEMENT_REQUIRE_REVIEW`** to make this go away: that would make
+  concept sets the only LegBot output that skips human review in production.
+- The ~2,600+ duplicate pending sets that already exist were deliberately not cleaned up by the fix;
+  that is BROKER-177 (read-only report from the prod agent first, then reject or delete with a backup).
+- Verified live 2026-10-01: a US/119 run skipped 752 of its first 868 bills as `already_exists_pending`.
+
+## The `ddp-knowledge-base` pipeline: one embedder, three off-by-default hooks (SYNC-83/87/89/90/91)
+
+`PLAN-enterprise-search.md` 5.6 adds a **second, independent** Pinecone index, `ddp-knowledge-base`,
+keyed by canonical ids (`ocd_bill_id`, bare openstates person uuid, broker org id), next to the
+legacy `votebot-large` (keyed by `webflow_id`). The legacy path is **never touched** by any of this
+and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives.md` (the
+"Knowledge-base ..." sections and the document-type table) before touching any of it.
+
+**Rules that are easy to break**
+- **One embedding path.** Everything goes through `KnowledgeBaseEmbedder`
+  (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version, diffs, votes),
+  `embed_entity` (a legislator or organization), narrowed by `EmbedScope`. The live post-archive hook
+  and the staged backfill share it so they cannot diverge. **Do not write a second path** to the index
+  or call Pinecone from a pipeline; add a stage or a document kind to the embedder instead.
+- **Legacy index refusal is structural.** The embedder is built from
+  `config.knowledge_base_settings(settings)`, which raises for an unset `KNOWLEDGE_BASE_INDEX_NAME`,
+  an index equal to `pinecone_index_name`, and `votebot-large`. Keep it that way.
+- **No Webflow, no LegBot output.** Legislators come from api-v3 `/people`, organizations from
+  ddp-broker-py `/api/organizations/`, bills from the archived text in the OpenStates DB. Nothing here
+  reads Webflow, and no `BillArtifact`/changelog text is ever embedded (Ramon's decision, 2026-09-30).
+- **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
+  with "now"; hashing it raw makes every entity look changed on every run (found while building
+  SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.
+- **The cache race guard narrows a race; it does not close it.** `embed_bill` re-reads a document's
+  cache entry right before writing it and skips one another writer changed; an unreadable cache is
+  *undone*, never "raced". There is no atomic compare-and-set across Pinecone and Redis, by design;
+  any residual mismatch heals on the next pass.
+- **Everything is OFF until enabled, per host.** `openstates_archive.knowledge_base_embedding`
+  (embedding + legislators; also needs `KNOWLEDGE_BASE_INDEX_NAME`), `openstates_archive.
+  bill_search_refresh` (refresh of api-v3's `ddp_bill_search`; always the RDS-backed api-v3, never the
+  Mac's local one), and the manual routes `/trigger/knowledge-base-backfill/{jurisdiction}` and
+  `/trigger/knowledge-base-entities/{legislators|organizations}` (both default to `dry_run=true`).
+  Never set `KNOWLEDGE_BASE_INDEX_NAME` on the votebot/ddp-api EC2 instance.
+
+**Merged is not deployed (as of 2026-10-01).** Everything above is merged to `main` and default-off;
+the Mac's production ddp-sync was last restarted on 2026-09-29 at the SYNC-85 commit, so none of it
+is running there. Dependencies before any of it does real work: api-v3 serving `archived_document_id`
+/ `version_stage` / `version_ordinal` on **both** instances (OPEN-311 merged, **OPEN-315** is the
+deploy), `KNOWLEDGE_BASE_INDEX_NAME` set on one host, and for organizations ddp-broker-py PR #389
+(BROKER-144) deployed (until then the organization run reports incomplete with nothing written).
+The legislator text is the OpenStates record, not the Webflow bio the legacy documents used.
+
+## The shared Redis is a single point of failure for several things at once
+
+ddp-sync's Redis (`redis://localhost:6379/0`) is the same `ddp-agents-redis-1` container CAMS uses.
+When it restarts, `/health` reports `redis: error`, ddp-sync logs `Redis is loading the dataset in
+memory`, and everything that is built to fail soft does (lock renewals, LegBot task records, version
+caches), but a long restart can let a run's overlap-lock lease lapse. Observed twice on 2026-09-30/10-01,
+reloading a snapshot that reported about 8 GB of memory: see the `notes/ops-handoff` session note for
+the open question. Before concluding a pipeline "stopped", check the Redis container first.
+
 ## Dev/prod checkout discipline
 
 `~/Developer/repos/ddp-sync` is **production** — the `com.ddp.ddp-sync` LaunchDaemon

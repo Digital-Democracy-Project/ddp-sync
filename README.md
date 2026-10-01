@@ -117,6 +117,33 @@ instance) — the two have not been reconciled; see CLAUDE.md before building on
 
 **Updated 2026-07-26 (Phase 8, PR #3):** now wired into a real write path. `pipelines/bill_artifact_generation.py` orchestrates dispatch → Pinecone ingest → a `ddp-broker-py` write (`broker_client.write_bill_artifact()`, `POST /api/bill-artifacts/`, shared-secret `ServiceTokenAuthentication` via `DDP_BROKER_API_TOKEN`) for `bill_summary`/`bill_pros_cons`. `model_version`/`prompt_version` are left null on every write — CAMS's task snapshot exposes a coarse `backend` tag, not LegBot's precise `model_used` string (tracked separately, `ddp-agents`' `PLAN-legbot.md` §14/AC15, not yet built). See `ddp-infra/PLAN-bill-document-provenance.md` Phase 8 for the full design and the production write path (still gated on `ddp-api`'s proxy + the EC2 broker's WireGuard peer — this only runs from the local Mac Studio instance today).
 
+### Enterprise-search pipeline: `ddp-knowledge-base` and `ddp_bill_search` (SYNC-83/87/89/90/91)
+
+`PLAN-enterprise-search.md` (ddp-infra) adds a second Pinecone index, `ddp-knowledge-base`, keyed by
+canonical ids, and keeps api-v3's `ddp_bill_search` projection fresh. The legacy `votebot-large` path
+is untouched. **Everything below is merged and OFF by default** (as of 2026-10-01 none of it is
+deployed to the Mac's production instance); see `CLAUDE.md` for the rules and `primitives.md` for the
+building blocks.
+
+| Piece | What it does | Gate |
+|---|---|---|
+| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text, version diffs and votes, then that jurisdiction's legislators (SYNC-91) | `openstates_archive.knowledge_base_embedding.enabled` **and** `KNOWLEDGE_BASE_INDEX_NAME` |
+| Search refresh (SYNC-87) | After a jurisdiction's archive: `POST /ddp/search/refresh` on the RDS-backed api-v3 until drained | `openstates_archive.bill_search_refresh.enabled`, plus `RDS_OPENSTATES_API_BASE`/`_KEY` |
+| Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: five stages (current, votes, diffs, prior-sessions, history), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
+| Entities (SYNC-91) | `POST /trigger/knowledge-base-entities/{legislators\|organizations}`; organizations read from ddp-broker-py `/api/organizations/` (BROKER-144) | manual; `dry_run=true` default |
+
+New setting: `KNOWLEDGE_BASE_INDEX_NAME` (env, default unset = disabled; per host, never on the
+votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
+`ddp:bill_version:legislator-{uuid}` / `ddp:bill_version:organization:{id}` (entities),
+`ddp:kb_embed:since:{jurisdiction}` (live-hook watermark), `ddp:kb_backfill:{jurisdiction}:{stage}`
+(backfill checkpoint), `ddp_sync:kb_backfill:lock:{jurisdiction}` (one backfill at a time).
+
+**Prerequisites before enabling anything:** api-v3 must serve the OPEN-311 fields
+(`archived_document_id`, `version_stage`, `version_ordinal`) on both the Mac's and the RDS-backed
+instance (OPEN-315); the index must exist (it does, `ddp-knowledge-base`); organizations also need
+ddp-broker-py PR #389 (BROKER-144) deployed. Enable one jurisdiction first and check the archive
+hook's duration and `knowledge_base_entities_run` counts before enabling more.
+
 ## API
 
 All endpoints are prefixed with `/ddp-sync/v1` (set in `src/ddp_sync/app.py` as `API_PREFIX`). The paths in the tables below are **relative to that prefix** — combine them when calling the service.
@@ -151,6 +178,8 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/legislator-bio-sync` | Trigger legislator bio + contact sync (federal in Phase 1; state in Phase 2) |
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |
 | POST | `/trigger/openstates-scrape/{target}` | Trigger an OpenStates scrape job immediately (returns 202, runs in background) |
+| POST | `/trigger/knowledge-base-backfill/{jurisdiction}` | SYNC-90: staged, resumable backfill of the `ddp-knowledge-base` index (`stage=`, `dry_run=true` default, `restart=`); 202, results in the log |
+| POST | `/trigger/knowledge-base-entities/{legislators\|organizations}` | SYNC-91: embed legislators or organizations into `ddp-knowledge-base` (`jurisdiction=`, `dry_run=true` default); 202, totals in the log |
 
 `/trigger/openstates-scrape/{target}` — valid targets: `patches`, `fl`, `wa`, `usa`, `secondary`, `people`, `va`, `mi`, `ma`, `ut`, `az`
 
