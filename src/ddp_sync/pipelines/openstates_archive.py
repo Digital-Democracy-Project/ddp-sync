@@ -840,6 +840,36 @@ async def _maybe_embed_knowledge_base(
     )
 
 
+def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> bool:
+    """OPEN-124's rule again: enrollment lives in sync_schedule.yaml
+    (`openstates_archive.bill_search_refresh`), not in code. Default off."""
+    block = (config or {}).get("bill_search_refresh") or {}
+    if not block.get("enabled", False):
+        return False
+    return jurisdiction.lower() in {str(j).lower() for j in block.get("jurisdictions", [])}
+
+
+async def _maybe_refresh_bill_search(jurisdiction: str, config: dict | None) -> None:
+    """SYNC-87 (PLAN-enterprise-search.md 4.5.5): post-archive hook that refreshes the api-v3
+    `ddp_bill_search` projection for this jurisdiction. Independent of the LegBot and embedding
+    hooks. ALWAYS targets the RDS-backed api-v3 (`rds_openstates_api_base`), never the Mac's local
+    one: the projection table exists only on the RDS side, and archives extract into RDS."""
+    if not _bill_search_refresh_eligible(jurisdiction, config):
+        return
+    settings = get_settings()
+    if not settings.rds_openstates_api_base:
+        logger.warning("bill_search_refresh_read_path_not_configured", jurisdiction=jurisdiction)
+        return
+
+    from ddp_sync.pipelines.bill_search_refresh import refresh_bill_search
+
+    await refresh_bill_search(
+        jurisdiction,
+        api_base=settings.rds_openstates_api_base,
+        api_key=settings.rds_openstates_api_key,
+    )
+
+
 async def _acquire_archive_debounce(jurisdiction: str) -> bool:
     """OPEN-291: True means this call may proceed, False means skip -- another archive
     attempt for this jurisdiction already claimed the debounce window and should be
@@ -961,7 +991,8 @@ async def _run_archive_with_hook(
     config: dict | None = None,
 ) -> dict[str, Any]:
     """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) and the independent
-    knowledge-base embedding hook (SYNC-83) uniformly over both archive branches (local run-archive.sh and Fargate cloud_archiver.py)
+    bill-search refresh (SYNC-87) and knowledge-base embedding (SYNC-83) hooks uniformly over both
+    archive branches (local run-archive.sh and Fargate cloud_archiver.py)
     -- neither run_archive_jobs() nor run_single_archive_job() needs its own copy.
 
     OPEN-291: also the debounce choke point for the new scrape-completion-triggers-
@@ -1001,6 +1032,15 @@ async def _run_archive_with_hook(
         except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
             logger.error(
                 "archiver_triggered_legbot_hook_failed",
+                jurisdiction=jurisdiction,
+                error=str(e),
+            )
+        # Before the embedding hook: that one can run for hours, and search should not wait for it.
+        try:
+            await _maybe_refresh_bill_search(jurisdiction, config)
+        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+            logger.error(
+                "archiver_triggered_bill_search_hook_failed",
                 jurisdiction=jurisdiction,
                 error=str(e),
             )

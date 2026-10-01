@@ -78,6 +78,11 @@ Post-archive hook, independent of the LegBot one: `openstates_archive._maybe_emb
 - Always `skip_duplicates=False`: a content-hash skip would leave a version with no vectors while the cache says it is embedded.
 - Not embedded: any LegBot/`BillArtifact` output, `bill-changelog`. Not yet written: `is_ddp_curated` / `ddp_url` (needs a ddp-broker-py read).
 
+
+## Bill-search refresh hook (`pipelines/bill_search_refresh.py`, SYNC-87)
+
+Post-archive hook, independent of the LegBot and embedding hooks: `openstates_archive._maybe_refresh_bill_search` (gated by `openstates_archive.bill_search_refresh` in `sync_schedule.yaml`, default `enabled: false`) → `refresh_bill_search(jurisdiction, api_base=, api_key=)`, which loops `POST /ddp/search/refresh?jurisdiction=&limit=200` on api-v3 (header `x-api-key`) while the response says `more`, retries `busy` 3 times 20 s apart, and logs `bill_search_refresh_incomplete` (WARNING, never raises) whenever the run was not drained. **Always the RDS-backed api-v3** (`settings.rds_openstates_api_base`/`rds_openstates_api_key`), never `local_openstates_api_base`: the `ddp_bill_search` table exists only there. It runs before the embedding hook so search does not wait for a long embed. A refresh only rebuilds changed rows, so a partial run is repaired by the next archive run.
+
 ## Bill version pipeline (`pipelines/bill_version.py`)
 
 The daily bill sync entry point. **Do not reinvent these methods.**
@@ -307,6 +312,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
 | `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions |
+| `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |
