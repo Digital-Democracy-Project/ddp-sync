@@ -143,6 +143,33 @@ class KnowledgeBaseEmbedder:
             extra=extra,
         )
 
+    async def embed_entity(
+        self, key: str, content: str, metadata: DocumentMetadata, *, dry_run: bool = False
+    ) -> str:
+        """SYNC-91: embed one standalone document (a legislator or an organization) unless its
+        cached content hash already matches. Returns "written", "unchanged", "would_write" (dry
+        run: nothing is written, not even the cache) or "undone:<why>". The cache entry is stored
+        under the document id itself (`ddp:bill_version:legislator-<uuid>`,
+        `ddp:bill_version:organization:<id>`), which cannot collide with a bare ocd bill id or a
+        legacy webflow id, and is written only after the Pinecone write succeeded."""
+        cache = await self.redis.get_bill_version(key) or {}
+        if cache.get("schema") != CACHE_SCHEMA:
+            cache = {}
+        digest = content_hash(content)
+        if cache.get("hash") == digest:
+            return "unchanged"
+        if dry_run:
+            return "would_write"
+        try:
+            chunks = await self._ingest(key, content, metadata, cache.get("chunks", 0))
+        except Exception as e:  # noqa: BLE001 -- the caller records it as undone
+            return f"undone:{e}"
+        written = await self.redis.set_bill_version(key, {
+            "schema": CACHE_SCHEMA, "hash": digest, "chunks": chunks,
+            "last_checked": datetime.now(timezone.utc).isoformat(),
+        })
+        return "written" if written else "undone:version cache not written (Redis)"
+
     async def embed_bill(self, ocd_bill_id: str, jurisdiction: str, bill: dict) -> dict:
         """Embed whatever of `bill` (an api-v3 detail response with versions, votes, sources) is
         not yet embedded. Returns a stats dict; `undone` lists what could not be finished, and
