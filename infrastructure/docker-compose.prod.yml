@@ -117,6 +117,16 @@ services:
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES=bill_summary,bill_pros_cons,bill_vote_yes_frame,bill_vote_no_frame,bill_supporting_orgs,bill_opposing_orgs,bill_impact_analysis,bill_topics,bill_changelog
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT=10000
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS=true
+      # SYNC-89 / Wave 3 step E (2026-10-02): which Pinecone index the knowledge-base embedding
+      # path (backfill endpoints and, later, the post-archive hook) writes to. Deliberately set
+      # HERE, per host, and NOT in the shared `ddp-sync/credentials` secret every host reads:
+      # config.py says the votebot/ddp-api instance must never enable this path, so the process
+      # environment has to win over the shared secret. The code refuses the legacy
+      # `votebot-large` index and an unset name. Setting it only enables the manually
+      # triggered backfill endpoints; the scheduled hook stays off while
+      # openstates_archive.knowledge_base_embedding.enabled is false in sync_schedule.yaml.
+      # Rollback: remove this line and recreate the service.
+      - KNOWLEDGE_BASE_INDEX_NAME=ddp-knowledge-base
     volumes:
       # config/sync_schedule.yaml is never baked into the image (Dockerfile only COPYs
       # pyproject.toml + src/) -- mounted read-only instead so an ordinary git pull on the host
