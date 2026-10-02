@@ -30,7 +30,6 @@ from tests.test_knowledge_base_embedding import (
     FakePipeline,
     FakeRedis,
     _settings,
-    _votes_formatter,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -57,8 +56,7 @@ def _org(oid, name="Florida Education Association", description="A union of educ
 
 def _embedder(redis=None, pipeline=None):
     redis, pipeline = redis or FakeRedis(), pipeline or FakePipeline()
-    return kb.KnowledgeBaseEmbedder(_settings(), pipeline=pipeline, votes_formatter=_votes_formatter,
-                                    redis_store=redis), redis, pipeline
+    return kb.KnowledgeBaseEmbedder(_settings(), pipeline=pipeline, redis_store=redis), redis, pipeline
 
 
 def _events(logs):

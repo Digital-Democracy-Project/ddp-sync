@@ -1,4 +1,4 @@
-"""SYNC-83: embed archived bill text, version diffs and votes into the NEW Pinecone index.
+"""SYNC-83: embed archived bill text and version diffs into the NEW Pinecone index.
 
 PLAN-enterprise-search.md 5.6. One more independent post-archive hook (see
 `openstates_archive._maybe_embed_knowledge_base`), same shape as the LegBot hook: after a
@@ -14,15 +14,20 @@ What is written, per bill (canonical ids, PLAN-local-openstates-migration.md 2.1
   retrieval filters on it; chunk ids (`<document key>-chunk-<n>`) still identify the vectors.
 * `bill-version-diff:{ocd_bill_id}:{document_id}` -- api-v3's stored `diff_from_previous_version`,
   verbatim, labelled with the from/to versions. Never generated here.
-* `bill-votes:{ocd_bill_id}` -- refreshed on its own change signal (vote count + latest date).
+
+Votes are deliberately NOT embedded (SYNC-94): they are structured data that changes regularly,
+so Votebot reads them from the vote records instead. The legacy `votebot-large` path still writes
+its own `bill-votes-{webflow_id}` documents and is untouched.
 
 Version order, stage and ordinal come from api-v3 (`version_stage`, `version_ordinal`, array
 order); nothing here classifies or sorts. No LegBot output is embedded.
 
 Redis cache `ddp:bill_version:{ocd_bill_id}` (`schema` 2): the per-document text/diff hashes and
-chunk counts, and the votes fingerprint and chunk count. It is written only after every Pinecone
-write for the bill has succeeded, so a failed bill is retried by the next run (the per-jurisdiction
-watermark is not advanced either), and a WARNING names what was left undone.
+chunk counts. It is written only after every Pinecone write for the bill has succeeded, so a failed
+bill is retried by the next run (the per-jurisdiction watermark is not advanced either), and a
+WARNING names what was left undone. `schema` stays 2 after SYNC-94 on purpose: bumping it would
+discard every existing entry and re-embed documents already paid for. An older entry may still
+carry a `votes` field; it is ignored and dropped the next time the entry is written.
 """
 
 from __future__ import annotations
@@ -47,7 +52,6 @@ logger = structlog.get_logger()
 CACHE_SCHEMA = 2
 DOCUMENT_TYPE_TEXT = "bill-text"
 DOCUMENT_TYPE_DIFF = "bill-version-diff"
-DOCUMENT_TYPE_VOTES = "bill-votes"
 STAGE_UNKNOWN = "unknown"  # api-v3's label for STAGE_UNKNOWN
 _SOURCE = "OpenStates archive"
 
@@ -60,20 +64,8 @@ def diff_document_key(ocd_bill_id: str, archive_id: Any) -> str:
     return f"{DOCUMENT_TYPE_DIFF}:{ocd_bill_id}:{archive_id}"
 
 
-def votes_document_key(ocd_bill_id: str) -> str:
-    return f"{DOCUMENT_TYPE_VOTES}:{ocd_bill_id}"
-
-
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def vote_fingerprint(votes: list[dict]) -> str:
-    """Vote count and latest vote date -- the change signal PLAN 5.6 names. '' when no votes."""
-    if not votes:
-        return ""
-    latest = max((str(v.get("start_date") or "") for v in votes), default="")
-    return f"{len(votes)}:{latest}"
 
 
 def version_text(version: dict) -> str:
@@ -93,11 +85,10 @@ class EmbedScope:
 
     text: "all" (every version), "current" (only the bill's current version, i.e. the highest
     `version_ordinal` among classifiable versions; stage-unknown versions are never current), or
-    None (no text documents). diffs / votes: whether to write those documents."""
+    None (no text documents). diffs: whether to write the version-diff documents."""
 
     text: str | None = "all"
     diffs: bool = True
-    votes: bool = True
 
 
 SCOPE_ALL = EmbedScope()
@@ -122,22 +113,11 @@ class KnowledgeBaseEmbedder:
         settings: SyncSettings,
         *,
         pipeline: IngestionPipeline | None = None,
-        votes_formatter=None,
         redis_store=None,
     ):
         self.settings = knowledge_base_settings(settings)  # raises if unset / equals legacy index
         self.pipeline = pipeline or IngestionPipeline(self.settings)
-        self._votes_formatter = votes_formatter
         self.redis = redis_store or get_redis_store()
-
-    def _format_votes(self, bill: dict) -> tuple[str, dict] | None:
-        if self._votes_formatter is None:
-            # Reused as-is so the votes document reads exactly like today's; built with the
-            # knowledge-base settings, so even its own pipeline points at the new index.
-            from ddp_sync.pipelines.bill_sync import BillSyncService
-
-            self._votes_formatter = BillSyncService(self.settings).format_bill_votes_chunk
-        return self._votes_formatter(bill, ddp_url=None)
 
     async def _ingest(self, key: str, content: str, metadata: DocumentMetadata, old_chunks: int) -> int:
         """Ingest one document, then drop chunks a shrunken document no longer has. Returns the
@@ -206,10 +186,10 @@ class KnowledgeBaseEmbedder:
         return "written" if written else "undone:version cache not written (Redis)"
 
     async def _cached_field(
-        self, ocd_bill_id: str, archive_id: str | None, field: str, *, expect_cache: bool
+        self, ocd_bill_id: str, archive_id: str, field: str, *, expect_cache: bool
     ) -> Any:
-        """Fresh read of one cached value: a document's `field`, or (archive_id None) the votes
-        fingerprint. None when nothing is cached (or the entry is not this path's schema).
+        """Fresh read of one cached value: a document's `field`. None when nothing is cached (or
+        the entry is not this path's schema).
         `get_bill_version` returns None both for "no entry" and for a Redis error, so when an entry
         existed at the start of the call (`expect_cache`) a None now is `_UNREADABLE`: most likely a
         blip, never evidence that another writer changed the document."""
@@ -218,14 +198,12 @@ class KnowledgeBaseEmbedder:
             return _UNREADABLE if expect_cache else None
         if fresh.get("schema") != CACHE_SCHEMA:
             return None
-        if archive_id is None:
-            return (fresh.get("votes") or {}).get("fingerprint")
         return ((fresh.get("documents") or {}).get(archive_id) or {}).get(field)
 
     async def embed_bill(
         self, ocd_bill_id: str, jurisdiction: str, bill: dict, scope: EmbedScope = SCOPE_ALL
     ) -> dict:
-        """Embed whatever of `bill` (an api-v3 detail response with versions, votes, sources) is
+        """Embed whatever of `bill` (an api-v3 detail response with versions and sources) is
         not yet embedded, limited to `scope`. Returns a stats dict; `undone` lists what could not
         be finished, and when it is non-empty the Redis cache was NOT advanced. `raced` counts
         documents skipped because another writer (the live hook or a backfill) changed their cache
@@ -234,7 +212,7 @@ class KnowledgeBaseEmbedder:
         across Pinecone and Redis, and a residual mismatch is healed by the next pass, which compares
         the cached hash with api-v3's current text."""
         stats: dict[str, Any] = {
-            "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0, "votes": 0,
+            "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0,
             "chunks": 0, "chars": 0, "no_text_yet": 0, "raced": 0, "undone": [],
         }
         cache = await self.redis.get_bill_version(ocd_bill_id) or {}
@@ -242,13 +220,10 @@ class KnowledgeBaseEmbedder:
             cache = {}
         had_cache = bool(cache)  # an entry exists now; losing sight of it later is a blip, not a race
         docs: dict[str, dict] = {k: dict(v) for k, v in (cache.get("documents") or {}).items()}
-        votes_cache: dict = dict(cache.get("votes") or {})
         updates: dict[str, dict] = {}  # archive id -> the cache fields THIS call set
-        votes_update: dict | None = None
 
         base = self._base_extra(bill, ocd_bill_id)
         gov_id = bill.get("identifier") or ocd_bill_id
-        bill_title = bill.get("title") or ""
         previous: dict | None = None  # the last classifiable version seen, for diff labels
         versions = bill.get("versions") or []
         # The current version is the last classifiable one in api-v3's own order (never re-derived).
@@ -337,37 +312,7 @@ class KnowledgeBaseEmbedder:
             if stage != STAGE_UNKNOWN:
                 previous = {"archive_id": archive_id, "note": note, "date": date}
 
-        votes = bill.get("votes") or []
-        fingerprint = vote_fingerprint(votes)
-        if scope.votes and fingerprint and fingerprint != votes_cache.get("fingerprint"):
-            key = votes_document_key(ocd_bill_id)
-            formatted = self._format_votes(bill)
-            if formatted:
-                current = await self._cached_field(ocd_bill_id, None, "fingerprint", expect_cache=had_cache)
-                if current is _UNREADABLE:
-                    stats["undone"].append(f"{key}: version cache unreadable before write")
-                elif current != votes_cache.get("fingerprint"):
-                    stats["raced"] += 1
-                else:
-                    content, ids = formatted
-                    meta = self._metadata(
-                        key, DOCUMENT_TYPE_VOTES, f"{gov_id} - {bill_title} - Voting Record", jurisdiction,
-                        ocd_bill_id,
-                        {**base, "vote_count": len(votes), "voter_count": ids.get("voter_count", 0),
-                         "voter_person_ids": ids.get("voter_person_ids", [])},
-                    )
-                    try:
-                        n = await self._ingest(key, content, meta, votes_cache.get("chunks", 0))
-                    except Exception as e:  # noqa: BLE001
-                        stats["undone"].append(f"{key}: {e}")
-                    else:
-                        votes_update = {"fingerprint": fingerprint, "chunks": n}
-                        votes_cache = votes_update
-                        stats["votes"] += 1
-                        stats["chunks"] += n
-                        stats["chars"] += len(content)
-
-        if not stats["undone"] and (updates or votes_update is not None):
+        if not stats["undone"] and updates:
             # Advanced last: every Pinecone write for this bill has succeeded. Merged onto a fresh
             # read so another writer's entries for OTHER documents are kept, not clobbered.
             latest = await self.redis.get_bill_version(ocd_bill_id)
@@ -382,7 +327,6 @@ class KnowledgeBaseEmbedder:
                     merged_docs.setdefault(aid, {}).update(fields)
                 written = await self.redis.set_bill_version(ocd_bill_id, {
                     "schema": CACHE_SCHEMA, "documents": merged_docs,
-                    "votes": votes_update if votes_update is not None else dict(latest.get("votes") or {}),
                     "last_checked": datetime.now(timezone.utc).isoformat(),
                 })
                 if not written:
@@ -411,7 +355,7 @@ async def embed_archived_bills(
     the jurisdiction's watermark advanced to `archive_started_at`."""
     redis = get_redis_store()
     totals: dict[str, Any] = {
-        "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0, "votes": 0,
+        "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0,
         "chunks": 0, "failed_bills": 0, "complete": False,
     }
     if not redis.is_available:
@@ -452,7 +396,7 @@ async def embed_archived_bills(
             logger.warning("knowledge_base_embedding_work_left_undone", jurisdiction=jurisdiction,
                            ocd_bill_id=ocd_bill_id, undone=[str(e)])
             continue
-        for k in ("documents", "diffs", "votes", "chunks"):
+        for k in ("documents", "diffs", "chunks"):
             totals[k] += stats[k]
         if stats["undone"]:
             totals["failed_bills"] += 1

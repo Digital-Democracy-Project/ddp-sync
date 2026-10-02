@@ -127,9 +127,9 @@ building blocks.
 
 | Piece | What it does | Gate |
 |---|---|---|
-| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text, version diffs and votes, then that jurisdiction's legislators (SYNC-91) | `openstates_archive.knowledge_base_embedding.enabled` **and** `KNOWLEDGE_BASE_INDEX_NAME` |
+| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text and version diffs, then that jurisdiction's legislators (SYNC-91) | `openstates_archive.knowledge_base_embedding.enabled` **and** `KNOWLEDGE_BASE_INDEX_NAME` |
 | Search refresh (SYNC-87) | After a jurisdiction's archive: `POST /ddp/search/refresh` on the RDS-backed api-v3 until drained | `openstates_archive.bill_search_refresh.enabled`, plus `RDS_OPENSTATES_API_BASE`/`_KEY` |
-| Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: five stages (current, votes, diffs, prior-sessions, history), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
+| Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: four stages (current, diffs, prior-sessions, history), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
 | Entities (SYNC-91) | `POST /trigger/knowledge-base-entities/{legislators\|organizations}`; organizations read from ddp-broker-py `/api/organizations/` (BROKER-144) | manual; `dry_run=true` default |
 
 New setting: `KNOWLEDGE_BASE_INDEX_NAME` (env, default unset = disabled; per host, never on the

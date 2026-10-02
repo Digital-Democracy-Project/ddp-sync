@@ -10,10 +10,12 @@ Stages, in order (`STAGES`). "Current" is api-v3's own newest classifiable versi
 "current session" is the jurisdiction's current session (`OpenStatesSource`), nothing re-derived:
 
 1. `current`        current version text of every current-session bill
-2. `votes`          the `bill-votes` document of every bill
-3. `diffs`          the `bill-version-diff` documents of every bill
-4. `prior-sessions` current version text of the prior-session bills
-5. `history`        every older version's text (and stage-unknown versions) of every bill
+2. `diffs`          the `bill-version-diff` documents of every bill
+3. `prior-sessions` current version text of the prior-session bills
+4. `history`        every older version's text (and stage-unknown versions) of every bill
+
+There is no votes stage (SYNC-94): votes are structured data that changes regularly, so they are
+not embedded; Votebot reads them from the vote records.
 
 Resumable and idempotent: one Redis checkpoint per jurisdiction and stage (last bill id, bills that
 failed and are retried first, cumulative totals, `done`). A finished stage is a no-op unless
@@ -60,13 +62,12 @@ from ddp_sync.services.redis_store import get_redis_store
 
 logger = structlog.get_logger()
 
-STAGES = ("current", "votes", "diffs", "prior-sessions", "history")
+STAGES = ("current", "diffs", "prior-sessions", "history")
 STAGE_SCOPES: dict[str, EmbedScope] = {
-    "current": EmbedScope(text="current", diffs=False, votes=False),
-    "votes": EmbedScope(text=None, diffs=False, votes=True),
-    "diffs": EmbedScope(text=None, diffs=True, votes=False),
-    "prior-sessions": EmbedScope(text="current", diffs=False, votes=False),
-    "history": EmbedScope(text="all", diffs=False, votes=False),
+    "current": EmbedScope(text="current", diffs=False),
+    "diffs": EmbedScope(text=None, diffs=True),
+    "prior-sessions": EmbedScope(text="current", diffs=False),
+    "history": EmbedScope(text="all", diffs=False),
 }
 
 CHECKPOINT_EVERY = 50  # bills between checkpoint saves and progress log lines
@@ -191,7 +192,7 @@ async def backfill_stage(
     if dry_run:
         return {"stage": stage, "status": "dry_run", "bills_in_stage": len(ids), "bills_remaining": len(todo)}
 
-    totals: dict[str, Any] = {k: 0 for k in ("bills", "documents", "diffs", "votes", "chunks", "chars",
+    totals: dict[str, Any] = {k: 0 for k in ("bills", "documents", "diffs", "chunks", "chars",
                                              "raced", "failed_bills")}
     totals.update(checkpoint.get("totals") or {})
     failed_ids: list[str] = []  # bills that failed during THIS run
@@ -222,7 +223,7 @@ async def backfill_stage(
         if ocd_bill_id in retry_left:
             retry_left.remove(ocd_bill_id)  # retried now; it re-enters failed_ids below if it fails again
         if stats is not None:
-            for k in ("documents", "diffs", "votes", "chunks", "chars", "raced"):
+            for k in ("documents", "diffs", "chunks", "chars", "raced"):
                 totals[k] += stats[k]
         if stats is None or stats["undone"]:
             failed_ids.append(ocd_bill_id)

@@ -1133,7 +1133,7 @@ async def trigger_knowledge_base_backfill(
     the log line `knowledge_base_backfill_dry_run`, not in this response, because a real run lasts
     hours. Defaults to `dry_run=true`.
 
-    stage: one of current, votes, diffs, prior-sessions, history; omit to run them all in order
+    stage: one of current, diffs, prior-sessions, history; omit to run them all in order
     (finished stages are skipped, interrupted ones resume from their checkpoint).
     restart: forget the checkpoint(s) and walk from the start.
 
