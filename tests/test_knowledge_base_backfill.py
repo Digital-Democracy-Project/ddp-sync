@@ -190,6 +190,20 @@ async def test_there_is_no_votes_stage_and_every_stage_has_a_scope():
     assert set(bf.STAGE_SCOPES) == set(bf.STAGES)
 
 
+async def test_a_leftover_votes_checkpoint_and_legacy_votes_totals_do_not_disturb_a_run():
+    """Checkpoints are keyed per stage, so one written for the removed `votes` stage is simply never
+    read; and a surviving stage's checkpoint may still carry a `votes` total from before SYNC-94."""
+    env = Env()
+    stale = {"last_bill_id": A, "failed_ids": [], "done": False, "totals": {"votes": 7}}
+    env.redis.checkpoints[("fl", "votes")] = dict(stale)
+    env.redis.checkpoints[("fl", "diffs")] = {"last_bill_id": "", "failed_ids": [], "done": False,
+                                              "totals": {"documents": 0, "votes": 0}}
+    result = await env.run(None)
+    assert result["status"] == "complete" and [r["stage"] for r in result["stages"]] == list(bf.STAGES)
+    assert env.redis.checkpoints[("fl", "votes")] == stale  # untouched, never consulted
+    assert env.redis.checkpoints[("fl", "diffs")]["done"] is True
+
+
 async def test_stage_selection_uses_the_session_filter_not_a_detail_fetch_per_bill():
     env = Env()
     await env.run(["current"])
