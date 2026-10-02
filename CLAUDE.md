@@ -375,7 +375,7 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
 
 **Rules that are easy to break**
 - **One embedding path.** Everything goes through `KnowledgeBaseEmbedder`
-  (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version, diffs, votes),
+  (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version, diffs; never votes, SYNC-94),
   `embed_entity` (a legislator or organization), narrowed by `EmbedScope`. The live post-archive hook
   and the staged backfill share it so they cannot diverge. **Do not write a second path** to the index
   or call Pinecone from a pipeline; add a stage or a document kind to the embedder instead.

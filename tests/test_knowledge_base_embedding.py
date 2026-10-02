@@ -2,7 +2,7 @@
 
 Mocked Pinecone/Redis/api-v3 throughout; nothing here can reach a real index. Covers the
 ticket's acceptance list: a new version yields correctly labelled text and diff documents,
-a rerun writes nothing, a vote-only change refreshes only the votes document, a shrinking
+a rerun writes nothing, votes are never embedded (SYNC-94), a shrinking
 document leaves no surplus chunks, a Pinecone failure leaves the cache un-advanced and the
 next run retries -- plus stage-unknown handling, the hook's gates and the watermark.
 """
@@ -79,16 +79,10 @@ def _settings() -> SyncSettings:
     return SyncSettings(knowledge_base_index_name="ddp-knowledge-base")
 
 
-def _votes_formatter(bill, ddp_url=None):
-    return "## Voting Record\n" + "vote " * 30, {"voter_count": 2, "voter_person_ids": ["ocd-person/a", "ocd-person/b"]}
-
-
 def _embedder(redis=None, pipeline=None):
     redis = redis or FakeRedis()
     pipeline = pipeline or FakePipeline()
-    return kb.KnowledgeBaseEmbedder(
-        _settings(), pipeline=pipeline, votes_formatter=_votes_formatter, redis_store=redis
-    ), redis, pipeline
+    return kb.KnowledgeBaseEmbedder(_settings(), pipeline=pipeline, redis_store=redis), redis, pipeline
 
 
 def _version(doc_id, note, stage, ordinal, text, diff=None, date="2026-01-01", unknown=False):
@@ -159,7 +153,7 @@ async def test_rerun_writes_nothing():
     sets = redis.set_calls
     stats = await emb.embed_bill(OCD, "fl", bill)
     assert pipe.calls == [] and redis.set_calls == sets
-    assert stats["documents"] == stats["diffs"] == stats["votes"] == 0
+    assert stats["documents"] == stats["diffs"] == 0
 
 
 async def test_new_version_only_embeds_the_new_version():
@@ -183,23 +177,35 @@ async def test_identical_text_in_two_versions_is_embedded_for_both():
     assert all(c[3] is False for c in pipe.calls)
 
 
-async def test_vote_only_change_refreshes_only_the_votes_document():
+async def test_votes_are_never_embedded_and_a_vote_change_writes_nothing():
+    """SYNC-94: votes are structured data that changes regularly; Votebot reads them directly."""
     emb, redis, pipe = _embedder()
     versions = [_version(11, "Introduced", "introduced", 0, TEXT_A)]
     votes = [{"start_date": "2026-02-01"}]
-    await emb.embed_bill(OCD, "fl", _bill(versions, votes))
-    assert pipe.keys == [f"bill-text:{OCD}:11", f"bill-votes:{OCD}"]
-    assert redis.versions[OCD]["votes"]["fingerprint"] == "1:2026-02-01"
+    stats = await emb.embed_bill(OCD, "fl", _bill(versions, votes))
+    assert pipe.keys == [f"bill-text:{OCD}:11"]
+    assert "votes" not in stats and "votes" not in redis.versions[OCD]
 
     pipe.calls.clear()
-    await emb.embed_bill(OCD, "fl", _bill(versions, votes))  # unchanged: nothing
-    assert pipe.calls == []
-
     await emb.embed_bill(OCD, "fl", _bill(versions, votes + [{"start_date": "2026-03-05"}]))
-    assert pipe.keys == [f"bill-votes:{OCD}"]
-    _, _, meta, _ = pipe.calls[0]
-    assert meta["document_type"] == "bill-votes" and meta["vote_count"] == 2
-    assert redis.versions[OCD]["votes"]["fingerprint"] == "2:2026-03-05"
+    assert pipe.calls == []  # a new vote is not a reason to write anything
+
+
+async def test_an_older_cache_entry_that_still_carries_votes_is_kept_working_and_drops_the_field():
+    """CACHE_SCHEMA stays 2 on purpose (bumping it would re-embed everything already paid for), so
+    an entry written before SYNC-94 may hold a `votes` field. Its documents must still count as
+    embedded, and the next write must not carry the dead field forward."""
+    emb, redis, pipe = _embedder()
+    redis.versions[OCD] = {
+        "schema": kb.CACHE_SCHEMA, "votes": {"fingerprint": "1:2026-02-01", "chunks": 3},
+        "documents": {"11": {"text_hash": kb.content_hash(TEXT_A), "chunks": 1}},
+    }
+    await emb.embed_bill(OCD, "fl", _bill([
+        _version(11, "Introduced", "introduced", 0, TEXT_A),
+        _version(12, "Sub", "amendment", 1, TEXT_B),
+    ]))
+    assert pipe.keys == [f"bill-text:{OCD}:12"]  # version 11 was already embedded: not redone
+    assert "votes" not in redis.versions[OCD] and set(redis.versions[OCD]["documents"]) == {"11", "12"}
 
 
 async def test_shrinking_document_leaves_no_surplus_chunks():
@@ -474,13 +480,13 @@ async def test_real_pipeline_chunk_ids_use_the_full_document_key_despite_the_met
         return len(documents)
 
     real.vector_store.upsert_documents = fake_upsert
-    emb = kb.KnowledgeBaseEmbedder(_settings(), pipeline=real, votes_formatter=_votes_formatter, redis_store=FakeRedis())
+    emb = kb.KnowledgeBaseEmbedder(_settings(), pipeline=real, redis_store=FakeRedis())
     await emb.embed_bill(OCD, "fl", _bill([_version(11, "Introduced", "introduced", 0, TEXT_A)]))
     assert upserted and upserted[0].id == f"bill-text:{OCD}:11-chunk-0"
     assert upserted[0].metadata["document_id"] == "11"  # archive id, as retrieval filters expect
 
 
-async def test_fetch_bill_for_embedding_requests_versions_votes_sources():
+async def test_fetch_bill_for_embedding_requests_versions_and_sources_but_not_votes():
     from ddp_sync.services import local_openstates_client as c
 
     get = AsyncMock(return_value={"id": "ocd-bill/aaa"})
@@ -488,7 +494,7 @@ async def test_fetch_bill_for_embedding_requests_versions_votes_sources():
         assert await c.fetch_bill_for_embedding("aaa", api_base="http://api", api_key="k") == {"id": "ocd-bill/aaa"}
     url, params, headers, _ = get.await_args.args
     assert url == "http://api/bills/ocd-bill/aaa" and headers == {"x-api-key": "k"}
-    assert params == [("include", "versions"), ("include", "votes"), ("include", "sources")]
+    assert params == [("include", "versions"), ("include", "sources")]
 
 
 async def test_redis_store_set_bill_version_reports_success_and_watermark_roundtrip():
@@ -534,58 +540,54 @@ def _diff(n):
 async def test_scope_current_embeds_only_the_current_version_text():
     emb, _, pipe = _embedder()
     await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
-                         kb.EmbedScope(text="current", diffs=False, votes=False))
+                         kb.EmbedScope(text="current", diffs=False))
     assert pipe.keys == [_text(3)]
 
 
-async def test_scope_votes_only_and_diffs_only():
+async def test_scope_diffs_only():
     emb, _, pipe = _embedder()
     await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
-                         kb.EmbedScope(text=None, diffs=False, votes=True))
-    assert pipe.keys == [kb.votes_document_key(OCD)]
-    emb, _, pipe = _embedder()
-    await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
-                         kb.EmbedScope(text=None, diffs=True, votes=False))
+                         kb.EmbedScope(text=None, diffs=True))
     assert pipe.keys == [_diff(2), _diff(3)]
 
 
 async def test_scope_all_text_embeds_every_version_and_nothing_else():
     emb, _, pipe = _embedder()
     await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES),
-                         kb.EmbedScope(text="all", diffs=False, votes=False))
+                         kb.EmbedScope(text="all", diffs=False))
     assert pipe.keys == [_text(1), _text(2), _text(3)]
 
 
 async def test_default_scope_is_everything_unchanged_for_the_live_hook():
     emb, _, pipe = _embedder()
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES))
-    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3), kb.votes_document_key(OCD)])
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3)])  # no votes document
     assert stats["chars"] > 0 and stats["raced"] == 0
 
 
 async def test_stage_unknown_is_never_the_current_version():
     unknown_only = [_version(7, "Mystery", "unknown", None, TEXT_A, unknown=True)]
     emb, _, pipe = _embedder()
-    await emb.embed_bill(OCD, "fl", _bill(unknown_only), kb.EmbedScope(text="current", diffs=False, votes=False))
+    await emb.embed_bill(OCD, "fl", _bill(unknown_only), kb.EmbedScope(text="current", diffs=False))
     assert pipe.keys == []
     mixed = unknown_only + [_version(8, "Filed", "introduced", 0, TEXT_B)]
     emb, _, pipe = _embedder()
-    await emb.embed_bill(OCD, "fl", _bill(mixed), kb.EmbedScope(text="current", diffs=False, votes=False))
+    await emb.embed_bill(OCD, "fl", _bill(mixed), kb.EmbedScope(text="current", diffs=False))
     assert pipe.keys == [_text(8)]
 
 
 async def test_a_narrow_pass_then_a_full_pass_never_rewrites_what_the_first_wrote():
     emb, _, pipe = _embedder()
     bill = _bill(_three_versions(), _VOTES)
-    await emb.embed_bill(OCD, "fl", bill, kb.EmbedScope(text="current", diffs=False, votes=False))
+    await emb.embed_bill(OCD, "fl", bill, kb.EmbedScope(text="current", diffs=False))
     first = list(pipe.keys)
     await emb.embed_bill(OCD, "fl", bill)
     assert first == [_text(3)]
     assert pipe.keys.count(_text(3)) == 1  # not re-embedded by the full pass
-    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2), _diff(2), _diff(3), kb.votes_document_key(OCD)])
+    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2), _diff(2), _diff(3)])
     again = len(pipe.keys)
     stats = await emb.embed_bill(OCD, "fl", bill)
-    assert len(pipe.keys) == again and stats["documents"] == stats["diffs"] == stats["votes"] == 0
+    assert len(pipe.keys) == again and stats["documents"] == stats["diffs"] == 0
 
 
 class _RacingRedis(FakeRedis):
@@ -598,7 +600,7 @@ class _RacingRedis(FakeRedis):
     async def get_bill_version(self, key):
         self.reads += 1
         if self.reads == 2:  # the guard's read, just before the first upsert
-            self.versions[key] = {"schema": kb.CACHE_SCHEMA, "votes": {},
+            self.versions[key] = {"schema": kb.CACHE_SCHEMA,
                                   "documents": {"1": {"text_hash": "live-newer", "chunks": 9}}}
         return self.versions.get(key)
 
@@ -607,7 +609,7 @@ async def test_a_document_changed_by_another_writer_is_skipped_and_its_entry_sur
     redis = _RacingRedis()
     emb, redis, pipe = _embedder(redis=redis)
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
-                                 kb.EmbedScope(text="all", diffs=False, votes=False))
+                                 kb.EmbedScope(text="all", diffs=False))
     assert _text(1) not in pipe.keys  # the older text never overwrote the newer live write
     assert _text(2) in pipe.keys and _text(3) in pipe.keys
     assert stats["raced"] == 1 and stats["undone"] == []
@@ -650,7 +652,7 @@ class _BlipRedis(FakeRedis):
 
 
 def _prior_cache():
-    return {"schema": kb.CACHE_SCHEMA, "votes": {},
+    return {"schema": kb.CACHE_SCHEMA,
             "documents": {"1": {"text_hash": kb.content_hash(TEXT_A), "chunks": 1}}}
 
 
@@ -662,7 +664,7 @@ async def test_a_redis_blip_before_the_write_is_undone_not_raced():
     emb, redis, _ = _embedder(redis=redis)
     with capture_logs() as logs:
         stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
-                                     kb.EmbedScope(text="all", diffs=False, votes=False))
+                                     kb.EmbedScope(text="all", diffs=False))
     assert stats["raced"] == 0
     assert any("unreadable before write" in u for u in stats["undone"])
     assert any(e["event"] == "knowledge_base_embedding_work_left_undone" for e in logs)
@@ -674,7 +676,7 @@ async def test_a_redis_blip_at_the_final_write_does_not_erase_the_other_entries(
     redis.versions[OCD] = _prior_cache()
     with capture_logs() as logs:
         stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
-                                     kb.EmbedScope(text="all", diffs=False, votes=False))
+                                     kb.EmbedScope(text="all", diffs=False))
     assert any("unreadable at write" in u for u in stats["undone"])
     assert any(e["event"] == "knowledge_base_embedding_work_left_undone" for e in logs)
     assert redis.versions[OCD] == _prior_cache()  # not replaced by a cache holding only this call's documents
@@ -684,5 +686,5 @@ async def test_a_redis_blip_at_the_final_write_does_not_erase_the_other_entries(
 async def test_no_cache_at_start_is_not_mistaken_for_a_blip():
     emb, _, pipe = _embedder(redis=_BlipRedis(blips=set()))
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
-                                 kb.EmbedScope(text="all", diffs=False, votes=False))
+                                 kb.EmbedScope(text="all", diffs=False))
     assert stats["undone"] == [] and stats["raced"] == 0 and len(pipe.keys) == 3

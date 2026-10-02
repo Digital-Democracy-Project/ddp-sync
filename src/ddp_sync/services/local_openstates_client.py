@@ -1141,12 +1141,13 @@ async def fetch_bill_for_embedding(
     ocd_bill_id: str, *, api_base: str, api_key: str = ""
 ) -> dict | None:
     """SYNC-83: one bill's detail with versions (ordered by api-v3, each with its archived text,
-    `diff_from_previous_version`, `archived_document_id`, `version_stage`, `version_ordinal`),
-    votes and sources. None on any failure or a 404. Never raises."""
+    `diff_from_previous_version`, `archived_document_id`, `version_stage`, `version_ordinal`)
+    and sources. Votes are not requested (SYNC-94: they are not embedded). None on any failure or
+    a 404. Never raises."""
     if not api_base:
         return None
     headers = {"x-api-key": api_key} if api_key else {}
-    params = [("include", "versions"), ("include", "votes"), ("include", "sources")]
+    params = [("include", "versions"), ("include", "sources")]
     return await _get_json_with_retry(
         f"{api_base}/bills/ocd-bill/{ocd_bill_id}", params, headers, {"ocd_bill_id": ocd_bill_id}
     )

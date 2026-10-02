@@ -34,7 +34,6 @@ from tests.test_knowledge_base_embedding import (
     FakeRedis,
     _settings,
     _version,
-    _votes_formatter,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -140,7 +139,7 @@ class Env:
         return self.world.get(ocd)
 
     def embedder(self, settings):
-        return kb.KnowledgeBaseEmbedder(settings, pipeline=self.pipe, votes_formatter=_votes_formatter,
+        return kb.KnowledgeBaseEmbedder(settings, pipeline=self.pipe,
                                         redis_store=self.redis)
 
     async def run(self, stages, *, dry_run=False, restart=False, config=None, run_id="r1"):
@@ -163,7 +162,6 @@ class Env:
 
 @pytest.mark.parametrize("stage, expected", [
     ("current", {_t(A, 3), _t(C, 7)}),  # current-session bills' current versions; unknown is never current
-    ("votes", {kb.votes_document_key(A)}),
     ("diffs", {_d(A, 2), _d(A, 3), _d(B, 5)}),
     ("prior-sessions", {_t(B, 5)}),  # the prior-session bill's current version
     ("history", {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7)}),
@@ -183,7 +181,13 @@ async def test_all_stages_in_order_write_every_document_exactly_once():
     assert result["status"] == "complete"
     assert len(env.pipe.keys) == len(set(env.pipe.keys))  # history skipped what stages 1 and 4 wrote
     assert set(env.pipe.keys) == {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7),
-                                  _d(A, 2), _d(A, 3), _d(B, 5), kb.votes_document_key(A)}
+                                  _d(A, 2), _d(A, 3), _d(B, 5)}
+
+
+async def test_there_is_no_votes_stage_and_every_stage_has_a_scope():
+    """SYNC-94: votes are not embedded, so a no-stage run can never write a votes document."""
+    assert bf.STAGES == ("current", "diffs", "prior-sessions", "history")
+    assert set(bf.STAGE_SCOPES) == set(bf.STAGES)
 
 
 async def test_stage_selection_uses_the_session_filter_not_a_detail_fetch_per_bill():
@@ -293,7 +297,7 @@ async def test_a_carried_over_failure_that_fails_again_stays_on_the_list_exactly
 async def test_a_malformed_blackout_window_fails_fast_before_taking_the_lock():
     env = Env()
     cfg = {"knowledge_base_embedding": {"backfill": {"blackout_start_utc": "late", "blackout_end_utc": "07:00"}}}
-    result = await env.run(["votes"], config=cfg)
+    result = await env.run(["diffs"], config=cfg)
     assert result["status"] == "error" and result["error"] == "bad_blackout_config"
     assert env.pipe.keys == [] and env.fetched == [] and env.redis._client.kv == {}
 
@@ -302,7 +306,7 @@ async def test_a_broken_stage_aborts_instead_of_walking_the_whole_corpus():
     env = Env()
     env.pipe.fail_keys = {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7)}
     with patch.object(bf, "MAX_FAILED_BILLS", 1), capture_logs() as logs:
-        result = await env.run(["history", "votes"])
+        result = await env.run(["history", "diffs"])
     assert [r["status"] for r in result["stages"]] == ["aborted"]  # the next stage never started
     assert env.fetched == [A, B]  # stopped once more than 1 bill had failed
     assert any(e["event"] == "knowledge_base_backfill_aborted" for e in logs)
@@ -311,10 +315,10 @@ async def test_a_broken_stage_aborts_instead_of_walking_the_whole_corpus():
 
 async def test_restart_forgets_the_stored_checkpoint_before_any_bill_work():
     env = Env(listing={None: None, "2026": None})  # the run dies at listing, before touching a bill
-    env.redis.checkpoints[("fl", "votes")] = {"last_bill_id": C, "failed_ids": [], "done": True, "totals": {}}
-    result = await env.run(["votes"], restart=True)
+    env.redis.checkpoints[("fl", "diffs")] = {"last_bill_id": C, "failed_ids": [], "done": True, "totals": {}}
+    result = await env.run(["diffs"], restart=True)
     assert result["stages"][0]["status"] == "error"
-    assert ("fl", "votes") not in env.redis.checkpoints  # a crash now cannot resurrect the old position
+    assert ("fl", "diffs") not in env.redis.checkpoints  # a crash now cannot resurrect the old position
 
 
 async def test_an_api_v3_without_the_archive_ids_aborts_the_stage_instead_of_walking_it():
@@ -350,8 +354,8 @@ async def test_totals_accumulate_across_resumed_runs_and_report_chars():
 async def test_listing_failure_is_an_error_and_advances_nothing():
     env = Env(listing={None: None, "2026": None})
     with capture_logs() as logs:
-        result = await env.run(["votes", "diffs"])
-    assert result["stages"] == [{"stage": "votes", "status": "error", "error": "listing_failed"}]
+        result = await env.run(["diffs", "history"])
+    assert result["stages"] == [{"stage": "diffs", "status": "error", "error": "listing_failed"}]
     assert env.redis.checkpoints == {} and env.pipe.keys == []
     assert any(e["event"] == "knowledge_base_backfill_failed" for e in logs)
 
@@ -365,7 +369,7 @@ async def test_unknown_current_session_is_an_error_not_a_guess():
 async def test_redis_down_refuses_a_real_run():
     env = Env()
     env.redis.is_available = False
-    result = await env.run(["votes"])
+    result = await env.run(["diffs"])
     assert result["error"] == "redis_unavailable" and env.pipe.keys == []
 
 
@@ -376,15 +380,15 @@ async def test_dry_run_reports_counts_per_stage_and_writes_nothing():
     env = Env()
     result = await env.run(None, dry_run=True)
     counts = {r["stage"]: (r["bills_in_stage"], r["bills_remaining"]) for r in result["stages"]}
-    assert counts == {"current": (2, 2), "votes": (3, 3), "diffs": (3, 3), "prior-sessions": (1, 1), "history": (3, 3)}
+    assert counts == {"current": (2, 2), "diffs": (3, 3), "prior-sessions": (1, 1), "history": (3, 3)}
     assert env.pipe.keys == [] and env.fetched == []
     assert env.redis.checkpoints == {} and env.redis._client.kv == {}  # no lock, no checkpoint
 
 
 async def test_dry_run_counts_only_what_a_checkpoint_has_left():
     env = Env()
-    env.redis.checkpoints[("fl", "votes")] = {"last_bill_id": A, "failed_ids": [], "done": False, "totals": {}}
-    result = await env.run(["votes"], dry_run=True)
+    env.redis.checkpoints[("fl", "diffs")] = {"last_bill_id": A, "failed_ids": [], "done": False, "totals": {}}
+    result = await env.run(["diffs"], dry_run=True)
     assert result["stages"][0]["bills_remaining"] == 2
 
 
@@ -422,7 +426,7 @@ async def test_a_run_inside_the_window_sleeps_until_it_ends_then_proceeds():
          patch.object(bf, "OpenStatesSource", return_value=source), \
          patch.object(bf, "KnowledgeBaseEmbedder", side_effect=env.embedder), \
          patch.object(bf, "_utcnow", return_value=inside), patch.object(bf, "_sleep", new=fake_sleep):
-        result = await bf.run_knowledge_base_backfill("fl", ["votes"], settings=_settings(),
+        result = await bf.run_knowledge_base_backfill("fl", ["diffs"], settings=_settings(),
                                                       api_base="http://api", dry_run=False, run_id="r1")
     assert slept == [120 * 60.0] * 3  # once per bill, until 07:00
     assert result["status"] == "complete"
@@ -434,13 +438,13 @@ async def test_a_run_inside_the_window_sleeps_until_it_ends_then_proceeds():
 async def test_a_held_lock_rejects_a_second_run_and_a_normal_run_releases_it():
     env = Env()
     env.redis._client.kv[bf.lock_key("fl")] = "someone-else"
-    result = await env.run(["votes"])
+    result = await env.run(["diffs"])
     assert result["status"] == "already_running" and result["current_run_id"] == "someone-else"
     assert env.pipe.keys == []
     assert env.redis._client.kv[bf.lock_key("fl")] == "someone-else"  # not released by the loser
 
     env2 = Env()
-    await env2.run(["votes"])
+    await env2.run(["diffs"])
     assert bf.lock_key("fl") not in env2.redis._client.kv
 
 
@@ -451,7 +455,7 @@ async def test_the_lock_is_released_when_setup_raises():
          patch.object(bf, "OpenStatesSource", return_value=source), \
          patch.object(bf, "KnowledgeBaseEmbedder", side_effect=ValueError("index unset")), \
          pytest.raises(ValueError):
-        await bf.run_knowledge_base_backfill("fl", ["votes"], settings=SyncSettings(), api_base="x",
+        await bf.run_knowledge_base_backfill("fl", ["diffs"], settings=SyncSettings(), api_base="x",
                                              dry_run=False, run_id="r1")
     assert bf.lock_key("fl") not in env.redis._client.kv
 
@@ -501,16 +505,18 @@ async def test_route_defaults_to_a_dry_run_of_every_stage():
 
 
 async def test_route_runs_one_stage_for_real_and_passes_restart():
-    resp, run = _route("/trigger/knowledge-base-backfill/fl?stage=votes&dry_run=false&restart=true")
+    resp, run = _route("/trigger/knowledge-base-backfill/fl?stage=diffs&dry_run=false&restart=true")
     assert resp.status_code == 202
-    assert resp.json()["stages"] == ["votes"] and resp.json()["run_id"].startswith("fl-kb-backfill-run-")
+    assert resp.json()["stages"] == ["diffs"] and resp.json()["run_id"].startswith("fl-kb-backfill-run-")
     args, kwargs = run.await_args
-    assert args == ("fl", ["votes"]) and kwargs["dry_run"] is False and kwargs["restart"] is True
+    assert args == ("fl", ["diffs"]) and kwargs["dry_run"] is False and kwargs["restart"] is True
 
 
 async def test_route_rejects_unknown_stage_and_unenrolled_jurisdiction():
     resp, run = _route("/trigger/knowledge-base-backfill/fl?stage=nope")
     assert resp.status_code == 404 and "Unknown stage" in resp.text
+    resp, run = _route("/trigger/knowledge-base-backfill/fl?stage=votes")  # SYNC-94: no longer a stage
+    assert resp.status_code == 404 and "Unknown stage" in resp.text and not run.await_count
     resp, run = _route("/trigger/knowledge-base-backfill/ca")
     assert resp.status_code == 404 and "not enrolled" in resp.text
     run.assert_not_awaited()
