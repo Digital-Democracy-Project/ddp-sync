@@ -102,6 +102,96 @@ async def test_fetch_jurisdiction_empty_jurisdiction_list_preserves_public_api_b
     assert called_kwargs["headers"]["X-API-Key"] == "public-key"
 
 
+# --- SYNC-93: hosts with no CAMS access route replica jurisdictions to the RDS-backed api-v3 ---
+
+
+def _make_ec2_source(cams_api_token: str = "", **settings_overrides) -> OpenStatesSource:
+    """The EC2 broker host: no CAMS token, a reachable RDS-backed api-v3, and the code-default
+    localhost:8002 'local' base that nothing answers there."""
+    settings = SyncSettings(
+        openstates_api_key="public-key",
+        openstates_api_base="https://v3.openstates.org",
+        local_openstates_api_base="http://localhost:8002",
+        local_openstates_api_key="",
+        rds_openstates_api_base="http://10.0.0.11:8002",
+        rds_openstates_api_key="rds-key",
+        cams_api_token=cams_api_token,
+        **settings_overrides,
+    )
+    return OpenStatesSource(settings)
+
+
+@pytest.mark.asyncio
+async def test_fetch_jurisdiction_on_a_non_mac_host_uses_the_rds_api_with_header_auth():
+    source = _make_ec2_source(ddp_openstates_jurisdictions=["UT", "US"])
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_JURISDICTION_BODY)
+
+    with _patch_async_client(mock_client):
+        result = await source.fetch_jurisdiction("ut")
+
+    assert result is not None
+    called_url, called_kwargs = mock_client.get.call_args
+    assert called_url[0] == "http://10.0.0.11:8002/jurisdictions/ut"
+    # The RDS-backed api-v3 is called with the X-API-Key header, never the `apikey` query
+    # parameter the Mac's local api-v3 uses.
+    assert called_kwargs["headers"]["X-API-Key"] == "rds-key"
+    assert all(name != "apikey" for name, _ in called_kwargs["params"])
+
+
+@pytest.mark.asyncio
+async def test_fetch_jurisdiction_on_the_mac_still_uses_the_local_replica():
+    """A host with a CAMS token is the Mac: unchanged, even when an RDS base is configured."""
+    source = _make_ec2_source(ddp_openstates_jurisdictions=["UT"], cams_api_token="cams-token")
+    source.settings.local_openstates_api_key = "local-key"
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_JURISDICTION_BODY)
+
+    with _patch_async_client(mock_client):
+        await source.fetch_jurisdiction("ut")
+
+    called_url, called_kwargs = mock_client.get.call_args
+    assert called_url[0] == "http://localhost:8002/jurisdictions/ut"
+    assert "X-API-Key" not in called_kwargs["headers"]
+    assert ("apikey", "local-key") in called_kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_jurisdiction_non_mac_host_without_an_rds_base_keeps_the_local_replica():
+    """No RDS base configured (dev, CI): nothing to route to, behavior unchanged."""
+    source = _make_ec2_source(ddp_openstates_jurisdictions=["UT"])
+    source.settings.rds_openstates_api_base = ""
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_JURISDICTION_BODY)
+
+    with _patch_async_client(mock_client):
+        await source.fetch_jurisdiction("ut")
+
+    called_url, _ = mock_client.get.call_args
+    assert called_url[0] == "http://localhost:8002/jurisdictions/ut"
+
+
+@pytest.mark.asyncio
+async def test_fetch_jurisdiction_non_mac_host_still_sends_unlisted_jurisdictions_to_the_public_api():
+    source = _make_ec2_source(ddp_openstates_jurisdictions=["UT"])
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_JURISDICTION_BODY)
+
+    with _patch_async_client(mock_client):
+        await source.fetch_jurisdiction("fl")
+
+    called_url, called_kwargs = mock_client.get.call_args
+    assert called_url[0] == "https://v3.openstates.org/jurisdictions/fl"
+    assert called_kwargs["headers"]["X-API-Key"] == "public-key"
+
+
+def test_get_api_base_and_key_flag_follows_the_instance_chosen():
+    ec2 = _make_ec2_source(ddp_openstates_jurisdictions=["UT"])
+    assert ec2._get_api_base_and_key("UT") == ("http://10.0.0.11:8002", "rds-key", False)
+    mac = _make_ec2_source(ddp_openstates_jurisdictions=["UT"], cams_api_token="t")
+    assert mac._get_api_base_and_key("UT") == ("http://localhost:8002", "", True)
+
+
 # --- fetch_legislators --------------------------------------------------------
 
 
