@@ -186,6 +186,27 @@ class OpenStatesSource:
         """
         replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
+            # SYNC-93: "local" means the Mac Studio's api-v3 on localhost:8002, which exists
+            # only on the Mac. A host with no CAMS access (`cams_api_token` unset -- the same
+            # signal as openstates_archive._mac_capable(), read from this instance's own
+            # settings) is the EC2 broker host, where localhost:8002 is the ddp-sync
+            # container itself and nothing answers; its replica is the RDS-backed api-v3
+            # (rds_openstates_api_base), the same split knowledge_base_embedding.read_target
+            # makes. That instance authenticates with the X-API-Key header, not the `apikey`
+            # query parameter, so is_local_replica is False for it -- the flag selects the
+            # auth style, nothing else. With no RDS base configured (dev, tests) the
+            # behavior is unchanged.
+            if not self.settings.cams_api_token and self.settings.rds_openstates_api_base:
+                logger.debug(
+                    "Routing jurisdiction to RDS-backed OpenStates api-v3",
+                    jurisdiction=jurisdiction,
+                    api_base=self.settings.rds_openstates_api_base,
+                )
+                return (
+                    self.settings.rds_openstates_api_base,
+                    self.settings.rds_openstates_api_key,
+                    False,
+                )
             logger.debug(
                 "Routing jurisdiction to local OpenStates replica",
                 jurisdiction=jurisdiction,
