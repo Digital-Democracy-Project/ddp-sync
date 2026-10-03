@@ -1255,71 +1255,44 @@ async def trigger_vote_person_backfill(
 async def trigger_knowledge_base_entities(
     entity: str,
     background_tasks: BackgroundTasks,
-    jurisdiction: str | None = None,
     dry_run: bool = True,
     token: str = Depends(api_key_auth),
 ):
-    """SYNC-91: embed legislators or organizations into `ddp-knowledge-base` (PLAN-enterprise-
-    search.md 5.6), through the same embedder as the bill hook. Returns 202 with a `run_id`; the
-    totals land in the log (`knowledge_base_entities_run` / `_incomplete`). Defaults to a dry run
-    (counts what it would write, writes nothing).
+    """SYNC-91: embed organizations into `ddp-knowledge-base` (PLAN-enterprise-search.md 5.6), through
+    the same embedder as the bill hook. Returns 202 with a `run_id`; the totals land in the log
+    (`knowledge_base_entities_run` / `_incomplete`). Defaults to a dry run (counts what it would
+    write, writes nothing).
 
-    entity: `legislators` (every enrolled jurisdiction in `openstates_archive.knowledge_base_
-    embedding.jurisdictions`, or just `jurisdiction`) or `organizations` (every public organization
-    in ddp-broker-py; needs BROKER-144 deployed there). Legislators also run on their own as part
-    of each jurisdiction's post-archive embedding hook; organizations only run from here.
+    entity: `organizations` (every public organization in ddp-broker-py; needs BROKER-144 deployed
+    there). Legislators are not embedded (SYNC-94), so `legislators` is an unknown entity.
 
-    404 for an unknown entity or a jurisdiction not enrolled; 503 when `KNOWLEDGE_BASE_INDEX_NAME`
-    (or the read path) is not usable on this host."""
+    404 for an unknown entity; 503 when `KNOWLEDGE_BASE_INDEX_NAME` is not usable on this host or
+    `DDP_BROKER_API_BASE` is not configured."""
     import uuid
 
     from ddp_sync.config import get_settings, knowledge_base_settings
     from ddp_sync.pipelines.knowledge_base_entities import run_knowledge_base_entities
-    from ddp_sync.pipelines.openstates_archive import _mac_capable
-    from ddp_sync.scheduler import get_scheduler
 
-    if entity not in ("legislators", "organizations"):
-        raise HTTPException(status_code=404, detail=f"Unknown entity '{entity}'. Available: ['legislators', 'organizations']")
-
-    scheduler = get_scheduler()
-    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
-    enrolled = [str(j).lower() for j in (config.get("knowledge_base_embedding") or {}).get("jurisdictions", [])]
-    jurisdictions: list[str] = []
-    if entity == "legislators":
-        if jurisdiction and jurisdiction.lower() not in enrolled:
-            raise HTTPException(
-                status_code=404,
-                detail=f"'{jurisdiction}' is not enrolled in knowledge_base_embedding.jurisdictions: {sorted(enrolled)}",
-            )
-        jurisdictions = [jurisdiction.lower()] if jurisdiction else enrolled
+    if entity != "organizations":
+        raise HTTPException(status_code=404, detail=f"Unknown entity '{entity}'. Available: ['organizations']")
 
     settings = get_settings()
     try:
         knowledge_base_settings(settings)  # unset or the legacy index: refuse here, not in the background
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
-    if _mac_capable():
-        api_base, api_key = settings.local_openstates_api_base, settings.local_openstates_api_key
-    else:
-        api_base, api_key = settings.rds_openstates_api_base, settings.rds_openstates_api_key
-    if entity == "legislators" and not api_base:
-        raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")
-    if entity == "organizations" and not settings.ddp_broker_api_base:
+    if not settings.ddp_broker_api_base:
         raise HTTPException(status_code=503, detail="DDP_BROKER_API_BASE is not configured on this host")
 
     run_id = f"kb-entities-{entity}-{'dry' if dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
     background_tasks.add_task(
         run_knowledge_base_entities,
         entity,
-        jurisdictions,
         settings=settings,
-        api_base=api_base,
-        api_key=api_key,
         dry_run=dry_run,
         run_id=run_id,
     )
-    return {"status": "started", "run_id": run_id, "entity": entity,
-            "jurisdictions": jurisdictions, "dry_run": dry_run}
+    return {"status": "started", "run_id": run_id, "entity": entity, "dry_run": dry_run}
 
 
 @router.post("/trigger/open304-lis-identifiers", status_code=202)
