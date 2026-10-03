@@ -157,12 +157,12 @@ class KnowledgeBaseEmbedder:
     async def embed_entity(
         self, key: str, content: str, metadata: DocumentMetadata, *, dry_run: bool = False
     ) -> str:
-        """SYNC-91: embed one standalone document (a legislator or an organization) unless its
-        cached digest (content plus metadata) already matches. Returns "written", "unchanged", "would_write" (dry
+        """SYNC-91: embed one standalone document (an organization) unless its cached digest
+        (content plus metadata) already matches. Returns "written", "unchanged", "would_write" (dry
         run: nothing is written, not even the cache) or "undone:<why>". The cache entry is stored
-        under the document id itself (`ddp:bill_version:legislator-<uuid>`,
-        `ddp:bill_version:organization:<id>`), which cannot collide with a bare ocd bill id or a
-        legacy webflow id, and is written only after the Pinecone write succeeded."""
+        under the document id itself (`ddp:bill_version:organization:<id>`), which cannot collide
+        with a bare ocd bill id or a legacy webflow id, and is written only after the Pinecone
+        write succeeded."""
         cache = await self.redis.get_bill_version(key) or {}
         if cache.get("schema") != CACHE_SCHEMA:
             cache = {}

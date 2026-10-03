@@ -839,15 +839,6 @@ async def _maybe_embed_knowledge_base(
         api_key=api_key,
     )
 
-    # SYNC-91: this jurisdiction's legislators ride the same run (people are few and an unchanged
-    # one costs a cache read). Own try/except: a failure here never changes the bill step's result.
-    try:
-        from ddp_sync.pipelines.knowledge_base_entities import embed_legislators
-
-        await embed_legislators(jurisdiction, settings=settings, api_base=api_base, api_key=api_key)
-    except Exception as e:  # noqa: BLE001 -- log and continue, like every post-archive hook
-        logger.error("knowledge_base_legislators_failed", jurisdiction=jurisdiction, error=str(e))
-
 
 def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> bool:
     """OPEN-124's rule again: enrollment lives in sync_schedule.yaml

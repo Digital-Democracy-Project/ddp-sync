@@ -376,15 +376,16 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
 **Rules that are easy to break**
 - **One embedding path.** Everything goes through `KnowledgeBaseEmbedder`
   (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version, diffs; never votes, SYNC-94),
-  `embed_entity` (a legislator or organization), narrowed by `EmbedScope`. The live post-archive hook
+  `embed_entity` (an organization), narrowed by `EmbedScope`. The live post-archive hook
   and the staged backfill share it so they cannot diverge. **Do not write a second path** to the index
   or call Pinecone from a pipeline; add a stage or a document kind to the embedder instead.
 - **Legacy index refusal is structural.** The embedder is built from
   `config.knowledge_base_settings(settings)`, which raises for an unset `KNOWLEDGE_BASE_INDEX_NAME`,
   an index equal to `pinecone_index_name`, and `votebot-large`. Keep it that way.
-- **No Webflow, no LegBot output.** Legislators come from api-v3 `/people`, organizations from
-  ddp-broker-py `/api/organizations/`, bills from the archived text in the OpenStates DB. Nothing here
-  reads Webflow, and no `BillArtifact`/changelog text is ever embedded (Ramon's decision, 2026-09-30).
+- **No Webflow, no LegBot output.** Organizations come from ddp-broker-py `/api/organizations/`, bills
+  from the archived text in the OpenStates DB. Legislators are not embedded at all (SYNC-94, Ramon
+  2026-10-02): their structured facts come from api-v3 directly and DDP has no narrative biography to
+  embed. Nothing here reads Webflow, and no `BillArtifact`/changelog text is ever embedded (Ramon's decision, 2026-09-30).
 - **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
   with "now"; hashing it raw makes every entity look changed on every run (found while building
   SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.
@@ -393,10 +394,10 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   *undone*, never "raced". There is no atomic compare-and-set across Pinecone and Redis, by design;
   any residual mismatch heals on the next pass.
 - **Everything is OFF until enabled, per host.** `openstates_archive.knowledge_base_embedding`
-  (embedding + legislators; also needs `KNOWLEDGE_BASE_INDEX_NAME`), `openstates_archive.
+  (bill embedding; also needs `KNOWLEDGE_BASE_INDEX_NAME`), `openstates_archive.
   bill_search_refresh` (refresh of api-v3's `ddp_bill_search`; always the RDS-backed api-v3, never the
   Mac's local one), and the manual routes `/trigger/knowledge-base-backfill/{jurisdiction}` and
-  `/trigger/knowledge-base-entities/{legislators|organizations}` (both default to `dry_run=true`).
+  `/trigger/knowledge-base-entities/organizations` (both default to `dry_run=true`).
   Never set `KNOWLEDGE_BASE_INDEX_NAME` on the votebot/ddp-api EC2 instance.
 
 **Merged is not deployed (as of 2026-10-01).** Everything above is merged to `main` and default-off;
@@ -405,7 +406,6 @@ is running there. Dependencies before any of it does real work: api-v3 serving `
 / `version_stage` / `version_ordinal` on **both** instances (OPEN-311 merged, **OPEN-315** is the
 deploy), `KNOWLEDGE_BASE_INDEX_NAME` set on one host, and for organizations ddp-broker-py PR #389
 (BROKER-144) deployed (until then the organization run reports incomplete with nothing written).
-The legislator text is the OpenStates record, not the Webflow bio the legacy documents used.
 
 ## The shared Redis is a single point of failure for several things at once
 

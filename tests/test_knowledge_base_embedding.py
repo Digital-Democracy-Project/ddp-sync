@@ -392,7 +392,6 @@ async def test_hook_runs_with_local_api_on_the_mac_and_rds_api_elsewhere():
                        rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
     for settings, base, key in ((mac, "http://local", "lk"), (ec2, "http://rds", "rk")):
         with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
-             patch("ddp_sync.pipelines.knowledge_base_entities.embed_legislators", new=AsyncMock()), \
              patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock()) as run:
             await _maybe_embed_knowledge_base("fl", _STARTED, _CFG)
         kwargs = run.await_args.kwargs
