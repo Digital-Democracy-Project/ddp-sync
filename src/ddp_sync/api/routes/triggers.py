@@ -1287,7 +1287,6 @@ async def trigger_knowledge_base_entities(
     run_id = f"kb-entities-{entity}-{'dry' if dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
     background_tasks.add_task(
         run_knowledge_base_entities,
-        entity,
         settings=settings,
         dry_run=dry_run,
         run_id=run_id,

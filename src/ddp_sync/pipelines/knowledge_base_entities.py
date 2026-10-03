@@ -170,19 +170,19 @@ async def embed_organizations(
 
 
 async def run_knowledge_base_entities(
-    entity: str,
     *,
     settings: SyncSettings,
     dry_run: bool = True,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """The manual trigger's body: embed `organizations` (read from ddp-broker-py). `entity` names
-    the run in the logs and the run id; the route only ever passes `organizations`."""
-    run_id = run_id or f"kb-entities-{entity}-{uuid.uuid4().hex[:12]}"
-    logger.info("knowledge_base_entities_start", run_id=run_id, entity=entity, dry_run=dry_run)
+    """The manual trigger's body: embed the organizations ddp-broker-py lists. There is no entity
+    argument any more (SYNC-94 left organizations as the only kind), so a stale caller cannot ask
+    for another kind and silently get organizations."""
+    run_id = run_id or f"kb-entities-organizations-{uuid.uuid4().hex[:12]}"
+    logger.info("knowledge_base_entities_start", run_id=run_id, entity="organizations", dry_run=dry_run)
     runs = [await embed_organizations(settings=settings, dry_run=dry_run)]
     ok = all(r["complete"] for r in runs)
     (logger.info if ok else logger.warning)(
-        "knowledge_base_entities_done", run_id=run_id, entity=entity, dry_run=dry_run, complete=ok
+        "knowledge_base_entities_done", run_id=run_id, entity="organizations", dry_run=dry_run, complete=ok
     )
     return {"run_id": run_id, "complete": ok, "runs": runs}

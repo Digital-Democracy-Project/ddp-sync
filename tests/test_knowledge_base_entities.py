@@ -370,18 +370,25 @@ async def test_route_defaults_to_a_dry_run_of_organizations():
     assert body["entity"] == "organizations" and body["dry_run"] is True
     assert body["run_id"].startswith("kb-entities-organizations-dry-")
     args, kwargs = run.await_args
-    assert args == ("organizations",) and kwargs["dry_run"] is True and kwargs["run_id"] == body["run_id"]
+    assert args == () and kwargs["dry_run"] is True and kwargs["run_id"] == body["run_id"]
 
 
 async def test_route_runs_organizations_for_real_when_asked():
     resp, run = _route("/trigger/knowledge-base-entities/organizations?dry_run=false")
-    assert resp.status_code == 202 and run.await_args.args == ("organizations",)
+    assert resp.status_code == 202 and run.await_args.args == ()
     assert run.await_args.kwargs["dry_run"] is False
+
+
+async def test_route_still_accepts_the_removed_jurisdiction_parameter_and_runs_organizations_only():
+    """A stale caller that still sends `jurisdiction` gets the same organization job, not an error."""
+    resp, run = _route("/trigger/knowledge-base-entities/organizations?jurisdiction=fl&dry_run=false")
+    assert resp.status_code == 202 and set(run.await_args.kwargs) == {"settings", "dry_run", "run_id"}
 
 
 async def test_route_rejects_an_unknown_entity_and_legislators_are_no_longer_one():
     for entity in ("policies", "legislators"):  # SYNC-94: legislator profiles are not embedded
-        resp, run = _route(f"/trigger/knowledge-base-entities/{entity}")
+        # Settings with no index and no broker: the entity is rejected first, so it is a 404, not a 503.
+        resp, run = _route(f"/trigger/knowledge-base-entities/{entity}", settings=SyncSettings())
         assert resp.status_code == 404 and "Unknown entity" in resp.text
         run.assert_not_awaited()
 
@@ -402,5 +409,5 @@ async def test_the_runner_reports_completeness():
     for complete in (True, False):
         orgs = AsyncMock(return_value={"complete": complete})
         with patch.object(ent, "embed_organizations", new=orgs):
-            out = await ent.run_knowledge_base_entities("organizations", settings=_settings(), dry_run=True)
+            out = await ent.run_knowledge_base_entities(settings=_settings(), dry_run=True)
         assert out["complete"] is complete and orgs.await_args.kwargs["dry_run"] is True
