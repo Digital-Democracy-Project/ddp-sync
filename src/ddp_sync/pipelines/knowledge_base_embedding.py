@@ -357,8 +357,8 @@ RECONCILE_PLAN_SAMPLE = 20  # bills read to estimate the size of the rest
 
 def _embeddable_size(bill: dict) -> tuple[int, int]:
     """`(documents, characters)` that `embed_bill` would write for `bill` at the default scope: every
-    version's text and every classifiable version's stored diff, minus what it skips (no archived text,
-    no archived document id)."""
+    version's text (version diffs are not embedded, Ramon 2026-10-05), minus what it skips (no archived
+    text, no archived document id)."""
     documents = characters = 0
     for version in bill.get("versions") or []:
         text = version_text(version)
@@ -366,10 +366,6 @@ def _embeddable_size(bill: dict) -> tuple[int, int]:
             continue
         documents += 1
         characters += len(text)
-        diff = version.get("diff_from_previous_version")
-        if diff and (version.get("version_stage") or STAGE_UNKNOWN) != STAGE_UNKNOWN:
-            documents += 1
-            characters += len(diff)
     return documents, characters
 
 

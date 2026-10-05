@@ -1060,11 +1060,12 @@ async def test_the_dry_run_counts_unrecorded_bills_and_estimates_cost_from_a_sam
     bills = {OCD2: _sized_bill(OCD2, 4000), OCD3: _sized_bill(OCD3, 8000, diff_chars=400)}
     plan, fetch = await _plan(redis, everything=[OCD, OCD2, OCD3], bills=bills)
     assert (plan["listed"], plan["unrecorded"], plan["sampled"]) == (3, 2, 2) and plan["run_id"] == "r1"
-    # mean of the sample is 6,200 characters and 1.5 documents; two unrecorded bills in all
+    # mean of the sample is 6,000 characters and 1 document (the stored diff is not embedded, so it is not
+    # counted); two unrecorded bills in all
     est = plan["estimate"]
-    assert est["documents"] == 3 and est["tokens"] == round(12400 / 4)
-    assert est["chunks"] == round(12400 * 0.279 / 1000) and est["usd"] == round(3100 / 1e6 * 0.13, 2)
-    assert est["largest_sampled_bill_chars"] == 8400
+    assert est["documents"] == 2 and est["tokens"] == round(12000 / 4)
+    assert est["chunks"] == round(12000 * 0.279 / 1000) and est["usd"] == round(3000 / 1e6 * 0.13, 2)
+    assert est["largest_sampled_bill_chars"] == 8000
     assert pipe.calls == [] and redis.set_calls == 0  # nothing embedded, nothing written
     assert redis.persist_expiring_seen is False  # not even the persistence repair
     assert sorted(c.args[0] for c in fetch.await_args_list) == sorted([OCD2, OCD3])  # only the unrecorded were read
@@ -1231,7 +1232,8 @@ async def test_the_dry_runs_size_matches_what_embed_bill_really_writes(name, ver
     bill = _bill([version])
     stats = await emb.embed_bill(OCD, "fl", bill)
     documents, characters = kb._embeddable_size(bill)
-    assert (documents, characters) == (stats["documents"] + stats["diffs"], stats["chars"]), name
+    assert (documents, characters) == (stats["documents"], stats["chars"]), name
+    assert stats["diffs"] == 0, name
 
 
 async def test_the_reconcile_plan_route_needs_the_same_api_key_as_its_siblings():
