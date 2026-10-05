@@ -1255,6 +1255,7 @@ async def trigger_vote_person_backfill(
 async def trigger_knowledge_base_reconcile_plan(
     jurisdiction: str,
     background_tasks: BackgroundTasks,
+    ledger: bool = False,
     token: str = Depends(api_key_auth),
 ):
     """SYNC-95: the dry run of the reconcile pass for one jurisdiction. It always plans and never
@@ -1265,12 +1266,17 @@ async def trigger_knowledge_base_reconcile_plan(
     `openstates_archive.knowledge_base_embedding.reconcile.max_bills_per_run`.
 
     404 for a jurisdiction not enrolled in `knowledge_base_embedding.jurisdictions`; 503 when
-    `KNOWLEDGE_BASE_INDEX_NAME` or the read api is not configured on this host."""
+    `KNOWLEDGE_BASE_INDEX_NAME` or the read api is not configured on this host.
+
+    `ledger=true` plans the api-v3 ledger reconcile instead (`knowledge_base_embedding.ledger`): the bills
+    whose documents are missing, changed or (if `delete_orphans` is on) orphaned, rather than the ones with
+    no record. Needs api-v3's `/ddp/embedding/ledger` (OPEN-319); without it the plan reports
+    `ledger_unavailable`."""
     import uuid
 
     from ddp_sync.config import get_settings, knowledge_base_settings
     from ddp_sync.pipelines.knowledge_base_embedding import plan_reconcile, read_target
-    from ddp_sync.pipelines.openstates_archive import _mac_capable
+    from ddp_sync.pipelines.openstates_archive import _delete_orphans, _mac_capable
     from ddp_sync.scheduler import get_scheduler
 
     scheduler = get_scheduler()
@@ -1293,8 +1299,9 @@ async def trigger_knowledge_base_reconcile_plan(
         raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")
 
     run_id = f"{jurisdiction}-kb-reconcile-plan-{uuid.uuid4().hex[:12]}"
-    background_tasks.add_task(plan_reconcile, jurisdiction.lower(), api_base=api_base, api_key=api_key, run_id=run_id)
-    return {"status": "started", "run_id": run_id, "jurisdiction": jurisdiction, "dry_run": True}
+    background_tasks.add_task(plan_reconcile, jurisdiction.lower(), api_base=api_base, api_key=api_key, run_id=run_id,
+                              use_ledger=ledger, delete_orphans=_delete_orphans(config))
+    return {"status": "started", "run_id": run_id, "jurisdiction": jurisdiction, "dry_run": True, "ledger": ledger}
 
 
 @router.post("/trigger/knowledge-base-entities/{entity}", status_code=202)

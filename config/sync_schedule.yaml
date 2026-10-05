@@ -795,6 +795,15 @@ openstates_archive:
     # `knowledge_base_reconcile_backlog`.
     reconcile:
       max_bills_per_run: 0
+    # SYNC-95 (needs api-v3 OPEN-319, GET /ddp/embedding/ledger, deployed): reconcile against api-v3's own list of
+    # the documents each bill should have instead of the watermark. A document that is missing, whose source row
+    # changed, or (with delete_orphans) is no longer listed, is found on every run with no per-jurisdiction state;
+    # the ddp:kb_embed:since:* watermark is neither read nor written. Up to this many bills ATTEMPTED per run
+    # (a random slice when more disagree). 0 = off (the watermark path above, plus `reconcile`, stay in force).
+    # If api-v3 has no ledger the run falls back to that path and logs knowledge_base_ledger_unavailable. Dry-run
+    # it first with POST /trigger/knowledge-base-reconcile/{jurisdiction}.
+    ledger:
+      max_bills_per_run: 0
     # SYNC-95: delete the vectors of documents api-v3 no longer lists for a bill the run touches (the picker
     # re-chose a different row, or a version was removed). Only vectors this path recorded, by exact id; a
     # version api-v3 still returns with an id but no text is never an orphan; a run never deletes more than 200

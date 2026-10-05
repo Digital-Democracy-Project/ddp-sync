@@ -813,6 +813,17 @@ def _reconcile_max_bills(config: dict | None) -> int:
     return value
 
 
+def _ledger_max_bills(config: dict | None) -> int:
+    """SYNC-95: `knowledge_base_embedding.ledger.max_bills_per_run` (> 0 switches the hook to the api-v3 ledger
+    reconcile, which replaces the watermark; same strictness as `_reconcile_max_bills`)."""
+    block = ((config or {}).get("knowledge_base_embedding") or {}).get("ledger") or {}
+    value = block.get("max_bills_per_run", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        logger.warning("knowledge_base_ledger_bad_cap", value=value)
+        return 0
+    return value
+
+
 def _delete_orphans(config: dict | None) -> bool:
     """SYNC-95: `knowledge_base_embedding.delete_orphans`. Only a literal `true` turns it on: it deletes
     vectors, so a quoted "false", a stray string or a typo must not enable it."""
@@ -856,6 +867,7 @@ async def _maybe_embed_knowledge_base(
         api_key=api_key,
         reconcile_max_bills=_reconcile_max_bills(config),
         delete_orphans=_delete_orphans(config),
+        ledger_max_bills=_ledger_max_bills(config),
     )
 
 

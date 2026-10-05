@@ -305,6 +305,14 @@ class KnowledgeBaseEmbedder:
                         stats["chunks"] += n
                         stats["chars"] += len(text)
 
+            # SYNC-95: remember the source row's updated_at this text was checked against (only for a document
+            # that is recorded in sync with api-v3's text), so the ledger pass can tell "unchanged" without
+            # reading the bill. A stamp is written even when the text itself needed nothing.
+            stamp = version.get("archived_updated_at")
+            if stamp and docs.get(aid, {}).get("text_hash") == h and docs[aid].get("source_updated_at") != stamp:
+                docs[aid]["source_updated_at"] = stamp
+                updates.setdefault(aid, {})["source_updated_at"] = stamp
+
             diff = version.get("diff_from_previous_version")
             if scope.diffs and diff and stage != STAGE_UNKNOWN:
                 dh = content_hash(diff)
@@ -426,7 +434,7 @@ def _embeddable_size(bill: dict) -> tuple[int, int]:
 
 async def plan_reconcile(
     jurisdiction: str, *, api_base: str, api_key: str = "", sample_size: int = RECONCILE_PLAN_SAMPLE,
-    run_id: str | None = None,
+    run_id: str | None = None, use_ledger: bool = False, delete_orphans: bool = False,
 ) -> dict:
     """SYNC-95's dry run: what a reconcile pass would find for `jurisdiction`, before any money is
     spent. Writes nothing (not even the persistence repair) and calls no embedding API; it costs the
@@ -441,7 +449,12 @@ async def plan_reconcile(
     could and could not be used (a bill that cannot be read, or whose data is malformed, is skipped
     and counted); with unrecorded bills but no usable sample the status is `error` and there is no
     estimate; an incomplete listing makes the status `incomplete` (the counts are lower bounds). A failed
-    read never raises."""
+    read never raises.
+
+    `use_ledger` plans the ledger pass instead (`_reconcile_from_ledger`): `unrecorded` then counts the bills
+    that disagree with api-v3's ledger, and `missing_documents`, `changed_documents` and `orphaned_documents`
+    (when `delete_orphans`) break that down. The estimate samples those bills at their full size, so it
+    over-states a bill that only needs a new stamp."""
     plan: dict[str, Any] = {"jurisdiction": jurisdiction, "status": "ok"}
     if run_id:
         plan["run_id"] = run_id  # the one the trigger returned, so the result line can be found
@@ -449,18 +462,33 @@ async def plan_reconcile(
     if not redis.is_available:
         plan.update(status="error", error="redis_unavailable")
     else:
-        listed = await local_openstates_client.list_touched_bill_ids(
-            jurisdiction, since=_EPOCH, api_base=api_base, api_key=api_key
-        )
-        if listed is None:
-            plan.update(status="error", error="listing_failed")
+        if use_ledger:
+            work = await _ledger_work(jurisdiction, redis, api_base=api_base, api_key=api_key,
+                                      delete_orphans=delete_orphans, persist_expiring=False)
+            if work is None:
+                plan.update(status="error", error="ledger_unavailable")
+                listed = None
+            else:
+                findings, complete, count = work
+                listed = (findings, complete)
+                plan.update(listed=count, missing_documents=sum(f["missing"] for f in findings.values()),
+                            changed_documents=sum(f["changed"] for f in findings.values()),
+                            orphaned_documents=sum(f["orphaned"] for f in findings.values()))
         else:
+            listed = await local_openstates_client.list_touched_bill_ids(
+                jurisdiction, since=_EPOCH, api_base=api_base, api_key=api_key
+            )
+            if listed is None:
+                plan.update(status="error", error="listing_failed")
+        if listed is not None:
             ids, complete = listed
-            missing = await redis.find_unrecorded_bill_versions(ids, persist_expiring=False)
+            missing = list(ids) if use_ledger else await redis.find_unrecorded_bill_versions(ids, persist_expiring=False)
             if missing is None:
                 plan.update(status="error", error="records_unreadable")
             else:
-                plan.update(listed=len(ids), listing_complete=complete, unrecorded=len(missing))
+                plan.update(listing_complete=complete, unrecorded=len(missing))
+                if not use_ledger:
+                    plan["listed"] = len(ids)
                 sizes: list[tuple[int, int]] = []
                 failed = 0
                 for ocd_bill_id in random.sample(missing, min(sample_size, len(missing))):
@@ -575,6 +603,90 @@ async def _reconcile_unembedded(
     return result
 
 
+def ledger_findings(ledger: dict[str, dict[str, str | None]], records: dict[str, dict | None],
+                    *, delete_orphans: bool) -> dict[str, dict[str, int]]:
+    """SYNC-95: per bill, what api-v3's ledger and this path's own version records disagree about; only
+    bills with a disagreement appear. `missing`: a listed document the record does not have (a bill with
+    no record at all has all of them missing). `changed`: a recorded document whose source row's
+    `updated_at` is not the one stamped on the record, or has no stamp yet (one cheap re-check after the
+    stamp exists, then it is quiet); `updated_at` only means "look again", the bill read compares the text
+    hash. `orphaned` (only counted with `delete_orphans`): a recorded document the ledger no longer lists."""
+    findings: dict[str, dict[str, int]] = {}
+    for ocd_bill_id, listed in ledger.items():
+        record = records.get(ocd_bill_id)
+        recorded = (record.get("documents") or {}) if record and record.get("schema") == CACHE_SCHEMA else {}
+        missing = sum(1 for a in listed if a not in recorded)
+        changed = sum(1 for a, updated in listed.items()
+                      if a in recorded and updated is not None and recorded[a].get("source_updated_at") != updated)
+        orphaned = sum(1 for a in recorded if a not in listed) if delete_orphans else 0
+        if missing or changed or orphaned:
+            findings[ocd_bill_id] = {"missing": missing, "changed": changed, "orphaned": orphaned}
+    return findings
+
+
+async def _ledger_work(jurisdiction: str, redis, *, api_base: str, api_key: str, delete_orphans: bool,
+                       persist_expiring: bool = True) -> tuple[dict[str, dict[str, int]], bool, int] | None:
+    """`(findings, ledger_complete, ledger_bills)`, or None when the ledger or the records could not be read
+    (api-v3 without the endpoint, an outage): the caller must not treat that as "nothing to do"."""
+    listed = await local_openstates_client.list_embedding_ledger(jurisdiction, api_base=api_base, api_key=api_key)
+    if listed is None:
+        return None
+    ledger, complete = listed
+    ids = list(ledger)
+    if await redis.find_unrecorded_bill_versions(ids, persist_expiring=persist_expiring) is None:  # keeps records from aging out
+        return None
+    records = await redis.get_bill_versions(ids)
+    if records is None:
+        return None
+    return ledger_findings(ledger, records, delete_orphans=delete_orphans), complete, len(ledger)
+
+
+async def _reconcile_from_ledger(
+    jurisdiction: str, redis, embedder: KnowledgeBaseEmbedder, totals: dict, *, max_bills: int,
+    delete_orphans: bool, api_base: str, api_key: str,
+) -> dict | None:
+    """SYNC-95: one loop over what api-v3 says should be embedded versus what this path recorded, in place
+    of the watermark's touched list and the unrecorded-bill pass: it finds a document that is missing, one
+    whose source row changed, and (with `delete_orphans`) one api-v3 no longer lists, without a watermark.
+    Reads each bill that disagrees and lets `embed_bill` decide what to write (it compares hashes, so a
+    changed `updated_at` with the same text writes nothing but the new stamp). At most `max_bills` bills
+    are attempted per run, a random slice when more disagree, so a bill that fails every time cannot
+    hold a slot forever; a fixed bill drops out and later runs reach the rest. Returns None when the ledger
+    could not be read (the caller falls back to the touched pass); a bill that fails is counted, not raised."""
+    work = await _ledger_work(jurisdiction, redis, api_base=api_base, api_key=api_key, delete_orphans=delete_orphans)
+    if work is None:
+        logger.warning("knowledge_base_ledger_unavailable", jurisdiction=jurisdiction)
+        return None
+    findings, complete, listed = work
+    pending = list(findings)
+    chosen = pending if len(pending) <= max_bills else random.sample(pending, max_bills)
+    result: dict[str, Any] = {
+        "listed": listed, "listing_complete": complete, "bills_to_check": len(pending), "selected": len(chosen),
+        "missing_documents": sum(f["missing"] for f in findings.values()),
+        "changed_documents": sum(f["changed"] for f in findings.values()),
+        "orphaned_documents": sum(f["orphaned"] for f in findings.values()), "failed": 0,
+    }
+    if len(pending) > len(chosen):
+        logger.warning("knowledge_base_reconcile_backlog", jurisdiction=jurisdiction,
+                       remaining=len(pending) - len(chosen), cap=max_bills)
+    for ocd_bill_id in chosen:
+        budget = max(0, MAX_ORPHAN_DOCUMENTS_PER_RUN - totals["orphans"]) if delete_orphans else None
+        totals["bills"] += 1
+        try:
+            stats = await _fetch_and_embed(embedder, jurisdiction, ocd_bill_id, api_base=api_base,
+                                           api_key=api_key, max_orphans=budget)
+        except Exception as e:  # noqa: BLE001 -- one bad bill must not stop the pass
+            result["failed"] += 1
+            logger.warning("knowledge_base_reconcile_bill_failed", jurisdiction=jurisdiction,
+                           ocd_bill_id=ocd_bill_id, error=str(e))
+            continue
+        for k in ("documents", "diffs", "chunks", "orphans", "orphans_over_budget"):
+            totals[k] += stats[k]
+        if stats["undone"]:
+            result["failed"] += 1
+    return result
+
+
 async def embed_archived_bills(
     jurisdiction: str,
     archive_started_at: datetime,
@@ -585,6 +697,7 @@ async def embed_archived_bills(
     embedder: KnowledgeBaseEmbedder | None = None,
     reconcile_max_bills: int = 0,
     delete_orphans: bool = False,
+    ledger_max_bills: int = 0,
 ) -> dict:
     """Embed every bill whose archived documents changed since the last run that left nothing
     undone (or `archive_started_at` when there is none). Never raises for a per-bill problem.
@@ -601,7 +714,12 @@ async def embed_archived_bills(
     documents api-v3 no longer returns for a bill the run touches. `totals["orphans"]` counts them. The
     run never deletes more than `MAX_ORPHAN_DOCUMENTS_PER_RUN` documents in total (each bill is given
     only what is left of that budget); the rest stay recorded, `totals["orphans_over_budget"]` counts them,
-    and `knowledge_base_orphan_removal_paused` is logged once."""
+    and `knowledge_base_orphan_removal_paused` is logged once.
+
+    `ledger_max_bills` > 0 (SYNC-95, `knowledge_base_embedding.ledger.max_bills_per_run`) replaces all of the
+    above with one reconcile against api-v3's ledger (`_reconcile_from_ledger`): no watermark is read or
+    written, and `reconcile_max_bills` is not used. It falls back to the watermark path when the ledger
+    cannot be read."""
     redis = get_redis_store()
     totals: dict[str, Any] = {
         "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0, "orphans": 0,
@@ -612,6 +730,25 @@ async def embed_archived_bills(
         logger.warning("knowledge_base_embedding_work_left_undone", jurisdiction=jurisdiction,
                        undone=["Redis unavailable; nothing embedded this run"])
         return totals
+
+    if ledger_max_bills > 0:
+        embedder = embedder or KnowledgeBaseEmbedder(settings)
+        outcome = await _reconcile_from_ledger(
+            jurisdiction, redis, embedder, totals, max_bills=ledger_max_bills, delete_orphans=delete_orphans,
+            api_base=api_base, api_key=api_key,
+        )
+        if outcome is not None:
+            totals["ledger"] = outcome
+            totals["failed_bills"] = outcome["failed"]
+            # Complete only when the whole ledger was read and nothing disagreeing was left (over the cap or failed).
+            totals["complete"] = (outcome["listing_complete"] and outcome["failed"] == 0
+                                  and outcome["selected"] == outcome["bills_to_check"])
+            if totals["orphans_over_budget"]:
+                logger.warning("knowledge_base_orphan_removal_paused", jurisdiction=jurisdiction, removed=totals["orphans"],
+                               left_recorded=totals["orphans_over_budget"], cap=MAX_ORPHAN_DOCUMENTS_PER_RUN)
+            (logger.info if totals["complete"] else logger.warning)("knowledge_base_embedding_run", mode="ledger", **totals)
+            return totals
+        # api-v3 has no ledger yet (or it failed): carry on with the watermark path below, as before.
 
     since = archive_started_at
     previous = await redis.get_kb_embed_watermark(jurisdiction)

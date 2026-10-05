@@ -1151,3 +1151,47 @@ async def fetch_bill_for_embedding(
     return await _get_json_with_retry(
         f"{api_base}/bills/ocd-bill/{ocd_bill_id}", params, headers, {"ocd_bill_id": ocd_bill_id}
     )
+
+
+_LEDGER_PAGE_LIMIT = 500  # api-v3's maximum bills per ledger page
+
+
+async def list_embedding_ledger(
+    jurisdiction_iso2: str, *, api_base: str, api_key: str = ""
+) -> tuple[dict[str, dict[str, str | None]], bool] | None:
+    """SYNC-95 / OPEN-319: what api-v3 says the embedder should have written for every bill of a
+    jurisdiction that has archived documents: `{bare ocd_bill_id: {archived_document_id (str):
+    updated_at (ISO string, or None when the row has none)}}`, from `GET /ddp/embedding/ledger`, which
+    chooses each row with the same picker as the bill detail.
+
+    Returns `(ledger, complete)`: `complete` is False when a later page failed (the ledger is then a
+    partial list, so "not on it" proves nothing). Returns None when nothing could be read, including an
+    api-v3 that does not have the endpoint yet (a 404 is a failed read here). Never raises. Not capped,
+    for the same reason as `list_touched_bill_ids`."""
+    if not api_base:
+        return None
+    headers = {"x-api-key": api_key} if api_key else {}
+    ledger: dict[str, dict[str, str | None]] = {}
+    after: str | None = None
+    while True:
+        params = {"jurisdiction": jurisdiction_iso2.lower(), "limit": str(_LEDGER_PAGE_LIMIT)}
+        if after:
+            params["after"] = after
+        data = await _get_json_with_retry(
+            f"{api_base}/ddp/embedding/ledger", params, headers,
+            {"jurisdiction": jurisdiction_iso2, "after": after},
+        )
+        results = data.get("results") if data else None
+        if not isinstance(results, list):
+            return (ledger, False) if ledger else None
+        for bill in results:
+            try:
+                ledger[bill["ocd_bill_id"]] = {
+                    str(d["archived_document_id"]): d.get("updated_at") for d in bill["documents"]
+                }
+            except (KeyError, TypeError, AttributeError):
+                logger.warning("api-v3 returned a malformed ledger entry", jurisdiction=jurisdiction_iso2)
+                return (ledger, False) if ledger else None  # a bill we cannot read, we cannot vouch for
+        after = data.get("next_after")
+        if not after:
+            return ledger, True

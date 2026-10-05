@@ -142,6 +142,12 @@ spend is per bill (a federal bill can be hundreds of thousands of tokens); turn 
 watch for `knowledge_base_reconcile_backlog`. The version cache is now the record of what is embedded:
 its knowledge-base entries no longer expire.
 
+`knowledge_base_embedding.ledger.max_bills_per_run: N` (SYNC-95, needs api-v3 OPEN-319's
+`GET /ddp/embedding/ledger`; ships at `0`) replaces both of the above with one reconcile against api-v3's
+own list of the documents each bill should have: a missing document, a source row that changed, and (with
+`delete_orphans`) a document no longer listed are all found on every run, with no watermark. Up to N bills
+are attempted per run. Dry-run it with `POST /trigger/knowledge-base-reconcile/{jurisdiction}?ledger=true`.
+
 New setting: `KNOWLEDGE_BASE_INDEX_NAME` (env, default unset = disabled; per host, never on the
 votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
 `ddp:bill_version:organization:{id}` (organizations),
