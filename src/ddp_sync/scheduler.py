@@ -588,8 +588,10 @@ class UpdateScheduler:
         }
 
         # --- patch refresh ---
+        # OPEN-320: env flag ANDs with the shared YAML gate, same pattern as the scrape/archive
+        # flags above -- the YAML is identical on every host, so it cannot opt one host out.
         patch_cfg = config.get("patch_refresh", {})
-        if patch_cfg.get("enabled", True):
+        if self.settings.openstates_patch_refresh_enabled and patch_cfg.get("enabled", True):
             ph, pm = map(int, patch_cfg.get("sync_time_utc", "01:00").split(":"))
 
             async def _patch_refresh_wrapper():

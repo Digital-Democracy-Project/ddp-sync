@@ -180,6 +180,9 @@ class SyncSettings:
     api_health_check_enabled: bool = True
     openstates_scrape_enabled: bool = True
     openstates_archive_enabled: bool = True
+    # OPEN-320: apply-local-patches.sh refreshes the Mac's live editable openstates checkouts; a
+    # host that scrapes through baked-in Fargate images has none, so opts out here.
+    openstates_patch_refresh_enabled: bool = True
     mi_cookie_publish_enabled: bool = True
     session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
@@ -595,6 +598,7 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "api_health_check_enabled": "API_HEALTH_CHECK_ENABLED",
     "openstates_scrape_enabled": "OPENSTATES_SCRAPE_ENABLED",
     "openstates_archive_enabled": "OPENSTATES_ARCHIVE_ENABLED",
+    "openstates_patch_refresh_enabled": "OPENSTATES_PATCH_REFRESH_ENABLED",
     "mi_cookie_publish_enabled": "MI_COOKIE_PUBLISH_ENABLED",
     "session_pipeline_batch_enabled": "SESSION_PIPELINE_BATCH_ENABLED",
     "grantbot_scrape_enabled": "GRANTBOT_SCRAPE_ENABLED",
