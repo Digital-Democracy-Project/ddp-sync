@@ -120,6 +120,18 @@ class KnowledgeBaseEmbedder:
         self.pipeline = pipeline or IngestionPipeline(self.settings)
         self.redis = redis_store or get_redis_store()
 
+    async def _delete_document_vectors(self, key: str, chunks: int) -> int:
+        """Delete the `chunks` vectors this path recorded for one document, by exact id
+        (`<key>-chunk-<n>`); never a metadata scan or a prefix, so only vectors we wrote are touched.
+        Not `delete_surplus_chunks`, whose guard refuses a delete down to zero chunks. Raises on a
+        Pinecone failure; the caller leaves the record in place so the next run tries again."""
+        if not chunks:
+            return 0
+        from ddp_sync.services.vector_store import VectorStoreService
+
+        await VectorStoreService(self.settings).delete(ids=[f"{key}-chunk-{i}" for i in range(chunks)])
+        return chunks
+
     async def _ingest(self, key: str, content: str, metadata: DocumentMetadata, old_chunks: int) -> int:
         """Ingest one document, then drop chunks a shrunken document no longer has. Returns the
         chunk count; raises RuntimeError on any failure so the caller leaves the cache alone."""
@@ -202,7 +214,8 @@ class KnowledgeBaseEmbedder:
         return ((fresh.get("documents") or {}).get(archive_id) or {}).get(field)
 
     async def embed_bill(
-        self, ocd_bill_id: str, jurisdiction: str, bill: dict, scope: EmbedScope = SCOPE_ALL
+        self, ocd_bill_id: str, jurisdiction: str, bill: dict, scope: EmbedScope = SCOPE_ALL,
+        *, delete_orphans: bool = False,
     ) -> dict:
         """Embed whatever of `bill` (an api-v3 detail response with versions and sources) is
         not yet embedded, limited to `scope`. Returns a stats dict; `undone` lists what could not
@@ -211,9 +224,15 @@ class KnowledgeBaseEmbedder:
         entry after this call read it; they are left to that writer, never overwritten (SYNC-90).
         The re-read narrows that race to the moment between it and the upsert; it is not atomic
         across Pinecone and Redis, and a residual mismatch is healed by the next pass, which compares
-        the cached hash with api-v3's current text."""
+        the cached hash with api-v3's current text.
+
+        `delete_orphans` (SYNC-95): also delete the vectors of any document this path recorded for the
+        bill whose archived document id api-v3 no longer lists for it at all (the picker re-chose a
+        different row, or the version was removed). `stats["orphans"]` counts the documents removed.
+        A version api-v3 still lists but has no text for is NOT an orphan, and a response that lists no
+        archived ids at all removes nothing."""
         stats: dict[str, Any] = {
-            "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0,
+            "ocd_bill_id": ocd_bill_id, "documents": 0, "diffs": 0, "orphans": 0,
             "chunks": 0, "chars": 0, "no_text_yet": 0, "raced": 0, "undone": [],
         }
         cache = await self.redis.get_bill_version(ocd_bill_id) or {}
@@ -313,7 +332,20 @@ class KnowledgeBaseEmbedder:
             if stage != STAGE_UNKNOWN:
                 previous = {"archive_id": archive_id, "note": note, "date": date}
 
-        if not stats["undone"] and updates:
+        removed: set[str] = set()
+        if delete_orphans:
+            listed_ids = {str(v["archived_document_id"]) for v in versions if v.get("archived_document_id") is not None}
+            for aid in ([a for a in docs if a not in listed_ids] if listed_ids else []):
+                recorded = docs[aid]
+                try:
+                    await self._delete_document_vectors(text_document_key(ocd_bill_id, aid), recorded.get("chunks", 0))
+                    await self._delete_document_vectors(diff_document_key(ocd_bill_id, aid), recorded.get("diff_chunks", 0))
+                except Exception as e:  # noqa: BLE001 -- recorded as undone; the record stays so the next run retries
+                    stats["undone"].append(f"{ocd_bill_id}: orphaned document {aid} not removed: {e}")
+                    continue
+                removed.add(aid)
+                stats["orphans"] += 1
+        if not stats["undone"] and (updates or removed):
             # Advanced last: every Pinecone write for this bill has succeeded. Merged onto a fresh
             # read so another writer's entries for OTHER documents are kept, not clobbered.
             latest = await self.redis.get_bill_version(ocd_bill_id)
@@ -326,6 +358,8 @@ class KnowledgeBaseEmbedder:
                 merged_docs = {k: dict(v) for k, v in (latest.get("documents") or {}).items()}
                 for aid, fields in updates.items():
                     merged_docs.setdefault(aid, {}).update(fields)
+                for aid in removed:
+                    merged_docs.pop(aid, None)
                 written = await self.redis.set_bill_version(ocd_bill_id, {
                     "schema": CACHE_SCHEMA, "documents": merged_docs,
                     "last_checked": datetime.now(timezone.utc).isoformat(),
@@ -350,6 +384,10 @@ _CHARS_PER_TOKEN = 4
 _CHUNKS_PER_1000_CHARS = 0.279
 _USD_PER_MILLION_TOKENS = 0.13
 RECONCILE_PLAN_SAMPLE = 20  # bills read to estimate the size of the rest
+
+# A circuit breaker for orphan removal: if one run finds more orphaned documents than this, something systematic
+# changed (say, api-v3 started returning ids in a different form) and deleting on would wipe real vectors.
+MAX_ORPHAN_DOCUMENTS_PER_RUN = 200
 
 
 def _embeddable_size(bill: dict) -> tuple[int, int]:
@@ -443,14 +481,15 @@ async def plan_reconcile(
 
 
 async def _fetch_and_embed(
-    embedder: KnowledgeBaseEmbedder, jurisdiction: str, ocd_bill_id: str, *, api_base: str, api_key: str
+    embedder: KnowledgeBaseEmbedder, jurisdiction: str, ocd_bill_id: str, *, api_base: str, api_key: str,
+    delete_orphans: bool = False,
 ) -> dict:
     """Read one bill from api-v3 and embed whatever of it is not yet embedded. Raises on a read
     failure; the caller records that bill as failed and carries on."""
     bill = await local_openstates_client.fetch_bill_for_embedding(ocd_bill_id, api_base=api_base, api_key=api_key)
     if bill is None:
         raise RuntimeError("bill detail could not be read from api-v3")
-    return await embedder.embed_bill(ocd_bill_id, jurisdiction, bill)
+    return await embedder.embed_bill(ocd_bill_id, jurisdiction, bill, delete_orphans=delete_orphans)
 
 
 async def _reconcile_unembedded(
@@ -529,6 +568,7 @@ async def embed_archived_bills(
     api_key: str = "",
     embedder: KnowledgeBaseEmbedder | None = None,
     reconcile_max_bills: int = 0,
+    delete_orphans: bool = False,
 ) -> dict:
     """Embed every bill whose archived documents changed since the last run that left nothing
     undone (or `archive_started_at` when there is none). Never raises for a per-bill problem.
@@ -539,10 +579,14 @@ async def embed_archived_bills(
     embeds up to that many bills the version cache has no record of; 0 (the default) skips that pass.
     Its outcome is in `totals["reconcile"]` and never affects `complete` or the watermark (`complete`
     describes the touched pass only): a bill it fails on keeps no record, so a later reconcile finds
-    it again."""
+    it again.
+
+    `delete_orphans` (SYNC-95, `knowledge_base_embedding.delete_orphans`) removes the vectors of
+    documents api-v3 no longer lists for a bill the run touches. `totals["orphans"]` counts them; after
+    `MAX_ORPHAN_DOCUMENTS_PER_RUN` the run stops deleting and warns."""
     redis = get_redis_store()
     totals: dict[str, Any] = {
-        "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0,
+        "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0, "orphans": 0,
         "chunks": 0, "failed_bills": 0, "complete": False,
     }
     if not redis.is_available:
@@ -569,16 +613,23 @@ async def embed_archived_bills(
     bill_ids, complete = listed
 
     embedder = embedder or KnowledgeBaseEmbedder(settings)
+    breaker_warned = False
     for ocd_bill_id in bill_ids:
         totals["bills"] += 1
+        allow_orphans = delete_orphans and totals["orphans"] < MAX_ORPHAN_DOCUMENTS_PER_RUN
+        if delete_orphans and not allow_orphans and not breaker_warned:
+            breaker_warned = True
+            logger.warning("knowledge_base_orphan_removal_paused", jurisdiction=jurisdiction,
+                           removed=totals["orphans"], cap=MAX_ORPHAN_DOCUMENTS_PER_RUN)
         try:
-            stats = await _fetch_and_embed(embedder, jurisdiction, ocd_bill_id, api_base=api_base, api_key=api_key)
+            stats = await _fetch_and_embed(embedder, jurisdiction, ocd_bill_id, api_base=api_base,
+                                           api_key=api_key, delete_orphans=allow_orphans)
         except Exception as e:  # noqa: BLE001 -- one bad bill must not stop the run
             totals["failed_bills"] += 1
             logger.warning("knowledge_base_embedding_work_left_undone", jurisdiction=jurisdiction,
                            ocd_bill_id=ocd_bill_id, undone=[str(e)])
             continue
-        for k in ("documents", "diffs", "chunks"):
+        for k in ("documents", "diffs", "chunks", "orphans"):
             totals[k] += stats[k]
         if stats["undone"]:
             totals["failed_bills"] += 1

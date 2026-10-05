@@ -813,6 +813,12 @@ def _reconcile_max_bills(config: dict | None) -> int:
     return value
 
 
+def _delete_orphans(config: dict | None) -> bool:
+    """SYNC-95: `knowledge_base_embedding.delete_orphans`. Only a literal `true` turns it on: it deletes
+    vectors, so a quoted "false", a stray string or a typo must not enable it."""
+    return ((config or {}).get("knowledge_base_embedding") or {}).get("delete_orphans") is True
+
+
 async def _maybe_embed_knowledge_base(
     jurisdiction: str,
     archive_started_at: datetime,
@@ -849,6 +855,7 @@ async def _maybe_embed_knowledge_base(
         api_base=api_base,
         api_key=api_key,
         reconcile_max_bills=_reconcile_max_bills(config),
+        delete_orphans=_delete_orphans(config),
     )
 
 
