@@ -802,6 +802,17 @@ def _knowledge_base_embedding_eligible(jurisdiction: str, config: dict | None) -
     return jurisdiction.lower() in {str(j).lower() for j in block.get("jurisdictions", [])}
 
 
+def _reconcile_max_bills(config: dict | None) -> int:
+    """SYNC-95: `knowledge_base_embedding.reconcile.max_bills_per_run`. 0, absent or anything that is
+    not a non-negative whole number means the reconcile pass is off: a yaml typo must not spend money."""
+    block = ((config or {}).get("knowledge_base_embedding") or {}).get("reconcile") or {}
+    value = block.get("max_bills_per_run", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        logger.warning("knowledge_base_reconcile_bad_cap", value=value)
+        return 0
+    return value
+
+
 async def _maybe_embed_knowledge_base(
     jurisdiction: str,
     archive_started_at: datetime,
@@ -837,6 +848,7 @@ async def _maybe_embed_knowledge_base(
         settings=settings,
         api_base=api_base,
         api_key=api_key,
+        reconcile_max_bills=_reconcile_max_bills(config),
     )
 
 

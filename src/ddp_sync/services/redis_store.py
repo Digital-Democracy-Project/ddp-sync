@@ -285,29 +285,75 @@ class RedisStore:
 
     # -- Bill version tracking --
 
-    async def set_bill_version(self, webflow_id: str, version_data: dict) -> bool:
+    async def set_bill_version(
+        self, webflow_id: str, version_data: dict, *, persistent: bool = False, only_if_absent: bool = False
+    ) -> bool:
         """Store last-ingested version info for a bill.
 
         Args:
             webflow_id: cache key suffix -- the Webflow item ID for the legacy path, the bare
                 `ocd_bill_id` for the SYNC-83 knowledge-base path (same prefix, disjoint keys)
             version_data: Dict with version_date, version_note, text_url, media_type, last_checked
+            persistent: no expiry (SYNC-95). The knowledge-base path sets it: its entries are the
+                record of which bills are embedded, so they must not age out after 90 days (an
+                aged-out entry would make an untouched, already-embedded bill look never embedded).
+            only_if_absent: write only when no entry exists (one atomic SET NX), so a record another
+                writer created in the meantime is never replaced (SYNC-95's "nothing to embed" marker).
 
-        Returns True when the value was written; False when Redis is down or the write failed
-        (legacy callers ignore it; SYNC-83 needs to know).
+        Returns True when the value was written; False when Redis is down, the write failed, or (with
+        `only_if_absent`) an entry already existed (legacy callers ignore it; SYNC-83 needs to know).
         """
         if not self._client:
             return False
         try:
-            await self._client.set(
+            written = await self._client.set(
                 f"{BILL_VERSION_PREFIX}{webflow_id}",
                 json.dumps(version_data),
-                ex=BILL_VERSION_TTL,
+                ex=None if persistent else BILL_VERSION_TTL,
+                nx=only_if_absent,
             )
-            return True
+            return bool(written) if only_if_absent else True
         except Exception as e:
             logger.error("Redis: failed to set bill version", webflow_id=webflow_id, error=str(e))
             return False
+
+    async def find_unrecorded_bill_versions(self, ids: list[str]) -> list[str] | None:
+        """SYNC-95: of the bare `ocd_bill_id`s in `ids`, those with no `ddp:bill_version:<id>` entry,
+        i.e. bills the knowledge-base embedder has no record of. Order is kept.
+
+        Returns None (never an empty or full list) when Redis is down or a read failed, so a caller
+        cannot mistake an outage for "nothing is embedded" and re-embed everything.
+
+        Entries that exist but still carry the legacy 90-day expiry (written before the knowledge-base
+        path made them persistent) are made persistent in the same pass: this cache is the record, and
+        it must not decay into false "never embedded" answers."""
+        if not self._client:
+            return None
+        missing: list[str] = []
+        try:
+            for start in range(0, len(ids), 1000):
+                chunk = ids[start:start + 1000]
+                async with self._client.pipeline(transaction=False) as pipe:
+                    for bill_id in chunk:
+                        pipe.ttl(f"{BILL_VERSION_PREFIX}{bill_id}")
+                    ttls = await pipe.execute()
+                expiring = []
+                for bill_id, ttl in zip(chunk, ttls):
+                    if ttl == -2:  # no such key
+                        missing.append(bill_id)
+                    elif ttl >= 0:  # has an expiry (-1 means it already has none)
+                        expiring.append(bill_id)
+                if expiring:
+                    # A key that expired since the TTL read just makes PERSIST a no-op; the next pass
+                    # finds it missing, which is the right answer for it.
+                    async with self._client.pipeline(transaction=False) as pipe:
+                        for bill_id in expiring:
+                            pipe.persist(f"{BILL_VERSION_PREFIX}{bill_id}")
+                        await pipe.execute()
+        except Exception as e:  # noqa: BLE001 -- unknown, not 'all missing': the caller skips the pass
+            logger.error("Redis: failed to check bill version records", error=str(e))
+            return None
+        return missing
 
     async def get_bill_version(self, webflow_id: str) -> dict | None:
         """Retrieve last-ingested version info for a bill.
