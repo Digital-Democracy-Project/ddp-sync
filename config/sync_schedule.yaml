@@ -801,9 +801,13 @@ openstates_archive:
     # the ddp:kb_embed:since:* watermark is neither read nor written. Up to this many bills ATTEMPTED per run
     # (a random slice when more disagree). 0 = off (the watermark path above, plus `reconcile`, stay in force).
     # If api-v3 has no ledger the run falls back to that path and logs knowledge_base_ledger_unavailable. Dry-run
-    # it first with POST /trigger/knowledge-base-reconcile/{jurisdiction}.
+    # it first with POST /trigger/knowledge-base-reconcile/{jurisdiction}?ledger=true.
+    # 1000000 (set 2026-10-05 on the EC2 broker host at the operator's request) is "no cap": far above any jurisdiction
+    # (the US has about 38,800 bills), so every bill that disagrees is attempted each run until Pinecone matches
+    # Postgres. With no cap the random slice no longer protects against a bill that fails every time; it is simply counted
+    # failed on each run. Only the host with KNOWLEDGE_BASE_INDEX_NAME acts on this; the Mac's hook returns first.
     ledger:
-      max_bills_per_run: 0
+      max_bills_per_run: 1000000
     # SYNC-95: post to Slack (#automation-errors, like the archive failure alert) when a run is not converging: the ledger
     # could not be read and the run used the watermark path instead, or more than this many bills were still out of step
     # after a ledger run (over the per-run cap, or failed). 0 = off. Checked once per archive run per jurisdiction.
