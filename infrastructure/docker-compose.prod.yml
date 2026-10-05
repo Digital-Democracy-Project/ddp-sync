@@ -80,13 +80,13 @@ services:
       # canary, not general OpenStates archive/MI-cookie maintenance. Flagged back on
       # notes/ops-handoff in case that call should go the other way.
       - OPENSTATES_ARCHIVE_ENABLED=false
+      - MI_COOKIE_PUBLISH_ENABLED=false
       # OPEN-320: patch refresh runs apply-local-patches.sh, which keeps the Mac's LIVE editable
       # openstates checkouts on their forks' main. This host scrapes through baked-in Fargate
       # images, so there is no such checkout -- and the script hardcodes the Mac's paths, so it
       # failed (and alerted) every night at 01:00 UTC. Opt out regardless of the scrape flag
       # above, which can be flipped independently.
       - OPENSTATES_PATCH_REFRESH_ENABLED=false
-      - MI_COOKIE_PUBLISH_ENABLED=false
     volumes:
       # config/sync_schedule.yaml is never baked into the image (Dockerfile only COPYs
       # pyproject.toml + src/) -- mounted read-only instead so an ordinary git pull on the host
