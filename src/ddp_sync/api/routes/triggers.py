@@ -1133,7 +1133,8 @@ async def trigger_knowledge_base_backfill(
     the log line `knowledge_base_backfill_dry_run`, not in this response, because a real run lasts
     hours. Defaults to `dry_run=true`.
 
-    stage: one of current, diffs, prior-sessions, history; omit to run them all in order
+    stage: one of current, diffs, prior-sessions, history; omit to run current, prior-sessions and history in
+    order (`diffs` is valid but never in the default: version diffs are not embedded, 2026-10-05)
     (finished stages are skipped, interrupted ones resume from their checkpoint).
     restart: forget the checkpoint(s) and walk from the start.
 
@@ -1143,6 +1144,7 @@ async def trigger_knowledge_base_backfill(
     """
     from ddp_sync.config import get_settings, knowledge_base_settings
     from ddp_sync.pipelines.knowledge_base_backfill import (
+        DEFAULT_STAGES,
         STAGES,
         lock_holder,
         run_knowledge_base_backfill,
@@ -1199,7 +1201,7 @@ async def trigger_knowledge_base_backfill(
         "status": "started",
         "run_id": run_id,
         "jurisdiction": jurisdiction,
-        "stages": [stage] if stage else list(STAGES),
+        "stages": [stage] if stage else list(DEFAULT_STAGES),
         "dry_run": dry_run,
         "restart": restart,
     }
@@ -1249,6 +1251,59 @@ async def trigger_vote_person_backfill(
         run_id=run_id,
     )
     return {"status": "started", "run_id": run_id, "mode": mode}
+
+
+@router.post("/trigger/knowledge-base-reconcile/{jurisdiction}", status_code=202)
+async def trigger_knowledge_base_reconcile_plan(
+    jurisdiction: str,
+    background_tasks: BackgroundTasks,
+    ledger: bool = False,
+    token: str = Depends(api_key_auth),
+):
+    """SYNC-95: the dry run of the reconcile pass for one jurisdiction. It always plans and never
+    writes: it lists the jurisdiction's archived bills, counts the ones the Redis version cache has no
+    record of, samples a few to estimate the documents, chunks, tokens and dollars they would cost, and
+    logs the result as `knowledge_base_reconcile_plan` (like the backfill's dry run, the numbers land in
+    the log, not in this 202). The real pass is the post-archive hook's, switched on by
+    `openstates_archive.knowledge_base_embedding.reconcile.max_bills_per_run`.
+
+    404 for a jurisdiction not enrolled in `knowledge_base_embedding.jurisdictions`; 503 when
+    `KNOWLEDGE_BASE_INDEX_NAME` or the read api is not configured on this host.
+
+    `ledger=true` plans the api-v3 ledger reconcile instead (`knowledge_base_embedding.ledger`): the bills
+    whose documents are missing, changed or (if `delete_orphans` is on) orphaned, rather than the ones with
+    no record. Needs api-v3's `/ddp/embedding/ledger` (OPEN-319); without it the plan reports
+    `ledger_unavailable`."""
+    import uuid
+
+    from ddp_sync.config import get_settings, knowledge_base_settings
+    from ddp_sync.pipelines.knowledge_base_embedding import plan_reconcile, read_target
+    from ddp_sync.pipelines.openstates_archive import _delete_orphans, _mac_capable
+    from ddp_sync.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    enrolled = {str(j).lower() for j in (config.get("knowledge_base_embedding") or {}).get("jurisdictions", [])}
+    if jurisdiction.lower() not in enrolled:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{jurisdiction}' is not enrolled in knowledge_base_embedding.jurisdictions: {sorted(enrolled)}",
+        )
+    settings = get_settings()
+    if not settings.knowledge_base_index_name:
+        raise HTTPException(status_code=503, detail="KNOWLEDGE_BASE_INDEX_NAME is not set on this host")
+    try:
+        knowledge_base_settings(settings)  # refuses the legacy index here, not silently in the background
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    api_base, api_key = read_target(settings, mac_capable=_mac_capable())
+    if not api_base:
+        raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")
+
+    run_id = f"{jurisdiction}-kb-reconcile-plan-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(plan_reconcile, jurisdiction.lower(), api_base=api_base, api_key=api_key, run_id=run_id,
+                              use_ledger=ledger, delete_orphans=_delete_orphans(config))
+    return {"status": "started", "run_id": run_id, "jurisdiction": jurisdiction, "dry_run": True, "ledger": ledger}
 
 
 @router.post("/trigger/knowledge-base-entities/{entity}", status_code=202)

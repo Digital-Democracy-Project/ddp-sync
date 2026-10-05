@@ -128,10 +128,26 @@ Gate column); the backfill and organizations are manual. See `CLAUDE.md` for the
 
 | Piece | What it does | Gate |
 |---|---|---|
-| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text and version diffs | `openstates_archive.knowledge_base_embedding.enabled` (on in the checked-in file since 2026-10-05) **and** `KNOWLEDGE_BASE_INDEX_NAME` (the real per-host gate: set only on the EC2 broker host) |
+| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text (no version diffs, no votes) | `openstates_archive.knowledge_base_embedding.enabled` (on in the checked-in file since 2026-10-05) **and** `KNOWLEDGE_BASE_INDEX_NAME` (the real per-host gate: set only on the EC2 broker host) |
 | Search refresh (SYNC-87) | After a jurisdiction's archive: `POST /ddp/search/refresh` on the RDS-backed api-v3 until drained | `openstates_archive.bill_search_refresh.enabled` (on in the checked-in file since 2026-10-05), plus `RDS_OPENSTATES_API_BASE`/`_KEY` (the real per-host gate) |
-| Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: four stages (current, diffs, prior-sessions, history), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
+| Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: three default stages (current, prior-sessions, history; a `diffs` stage exists but is not run), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
+| Reconcile plan (SYNC-95) | `POST /trigger/knowledge-base-reconcile/{jurisdiction}`: the dry run of the reconcile pass. Counts the archived bills the Redis version cache has no record of and estimates their documents, chunks, tokens and dollars from a sample of 20; writes nothing; the result is the log line `knowledge_base_reconcile_plan` | manual; always a dry run |
 | Organizations (SYNC-91) | `POST /trigger/knowledge-base-entities/organizations`; read from ddp-broker-py `/api/organizations/` (BROKER-144). Legislators are not embedded (SYNC-94) | manual; `dry_run=true` default |
+
+**Reconcile (SYNC-95, off by default).** The embedding hook only lists bills archived or changed since a
+watermark, so a bill nobody has touched since it was archived (a newly enrolled state, a gap after a
+Pinecone or Redis problem) is never embedded by it. `openstates_archive.knowledge_base_embedding.
+reconcile.max_bills_per_run: N` also embeds up to N bills per run (a random slice, bills attempted) that the Redis version cache has no
+record of, the way the LegBot pipeline dispatches only what is missing. It ships at `0` (off) because
+spend is per bill (a federal bill can be hundreds of thousands of tokens); turn it on deliberately and
+watch for `knowledge_base_reconcile_backlog`. The version cache is now the record of what is embedded:
+its knowledge-base entries no longer expire.
+
+`knowledge_base_embedding.ledger.max_bills_per_run: N` (SYNC-95, needs api-v3 OPEN-319's
+`GET /ddp/embedding/ledger`; ships at `0`) replaces both of the above with one reconcile against api-v3's
+own list of the documents each bill should have: a missing document, a source row that changed, and (with
+`delete_orphans`) a document no longer listed are all found on every run, with no watermark. Up to N bills
+are attempted per run. Dry-run it with `POST /trigger/knowledge-base-reconcile/{jurisdiction}?ledger=true`.
 
 New setting: `KNOWLEDGE_BASE_INDEX_NAME` (env, default unset = disabled; per host, never on the
 votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
@@ -191,6 +207,7 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/webflow/{job}` | Trigger specific Webflow batch job |
 | POST | `/trigger/openstates-scrape/{target}` | Trigger an OpenStates scrape job immediately (returns 202, runs in background) |
 | POST | `/trigger/knowledge-base-backfill/{jurisdiction}` | SYNC-90: staged, resumable backfill of the `ddp-knowledge-base` index (`stage=`, `dry_run=true` default, `restart=`); 202, results in the log |
+| POST | `/trigger/knowledge-base-reconcile/{jurisdiction}` | SYNC-95: dry run of the reconcile pass (unrecorded bills and an estimated cost from a sample); 202, result in the log as `knowledge_base_reconcile_plan` |
 | POST | `/trigger/knowledge-base-entities/organizations` | SYNC-91: embed organizations into `ddp-knowledge-base` (`dry_run=true` default); 202, totals in the log. Any other entity, including `legislators`, is a 404 (SYNC-94) |
 
 `/trigger/openstates-scrape/{target}` — valid targets: `patches`, `fl`, `wa`, `usa`, `secondary`, `people`, `va`, `mi`, `ma`, `ut`, `az`

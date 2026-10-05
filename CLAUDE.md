@@ -375,7 +375,7 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
 
 **Rules that are easy to break**
 - **One embedding path.** Everything goes through `KnowledgeBaseEmbedder`
-  (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version, diffs; never votes, SYNC-94),
+  (`pipelines/knowledge_base_embedding.py`): `embed_bill` (text per version; never votes (SYNC-94) and, since 2026-10-05, no diffs by default),
   `embed_entity` (an organization), narrowed by `EmbedScope`. The live post-archive hook
   and the staged backfill share it so they cannot diverge. **Do not write a second path** to the index
   or call Pinecone from a pipeline; add a stage or a document kind to the embedder instead.
@@ -386,7 +386,34 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   from the archived text in the OpenStates DB. Legislators are not embedded at all (SYNC-94, Ramon
   2026-10-02): their structured facts come from api-v3 directly and DDP has no narrative biography to
   embed. Nothing here reads Webflow, and no `BillArtifact`/changelog text is ever embedded (Ramon's decision, 2026-09-30).
-- **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
+- **The version cache is the record of what is embedded (SYNC-95).** `ddp:bill_version:<ocd_bill_id>`
+  entries are written with no expiry (`set_bill_version(..., persistent=True)`) and the optional
+  reconcile pass (`knowledge_base_embedding.reconcile.max_bills_per_run`, default off) treats "no entry"
+  as "never embedded". Do not give those entries a TTL again, or every bill untouched for 90 days would
+  look unembedded and be re-embedded and re-paid for. `RedisStore.find_unrecorded_bill_versions` returns
+  `None`, not a list, when Redis cannot answer: keep it that way, because an outage must never read as
+  "nothing is embedded". A Redis flush still makes everything look unembedded (the cap bounds the
+  cost); a durable record is the open design question on SYNC-95.
+- **Orphan removal deletes vectors; keep its guards (SYNC-95).** `knowledge_base_embedding.delete_orphans`
+  (off, literal `true` only) removes only vectors this path recorded, by exact id, for documents api-v3
+  no longer lists for a bill. Do not widen it to a prefix or metadata delete, do not treat "listed but
+  no text" as an orphan, and keep the per-run circuit breaker (`MAX_ORPHAN_DOCUMENTS_PER_RUN`): a
+  systematic change in how api-v3 returns document ids would otherwise delete real vectors en masse. The
+  budget is a hard cap (each bill gets only what is left of it), and each deletion re-reads the record and
+  skips a document another writer changed.
+- **Cache digests exclude timestamps.**- **The ledger pass replaces the watermark; it does not add a second one (SYNC-95 / OPEN-319).**
+  `knowledge_base_embedding.ledger.max_bills_per_run` (> 0; ships 0) makes the hook compare api-v3's
+  `GET /ddp/embedding/ledger` (per bill, the documents the embedder would write, each with the source
+  row's `updated_at`) with this path's own Redis records, and read only bills that disagree: a document
+  missing, a source row whose `updated_at` is not the one stamped on the record (`source_updated_at`), or
+  (with `delete_orphans`) a recorded document the ledger no longer lists. It reads and writes no
+  `ddp:kb_embed:since:*` key and ignores `reconcile`. `updated_at` only means "look again": `embed_bill`
+  compares the text hash, so a bulk update of rows costs reads, not embeddings. Never copy a bill's ledger
+  entry into the record without the text hash; the ledger says what should exist, only a hash says it is
+  embedded. The ledger needs api-v3 OPEN-319 deployed on the read host; without it the run logs
+  `knowledge_base_ledger_unavailable` and uses the watermark path. A bill whose every document vanished
+  from the ledger is not on it, so its record is not found this way (a known gap, kept out of scope).
+ `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
   with "now"; hashing it raw makes every entity look changed on every run (found while building
   SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.
 - **The cache race guard narrows a race; it does not close it.** `embed_bill` re-reads a document's

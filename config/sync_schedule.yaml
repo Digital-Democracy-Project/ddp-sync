@@ -773,7 +773,7 @@ openstates_archive:
       memory_prefix: "prod"
       max_wait_seconds: 43200   # 12h backstop, same reasoning as the scrape block's
   # SYNC-83 (PLAN-enterprise-search.md 5.6): embed the bills this archive run touched into the NEW
-  # `ddp-knowledge-base` Pinecone index (bill text per version, version diffs). Off until
+  # `ddp-knowledge-base` Pinecone index (bill text per version; no version diffs, no votes). Off until
   # BOTH `enabled` is true here AND the host's KNOWLEDGE_BASE_INDEX_NAME is set (SYNC-89) -- and the
   # api-v3 it reads must expose archived_document_id/version_stage/version_ordinal. The legacy
   # votebot-large path is unaffected either way.
@@ -784,6 +784,36 @@ openstates_archive:
     # Mac cannot double-embed. Do not set that variable on a second host.
     enabled: true
     jurisdictions: [fl, us, va, mi, wa, az, ut]
+    # SYNC-95: also embed bills the version cache has no record of (a bill nobody changed since it was
+    # archived is never "touched", so a new state or a gap would otherwise never be filled). Up to this
+    # many bills ATTEMPTED per run per jurisdiction, a random slice when more are missing; embedded bills
+    # drop out, so later runs reach the rest. 0 = off. Spend is per bill (a federal bill can be hundreds
+    # of thousands of tokens), so turn it on deliberately with a small number, after the dry run
+    # (POST /trigger/knowledge-base-reconcile/{jurisdiction} logs the unrecorded count and a cost estimate).
+    # Every enabled run also lists ALL of the jurisdiction's archived bills (the US is about 38,000,
+    # roughly 1,900 api-v3 pages) and checks each in Redis; that scan is not capped. Read
+    # `knowledge_base_reconcile_backlog`.
+    reconcile:
+      max_bills_per_run: 0
+    # SYNC-95 (needs api-v3 OPEN-319, GET /ddp/embedding/ledger, deployed): reconcile against api-v3's own list of
+    # the documents each bill should have instead of the watermark. A document that is missing, whose source row
+    # changed, or (with delete_orphans) is no longer listed, is found on every run with no per-jurisdiction state;
+    # the ddp:kb_embed:since:* watermark is neither read nor written. Up to this many bills ATTEMPTED per run
+    # (a random slice when more disagree). 0 = off (the watermark path above, plus `reconcile`, stay in force).
+    # If api-v3 has no ledger the run falls back to that path and logs knowledge_base_ledger_unavailable. Dry-run
+    # it first with POST /trigger/knowledge-base-reconcile/{jurisdiction}.
+    ledger:
+      max_bills_per_run: 0
+    # SYNC-95: post to Slack (#automation-errors, like the archive failure alert) when a run is not converging: the ledger
+    # could not be read and the run used the watermark path instead, or more than this many bills were still out of step
+    # after a ledger run (over the per-run cap, or failed). 0 = off. Checked once per archive run per jurisdiction.
+    alert_backlog_over: 0
+    # SYNC-95: delete the vectors of documents api-v3 no longer lists for a bill the run touches (the picker
+    # re-chose a different row, or a version was removed). Only vectors this path recorded, by exact id; a
+    # version api-v3 still returns with an id but no text is never an orphan; a run never deletes more than 200
+    # documents (the rest stay recorded, with a warning); a document another writer changed is skipped. Only a
+    # literal true enables it. Off until someone chooses.
+    delete_orphans: false
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
     # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
     # It pauses through this UTC window so it stays out of the 05:00 UTC archive start.

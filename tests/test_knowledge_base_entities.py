@@ -241,7 +241,7 @@ async def test_a_failed_write_is_counted_warned_and_retried_next_run():
 
 async def test_a_cache_write_failure_after_a_good_ingest_is_undone_and_rewritten_next_time():
     class _NoWrite(FakeRedis):
-        async def set_bill_version(self, key, data):
+        async def set_bill_version(self, key, data, **kwargs):
             return False
 
     emb, _, pipe = _embedder(redis=_NoWrite())
