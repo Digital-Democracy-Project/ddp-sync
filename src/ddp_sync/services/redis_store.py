@@ -317,7 +317,9 @@ class RedisStore:
             logger.error("Redis: failed to set bill version", webflow_id=webflow_id, error=str(e))
             return False
 
-    async def find_unrecorded_bill_versions(self, ids: list[str]) -> list[str] | None:
+    async def find_unrecorded_bill_versions(
+        self, ids: list[str], *, persist_expiring: bool = True
+    ) -> list[str] | None:
         """SYNC-95: of the bare `ocd_bill_id`s in `ids`, those with no `ddp:bill_version:<id>` entry,
         i.e. bills the knowledge-base embedder has no record of. Order is kept.
 
@@ -326,7 +328,8 @@ class RedisStore:
 
         Entries that exist but still carry the legacy 90-day expiry (written before the knowledge-base
         path made them persistent) are made persistent in the same pass: this cache is the record, and
-        it must not decay into false "never embedded" answers."""
+        it must not decay into false "never embedded" answers. `persist_expiring=False` (a dry run) only
+        reads."""
         if not self._client:
             return None
         missing: list[str] = []
@@ -343,7 +346,7 @@ class RedisStore:
                         missing.append(bill_id)
                     elif ttl >= 0:  # has an expiry (-1 means it already has none)
                         expiring.append(bill_id)
-                if expiring:
+                if expiring and persist_expiring:
                     # A key that expired since the TTL read just makes PERSIST a no-op; the next pass
                     # finds it missing, which is the right answer for it.
                     async with self._client.pipeline(transaction=False) as pipe:
