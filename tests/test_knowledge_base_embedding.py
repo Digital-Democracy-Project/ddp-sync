@@ -118,7 +118,7 @@ async def test_new_version_produces_labelled_text_and_diff_documents():
         _version(11, "Introduced", "introduced", 0, TEXT_A),
         _version(12, "Committee Substitute", "amendment", 1, TEXT_B, diff=DIFF_B, date="2026-02-01"),
     ])
-    stats = await emb.embed_bill(OCD, "fl", bill)
+    stats = await emb.embed_bill(OCD, "fl", bill, kb.EmbedScope(diffs=True))
 
     assert pipe.keys == [
         f"bill-text:{OCD}:11", f"bill-text:{OCD}:12", f"bill-version-diff:{OCD}:12"
@@ -159,9 +159,9 @@ async def test_rerun_writes_nothing():
 async def test_new_version_only_embeds_the_new_version():
     emb, redis, pipe = _embedder()
     v1 = _version(11, "Introduced", "introduced", 0, TEXT_A)
-    await emb.embed_bill(OCD, "fl", _bill([v1]))
+    await emb.embed_bill(OCD, "fl", _bill([v1]), kb.EmbedScope(diffs=True))
     pipe.calls.clear()
-    await emb.embed_bill(OCD, "fl", _bill([v1, _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B)]))
+    await emb.embed_bill(OCD, "fl", _bill([v1, _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B)]), kb.EmbedScope(diffs=True))
     assert pipe.keys == [f"bill-text:{OCD}:12", f"bill-version-diff:{OCD}:12"]
 
 
@@ -268,7 +268,7 @@ async def test_diff_is_labelled_from_the_previous_classifiable_version_not_an_un
         _version(9, "Fiscal Note", "unknown", None, TEXT_B, unknown=True),
         _version(11, "Introduced", "introduced", 0, TEXT_A),
         _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B),
-    ]))
+    ]), kb.EmbedScope(diffs=True))
     diff_meta = pipe.calls[-1][2]
     assert diff_meta["from_document_id"] == "11"
 
@@ -570,11 +570,20 @@ async def test_scope_all_text_embeds_every_version_and_nothing_else():
     assert pipe.keys == [_text(1), _text(2), _text(3)]
 
 
-async def test_default_scope_is_everything_unchanged_for_the_live_hook():
+async def test_default_scope_embeds_every_version_but_no_diffs_and_no_votes():
+    """Ramon, 2026-10-05: version diffs are not embedded (as with votes, SYNC-94); the live hook and every pass
+    that takes the default scope write bill text only."""
     emb, _, pipe = _embedder()
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES))
-    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3)])  # no votes document
-    assert stats["chars"] > 0 and stats["raced"] == 0
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3)])
+    assert stats["diffs"] == 0 and stats["chars"] > 0 and stats["raced"] == 0
+
+
+async def test_a_diff_is_written_only_when_the_scope_asks_for_it():
+    emb, _, pipe = _embedder()
+    stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES), kb.EmbedScope(diffs=True))
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3)])
+    assert stats["diffs"] == 2
 
 
 async def test_stage_unknown_is_never_the_current_version():
@@ -596,7 +605,7 @@ async def test_a_narrow_pass_then_a_full_pass_never_rewrites_what_the_first_wrot
     await emb.embed_bill(OCD, "fl", bill)
     assert first == [_text(3)]
     assert pipe.keys.count(_text(3)) == 1  # not re-embedded by the full pass
-    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2), _diff(2), _diff(3)])
+    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2)])  # the default scope writes no diffs
     again = len(pipe.keys)
     stats = await emb.embed_bill(OCD, "fl", bill)
     assert len(pipe.keys) == again and stats["documents"] == stats["diffs"] == 0
