@@ -401,7 +401,19 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   systematic change in how api-v3 returns document ids would otherwise delete real vectors en masse. The
   budget is a hard cap (each bill gets only what is left of it), and each deletion re-reads the record and
   skips a document another writer changed.
-- **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
+- **Cache digests exclude timestamps.**- **The ledger pass replaces the watermark; it does not add a second one (SYNC-95 / OPEN-319).**
+  `knowledge_base_embedding.ledger.max_bills_per_run` (> 0; ships 0) makes the hook compare api-v3's
+  `GET /ddp/embedding/ledger` (per bill, the documents the embedder would write, each with the source
+  row's `updated_at`) with this path's own Redis records, and read only bills that disagree: a document
+  missing, a source row whose `updated_at` is not the one stamped on the record (`source_updated_at`), or
+  (with `delete_orphans`) a recorded document the ledger no longer lists. It reads and writes no
+  `ddp:kb_embed:since:*` key and ignores `reconcile`. `updated_at` only means "look again": `embed_bill`
+  compares the text hash, so a bulk update of rows costs reads, not embeddings. Never copy a bill's ledger
+  entry into the record without the text hash; the ledger says what should exist, only a hash says it is
+  embedded. The ledger needs api-v3 OPEN-319 deployed on the read host; without it the run logs
+  `knowledge_base_ledger_unavailable` and uses the watermark path. A bill whose every document vanished
+  from the ledger is not on it, so its record is not found this way (a known gap, kept out of scope).
+ `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
   with "now"; hashing it raw makes every entity look changed on every run (found while building
   SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.
 - **The cache race guard narrows a race; it does not close it.** `embed_bill` re-reads a document's

@@ -38,6 +38,7 @@ class FakeRedis:
         self.set_calls = 0
         self.persistent_keys: set[str] = set()  # entries written with persistent=True (no expiry)
         self.unreadable = False  # find_unrecorded_bill_versions behaves as if Redis failed
+        self.unreadable_records = False  # get_bill_versions behaves as if Redis failed
 
     async def get_bill_version(self, key):
         return self.versions.get(key)
@@ -50,6 +51,9 @@ class FakeRedis:
         if persistent:
             self.persistent_keys.add(key)
         return True
+
+    async def get_bill_versions(self, ids):
+        return None if self.unreadable_records else {i: self.versions.get(i) for i in ids}
 
     async def find_unrecorded_bill_versions(self, ids, *, persist_expiring=True):
         self.persist_expiring_seen = persist_expiring
@@ -1504,3 +1508,313 @@ async def test_an_id_missing_from_a_non_empty_response_is_an_orphan_because_the_
     with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
         stats = await emb.embed_bill(OCD, "fl", _bill([_version(12, "Intro", "introduced", 0, TEXT_A)]), max_orphans=10)
     assert stats["orphans"] == 1 and set(redis.versions[OCD]["documents"]) == {"12"}
+
+
+# --- SYNC-95: the api-v3 ledger consumer (OPEN-319) ---------------------------------------------------------
+
+U1, U2 = "2026-10-01T00:00:00+00:00", "2026-10-02T00:00:00+00:00"
+
+
+def _stamped(version, updated_at):
+    return {**version, "archived_updated_at": updated_at}
+
+
+def _ledger_bill(ocd, *docs):
+    """A bill whose versions are `docs` = (archived id, text, updated_at); its ledger entry is `_ledger_of`."""
+    bill = _bill([_stamped(_version(i, f"V{i}", "introduced" if n == 0 else "amendment", n, t), u)
+                  for n, (i, t, u) in enumerate(docs)])
+    bill["id"] = f"ocd-bill/{ocd}"
+    return bill
+
+
+def _ledger_of(bills):
+    return {b["id"].removeprefix("ocd-bill/"): {str(v["archived_document_id"]): v["archived_updated_at"]
+                                                 for v in b["versions"]} for b in bills}
+
+
+async def _run_ledger(redis, embedder, bills, *, cap=10, ledger="derive", complete=True, delete_orphans=False,
+                      touched=()):
+    by_id = {b["id"].removeprefix("ocd-bill/"): b for b in bills}
+    listing = (_ledger_of(bills), complete) if ledger == "derive" else ledger
+    touched_mock = AsyncMock(return_value=(list(touched), True))
+    fetch = AsyncMock(side_effect=lambda i, **kw: by_id.get(i))
+    c = "ddp_sync.pipelines.knowledge_base_embedding"
+    with patch(f"{c}.local_openstates_client.list_embedding_ledger", AsyncMock(return_value=listing)), \
+         patch(f"{c}.local_openstates_client.list_touched_bill_ids", touched_mock), \
+         patch(f"{c}.local_openstates_client.fetch_bill_for_embedding", fetch), \
+         patch(f"{c}.get_redis_store", return_value=redis):
+        totals = await kb.embed_archived_bills(
+            "fl", _STARTED, settings=_settings(), api_base="http://api", embedder=embedder,
+            ledger_max_bills=cap, delete_orphans=delete_orphans,
+        )
+    return totals, fetch, touched_mock
+
+
+async def test_embed_bill_stamps_the_source_row_and_a_changed_stamp_with_the_same_text_writes_only_the_stamp():
+    emb, redis, pipe = _embedder()
+    await emb.embed_bill(OCD, "fl", _ledger_bill(OCD, (11, TEXT_A, U1)))
+    assert redis.versions[OCD]["documents"]["11"]["source_updated_at"] == U1
+    writes = redis.set_calls
+    await emb.embed_bill(OCD, "fl", _ledger_bill(OCD, (11, TEXT_A, U1)))
+    assert redis.set_calls == writes  # nothing changed: nothing written
+    pipe.calls.clear()
+    stats = await emb.embed_bill(OCD, "fl", _ledger_bill(OCD, (11, TEXT_A, U2)))
+    assert pipe.calls == [] and stats["documents"] == 0  # same text: no embedding spend
+    assert redis.versions[OCD]["documents"]["11"]["source_updated_at"] == U2
+
+
+async def test_a_stamp_is_never_written_for_text_that_is_not_recorded_in_sync():
+    emb, redis, pipe = _embedder()
+    redis.versions[OCD] = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "stale", "chunks": 1}}}
+    pipe.fail_keys.add(f"bill-text:{OCD}:11")
+    await emb.embed_bill(OCD, "fl", _ledger_bill(OCD, (11, TEXT_A, U1)))
+    assert "source_updated_at" not in redis.versions[OCD]["documents"]["11"]
+
+
+def test_ledger_findings_compare_documents_stamps_and_orphans():
+    ok = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "h", "source_updated_at": U1}}}
+    ledger = {"a": {"11": U1}, "b": {"11": U1, "12": U1}, "c": {"11": U2}, "d": {"11": U1},
+              "e": {"11": None}, "f": {"11": U1}, "g": {"11": U1}}
+    records = {"a": ok, "b": ok, "c": ok, "d": None,
+               "e": {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "h"}}},   # no stamp, ledger has none either
+               "f": {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "h"}}},   # unstamped, ledger has one
+               "g": {"schema": 1, "documents": {"11": {"text_hash": "h", "source_updated_at": U1}}}}  # other schema
+    found = kb.ledger_findings(ledger, records, delete_orphans=False)
+    assert "a" not in found and "e" not in found  # in sync; an unknown source time is not a change
+    assert found["b"] == {"missing": 1, "changed": 0, "orphaned": 0}
+    assert found["c"] == {"missing": 0, "changed": 1, "orphaned": 0}
+    assert found["d"] == {"missing": 1, "changed": 0, "orphaned": 0}  # no record: everything is missing
+    assert found["f"] == {"missing": 0, "changed": 1, "orphaned": 0}  # one cheap check, then it is stamped
+    assert found["g"] == {"missing": 1, "changed": 0, "orphaned": 0}
+    extra = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "h", "source_updated_at": U1},
+                                                      "99": {"text_hash": "h"}}}
+    assert kb.ledger_findings({"a": {"11": U1}}, {"a": extra}, delete_orphans=False) == {}
+    assert kb.ledger_findings({"a": {"11": U1}}, {"a": extra}, delete_orphans=True) == {
+        "a": {"missing": 0, "changed": 0, "orphaned": 1}}
+
+
+async def test_ledger_run_embeds_a_bill_nobody_touched_and_never_reads_the_watermark_path():
+    emb, redis, pipe = _embedder()
+    bills = [_ledger_bill(OCD, (11, TEXT_A, U1)), _ledger_bill(OCD2, (21, TEXT_B, U1))]
+    totals, _, touched = await _run_ledger(redis, emb, bills)
+    assert sorted(pipe.keys) == [f"bill-text:{OCD}:11", f"bill-text:{OCD2}:21"]
+    assert touched.await_count == 0 and redis.watermarks == {}  # the watermark is neither read nor written
+    assert totals["complete"] is True and totals["ledger"]["bills_to_check"] == 2 and totals["mode"] == "ledger"
+
+
+async def test_deleting_one_documents_record_re_embeds_exactly_that_document():
+    emb, redis, pipe = _embedder()
+    bill = _ledger_bill(OCD, (11, TEXT_A, U1), (12, TEXT_B, U1))
+    await _run_ledger(redis, emb, [bill])
+    pipe.calls.clear()
+    del redis.versions[OCD]["documents"]["12"]
+    totals, _, _ = await _run_ledger(redis, emb, [bill])
+    assert pipe.keys == [f"bill-text:{OCD}:12"]  # not 11, not the diff of anything else
+    assert totals["ledger"]["missing_documents"] == 1
+
+
+async def test_a_steady_state_run_reads_nothing_and_a_changed_row_costs_one_read_and_no_embedding():
+    emb, redis, pipe = _embedder()
+    bill = _ledger_bill(OCD, (11, TEXT_A, U1))
+    await _run_ledger(redis, emb, [bill])
+    pipe.calls.clear()
+    totals, fetch, _ = await _run_ledger(redis, emb, [bill])
+    assert fetch.await_count == 0 and pipe.calls == [] and totals["complete"] is True
+    changed = _ledger_bill(OCD, (11, TEXT_A, U2))
+    totals, fetch, _ = await _run_ledger(redis, emb, [changed])
+    assert fetch.await_count == 1 and pipe.calls == [] and totals["ledger"]["changed_documents"] == 1
+    totals, fetch, _ = await _run_ledger(redis, emb, [changed])
+    assert fetch.await_count == 0  # stamped: quiet again
+
+
+async def test_a_changed_text_under_a_changed_row_is_re_embedded():
+    emb, redis, pipe = _embedder()
+    await _run_ledger(redis, emb, [_ledger_bill(OCD, (11, TEXT_A, U1))])
+    pipe.calls.clear()
+    await _run_ledger(redis, emb, [_ledger_bill(OCD, (11, TEXT_B, U2))])
+    assert pipe.keys == [f"bill-text:{OCD}:11"]
+
+
+async def test_ledger_cap_attempts_a_slice_and_is_not_complete_until_the_rest_are_reached():
+    emb, redis, pipe = _embedder()
+    bills = [_ledger_bill(i, (11, TEXT_A, U1)) for i in (OCD, OCD2, OCD3)]
+    with capture_logs() as logs:
+        first, _, _ = await _run_ledger(redis, emb, bills, cap=2)
+    assert len(pipe.keys) == 2 and first["complete"] is False
+    assert any(e["event"] == "knowledge_base_reconcile_backlog" and e["remaining"] == 1 for e in logs)
+    second, _, _ = await _run_ledger(redis, emb, bills, cap=2)
+    assert len(set(pipe.keys)) == 3 and second["complete"] is True
+
+
+async def test_a_bill_that_fails_every_time_does_not_starve_the_others_and_blocks_complete():
+    emb, redis, pipe = _embedder()
+    pipe.fail_keys.add(f"bill-text:{OCD}:11")
+    bills = [_ledger_bill(OCD, (11, TEXT_A, U1)), _ledger_bill(OCD2, (21, TEXT_A, U1))]
+    for _ in range(12):  # a random slice of 1: the healthy bill is reached with near certainty
+        totals, _, _ = await _run_ledger(redis, emb, bills, cap=1)
+    assert f"bill-text:{OCD2}:21" in pipe.keys
+    assert totals["complete"] is False
+
+
+async def test_a_partial_ledger_is_used_but_never_complete():
+    emb, redis, pipe = _embedder()
+    bills = [_ledger_bill(OCD, (11, TEXT_A, U1))]
+    totals, _, _ = await _run_ledger(redis, emb, bills, complete=False)
+    assert pipe.keys == [f"bill-text:{OCD}:11"] and totals["complete"] is False
+
+
+async def test_without_a_ledger_or_records_the_run_falls_back_to_the_watermark_path():
+    emb, redis, pipe = _embedder()
+    bill = _one_version_bill(OCD)
+    with capture_logs() as logs:
+        totals, _, touched = await _run_ledger(redis, emb, [bill], ledger=None, touched=[OCD])
+    assert touched.await_count == 1 and pipe.keys == [f"bill-text:{OCD}:11"] and redis.watermarks
+    assert any(e["event"] == "knowledge_base_ledger_unavailable" for e in logs)
+    assert totals["mode"] == "watermark_fallback"
+    redis.watermarks.clear()
+    redis.unreadable_records = True  # an outage is not "everything is missing"
+    pipe.calls.clear()
+    redis.versions.clear()
+    _, _, touched = await _run_ledger(redis, emb, [_ledger_bill(OCD2, (21, TEXT_A, U1))])
+    assert pipe.keys == [] and touched.await_count == 1
+
+
+async def test_ledger_run_removes_orphans_only_when_asked_and_within_the_budget():
+    emb, redis, _ = _embedder()
+    bill = _ledger_bill(OCD, (12, "t" * 50, U1))
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+    redis.versions[OCD]["documents"]["11"]["text_hash"] = "old"
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        await _run_ledger(redis, emb, [bill])
+        assert "11" in redis.versions[OCD]["documents"] and vs.delete.await_count == 0  # embedded 12; 11 left alone
+        on, _, _ = await _run_ledger(redis, emb, [bill], delete_orphans=True)
+    assert on["orphans"] == 1 and "11" not in redis.versions[OCD]["documents"]
+    assert sorted(_deleted_ids(vs)) == sorted(f"bill-text:{OCD}:11-chunk-{n}" for n in range(3))
+
+
+async def test_ledger_run_is_off_at_zero_and_leaves_the_watermark_path_in_force():
+    emb, redis, _ = _embedder()
+    totals, _, touched = await _run_ledger(redis, emb, [_ledger_bill(OCD, (11, TEXT_A, U1))], cap=0, touched=[OCD])
+    assert touched.await_count == 1 and "ledger" not in totals
+
+
+async def test_list_embedding_ledger_pages_by_cursor_and_reads_nothing_it_cannot_vouch_for():
+    from ddp_sync.services import local_openstates_client as c
+
+    page = lambda ids, nxt: {"results": [{"ocd_bill_id": i, "session": "2026", "documents": [
+        {"archived_document_id": 7, "updated_at": U1}, {"archived_document_id": 8, "updated_at": None}]} for i in ids],
+        "next_after": nxt}
+    get = AsyncMock(side_effect=[page(["a", "b"], "ocd-bill/b"), page(["c"], None)])
+    with patch.object(c, "_get_json_with_retry", get):
+        out = await c.list_embedding_ledger("FL", api_base="http://api", api_key="k")
+    assert out == ({"a": {"7": U1, "8": None}, "b": {"7": U1, "8": None}, "c": {"7": U1, "8": None}}, True)
+    first, second = (call.args[1] for call in get.await_args_list)
+    assert first["jurisdiction"] == "fl" and "after" not in first and second["after"] == "ocd-bill/b"
+    with patch.object(c, "_get_json_with_retry", AsyncMock(side_effect=[page(["a"], "x"), None])):
+        assert await c.list_embedding_ledger("fl", api_base="x") == ({"a": {"7": U1, "8": None}}, False)
+    with patch.object(c, "_get_json_with_retry", AsyncMock(return_value=None)):  # an api-v3 without the endpoint
+        assert await c.list_embedding_ledger("fl", api_base="x") is None
+    bad = {"results": [{"ocd_bill_id": "a", "documents": [{"updated_at": U1}]}], "next_after": None}
+    with patch.object(c, "_get_json_with_retry", AsyncMock(return_value=bad)):
+        assert await c.list_embedding_ledger("fl", api_base="x") is None  # a malformed entry: nothing vouched for
+    assert await c.list_embedding_ledger("fl", api_base="") is None
+
+
+async def test_redis_store_get_bill_versions_reads_many_and_is_unknown_on_failure():
+    from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
+
+    store = RedisStore()
+    assert await store.get_bill_versions(["a"]) is None
+
+    class _Client:
+        def __init__(self, raws, boom=False):
+            self.raws, self.boom = raws, boom
+
+        def pipeline(self, transaction=False):
+            client = self
+
+            class _Pipe:
+                async def __aenter__(self):
+                    self.keys = []
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+                def get(self, key):
+                    self.keys.append(key)
+
+                async def execute(self):
+                    if client.boom:
+                        raise RuntimeError("down")
+                    return [client.raws.get(k) for k in self.keys]
+
+            return _Pipe()
+
+    store._client = _Client({f"{BILL_VERSION_PREFIX}a": '{"schema": 2}', f"{BILL_VERSION_PREFIX}c": "not json",
+                             f"{BILL_VERSION_PREFIX}d": "[1]"})
+    assert await store.get_bill_versions(["a", "b", "c", "d"]) == {"a": {"schema": 2}, "b": None, "c": None, "d": None}
+    store._client = _Client({}, boom=True)
+    assert await store.get_bill_versions(["a"]) is None
+
+
+async def test_the_ledger_plan_counts_what_disagrees_and_writes_nothing():
+    _, redis, pipe = _embedder()
+    bills = [_ledger_bill(OCD, (11, TEXT_A, U1)), _ledger_bill(OCD2, (21, TEXT_B, U1))]
+    redis.versions[OCD] = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "h", "source_updated_at": U1}}}
+    by_id = {b["id"].removeprefix("ocd-bill/"): b for b in bills}
+    c = "ddp_sync.pipelines.knowledge_base_embedding"
+    with patch(f"{c}.local_openstates_client.list_embedding_ledger", AsyncMock(return_value=(_ledger_of(bills), True))), \
+         patch(f"{c}.local_openstates_client.fetch_bill_for_embedding", AsyncMock(side_effect=lambda i, **kw: by_id[i])), \
+         patch(f"{c}.get_redis_store", return_value=redis):
+        plan = await kb.plan_reconcile("fl", api_base="http://api", use_ledger=True)
+        assert (plan["status"], plan["unrecorded"], plan["missing_documents"]) == ("ok", 1, 1)
+        assert plan["changed_documents"] == 0 and plan["estimate"]["documents"] == 1
+        assert redis.persist_expiring_seen is False and pipe.calls == [] and redis.set_calls == 0
+    with patch(f"{c}.local_openstates_client.list_embedding_ledger", AsyncMock(return_value=None)), \
+         patch(f"{c}.get_redis_store", return_value=redis):
+        assert (await kb.plan_reconcile("fl", api_base="x", use_ledger=True))["error"] == "ledger_unavailable"
+
+
+async def test_the_ledger_cap_comes_from_yaml_the_hook_passes_it_and_the_yaml_ships_it_off():
+    from pathlib import Path
+
+    import yaml
+
+    from ddp_sync.pipelines.openstates_archive import _ledger_max_bills
+
+    def cfg(v):
+        return {"knowledge_base_embedding": {"ledger": {"max_bills_per_run": v}}}
+
+    assert _ledger_max_bills(None) == 0 and _ledger_max_bills({"knowledge_base_embedding": {}}) == 0
+    assert _ledger_max_bills(cfg(40)) == 40
+    for odd in ("many", -1, True, 1.5, None):
+        assert _ledger_max_bills(cfg(odd)) == 0, odd
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], **cfg(40)["knowledge_base_embedding"]}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock()) as run:
+        await _maybe_embed_knowledge_base("fl", _STARTED, config)
+    assert run.await_args.kwargs["ledger_max_bills"] == 40
+    shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
+    assert shipped["knowledge_base_embedding"]["ledger"]["max_bills_per_run"] == 0
+
+
+async def test_a_stamp_is_not_advanced_when_anything_else_in_the_bill_was_left_undone():
+    """The record is written only when every Pinecone write for the bill succeeded, so a stamp can never get
+    ahead of a failed one: the next run still finds the bill disagreeing."""
+    emb, redis, pipe = _embedder()
+    bill = _ledger_bill(OCD, (11, TEXT_A, U1), (12, TEXT_B, U1))
+    await _run_ledger(redis, emb, [bill])
+    pipe.calls.clear()
+    changed = _ledger_bill(OCD, (11, TEXT_A, U2), (12, TEXT_C, U2))
+    pipe.fail_keys.add(f"bill-text:{OCD}:12")
+    totals, _, _ = await _run_ledger(redis, emb, [changed])
+    assert totals["complete"] is False and totals["failed_bills"] == 1
+    assert {d["source_updated_at"] for d in redis.versions[OCD]["documents"].values()} == {U1}  # nothing advanced
+    pipe.fail_keys.clear()
+    totals, _, _ = await _run_ledger(redis, emb, [changed])
+    assert totals["complete"] is True
+    assert {d["source_updated_at"] for d in redis.versions[OCD]["documents"].values()} == {U2}

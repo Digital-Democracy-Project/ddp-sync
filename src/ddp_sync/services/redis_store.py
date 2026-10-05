@@ -358,6 +358,31 @@ class RedisStore:
             return None
         return missing
 
+    async def get_bill_versions(self, ids: list[str]) -> dict[str, dict | None] | None:
+        """SYNC-95: `get_bill_version` for many bare `ocd_bill_id`s in a pipelined read. A missing or
+        unparsable entry is None for that id; the whole result is None (never a dict of Nones) when
+        Redis is down or a read failed, so an outage cannot look like "nothing is recorded"."""
+        if not self._client:
+            return None
+        found: dict[str, dict | None] = {}
+        try:
+            for start in range(0, len(ids), 1000):
+                chunk = ids[start:start + 1000]
+                async with self._client.pipeline(transaction=False) as pipe:
+                    for bill_id in chunk:
+                        pipe.get(f"{BILL_VERSION_PREFIX}{bill_id}")
+                    raws = await pipe.execute()
+                for bill_id, raw in zip(chunk, raws):
+                    try:
+                        value = json.loads(raw) if raw else None
+                    except ValueError:
+                        value = None
+                    found[bill_id] = value if isinstance(value, dict) else None
+        except Exception as e:  # noqa: BLE001
+            logger.error("Redis: failed to read bill version records", error=str(e))
+            return None
+        return found
+
     async def get_bill_version(self, webflow_id: str) -> dict | None:
         """Retrieve last-ingested version info for a bill.
 
