@@ -266,8 +266,9 @@ async def test_failed_archive_does_not_refresh():
     refresh.assert_not_awaited()
 
 
-async def test_checked_in_yaml_block_is_off_and_enrolls_the_eight_search_jurisdictions():
+async def test_checked_in_yaml_block_is_on_and_enrolls_the_eight_search_jurisdictions():
     cfg = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())
     block = cfg["openstates_archive"]["bill_search_refresh"]
-    assert block["enabled"] is False
+    # On since 2026-10-05; inert on a host without RDS_OPENSTATES_API_BASE and its key (test_..._read_path_not_configured).
+    assert block["enabled"] is True
     assert sorted(block["jurisdictions"]) == sorted(["us", "fl", "mi", "az", "va", "wa", "ut", "nc"])

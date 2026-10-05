@@ -778,7 +778,11 @@ openstates_archive:
   # api-v3 it reads must expose archived_document_id/version_stage/version_ordinal. The legacy
   # votebot-large path is unaffected either way.
   knowledge_base_embedding:
-    enabled: false
+    # Enabled 2026-10-05 (Ramon) now that the staged backfill is complete (426,166 vectors). This file is shared by
+    # every ddp-sync host, so the REAL per-host gate is KNOWLEDGE_BASE_INDEX_NAME (set only on the EC2 broker host):
+    # on a host without it the hook logs `knowledge_base_embedding_enrolled_but_index_unset` and returns, so the
+    # Mac cannot double-embed. Do not set that variable on a second host.
+    enabled: true
     jurisdictions: [fl, us, va, mi, wa, az, ut]
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
     # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
@@ -793,7 +797,10 @@ openstates_archive:
   # archives, and that instance must be able to reach RDS_OPENSTATES_API_BASE (a deploy check).
   # Enroll the 8 jurisdictions search covers (OPEN-310): US, FL, MI, AZ, VA, WA, UT, NC.
   bill_search_refresh:
-    enabled: false
+    # Enabled on the EC2 broker host since 2026-10-01 (SYNC-87), committed here 2026-10-05 so that host's local edit
+    # does not conflict with a pull. A host without RDS_OPENSTATES_API_BASE and RDS_OPENSTATES_API_KEY logs
+    # `bill_search_refresh_read_path_not_configured` and skips, so this is inert on the Mac.
+    enabled: true
     jurisdictions: [us, fl, mi, az, va, wa, ut, nc]
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
