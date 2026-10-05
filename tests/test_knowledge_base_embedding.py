@@ -1777,7 +1777,7 @@ async def test_the_ledger_plan_counts_what_disagrees_and_writes_nothing():
         assert (await kb.plan_reconcile("fl", api_base="x", use_ledger=True))["error"] == "ledger_unavailable"
 
 
-async def test_the_ledger_cap_comes_from_yaml_the_hook_passes_it_and_the_yaml_ships_it_off():
+async def test_the_ledger_cap_comes_from_yaml_the_hook_passes_it_and_the_yaml_ships_no_cap():
     from pathlib import Path
 
     import yaml
@@ -1799,7 +1799,7 @@ async def test_the_ledger_cap_comes_from_yaml_the_hook_passes_it_and_the_yaml_sh
         await _maybe_embed_knowledge_base("fl", _STARTED, config)
     assert run.await_args.kwargs["ledger_max_bills"] == 40
     shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
-    assert shipped["knowledge_base_embedding"]["ledger"]["max_bills_per_run"] == 0
+    assert shipped["knowledge_base_embedding"]["ledger"]["max_bills_per_run"] == 1_000_000  # "no cap", set 2026-10-05
 
 
 async def test_a_stamp_is_not_advanced_when_anything_else_in_the_bill_was_left_undone():
