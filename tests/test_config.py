@@ -374,3 +374,22 @@ def test_load_from_env_reads_patch_refresh_opt_out(monkeypatch):
 
     monkeypatch.setenv("OPENSTATES_PATCH_REFRESH_ENABLED", "false")
     assert _load_from_env()["openstates_patch_refresh_enabled"] is False
+
+
+def test_patch_refresh_opt_out_applies_when_secrets_manager_supplies_the_base_config(monkeypatch):
+    """OPEN-320: the EC2-broker host gets its config from Secrets Manager, where SYNC-51's
+    flags were once silently inert -- pin that this one takes effect on that same path."""
+    monkeypatch.setenv("OPENSTATES_PATCH_REFRESH_ENABLED", "false")
+    get_settings.cache_clear()
+
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={"api_key": "from-secrets-manager"},
+    ):
+        settings = get_settings()
+
+    try:
+        assert settings.api_key == "from-secrets-manager"  # Secrets Manager path was taken
+        assert settings.openstates_patch_refresh_enabled is False
+    finally:
+        get_settings.cache_clear()
