@@ -35,6 +35,7 @@ def _settings(**overrides) -> MagicMock:
     settings.api_health_check_enabled = True
     settings.openstates_scrape_enabled = True
     settings.openstates_archive_enabled = True
+    settings.openstates_patch_refresh_enabled = True
     settings.mi_cookie_publish_enabled = True
     settings.session_pipeline_batch_enabled = True
     for key, value in overrides.items():
@@ -217,5 +218,57 @@ async def test_session_pipeline_batch_enabled_true_still_requires_yaml_enabled_t
     try:
         ids = {j.id for j in sched.scheduler.get_jobs()}
         assert "session_pipeline_batch" not in ids
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_patch_refresh_enabled_false_skips_only_the_patch_job():
+    """OPEN-320: the EC2 host scrapes through Fargate, has no live editable checkouts to
+    refresh, and the shared YAML says patch_refresh.enabled: true for every host -- so the
+    env flag is the only way to opt that one job out without also dropping the scrapes."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        openstates_scrape:
+          enabled: true
+          patch_refresh:
+            enabled: true
+            sync_time_utc: "01:00"
+          primary:
+            wa:
+              enabled: true
+              sync_time_utc: "02:30"
+        """,
+        openstates_patch_refresh_enabled=False,
+    )
+    sched.start()
+    try:
+        ids = {j.id for j in sched.scheduler.get_jobs()}
+        assert "openstates_patch_refresh" not in ids
+        assert any(job_id.startswith("openstates_wa") for job_id in ids)
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_patch_refresh_enabled_true_still_registers_the_job():
+    """The default (every existing host, the Mac included) is unchanged."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        openstates_scrape:
+          enabled: true
+          patch_refresh:
+            enabled: true
+            sync_time_utc: "01:00"
+        """
+    )
+    sched.start()
+    try:
+        ids = {j.id for j in sched.scheduler.get_jobs()}
+        assert "openstates_patch_refresh" in ids
     finally:
         sched.stop()

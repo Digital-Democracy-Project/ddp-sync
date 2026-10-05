@@ -365,3 +365,12 @@ def test_secrets_manager_value_is_used_when_the_env_var_is_absent(monkeypatch):
         settings = get_settings()
     get_settings.cache_clear()
     assert settings.knowledge_base_index_name == "ddp-knowledge-base"
+
+
+def test_load_from_env_reads_patch_refresh_opt_out(monkeypatch):
+    """OPEN-320: defaults True (Mac unchanged); a host's own env opts out."""
+    monkeypatch.delenv("OPENSTATES_PATCH_REFRESH_ENABLED", raising=False)
+    assert _load_from_env()["openstates_patch_refresh_enabled"] is True
+
+    monkeypatch.setenv("OPENSTATES_PATCH_REFRESH_ENABLED", "false")
+    assert _load_from_env()["openstates_patch_refresh_enabled"] is False
