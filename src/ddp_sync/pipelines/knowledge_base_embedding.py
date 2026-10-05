@@ -724,6 +724,8 @@ async def embed_archived_bills(
     totals: dict[str, Any] = {
         "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0, "orphans": 0,
         "orphans_over_budget": 0, "chunks": 0, "failed_bills": 0, "complete": False,
+        # "ledger" | "watermark" | "watermark_fallback" (the ledger was asked for and could not be read)
+        "mode": "ledger" if ledger_max_bills > 0 else "watermark",
     }
     if not redis.is_available:
         # Without the version cache every touched bill would be re-embedded in full.
@@ -746,9 +748,11 @@ async def embed_archived_bills(
             if totals["orphans_over_budget"]:
                 logger.warning("knowledge_base_orphan_removal_paused", jurisdiction=jurisdiction, removed=totals["orphans"],
                                left_recorded=totals["orphans_over_budget"], cap=MAX_ORPHAN_DOCUMENTS_PER_RUN)
-            (logger.info if totals["complete"] else logger.warning)("knowledge_base_embedding_run", mode="ledger", **totals)
+            (logger.info if totals["complete"] else logger.warning)("knowledge_base_embedding_run", **totals)
             return totals
         # api-v3 has no ledger yet (or it failed): carry on with the watermark path below, as before.
+        # It reads and advances the watermark, so a fallback run reports that it was one.
+        totals["mode"] = "watermark_fallback"
 
     since = archive_started_at
     previous = await redis.get_kb_embed_watermark(jurisdiction)

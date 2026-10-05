@@ -1588,7 +1588,7 @@ async def test_ledger_run_embeds_a_bill_nobody_touched_and_never_reads_the_water
     totals, _, touched = await _run_ledger(redis, emb, bills)
     assert sorted(pipe.keys) == [f"bill-text:{OCD}:11", f"bill-text:{OCD2}:21"]
     assert touched.await_count == 0 and redis.watermarks == {}  # the watermark is neither read nor written
-    assert totals["complete"] is True and totals["ledger"]["bills_to_check"] == 2
+    assert totals["complete"] is True and totals["ledger"]["bills_to_check"] == 2 and totals["mode"] == "ledger"
 
 
 async def test_deleting_one_documents_record_re_embeds_exactly_that_document():
@@ -1656,9 +1656,10 @@ async def test_without_a_ledger_or_records_the_run_falls_back_to_the_watermark_p
     emb, redis, pipe = _embedder()
     bill = _one_version_bill(OCD)
     with capture_logs() as logs:
-        _, _, touched = await _run_ledger(redis, emb, [bill], ledger=None, touched=[OCD])
+        totals, _, touched = await _run_ledger(redis, emb, [bill], ledger=None, touched=[OCD])
     assert touched.await_count == 1 and pipe.keys == [f"bill-text:{OCD}:11"] and redis.watermarks
     assert any(e["event"] == "knowledge_base_ledger_unavailable" for e in logs)
+    assert totals["mode"] == "watermark_fallback"
     redis.watermarks.clear()
     redis.unreadable_records = True  # an outage is not "everything is missing"
     pipe.calls.clear()
@@ -1788,3 +1789,21 @@ async def test_the_ledger_cap_comes_from_yaml_the_hook_passes_it_and_the_yaml_sh
     assert run.await_args.kwargs["ledger_max_bills"] == 40
     shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
     assert shipped["knowledge_base_embedding"]["ledger"]["max_bills_per_run"] == 0
+
+
+async def test_a_stamp_is_not_advanced_when_anything_else_in_the_bill_was_left_undone():
+    """The record is written only when every Pinecone write for the bill succeeded, so a stamp can never get
+    ahead of a failed one: the next run still finds the bill disagreeing."""
+    emb, redis, pipe = _embedder()
+    bill = _ledger_bill(OCD, (11, TEXT_A, U1), (12, TEXT_B, U1))
+    await _run_ledger(redis, emb, [bill])
+    pipe.calls.clear()
+    changed = _ledger_bill(OCD, (11, TEXT_A, U2), (12, TEXT_C, U2))
+    pipe.fail_keys.add(f"bill-text:{OCD}:12")
+    totals, _, _ = await _run_ledger(redis, emb, [changed])
+    assert totals["complete"] is False and totals["failed_bills"] == 1
+    assert {d["source_updated_at"] for d in redis.versions[OCD]["documents"].values()} == {U1}  # nothing advanced
+    pipe.fail_keys.clear()
+    totals, _, _ = await _run_ledger(redis, emb, [changed])
+    assert totals["complete"] is True
+    assert {d["source_updated_at"] for d in redis.versions[OCD]["documents"].values()} == {U2}
