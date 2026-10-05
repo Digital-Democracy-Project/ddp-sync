@@ -134,7 +134,7 @@ async def test_new_version_produces_labelled_text_and_diff_documents():
         _version(11, "Introduced", "introduced", 0, TEXT_A),
         _version(12, "Committee Substitute", "amendment", 1, TEXT_B, diff=DIFF_B, date="2026-02-01"),
     ])
-    stats = await emb.embed_bill(OCD, "fl", bill)
+    stats = await emb.embed_bill(OCD, "fl", bill, kb.EmbedScope(diffs=True))
 
     assert pipe.keys == [
         f"bill-text:{OCD}:11", f"bill-text:{OCD}:12", f"bill-version-diff:{OCD}:12"
@@ -175,9 +175,9 @@ async def test_rerun_writes_nothing():
 async def test_new_version_only_embeds_the_new_version():
     emb, redis, pipe = _embedder()
     v1 = _version(11, "Introduced", "introduced", 0, TEXT_A)
-    await emb.embed_bill(OCD, "fl", _bill([v1]))
+    await emb.embed_bill(OCD, "fl", _bill([v1]), kb.EmbedScope(diffs=True))
     pipe.calls.clear()
-    await emb.embed_bill(OCD, "fl", _bill([v1, _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B)]))
+    await emb.embed_bill(OCD, "fl", _bill([v1, _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B)]), kb.EmbedScope(diffs=True))
     assert pipe.keys == [f"bill-text:{OCD}:12", f"bill-version-diff:{OCD}:12"]
 
 
@@ -284,7 +284,7 @@ async def test_diff_is_labelled_from_the_previous_classifiable_version_not_an_un
         _version(9, "Fiscal Note", "unknown", None, TEXT_B, unknown=True),
         _version(11, "Introduced", "introduced", 0, TEXT_A),
         _version(12, "Sub", "amendment", 1, TEXT_B, diff=DIFF_B),
-    ]))
+    ]), kb.EmbedScope(diffs=True))
     diff_meta = pipe.calls[-1][2]
     assert diff_meta["from_document_id"] == "11"
 
@@ -586,11 +586,20 @@ async def test_scope_all_text_embeds_every_version_and_nothing_else():
     assert pipe.keys == [_text(1), _text(2), _text(3)]
 
 
-async def test_default_scope_is_everything_unchanged_for_the_live_hook():
+async def test_default_scope_embeds_every_version_but_no_diffs_and_no_votes():
+    """Ramon, 2026-10-05: version diffs are not embedded (as with votes, SYNC-94); the live hook and every pass
+    that takes the default scope write bill text only."""
     emb, _, pipe = _embedder()
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES))
-    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3)])  # no votes document
-    assert stats["chars"] > 0 and stats["raced"] == 0
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3)])
+    assert stats["diffs"] == 0 and stats["chars"] > 0 and stats["raced"] == 0
+
+
+async def test_a_diff_is_written_only_when_the_scope_asks_for_it():
+    emb, _, pipe = _embedder()
+    stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions(), _VOTES), kb.EmbedScope(diffs=True))
+    assert sorted(pipe.keys) == sorted([_text(1), _text(2), _text(3), _diff(2), _diff(3)])
+    assert stats["diffs"] == 2
 
 
 async def test_stage_unknown_is_never_the_current_version():
@@ -612,7 +621,7 @@ async def test_a_narrow_pass_then_a_full_pass_never_rewrites_what_the_first_wrot
     await emb.embed_bill(OCD, "fl", bill)
     assert first == [_text(3)]
     assert pipe.keys.count(_text(3)) == 1  # not re-embedded by the full pass
-    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2), _diff(2), _diff(3)])
+    assert sorted(pipe.keys[1:]) == sorted([_text(1), _text(2)])  # the default scope writes no diffs
     again = len(pipe.keys)
     stats = await emb.embed_bill(OCD, "fl", bill)
     assert len(pipe.keys) == again and stats["documents"] == stats["diffs"] == 0
@@ -1055,11 +1064,12 @@ async def test_the_dry_run_counts_unrecorded_bills_and_estimates_cost_from_a_sam
     bills = {OCD2: _sized_bill(OCD2, 4000), OCD3: _sized_bill(OCD3, 8000, diff_chars=400)}
     plan, fetch = await _plan(redis, everything=[OCD, OCD2, OCD3], bills=bills)
     assert (plan["listed"], plan["unrecorded"], plan["sampled"]) == (3, 2, 2) and plan["run_id"] == "r1"
-    # mean of the sample is 6,200 characters and 1.5 documents; two unrecorded bills in all
+    # mean of the sample is 6,000 characters and 1 document (the stored diff is not embedded, so it is not
+    # counted); two unrecorded bills in all
     est = plan["estimate"]
-    assert est["documents"] == 3 and est["tokens"] == round(12400 / 4)
-    assert est["chunks"] == round(12400 * 0.279 / 1000) and est["usd"] == round(3100 / 1e6 * 0.13, 2)
-    assert est["largest_sampled_bill_chars"] == 8400
+    assert est["documents"] == 2 and est["tokens"] == round(12000 / 4)
+    assert est["chunks"] == round(12000 * 0.279 / 1000) and est["usd"] == round(3000 / 1e6 * 0.13, 2)
+    assert est["largest_sampled_bill_chars"] == 8000
     assert pipe.calls == [] and redis.set_calls == 0  # nothing embedded, nothing written
     assert redis.persist_expiring_seen is False  # not even the persistence repair
     assert sorted(c.args[0] for c in fetch.await_args_list) == sorted([OCD2, OCD3])  # only the unrecorded were read
@@ -1226,7 +1236,8 @@ async def test_the_dry_runs_size_matches_what_embed_bill_really_writes(name, ver
     bill = _bill([version])
     stats = await emb.embed_bill(OCD, "fl", bill)
     documents, characters = kb._embeddable_size(bill)
-    assert (documents, characters) == (stats["documents"] + stats["diffs"], stats["chars"]), name
+    assert (documents, characters) == (stats["documents"], stats["chars"]), name
+    assert stats["diffs"] == 0, name
 
 
 async def test_the_reconcile_plan_route_needs_the_same_api_key_as_its_siblings():
