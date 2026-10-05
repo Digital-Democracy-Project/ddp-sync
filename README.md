@@ -132,6 +132,15 @@ building blocks.
 | Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: four stages (current, diffs, prior-sessions, history), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
 | Organizations (SYNC-91) | `POST /trigger/knowledge-base-entities/organizations`; read from ddp-broker-py `/api/organizations/` (BROKER-144). Legislators are not embedded (SYNC-94) | manual; `dry_run=true` default |
 
+**Reconcile (SYNC-95, off by default).** The embedding hook only lists bills archived or changed since a
+watermark, so a bill nobody has touched since it was archived (a newly enrolled state, a gap after a
+Pinecone or Redis problem) is never embedded by it. `openstates_archive.knowledge_base_embedding.
+reconcile.max_bills_per_run: N` also embeds up to N bills per run that the Redis version cache has no
+record of, the way the LegBot pipeline dispatches only what is missing. It ships at `0` (off) because
+spend is per bill (a federal bill can be hundreds of thousands of tokens); turn it on deliberately and
+watch for `knowledge_base_reconcile_backlog`. The version cache is now the record of what is embedded:
+its knowledge-base entries no longer expire.
+
 New setting: `KNOWLEDGE_BASE_INDEX_NAME` (env, default unset = disabled; per host, never on the
 votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
 `ddp:bill_version:organization:{id}` (organizations),

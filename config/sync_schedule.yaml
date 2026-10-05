@@ -784,6 +784,13 @@ openstates_archive:
     # Mac cannot double-embed. Do not set that variable on a second host.
     enabled: true
     jurisdictions: [fl, us, va, mi, wa, az, ut]
+    # SYNC-95: also embed bills the version cache has no record of (a bill nobody changed since it was
+    # archived is never "touched", so a new state or a gap would otherwise never be filled). Up to this
+    # many bills per run per jurisdiction, oldest listed first; the record is the cursor, so the next run
+    # takes the next slice. 0 = off. Spend is per bill (a federal bill can be hundreds of thousands of
+    # tokens), so turn it on deliberately, and read the `knowledge_base_reconcile_backlog` warning.
+    reconcile:
+      max_bills_per_run: 0
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
     # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
     # It pauses through this UTC window so it stays out of the 05:00 UTC archive start.

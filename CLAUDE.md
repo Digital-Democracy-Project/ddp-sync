@@ -386,6 +386,14 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   from the archived text in the OpenStates DB. Legislators are not embedded at all (SYNC-94, Ramon
   2026-10-02): their structured facts come from api-v3 directly and DDP has no narrative biography to
   embed. Nothing here reads Webflow, and no `BillArtifact`/changelog text is ever embedded (Ramon's decision, 2026-09-30).
+- **The version cache is the record of what is embedded (SYNC-95).** `ddp:bill_version:<ocd_bill_id>`
+  entries are written with no expiry (`set_bill_version(..., persistent=True)`) and the optional
+  reconcile pass (`knowledge_base_embedding.reconcile.max_bills_per_run`, default off) treats "no entry"
+  as "never embedded". Do not give those entries a TTL again, or every bill untouched for 90 days would
+  look unembedded and be re-embedded and re-paid for. `RedisStore.find_unrecorded_bill_versions` returns
+  `None`, not a list, when Redis cannot answer: keep it that way, because an outage must never read as
+  "nothing is embedded". A Redis flush still makes everything look unembedded (the cap bounds the
+  cost); a durable record is the open design question on SYNC-95.
 - **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
   with "now"; hashing it raw makes every entity look changed on every run (found while building
   SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.

@@ -35,7 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 import structlog
@@ -328,7 +328,7 @@ class KnowledgeBaseEmbedder:
                 written = await self.redis.set_bill_version(ocd_bill_id, {
                     "schema": CACHE_SCHEMA, "documents": merged_docs,
                     "last_checked": datetime.now(timezone.utc).isoformat(),
-                })
+                }, persistent=True)
                 if not written:
                     stats["undone"].append("version cache not written (Redis)")
         if stats["undone"]:
@@ -340,6 +340,85 @@ class KnowledgeBaseEmbedder:
         return stats
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)  # `document_updated_since` this old lists every bill with an archived document
+
+
+async def _fetch_and_embed(
+    embedder: KnowledgeBaseEmbedder, jurisdiction: str, ocd_bill_id: str, *, api_base: str, api_key: str
+) -> dict:
+    """Read one bill from api-v3 and embed whatever of it is not yet embedded. Raises on a read
+    failure; the caller records that bill as failed and carries on."""
+    bill = await local_openstates_client.fetch_bill_for_embedding(ocd_bill_id, api_base=api_base, api_key=api_key)
+    if bill is None:
+        raise RuntimeError("bill detail could not be read from api-v3")
+    return await embedder.embed_bill(ocd_bill_id, jurisdiction, bill)
+
+
+async def _reconcile_unembedded(
+    jurisdiction: str,
+    redis,
+    embedder: KnowledgeBaseEmbedder,
+    totals: dict,
+    *,
+    touched: set[str],
+    max_bills: int,
+    api_base: str,
+    api_key: str,
+) -> dict[str, int]:
+    """SYNC-95: embed bills the version cache has no record of, the way the LegBot pipeline checks
+    which bills are already covered and dispatches only what is missing. A bill nobody changed
+    since it was archived is never in the touched list, so without this it stays unembedded forever
+    (a newly enrolled jurisdiction, a Pinecone or Redis gap, a bill added mid-backfill).
+
+    Lists every bill api-v3 has an archived document for, drops the ones this run already handled,
+    asks Redis which have no record, and embeds up to `max_bills` of them. The cap bounds spend and
+    runtime; the record is the cursor, so the next run takes the next slice. A failed bill keeps no
+    record and is found again. Never raises; a failed read just skips the pass."""
+    result = {"missing": 0, "selected": 0, "embedded": 0, "nothing_to_embed": 0, "failed": 0}
+    listed = await local_openstates_client.list_touched_bill_ids(
+        jurisdiction, since=_EPOCH, api_base=api_base, api_key=api_key
+    )
+    if listed is None:
+        logger.warning("knowledge_base_reconcile_skipped", jurisdiction=jurisdiction, reason="bills could not be listed")
+        return result
+    candidates = [i for i in listed[0] if i not in touched]
+    missing = await redis.find_unrecorded_bill_versions(candidates)
+    if missing is None:  # Redis could not answer: an outage must not look like "nothing is embedded"
+        logger.warning("knowledge_base_reconcile_skipped", jurisdiction=jurisdiction, reason="version records unreadable")
+        return result
+    chosen = missing[:max_bills]
+    result["missing"], result["selected"] = len(missing), len(chosen)
+    if len(missing) > len(chosen):
+        logger.warning("knowledge_base_reconcile_backlog", jurisdiction=jurisdiction,
+                       remaining=len(missing) - len(chosen), cap=max_bills)
+
+    for ocd_bill_id in chosen:
+        try:
+            stats = await _fetch_and_embed(embedder, jurisdiction, ocd_bill_id, api_base=api_base, api_key=api_key)
+        except Exception as e:  # noqa: BLE001 -- one bad bill must not stop the pass
+            result["failed"] += 1
+            logger.warning("knowledge_base_reconcile_bill_failed", jurisdiction=jurisdiction,
+                           ocd_bill_id=ocd_bill_id, error=str(e))
+            continue
+        for k in ("documents", "diffs", "chunks"):
+            totals[k] += stats[k]
+        if stats["undone"]:
+            result["failed"] += 1
+        elif stats["documents"] == 0 and stats["diffs"] == 0:
+            # Nothing embeddable yet (no archived text). Record that it was checked so it is not read
+            # again every night; a later archive that adds text lists it as touched and embeds it.
+            # Only when no entry appeared meanwhile: never overwrite another writer's record.
+            if await redis.get_bill_version(ocd_bill_id) is None:
+                await redis.set_bill_version(ocd_bill_id, {
+                    "schema": CACHE_SCHEMA, "documents": {},
+                    "last_checked": datetime.now(UTC).isoformat(),
+                }, persistent=True)
+            result["nothing_to_embed"] += 1
+        else:
+            result["embedded"] += 1
+    return result
+
+
 async def embed_archived_bills(
     jurisdiction: str,
     archive_started_at: datetime,
@@ -348,11 +427,17 @@ async def embed_archived_bills(
     api_base: str,
     api_key: str = "",
     embedder: KnowledgeBaseEmbedder | None = None,
+    reconcile_max_bills: int = 0,
 ) -> dict:
     """Embed every bill whose archived documents changed since the last run that left nothing
     undone (or `archive_started_at` when there is none). Never raises for a per-bill problem.
     Returns run totals; `complete` is True only when nothing was left undone, and only then is
-    the jurisdiction's watermark advanced to `archive_started_at`."""
+    the jurisdiction's watermark advanced to `archive_started_at`.
+
+    `reconcile_max_bills` > 0 (SYNC-95, `knowledge_base_embedding.reconcile.max_bills_per_run`) also
+    embeds up to that many bills the version cache has no record of; 0 (the default) skips that pass.
+    Its outcome is in `totals["reconcile"]` and never affects `complete` or the watermark: a bill it
+    fails on keeps no record, so the next reconcile finds it again."""
     redis = get_redis_store()
     totals: dict[str, Any] = {
         "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0,
@@ -385,12 +470,7 @@ async def embed_archived_bills(
     for ocd_bill_id in bill_ids:
         totals["bills"] += 1
         try:
-            bill = await local_openstates_client.fetch_bill_for_embedding(
-                ocd_bill_id, api_base=api_base, api_key=api_key
-            )
-            if bill is None:
-                raise RuntimeError("bill detail could not be read from api-v3")
-            stats = await embedder.embed_bill(ocd_bill_id, jurisdiction, bill)
+            stats = await _fetch_and_embed(embedder, jurisdiction, ocd_bill_id, api_base=api_base, api_key=api_key)
         except Exception as e:  # noqa: BLE001 -- one bad bill must not stop the run
             totals["failed_bills"] += 1
             logger.warning("knowledge_base_embedding_work_left_undone", jurisdiction=jurisdiction,
@@ -404,6 +484,11 @@ async def embed_archived_bills(
     totals["complete"] = complete and totals["failed_bills"] == 0
     if totals["complete"]:
         await redis.set_kb_embed_watermark(jurisdiction, archive_started_at.isoformat())
+    if reconcile_max_bills > 0:
+        totals["reconcile"] = await _reconcile_unembedded(
+            jurisdiction, redis, embedder, totals, touched=set(bill_ids), max_bills=reconcile_max_bills,
+            api_base=api_base, api_key=api_key,
+        )
     log = logger.info if totals["complete"] else logger.warning
     log("knowledge_base_embedding_run", since=since.isoformat(), **totals)
     return totals

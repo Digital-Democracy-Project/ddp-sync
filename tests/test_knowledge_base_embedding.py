@@ -36,14 +36,23 @@ class FakeRedis:
         self.versions: dict[str, dict] = {}
         self.watermarks: dict[str, str] = {}
         self.set_calls = 0
+        self.persistent_keys: set[str] = set()  # entries written with persistent=True (no expiry)
+        self.unreadable = False  # find_unrecorded_bill_versions behaves as if Redis failed
 
     async def get_bill_version(self, key):
         return self.versions.get(key)
 
-    async def set_bill_version(self, key, data):
+    async def set_bill_version(self, key, data, *, persistent=False):
         self.set_calls += 1
         self.versions[key] = data
+        if persistent:
+            self.persistent_keys.add(key)
         return True
+
+    async def find_unrecorded_bill_versions(self, ids):
+        if self.unreadable:
+            return None
+        return [i for i in ids if i not in self.versions]
 
     async def get_kb_embed_watermark(self, jurisdiction):
         return self.watermarks.get(jurisdiction.lower())
@@ -700,3 +709,230 @@ async def test_no_cache_at_start_is_not_mistaken_for_a_blip():
     stats = await emb.embed_bill(OCD, "fl", _bill(_three_versions()),
                                  kb.EmbedScope(text="all", diffs=False))
     assert stats["undone"] == [] and stats["raced"] == 0 and len(pipe.keys) == 3
+
+
+# --- SYNC-95: reconcile bills the version cache has no record of ---------------------------------------
+
+OCD2 = "0b1c2d3e-0000-0000-0000-000000000002"
+OCD3 = "0b1c2d3e-0000-0000-0000-000000000003"
+
+
+def _one_version_bill(ocd, text=TEXT_A, doc_id=11):
+    bill = _bill([_version(doc_id, "Introduced", "introduced", 0, text)])
+    bill["id"] = f"ocd-bill/{ocd}"
+    return bill
+
+
+async def _run_reconcile(redis, embedder, *, touched, everything, bills, cap, watermark_listing=None):
+    """The touched window (a `since` after the epoch) and the full listing (`since` = the epoch) answer
+    differently, as api-v3 does."""
+    async def listed(jurisdiction, *, since, **kw):
+        return (list(everything), True) if since == kb._EPOCH else (list(touched), True)
+
+    list_mock = AsyncMock(side_effect=listed)
+    fetch = AsyncMock(side_effect=lambda i, **kw: bills.get(i))
+    started = _STARTED
+    with patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.list_touched_bill_ids", list_mock), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.fetch_bill_for_embedding", fetch), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.get_redis_store", return_value=redis):
+        totals = await kb.embed_archived_bills(
+            "fl", started, settings=_settings(), api_base="http://api", embedder=embedder,
+            reconcile_max_bills=cap,
+        )
+    return totals, list_mock, fetch
+
+
+async def test_reconcile_embeds_an_unchanged_bill_that_was_never_embedded():
+    emb, redis, pipe = _embedder()
+    redis.versions[OCD] = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "x", "chunks": 1}}}
+    totals, _, fetch = await _run_reconcile(
+        redis, emb, touched=[], everything=[OCD, OCD2], bills={OCD2: _one_version_bill(OCD2)}, cap=10)
+    assert pipe.keys == [f"bill-text:{OCD2}:11"]
+    assert [c.args[0] for c in fetch.await_args_list] == [OCD2]  # the recorded bill is never even read
+    assert totals["reconcile"] == {"missing": 1, "selected": 1, "embedded": 1, "nothing_to_embed": 0, "failed": 0}
+    assert OCD2 in redis.persistent_keys  # the new record does not expire
+
+
+async def test_reconcile_is_off_by_default_and_then_lists_only_the_touched_window():
+    emb, redis, pipe = _embedder()
+    totals, listed, _ = await _run_reconcile(
+        redis, emb, touched=[], everything=[OCD2], bills={OCD2: _one_version_bill(OCD2)}, cap=0)
+    assert pipe.keys == [] and "reconcile" not in totals
+    assert listed.await_count == 1 and listed.await_args.kwargs["since"] != kb._EPOCH
+
+
+async def test_reconcile_cap_takes_a_slice_and_the_next_run_takes_the_next():
+    emb, redis, pipe = _embedder()
+    everything = [OCD, OCD2, OCD3]
+    bills = {i: _one_version_bill(i) for i in everything}
+    with capture_logs() as logs:
+        first, _, _ = await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=2)
+    assert pipe.keys == [f"bill-text:{OCD}:11", f"bill-text:{OCD2}:11"]
+    assert (first["reconcile"]["missing"], first["reconcile"]["selected"]) == (3, 2)
+    backlog = [e for e in logs if e["event"] == "knowledge_base_reconcile_backlog"]
+    assert backlog and backlog[0]["remaining"] == 1 and backlog[0]["cap"] == 2
+    second, _, _ = await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=2)
+    assert pipe.keys[2:] == [f"bill-text:{OCD3}:11"] and second["reconcile"]["missing"] == 1
+
+
+async def test_reconcile_does_nothing_when_redis_cannot_say_what_is_recorded():
+    """An outage must never look like 'nothing is embedded', or every bill would be re-embedded."""
+    emb, redis, pipe = _embedder()
+    redis.unreadable = True
+    bills = {OCD: _one_version_bill(OCD), OCD2: _one_version_bill(OCD2)}
+    with capture_logs() as logs:
+        totals, _, _ = await _run_reconcile(redis, emb, touched=[OCD], everything=[OCD, OCD2], bills=bills, cap=10)
+    assert pipe.keys == [f"bill-text:{OCD}:11"]  # the touched bill is still embedded; OCD2 is not guessed at
+    assert totals["reconcile"]["selected"] == 0
+    assert any(e["event"] == "knowledge_base_reconcile_skipped" for e in logs)
+
+
+async def test_reconcile_skips_bills_the_touched_pass_already_handled():
+    emb, redis, pipe = _embedder()
+    totals, _, fetch = await _run_reconcile(
+        redis, emb, touched=[OCD], everything=[OCD, OCD2],
+        bills={OCD: _one_version_bill(OCD), OCD2: _one_version_bill(OCD2)}, cap=10)
+    assert pipe.keys == [f"bill-text:{OCD}:11", f"bill-text:{OCD2}:11"]
+    assert [c.args[0] for c in fetch.await_args_list] == [OCD, OCD2]  # OCD once, from the touched pass
+    assert totals["reconcile"]["missing"] == 1
+
+
+async def test_a_bill_with_nothing_to_embed_is_recorded_so_it_is_not_read_every_night():
+    emb, redis, pipe = _embedder()
+    empty = _bill([_version(11, "Introduced", "introduced", 0, "")])  # no archived text yet
+    empty["id"] = f"ocd-bill/{OCD}"
+    first, _, _ = await _run_reconcile(redis, emb, touched=[], everything=[OCD], bills={OCD: empty}, cap=10)
+    assert pipe.keys == [] and first["reconcile"]["nothing_to_embed"] == 1
+    assert redis.versions[OCD]["documents"] == {} and OCD in redis.persistent_keys
+    again, _, fetch2 = await _run_reconcile(redis, emb, touched=[], everything=[OCD], bills={OCD: empty}, cap=10)
+    assert fetch2.await_count == 0 and again["reconcile"]["missing"] == 0
+    # when text later arrives, the touched pass embeds it normally against the empty record
+    await _run_reconcile(redis, emb, touched=[OCD], everything=[OCD], bills={OCD: _one_version_bill(OCD)}, cap=10)
+    assert pipe.keys == [f"bill-text:{OCD}:11"]
+
+
+async def test_a_reconcile_failure_keeps_no_record_and_does_not_hold_back_the_watermark():
+    emb, redis, pipe = _embedder()
+    pipe.fail_keys = {f"bill-text:{OCD}:11"}
+    totals, _, _ = await _run_reconcile(
+        redis, emb, touched=[], everything=[OCD], bills={OCD: _one_version_bill(OCD)}, cap=10)
+    assert totals["reconcile"]["failed"] == 1 and OCD not in redis.versions
+    assert totals["complete"] is True and "fl" in redis.watermarks  # the touched pass was clean
+    pipe.fail_keys = set()
+    retry, _, _ = await _run_reconcile(
+        redis, emb, touched=[], everything=[OCD], bills={OCD: _one_version_bill(OCD)}, cap=10)
+    assert retry["reconcile"]["embedded"] == 1 and OCD in redis.versions  # the retry wrote it (the first attempt failed)
+
+
+async def test_embed_bill_writes_its_record_without_an_expiry():
+    emb, redis, _ = _embedder()
+    await emb.embed_bill(OCD, "fl", _one_version_bill(OCD))
+    assert OCD in redis.persistent_keys
+
+
+async def test_the_reconcile_cap_comes_from_yaml_and_anything_odd_means_off():
+    from ddp_sync.pipelines.openstates_archive import _reconcile_max_bills
+
+    def cfg(value):
+        return {"knowledge_base_embedding": {"reconcile": {"max_bills_per_run": value}}}
+
+    assert _reconcile_max_bills(None) == 0 and _reconcile_max_bills({}) == 0
+    assert _reconcile_max_bills({"knowledge_base_embedding": {}}) == 0
+    assert _reconcile_max_bills(cfg(25)) == 25 and _reconcile_max_bills(cfg(0)) == 0
+    for odd in ("many", -1, True, 1.5, None):
+        assert _reconcile_max_bills(cfg(odd)) == 0, odd
+
+
+async def test_the_hook_passes_the_reconcile_cap_to_the_run():
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"],
+                                           "reconcile": {"max_bills_per_run": 25}}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock()) as run:
+        await _maybe_embed_knowledge_base("fl", _STARTED, config)
+    assert run.await_args.kwargs["reconcile_max_bills"] == 25
+
+
+async def test_the_checked_in_yaml_ships_with_the_reconcile_pass_off():
+    from pathlib import Path
+
+    import yaml
+
+    cfg = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
+    assert cfg["knowledge_base_embedding"]["reconcile"]["max_bills_per_run"] == 0
+
+
+# --- SYNC-95: the record check in RedisStore -------------------------------------------------------------
+
+
+class _PipeClient:
+    """Just enough of redis.asyncio for `find_unrecorded_bill_versions`: ttl() and persist() queue ops
+    on a pipeline whose execute() returns their answers."""
+
+    def __init__(self, ttls, fail=False):
+        self.ttls, self.fail, self.persisted, self.pipelines = ttls, fail, [], 0
+
+    def pipeline(self, transaction=False):
+        client = self
+        client.pipelines += 1
+        if client.fail:
+            raise RuntimeError("redis down")
+
+        class _Pipe:
+            def __init__(self):
+                self.ops = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def ttl(self, key):
+                self.ops.append(("ttl", key))
+
+            def persist(self, key):
+                self.ops.append(("persist", key))
+                client.persisted.append(key)
+
+            async def execute(self):
+                return [client.ttls[k] if op == "ttl" else 1 for op, k in self.ops]
+
+        return _Pipe()
+
+
+async def test_find_unrecorded_bill_versions_reports_missing_and_makes_expiring_entries_persistent():
+    from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
+
+    store = RedisStore()
+    assert await store.find_unrecorded_bill_versions(["a"]) is None  # no client: unknown, not "all missing"
+    ttls = {f"{BILL_VERSION_PREFIX}a": -2, f"{BILL_VERSION_PREFIX}b": 5000, f"{BILL_VERSION_PREFIX}c": -1,
+            f"{BILL_VERSION_PREFIX}d": -2}
+    store._client = _PipeClient(ttls)
+    assert await store.find_unrecorded_bill_versions(["a", "b", "c", "d"]) == ["a", "d"]
+    assert store._client.persisted == [f"{BILL_VERSION_PREFIX}b"]  # only the entry that still had an expiry
+
+
+async def test_find_unrecorded_bill_versions_is_unknown_when_redis_fails_and_reads_in_chunks():
+    from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
+
+    store = RedisStore()
+    store._client = _PipeClient({}, fail=True)
+    assert await store.find_unrecorded_bill_versions(["a"]) is None
+    ids = [f"id{i}" for i in range(1500)]
+    store._client = _PipeClient({f"{BILL_VERSION_PREFIX}{i}": -1 for i in ids})
+    assert await store.find_unrecorded_bill_versions(ids) == []
+    assert store._client.pipelines == 2  # 1,000 then 500
+
+
+async def test_set_bill_version_persistent_has_no_expiry_and_the_default_keeps_the_legacy_one():
+    from ddp_sync.services.redis_store import BILL_VERSION_TTL, RedisStore
+
+    store = RedisStore()
+    store._client = MagicMock()
+    store._client.set = AsyncMock()
+    await store.set_bill_version("k", {"a": 1})
+    assert store._client.set.await_args.kwargs["ex"] == BILL_VERSION_TTL
+    await store.set_bill_version("k", {"a": 1}, persistent=True)
+    assert store._client.set.await_args.kwargs["ex"] is None
