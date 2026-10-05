@@ -372,6 +372,19 @@ async def test_eligibility_is_yaml_policy_default_off():
     assert not _knowledge_base_embedding_eligible("va", cfg)
 
 
+async def test_checked_in_yaml_enrolls_the_seven_embedding_jurisdictions_and_not_nc():
+    """On since 2026-10-05. The per-host gate is KNOWLEDGE_BASE_INDEX_NAME (see the test below), so the shared file
+    being on is inert on a host that does not set it."""
+    from pathlib import Path
+
+    import yaml
+
+    cfg = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
+    for jurisdiction in ("fl", "us", "va", "mi", "wa", "az", "ut"):
+        assert _knowledge_base_embedding_eligible(jurisdiction, cfg), jurisdiction
+    assert not _knowledge_base_embedding_eligible("nc", cfg)  # NC has no embedded people or backfill
+
+
 _CFG = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"]}}
 _STARTED = datetime(2026, 9, 30, 5, 0, tzinfo=timezone.utc)
 

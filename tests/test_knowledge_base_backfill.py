@@ -567,6 +567,6 @@ async def test_checked_in_yaml_has_the_blackout_window():
 
     cfg = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())
     block = cfg["openstates_archive"]["knowledge_base_embedding"]
-    assert block["enabled"] is False
+    assert block["enabled"] is True  # on since 2026-10-05; the per-host gate is KNOWLEDGE_BASE_INDEX_NAME
     assert (block["backfill"]["blackout_start_utc"], block["backfill"]["blackout_end_utc"]) == ("04:45", "07:00")
     assert bf._blackout_seconds_left(datetime(2026, 10, 1, 5, 0, tzinfo=timezone.utc), cfg["openstates_archive"]) > 0
