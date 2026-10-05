@@ -135,7 +135,7 @@ building blocks.
 **Reconcile (SYNC-95, off by default).** The embedding hook only lists bills archived or changed since a
 watermark, so a bill nobody has touched since it was archived (a newly enrolled state, a gap after a
 Pinecone or Redis problem) is never embedded by it. `openstates_archive.knowledge_base_embedding.
-reconcile.max_bills_per_run: N` also embeds up to N bills per run that the Redis version cache has no
+reconcile.max_bills_per_run: N` also embeds up to N bills per run (a random slice, bills attempted) that the Redis version cache has no
 record of, the way the LegBot pipeline dispatches only what is missing. It ships at `0` (off) because
 spend is per bill (a federal bill can be hundreds of thousands of tokens); turn it on deliberately and
 watch for `knowledge_base_reconcile_backlog`. The version cache is now the record of what is embedded:

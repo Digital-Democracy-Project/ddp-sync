@@ -286,7 +286,7 @@ class RedisStore:
     # -- Bill version tracking --
 
     async def set_bill_version(
-        self, webflow_id: str, version_data: dict, *, persistent: bool = False
+        self, webflow_id: str, version_data: dict, *, persistent: bool = False, only_if_absent: bool = False
     ) -> bool:
         """Store last-ingested version info for a bill.
 
@@ -297,19 +297,22 @@ class RedisStore:
             persistent: no expiry (SYNC-95). The knowledge-base path sets it: its entries are the
                 record of which bills are embedded, so they must not age out after 90 days (an
                 aged-out entry would make an untouched, already-embedded bill look never embedded).
+            only_if_absent: write only when no entry exists (one atomic SET NX), so a record another
+                writer created in the meantime is never replaced (SYNC-95's "nothing to embed" marker).
 
-        Returns True when the value was written; False when Redis is down or the write failed
-        (legacy callers ignore it; SYNC-83 needs to know).
+        Returns True when the value was written; False when Redis is down, the write failed, or (with
+        `only_if_absent`) an entry already existed (legacy callers ignore it; SYNC-83 needs to know).
         """
         if not self._client:
             return False
         try:
-            await self._client.set(
+            written = await self._client.set(
                 f"{BILL_VERSION_PREFIX}{webflow_id}",
                 json.dumps(version_data),
                 ex=None if persistent else BILL_VERSION_TTL,
+                nx=only_if_absent,
             )
-            return True
+            return bool(written) if only_if_absent else True
         except Exception as e:
             logger.error("Redis: failed to set bill version", webflow_id=webflow_id, error=str(e))
             return False
@@ -341,6 +344,8 @@ class RedisStore:
                     elif ttl >= 0:  # has an expiry (-1 means it already has none)
                         expiring.append(bill_id)
                 if expiring:
+                    # A key that expired since the TTL read just makes PERSIST a no-op; the next pass
+                    # finds it missing, which is the right answer for it.
                     async with self._client.pipeline(transaction=False) as pipe:
                         for bill_id in expiring:
                             pipe.persist(f"{BILL_VERSION_PREFIX}{bill_id}")

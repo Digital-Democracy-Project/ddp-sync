@@ -42,7 +42,9 @@ class FakeRedis:
     async def get_bill_version(self, key):
         return self.versions.get(key)
 
-    async def set_bill_version(self, key, data, *, persistent=False):
+    async def set_bill_version(self, key, data, *, persistent=False, only_if_absent=False):
+        if only_if_absent and key in self.versions:
+            return False
         self.set_calls += 1
         self.versions[key] = data
         if persistent:
@@ -767,12 +769,13 @@ async def test_reconcile_cap_takes_a_slice_and_the_next_run_takes_the_next():
     bills = {i: _one_version_bill(i) for i in everything}
     with capture_logs() as logs:
         first, _, _ = await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=2)
-    assert pipe.keys == [f"bill-text:{OCD}:11", f"bill-text:{OCD2}:11"]
+    assert len(pipe.keys) == 2 and len(set(pipe.keys)) == 2  # a slice of two of the three, whichever the random pick chose
     assert (first["reconcile"]["missing"], first["reconcile"]["selected"]) == (3, 2)
     backlog = [e for e in logs if e["event"] == "knowledge_base_reconcile_backlog"]
     assert backlog and backlog[0]["remaining"] == 1 and backlog[0]["cap"] == 2
     second, _, _ = await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=2)
-    assert pipe.keys[2:] == [f"bill-text:{OCD3}:11"] and second["reconcile"]["missing"] == 1
+    assert second["reconcile"]["missing"] == 1  # the embedded two dropped out; only the third is left
+    assert sorted(pipe.keys) == sorted(f"bill-text:{i}:11" for i in everything)
 
 
 async def test_reconcile_does_nothing_when_redis_cannot_say_what_is_recorded():
@@ -870,13 +873,13 @@ class _PipeClient:
     """Just enough of redis.asyncio for `find_unrecorded_bill_versions`: ttl() and persist() queue ops
     on a pipeline whose execute() returns their answers."""
 
-    def __init__(self, ttls, fail=False):
-        self.ttls, self.fail, self.persisted, self.pipelines = ttls, fail, [], 0
+    def __init__(self, ttls, fail_on=None):
+        self.ttls, self.fail_on, self.persisted, self.pipelines = ttls, fail_on, [], 0
 
     def pipeline(self, transaction=False):
         client = self
         client.pipelines += 1
-        if client.fail:
+        if client.fail_on is not None and client.pipelines >= client.fail_on:
             raise RuntimeError("redis down")
 
         class _Pipe:
@@ -918,7 +921,7 @@ async def test_find_unrecorded_bill_versions_is_unknown_when_redis_fails_and_rea
     from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
 
     store = RedisStore()
-    store._client = _PipeClient({}, fail=True)
+    store._client = _PipeClient({}, fail_on=1)
     assert await store.find_unrecorded_bill_versions(["a"]) is None
     ids = [f"id{i}" for i in range(1500)]
     store._client = _PipeClient({f"{BILL_VERSION_PREFIX}{i}": -1 for i in ids})
@@ -936,3 +939,85 @@ async def test_set_bill_version_persistent_has_no_expiry_and_the_default_keeps_t
     assert store._client.set.await_args.kwargs["ex"] == BILL_VERSION_TTL
     await store.set_bill_version("k", {"a": 1}, persistent=True)
     assert store._client.set.await_args.kwargs["ex"] is None
+    assert store._client.set.await_args.kwargs["nx"] is False  # the default write replaces, as it always did
+
+
+async def test_set_bill_version_only_if_absent_is_one_atomic_set_nx_and_reports_whether_it_wrote():
+    from ddp_sync.services.redis_store import RedisStore
+
+    store = RedisStore()
+    store._client = MagicMock()
+    store._client.set = AsyncMock(return_value=True)
+    assert await store.set_bill_version("k", {}, persistent=True, only_if_absent=True) is True
+    assert store._client.set.await_args.kwargs["nx"] is True
+    store._client.set = AsyncMock(return_value=None)  # redis-py answers None when NX found the key
+    assert await store.set_bill_version("k", {}, persistent=True, only_if_absent=True) is False
+
+
+async def test_find_unrecorded_bill_versions_is_unknown_when_a_later_chunk_fails_not_a_partial_list():
+    """The first 1,000 ids were checked and 'a' was missing; the second chunk fails. Returning what the
+    first chunk found would be a partial answer, so the whole check reports unknown."""
+    from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
+
+    store = RedisStore()
+    ids = ["a"] + [f"id{i}" for i in range(1499)]
+    store._client = _PipeClient({f"{BILL_VERSION_PREFIX}{i}": (-2 if i == "a" else -1) for i in ids}, fail_on=2)
+    assert await store.find_unrecorded_bill_versions(ids) is None
+
+
+async def test_the_nothing_to_embed_marker_never_replaces_a_record_written_in_the_meantime():
+    emb, redis, _ = _embedder()
+    real = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "real", "chunks": 3}}}
+
+    async def embed_then_a_real_record_appears(ocd, jurisdiction, bill, scope=kb.SCOPE_ALL):
+        redis.versions[ocd] = real  # another writer finishes this bill while we were reading it
+        return {"documents": 0, "diffs": 0, "chunks": 0, "undone": []}
+
+    emb.embed_bill = embed_then_a_real_record_appears
+    totals, _, _ = await _run_reconcile(redis, emb, touched=[], everything=[OCD], bills={OCD: _one_version_bill(OCD)}, cap=10)
+    assert redis.versions[OCD] is real and totals["reconcile"]["nothing_to_embed"] == 1
+
+
+async def test_bills_that_always_fail_cannot_starve_the_rest_of_a_capped_backlog():
+    """As many always-failing bills as the cap, listed first: a front slice would retry only them, forever."""
+    import random
+
+    random.seed(7)
+    emb, redis, pipe = _embedder()
+    bad = [OCD, OCD2]
+    good = [f"0b1c2d3e-0000-0000-0000-0000000001{n:02d}" for n in range(8)]
+    everything = bad + good  # the failing bills are first in api-v3's order
+    bills = {i: _one_version_bill(i) for i in everything}
+    pipe.fail_keys = {f"bill-text:{i}:11" for i in bad}
+    for _ in range(40):
+        await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=2)
+        if len(redis.versions) == len(good):
+            break
+    assert set(redis.versions) == set(good)  # every other bill was reached; the failing ones keep no record
+
+
+async def test_a_partial_listing_is_still_safe_to_reconcile_against():
+    """`list_touched_bill_ids` flags an incomplete listing; every bill that IS on it and has no record
+    really is unrecorded, so the pass embeds those and merely misses the bills the listing never reached."""
+    emb, redis, pipe = _embedder()
+
+    async def listed(jurisdiction, *, since, **kw):
+        return ([OCD2], False) if since == kb._EPOCH else ([], True)
+
+    with patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.list_touched_bill_ids", AsyncMock(side_effect=listed)), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.fetch_bill_for_embedding",
+               AsyncMock(return_value=_one_version_bill(OCD2))), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.get_redis_store", return_value=redis):
+        totals = await kb.embed_archived_bills("fl", _STARTED, settings=_settings(), api_base="http://api",
+                                               embedder=emb, reconcile_max_bills=5)
+    assert pipe.keys == [f"bill-text:{OCD2}:11"] and totals["reconcile"]["embedded"] == 1
+
+
+async def test_only_the_knowledge_base_path_writes_bill_versions_without_an_expiry():
+    """The legacy webflow-keyed entries must keep their 90-day TTL (a source scan, as SYNC-42 does)."""
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "src"
+    users = {str(p.relative_to(src)) for p in src.rglob("*.py")
+             if "persistent=True" in p.read_text() and p.name != "redis_store.py"}
+    assert users == {"ddp_sync/pipelines/knowledge_base_embedding.py"}

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from typing import Any
@@ -371,9 +372,12 @@ async def _reconcile_unembedded(
     (a newly enrolled jurisdiction, a Pinecone or Redis gap, a bill added mid-backfill).
 
     Lists every bill api-v3 has an archived document for, drops the ones this run already handled,
-    asks Redis which have no record, and embeds up to `max_bills` of them. The cap bounds spend and
-    runtime; the record is the cursor, so the next run takes the next slice. A failed bill keeps no
-    record and is found again. Never raises; a failed read just skips the pass."""
+    asks Redis which have no record, and embeds up to `max_bills` of them (bills *attempted*, not tokens;
+    the listing and the Redis check above it are not capped). The slice is random when there are more
+    missing than the cap, so a bill that fails every time cannot hold a slot at the front forever; the
+    record is the cursor, so embedded bills drop out and later runs reach the rest. A failed bill keeps
+    no record and is found again. A listing that came back incomplete is still safe to use: every bill
+    on it that has no record really is unrecorded. Never raises; a failed read just skips the pass."""
     result = {"missing": 0, "selected": 0, "embedded": 0, "nothing_to_embed": 0, "failed": 0}
     listed = await local_openstates_client.list_touched_bill_ids(
         jurisdiction, since=_EPOCH, api_base=api_base, api_key=api_key
@@ -386,7 +390,7 @@ async def _reconcile_unembedded(
     if missing is None:  # Redis could not answer: an outage must not look like "nothing is embedded"
         logger.warning("knowledge_base_reconcile_skipped", jurisdiction=jurisdiction, reason="version records unreadable")
         return result
-    chosen = missing[:max_bills]
+    chosen = missing if len(missing) <= max_bills else random.sample(missing, max_bills)
     result["missing"], result["selected"] = len(missing), len(chosen)
     if len(missing) > len(chosen):
         logger.warning("knowledge_base_reconcile_backlog", jurisdiction=jurisdiction,
@@ -407,12 +411,11 @@ async def _reconcile_unembedded(
         elif stats["documents"] == 0 and stats["diffs"] == 0:
             # Nothing embeddable yet (no archived text). Record that it was checked so it is not read
             # again every night; a later archive that adds text lists it as touched and embeds it.
-            # Only when no entry appeared meanwhile: never overwrite another writer's record.
-            if await redis.get_bill_version(ocd_bill_id) is None:
-                await redis.set_bill_version(ocd_bill_id, {
-                    "schema": CACHE_SCHEMA, "documents": {},
-                    "last_checked": datetime.now(UTC).isoformat(),
-                }, persistent=True)
+            # Set-if-absent, so a record another writer created meanwhile is never replaced.
+            await redis.set_bill_version(ocd_bill_id, {
+                "schema": CACHE_SCHEMA, "documents": {},
+                "last_checked": datetime.now(UTC).isoformat(),
+            }, persistent=True, only_if_absent=True)
             result["nothing_to_embed"] += 1
         else:
             result["embedded"] += 1
@@ -436,8 +439,9 @@ async def embed_archived_bills(
 
     `reconcile_max_bills` > 0 (SYNC-95, `knowledge_base_embedding.reconcile.max_bills_per_run`) also
     embeds up to that many bills the version cache has no record of; 0 (the default) skips that pass.
-    Its outcome is in `totals["reconcile"]` and never affects `complete` or the watermark: a bill it
-    fails on keeps no record, so the next reconcile finds it again."""
+    Its outcome is in `totals["reconcile"]` and never affects `complete` or the watermark (`complete`
+    describes the touched pass only): a bill it fails on keeps no record, so a later reconcile finds
+    it again."""
     redis = get_redis_store()
     totals: dict[str, Any] = {
         "jurisdiction": jurisdiction, "bills": 0, "documents": 0, "diffs": 0,
