@@ -86,10 +86,13 @@ class EmbedScope:
 
     text: "all" (every version), "current" (only the bill's current version, i.e. the highest
     `version_ordinal` among classifiable versions; stage-unknown versions are never current), or
-    None (no text documents). diffs: whether to write the version-diff documents."""
+    None (no text documents). diffs: whether to write the version-diff documents. **Off by default
+    (Ramon, 2026-10-05):** version diffs are not embedded, because a vector of a raw unified diff only captures
+    the topics of the changed lines; a "what changed" question is answered from the two versions' text or the
+    stored diff read live. The code path stays so a stage can still ask for it deliberately; nothing does."""
 
     text: str | None = "all"
-    diffs: bool = True
+    diffs: bool = False
 
 
 SCOPE_ALL = EmbedScope()
@@ -408,8 +411,8 @@ MAX_ORPHAN_DOCUMENTS_PER_RUN = 200
 
 def _embeddable_size(bill: dict) -> tuple[int, int]:
     """`(documents, characters)` that `embed_bill` would write for `bill` at the default scope: every
-    version's text and every classifiable version's stored diff, minus what it skips (no archived text,
-    no archived document id)."""
+    version's text (version diffs are not embedded, Ramon 2026-10-05), minus what it skips (no archived
+    text, no archived document id)."""
     documents = characters = 0
     for version in bill.get("versions") or []:
         text = version_text(version)
@@ -417,10 +420,6 @@ def _embeddable_size(bill: dict) -> tuple[int, int]:
             continue
         documents += 1
         characters += len(text)
-        diff = version.get("diff_from_previous_version")
-        if diff and (version.get("version_stage") or STAGE_UNKNOWN) != STAGE_UNKNOWN:
-            documents += 1
-            characters += len(diff)
     return documents, characters
 
 

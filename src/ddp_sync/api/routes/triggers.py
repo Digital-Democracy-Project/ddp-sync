@@ -1133,7 +1133,8 @@ async def trigger_knowledge_base_backfill(
     the log line `knowledge_base_backfill_dry_run`, not in this response, because a real run lasts
     hours. Defaults to `dry_run=true`.
 
-    stage: one of current, diffs, prior-sessions, history; omit to run them all in order
+    stage: one of current, diffs, prior-sessions, history; omit to run current, prior-sessions and history in
+    order (`diffs` is valid but never in the default: version diffs are not embedded, 2026-10-05)
     (finished stages are skipped, interrupted ones resume from their checkpoint).
     restart: forget the checkpoint(s) and walk from the start.
 
@@ -1143,6 +1144,7 @@ async def trigger_knowledge_base_backfill(
     """
     from ddp_sync.config import get_settings, knowledge_base_settings
     from ddp_sync.pipelines.knowledge_base_backfill import (
+        DEFAULT_STAGES,
         STAGES,
         lock_holder,
         run_knowledge_base_backfill,
@@ -1199,7 +1201,7 @@ async def trigger_knowledge_base_backfill(
         "status": "started",
         "run_id": run_id,
         "jurisdiction": jurisdiction,
-        "stages": [stage] if stage else list(STAGES),
+        "stages": [stage] if stage else list(DEFAULT_STAGES),
         "dry_run": dry_run,
         "restart": restart,
     }
