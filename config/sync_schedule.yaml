@@ -804,6 +804,10 @@ openstates_archive:
     # it first with POST /trigger/knowledge-base-reconcile/{jurisdiction}.
     ledger:
       max_bills_per_run: 0
+    # SYNC-95: post to Slack (#automation-errors, like the archive failure alert) when a run is not converging: the ledger
+    # could not be read and the run used the watermark path instead, or more than this many bills were still out of step
+    # after a ledger run (over the per-run cap, or failed). 0 = off. Checked once per archive run per jurisdiction.
+    alert_backlog_over: 0
     # SYNC-95: delete the vectors of documents api-v3 no longer lists for a bill the run touches (the picker
     # re-chose a different row, or a version was removed). Only vectors this path recorded, by exact id; a
     # version api-v3 still returns with an id but no text is never an orphan; a run never deletes more than 200

@@ -824,6 +824,56 @@ def _ledger_max_bills(config: dict | None) -> int:
     return value
 
 
+def _alert_backlog_over(config: dict | None) -> int:
+    """SYNC-95: `knowledge_base_embedding.alert_backlog_over`. A whole number > 0 turns the backlog alert on;
+    0, absent or anything else is off, so a yaml typo cannot start paging."""
+    value = ((config or {}).get("knowledge_base_embedding") or {}).get("alert_backlog_over", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        logger.warning("knowledge_base_bad_alert_threshold", value=value)
+        return 0
+    return value
+
+
+def _backlog_alert_text(jurisdiction: str, totals: dict, threshold: int) -> str | None:
+    """SYNC-95: the alert for a knowledge-base run that is not converging, or None. Two cases, both only
+    when `threshold` > 0: the ledger was asked for and could not be read (the run fell back to the watermark
+    path, whose blind spots are what the ledger exists to close), and a ledger run that left more than
+    `threshold` bills still disagreeing (not reached under the cap, or failed)."""
+    if not threshold:
+        return None
+    if totals.get("mode") == "watermark_fallback":
+        return (f"knowledge-base embedding for {jurisdiction} could not read api-v3's ledger and ran on the "
+                f"watermark path instead (check `knowledge_base_ledger_unavailable` in the ddp-sync log)")
+    ledger = totals.get("ledger")
+    if ledger:
+        left = ledger["bills_to_check"] - ledger["selected"] + ledger["failed"]
+        if left > threshold:
+            return (f"knowledge-base embedding for {jurisdiction} still has {left} bills out of step with api-v3 "
+                    f"after this run ({ledger['failed']} failed, {ledger['bills_to_check'] - ledger['selected']} "
+                    f"over the per-run cap); alert threshold {threshold}")
+    return None
+
+
+def _post_slack_alert(text: str) -> None:
+    """Best-effort Slack post, the same token and channel convention as `_alert_archive_failure`. Never raises."""
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        logger.warning("knowledge_base_alert_not_sent_no_slack_token", text=text)
+        return
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors"),
+                  "text": f":warning: {text}"},
+            timeout=15,
+        )
+        if not (resp.ok and resp.json().get("ok")):
+            logger.error("knowledge_base_alert_failed", response=resp.text[:200])
+    except Exception as e:  # noqa: BLE001
+        logger.error("knowledge_base_alert_error", error=str(e))
+
+
 def _delete_orphans(config: dict | None) -> bool:
     """SYNC-95: `knowledge_base_embedding.delete_orphans`. Only a literal `true` turns it on: it deletes
     vectors, so a quoted "false", a stray string or a typo must not enable it."""
@@ -859,7 +909,7 @@ async def _maybe_embed_knowledge_base(
         logger.warning("knowledge_base_embedding_read_path_not_configured", jurisdiction=jurisdiction)
         return
 
-    await embed_archived_bills(
+    totals = await embed_archived_bills(
         jurisdiction,
         archive_started_at,
         settings=settings,
@@ -869,6 +919,9 @@ async def _maybe_embed_knowledge_base(
         delete_orphans=_delete_orphans(config),
         ledger_max_bills=_ledger_max_bills(config),
     )
+    text = _backlog_alert_text(jurisdiction, totals, _alert_backlog_over(config))
+    if text:
+        _post_slack_alert(text)
 
 
 def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> bool:
