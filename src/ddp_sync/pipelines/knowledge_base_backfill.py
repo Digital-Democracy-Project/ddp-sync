@@ -10,7 +10,9 @@ Stages, in order (`STAGES`). "Current" is api-v3's own newest classifiable versi
 "current session" is the jurisdiction's current session (`OpenStatesSource`), nothing re-derived:
 
 1. `current`        current version text of every current-session bill
-2. `diffs`          the `bill-version-diff` documents of every bill
+2. `diffs`          the `bill-version-diff` documents of every bill. NOT part of a default run and not to be run:
+                    version diffs are not embedded (Ramon, 2026-10-05); the name stays valid only so an
+                    operator can ask for it deliberately.
 3. `prior-sessions` current version text of the prior-session bills
 4. `history`        every older version's text (and stage-unknown versions) of every bill
 
@@ -63,6 +65,9 @@ from ddp_sync.services.redis_store import get_redis_store
 logger = structlog.get_logger()
 
 STAGES = ("current", "diffs", "prior-sessions", "history")
+# The stages a run with no `stage` walks. `diffs` stays a valid name for a deliberate operator run, but is not
+# in the default: Ramon decided on 2026-10-05 that version diffs are not embedded (see EmbedScope).
+DEFAULT_STAGES = ("current", "prior-sessions", "history")
 STAGE_SCOPES: dict[str, EmbedScope] = {
     "current": EmbedScope(text="current", diffs=False),
     "diffs": EmbedScope(text=None, diffs=True),
@@ -265,7 +270,7 @@ async def run_knowledge_base_backfill(
     """Backfill `stages` (default: all, in order) for one jurisdiction. A dry run only counts, takes
     no lock and writes nothing. Otherwise holds the per-jurisdiction lease for the whole run."""
     run_id = run_id or f"{jurisdiction}-kb-backfill-{uuid.uuid4().hex[:12]}"
-    stages = list(stages or STAGES)
+    stages = list(stages or DEFAULT_STAGES)
     logger.info("knowledge_base_backfill_start", run_id=run_id, jurisdiction=jurisdiction,
                 stages=stages, dry_run=dry_run, restart=restart)
 
