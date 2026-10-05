@@ -51,7 +51,8 @@ class FakeRedis:
             self.persistent_keys.add(key)
         return True
 
-    async def find_unrecorded_bill_versions(self, ids):
+    async def find_unrecorded_bill_versions(self, ids, *, persist_expiring=True):
+        self.persist_expiring_seen = persist_expiring
         if self.unreadable:
             return None
         return [i for i in ids if i not in self.versions]
@@ -1021,3 +1022,137 @@ async def test_only_the_knowledge_base_path_writes_bill_versions_without_an_expi
     users = {str(p.relative_to(src)) for p in src.rglob("*.py")
              if "persistent=True" in p.read_text() and p.name != "redis_store.py"}
     assert users == {"ddp_sync/pipelines/knowledge_base_embedding.py"}
+
+
+# --- SYNC-95: the dry run -----------------------------------------------------------------------------
+
+
+def _sized_bill(ocd, text_chars, diff_chars=0):
+    """A bill with one classifiable version of `text_chars` characters (and, with `diff_chars`, a stored diff)."""
+    bill = _bill([_version(11, "Introduced", "introduced", 0, "t" * text_chars,
+                           diff="d" * diff_chars if diff_chars else None)])
+    bill["id"] = f"ocd-bill/{ocd}"
+    return bill
+
+
+async def _plan(redis, *, everything, bills, sample_size=20, listing=True):
+    list_mock = AsyncMock(return_value=(list(everything), True) if listing else None)
+    fetch = AsyncMock(side_effect=lambda i, **kw: bills.get(i))
+    with patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.list_touched_bill_ids", list_mock), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.fetch_bill_for_embedding", fetch), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.get_redis_store", return_value=redis):
+        plan = await kb.plan_reconcile("fl", api_base="http://api", sample_size=sample_size, run_id="r1")
+    return plan, fetch
+
+
+async def test_the_dry_run_counts_unrecorded_bills_and_estimates_cost_from_a_sample_and_writes_nothing():
+    _, redis, pipe = _embedder()
+    redis.versions[OCD] = {"schema": kb.CACHE_SCHEMA, "documents": {}}  # recorded: not counted
+    bills = {OCD2: _sized_bill(OCD2, 4000), OCD3: _sized_bill(OCD3, 8000, diff_chars=400)}
+    plan, fetch = await _plan(redis, everything=[OCD, OCD2, OCD3], bills=bills)
+    assert (plan["listed"], plan["unrecorded"], plan["sampled"]) == (3, 2, 2) and plan["run_id"] == "r1"
+    # mean of the sample is 6,200 characters and 1.5 documents; two unrecorded bills in all
+    est = plan["estimate"]
+    assert est["documents"] == 3 and est["tokens"] == round(12400 / 4)
+    assert est["chunks"] == round(12400 * 0.279 / 1000) and est["usd"] == round(3100 / 1e6 * 0.13, 2)
+    assert est["largest_sampled_bill_chars"] == 8400
+    assert pipe.calls == [] and redis.set_calls == 0  # nothing embedded, nothing written
+    assert redis.persist_expiring_seen is False  # not even the persistence repair
+    assert sorted(c.args[0] for c in fetch.await_args_list) == sorted([OCD2, OCD3])  # only the unrecorded were read
+
+
+async def test_the_dry_run_reads_only_a_sample_of_a_large_backlog():
+    _, redis, _ = _embedder()
+    ids = [f"0b1c2d3e-0000-0000-0000-0000000002{n:02d}" for n in range(30)]
+    plan, fetch = await _plan(redis, everything=ids, bills={i: _sized_bill(i, 1000) for i in ids}, sample_size=5)
+    assert plan["unrecorded"] == 30 and plan["sampled"] == 5 and fetch.await_count == 5
+    assert plan["estimate"]["documents"] == 30  # one document each, extrapolated to all thirty
+
+
+async def test_the_dry_run_reports_failures_instead_of_raising_or_guessing():
+    _, redis, _ = _embedder()
+    plan, _ = await _plan(redis, everything=[OCD], bills={}, listing=False)
+    assert plan["status"] == "error" and plan["error"] == "listing_failed"
+    redis.unreadable = True
+    plan, _ = await _plan(redis, everything=[OCD], bills={})
+    assert plan["status"] == "error" and plan["error"] == "records_unreadable" and "unrecorded" not in plan
+    redis.is_available = False
+    plan, _ = await _plan(redis, everything=[OCD], bills={})
+    assert plan["error"] == "redis_unavailable"
+
+
+async def test_deleting_one_bills_record_makes_the_next_pass_embed_exactly_that_bill():
+    """SYNC-95's done-when: delete a record, run the pass, and only what is missing is embedded."""
+    emb, redis, pipe = _embedder()
+    everything = [OCD, OCD2, OCD3]
+    bills = {i: _one_version_bill(i) for i in everything}
+    await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=10)
+    assert len(pipe.keys) == 3
+    del redis.versions[OCD2]
+    again, _, fetch = await _run_reconcile(redis, emb, touched=[], everything=everything, bills=bills, cap=10)
+    assert again["reconcile"]["missing"] == 1 and again["reconcile"]["embedded"] == 1
+    assert pipe.keys[3:] == [f"bill-text:{OCD2}:11"]  # one new document; the two recorded bills were not read
+    assert [c.args[0] for c in fetch.await_args_list] == [OCD2]
+
+
+async def test_find_unrecorded_bill_versions_with_persist_expiring_off_only_reads():
+    from ddp_sync.services.redis_store import BILL_VERSION_PREFIX, RedisStore
+
+    store = RedisStore()
+    store._client = _PipeClient({f"{BILL_VERSION_PREFIX}a": 5000, f"{BILL_VERSION_PREFIX}b": -2})
+    assert await store.find_unrecorded_bill_versions(["a", "b"], persist_expiring=False) == ["b"]
+    assert store._client.persisted == []  # the expiring entry was left alone
+
+
+# --- the reconcile-plan trigger route ---------------------------------------------------------------------
+
+
+def _plan_route(path, *, settings=None, scheduler=None):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from ddp_sync.api.auth import api_key_auth
+    from ddp_sync.api.routes.triggers import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[api_key_auth] = lambda: "test-token"
+    settings = settings or SyncSettings(
+        knowledge_base_index_name="ddp-knowledge-base",
+        local_openstates_api_base="http://local", local_openstates_api_key="lk",
+        rds_openstates_api_base="http://rds", rds_openstates_api_key="rk",
+    )
+    sched = scheduler or MagicMock()
+    if scheduler is None:
+        sched._sync_config = {"openstates_archive": {"knowledge_base_embedding": {"jurisdictions": ["fl", "us"]}}}
+    run = AsyncMock()
+    with patch("ddp_sync.scheduler.get_scheduler", return_value=sched), \
+         patch("ddp_sync.config.get_settings", return_value=settings), \
+         patch("ddp_sync.pipelines.openstates_archive._mac_capable", return_value=True), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.plan_reconcile", new=run):
+        resp = TestClient(app).post(path)
+    return resp, run
+
+
+async def test_the_reconcile_plan_route_starts_a_dry_run_with_the_mac_read_split_and_a_findable_run_id():
+    resp, run = _plan_route("/trigger/knowledge-base-reconcile/FL")
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["dry_run"] is True and body["run_id"].startswith("FL-kb-reconcile-plan-")
+    args, kwargs = run.await_args
+    assert args == ("fl",) and kwargs["run_id"] == body["run_id"]
+    assert (kwargs["api_base"], kwargs["api_key"]) == ("http://local", "lk")
+
+
+async def test_the_reconcile_plan_route_refuses_what_it_cannot_run():
+    resp, run = _plan_route("/trigger/knowledge-base-reconcile/ca")
+    assert resp.status_code == 404 and "not enrolled" in resp.text
+    resp, run = _plan_route("/trigger/knowledge-base-reconcile/fl", settings=SyncSettings())
+    assert resp.status_code == 503
+    resp, run = _plan_route("/trigger/knowledge-base-reconcile/fl", settings=SyncSettings(
+        knowledge_base_index_name="votebot-large", local_openstates_api_base="http://x"))
+    assert resp.status_code == 503 and "legacy index" in resp.text
+    resp, run = _plan_route("/trigger/knowledge-base-reconcile/fl", settings=SyncSettings(
+        knowledge_base_index_name="ddp-knowledge-base", local_openstates_api_base=""))
+    assert resp.status_code == 503 and "read path" in resp.text
+    run.assert_not_awaited()

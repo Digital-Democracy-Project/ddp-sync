@@ -343,6 +343,87 @@ class KnowledgeBaseEmbedder:
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)  # `document_updated_since` this old lists every bill with an archived document
 
+# The dry run's cost model, from the SYNC-89 measurement on real Utah documents (about four characters
+# per token; 0.279 vectors per 1,000 characters) at OpenAI's list price for text-embedding-3-large.
+# The backfill's `approx_tokens` uses the same four characters per token.
+_CHARS_PER_TOKEN = 4
+_CHUNKS_PER_1000_CHARS = 0.279
+_USD_PER_MILLION_TOKENS = 0.13
+RECONCILE_PLAN_SAMPLE = 20  # bills read to estimate the size of the rest
+
+
+def _embeddable_size(bill: dict) -> tuple[int, int]:
+    """`(documents, characters)` that `embed_bill` would write for `bill` at the default scope: every
+    version's text and every classifiable version's stored diff, minus what it skips (no archived text,
+    no archived document id)."""
+    documents = characters = 0
+    for version in bill.get("versions") or []:
+        text = version_text(version)
+        if not text or version.get("archived_document_id") is None:
+            continue
+        documents += 1
+        characters += len(text)
+        diff = version.get("diff_from_previous_version")
+        if diff and (version.get("version_stage") or STAGE_UNKNOWN) != STAGE_UNKNOWN:
+            documents += 1
+            characters += len(diff)
+    return documents, characters
+
+
+async def plan_reconcile(
+    jurisdiction: str, *, api_base: str, api_key: str = "", sample_size: int = RECONCILE_PLAN_SAMPLE,
+    run_id: str | None = None,
+) -> dict:
+    """SYNC-95's dry run: what a reconcile pass would find for `jurisdiction`, before any money is
+    spent. Writes nothing (not even the persistence repair) and calls no embedding API; it costs the
+    bill listing, one Redis read per bill, and `sample_size` bill reads from api-v3.
+
+    Lists every archived bill, counts the ones with no record, reads a random sample of those, and
+    extrapolates documents, chunks, tokens and dollars from the sample's mean size. The estimate is an
+    order of magnitude, not a quote: bill sizes vary by orders of magnitude (a federal bill can be a
+    hundred times a state bill), so a small sample can be far off. Never raises."""
+    plan: dict[str, Any] = {"jurisdiction": jurisdiction, "status": "ok"}
+    if run_id:
+        plan["run_id"] = run_id  # the one the trigger returned, so the result line can be found
+    redis = get_redis_store()
+    if not redis.is_available:
+        plan.update(status="error", error="redis_unavailable")
+    else:
+        listed = await local_openstates_client.list_touched_bill_ids(
+            jurisdiction, since=_EPOCH, api_base=api_base, api_key=api_key
+        )
+        if listed is None:
+            plan.update(status="error", error="listing_failed")
+        else:
+            ids, complete = listed
+            missing = await redis.find_unrecorded_bill_versions(ids, persist_expiring=False)
+            if missing is None:
+                plan.update(status="error", error="records_unreadable")
+            else:
+                plan.update(listed=len(ids), listing_complete=complete, unrecorded=len(missing))
+                sizes = []
+                for ocd_bill_id in random.sample(missing, min(sample_size, len(missing))):
+                    bill = await local_openstates_client.fetch_bill_for_embedding(
+                        ocd_bill_id, api_base=api_base, api_key=api_key
+                    )
+                    if bill is not None:
+                        sizes.append(_embeddable_size(bill))
+                plan["sampled"] = len(sizes)
+                if sizes:
+                    mean_documents = sum(d for d, _ in sizes) / len(sizes)
+                    mean_chars = sum(c for _, c in sizes) / len(sizes)
+                    chars = mean_chars * len(missing)
+                    tokens = chars / _CHARS_PER_TOKEN
+                    plan["estimate"] = {
+                        "documents": round(mean_documents * len(missing)),
+                        "chunks": round(chars * _CHUNKS_PER_1000_CHARS / 1000),
+                        "tokens": round(tokens),
+                        "usd": round(tokens / 1_000_000 * _USD_PER_MILLION_TOKENS, 2),
+                        "largest_sampled_bill_chars": max(c for _, c in sizes),
+                    }
+    (logger.info if plan["status"] == "ok" else logger.warning)("knowledge_base_reconcile_plan", **plan)
+    return plan
+
 
 async def _fetch_and_embed(
     embedder: KnowledgeBaseEmbedder, jurisdiction: str, ocd_bill_id: str, *, api_base: str, api_key: str

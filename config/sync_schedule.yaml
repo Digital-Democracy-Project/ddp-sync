@@ -788,9 +788,11 @@ openstates_archive:
     # archived is never "touched", so a new state or a gap would otherwise never be filled). Up to this
     # many bills ATTEMPTED per run per jurisdiction, a random slice when more are missing; embedded bills
     # drop out, so later runs reach the rest. 0 = off. Spend is per bill (a federal bill can be hundreds
-    # of thousands of tokens), so turn it on deliberately with a small number. Every enabled run also
-    # lists ALL of the jurisdiction's archived bills (the US is about 38,000, roughly 1,900 api-v3 pages)
-    # and checks each in Redis; that scan is not capped. Read `knowledge_base_reconcile_backlog`.
+    # of thousands of tokens), so turn it on deliberately with a small number, after the dry run
+    # (POST /trigger/knowledge-base-reconcile/{jurisdiction} logs the unrecorded count and a cost estimate).
+    # Every enabled run also lists ALL of the jurisdiction's archived bills (the US is about 38,000,
+    # roughly 1,900 api-v3 pages) and checks each in Redis; that scan is not capped. Read
+    # `knowledge_base_reconcile_backlog`.
     reconcile:
       max_bills_per_run: 0
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
