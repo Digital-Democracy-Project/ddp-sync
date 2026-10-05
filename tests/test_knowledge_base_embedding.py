@@ -1875,3 +1875,26 @@ def test_the_slack_post_never_raises_and_the_yaml_ships_the_alert_off(monkeypatc
     assert post.call_args.kwargs["json"]["text"] == ":warning: hello"
     shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
     assert shipped["knowledge_base_embedding"]["alert_backlog_over"] == 0
+
+
+async def test_a_malformed_totals_dict_cannot_raise_into_the_hook_and_the_threshold_is_exclusive():
+    from ddp_sync.pipelines.openstates_archive import _backlog_alert_text
+
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], "alert_backlog_over": 5}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    base = "ddp_sync.pipelines.openstates_archive"
+    for bad in ({"mode": "ledger", "ledger": {"bills_to_check": 3}},
+                {"mode": "ledger", "ledger": {"bills_to_check": None, "selected": 1, "failed": 0}},
+                {"mode": "ledger", "ledger": {"bills_to_check": "9", "selected": 1, "failed": 0}}):
+        with patch(f"{base}.get_settings", return_value=settings), \
+             patch(f"{base}._post_slack_alert") as post, \
+             patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock(return_value=bad)), \
+             capture_logs() as logs:
+            await _maybe_embed_knowledge_base("fl", _STARTED, config)  # does not raise
+        post.assert_not_called()
+        assert any(e["event"] == "knowledge_base_alert_error" for e in logs)
+    ledger = lambda check, selected, failed: {"ledger": {"bills_to_check": check, "selected": selected, "failed": failed}}
+    assert _backlog_alert_text("fl", ledger(15, 10, 0), 5) is None  # exactly the threshold: no alert
+    assert _backlog_alert_text("fl", ledger(16, 10, 0), 5) is not None
+    assert _backlog_alert_text("fl", ledger(14, 10, 2), 5) is not None  # 4 over the cap + 2 failed = 6

@@ -838,7 +838,8 @@ def _backlog_alert_text(jurisdiction: str, totals: dict, threshold: int) -> str 
     """SYNC-95: the alert for a knowledge-base run that is not converging, or None. Two cases, both only
     when `threshold` > 0: the ledger was asked for and could not be read (the run fell back to the watermark
     path, whose blind spots are what the ledger exists to close), and a ledger run that left more than
-    `threshold` bills still disagreeing (not reached under the cap, or failed)."""
+    `threshold` bills still disagreeing (not reached under the cap, or failed). `bills_to_check` is the count
+    before the cap and `failed` counts only bills among the `selected`, so the two do not overlap."""
     if not threshold:
         return None
     if totals.get("mode") == "watermark_fallback":
@@ -919,9 +920,12 @@ async def _maybe_embed_knowledge_base(
         delete_orphans=_delete_orphans(config),
         ledger_max_bills=_ledger_max_bills(config),
     )
-    text = _backlog_alert_text(jurisdiction, totals, _alert_backlog_over(config))
-    if text:
-        _post_slack_alert(text)
+    try:  # an alert is best-effort: building it must never turn a finished embedding run into a hook failure
+        text = _backlog_alert_text(jurisdiction, totals, _alert_backlog_over(config))
+        if text:
+            _post_slack_alert(text)
+    except Exception as e:  # noqa: BLE001
+        logger.error("knowledge_base_alert_error", jurisdiction=jurisdiction, error=str(e))
 
 
 def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> bool:
