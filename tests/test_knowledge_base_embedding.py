@@ -1156,3 +1156,82 @@ async def test_the_reconcile_plan_route_refuses_what_it_cannot_run():
         knowledge_base_index_name="ddp-knowledge-base", local_openstates_api_base=""))
     assert resp.status_code == 503 and "read path" in resp.text
     run.assert_not_awaited()
+
+
+async def test_the_dry_run_says_when_its_sample_is_weak_instead_of_looking_fine():
+    _, redis, _ = _embedder()
+    ids = [OCD, OCD2, OCD3]
+    # one readable bill, one that cannot be read, one whose data is malformed
+    bills = {OCD: _sized_bill(OCD, 4000), OCD3: {"versions": "not-a-list-of-versions"}}
+    with capture_logs() as logs:
+        plan, _ = await _plan(redis, everything=ids, bills=bills)
+    assert plan["status"] == "ok" and (plan["sampled"], plan["sample_failed"]) == (1, 2)
+    assert plan["estimate"]["documents"] == 3  # the one usable bill's size, extrapolated to all three
+    assert sum(e["event"] == "knowledge_base_reconcile_plan_sample_failed" for e in logs) == 2
+
+    plan, _ = await _plan(redis, everything=ids, bills={})  # nothing could be read
+    assert plan["status"] == "error" and plan["error"] == "sample_unreadable"
+    assert (plan["sampled"], plan["sample_failed"], plan["unrecorded"]) == (0, 3, 3) and "estimate" not in plan
+
+
+async def test_the_dry_run_marks_an_incomplete_listing_as_a_lower_bound():
+    _, redis, _ = _embedder()
+    list_mock = AsyncMock(return_value=([OCD], False))
+    fetch = AsyncMock(return_value=_sized_bill(OCD, 1000))
+    with patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.list_touched_bill_ids", list_mock), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.fetch_bill_for_embedding", fetch), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.get_redis_store", return_value=redis):
+        plan = await kb.plan_reconcile("fl", api_base="http://api")
+    assert plan["status"] == "incomplete" and plan["listing_complete"] is False
+    assert "lower bounds" in plan["note"] and plan["unrecorded"] == 1 and "estimate" in plan
+
+
+async def test_the_dry_run_with_nothing_unrecorded_reads_no_bill():
+    _, redis, _ = _embedder()
+    redis.versions[OCD] = {"schema": kb.CACHE_SCHEMA, "documents": {}}
+    plan, fetch = await _plan(redis, everything=[OCD], bills={})
+    assert plan["status"] == "ok" and plan["unrecorded"] == 0 and plan["sampled"] == 0
+    assert fetch.await_count == 0 and "estimate" not in plan
+
+
+async def test_the_dry_run_never_builds_an_embedder_or_writes_even_when_everything_fails():
+    def boom(*a, **kw):
+        raise AssertionError("the dry run must not embed")
+
+    _, redis, _ = _embedder()
+    with patch.object(kb, "KnowledgeBaseEmbedder", side_effect=boom), patch.object(kb, "IngestionPipeline", side_effect=boom):
+        await _plan(redis, everything=[OCD], bills={}, listing=False)  # listing fails
+        redis.unreadable = True
+        await _plan(redis, everything=[OCD], bills={})  # records unreadable
+        redis.unreadable = False
+        await _plan(redis, everything=[OCD, OCD2], bills={})  # no sample can be read
+    assert redis.set_calls == 0 and redis.versions == {} and redis.watermarks == {}
+
+
+@pytest.mark.parametrize("name, version", [
+    ("normal text and a stored diff", _version(11, "Sub", "amendment", 1, "t" * 500, diff="d" * 120)),
+    ("text only, no diff", _version(11, "Sub", "amendment", 1, "t" * 500)),
+    ("an empty diff is not a document", {**_version(11, "Sub", "amendment", 1, "t" * 500), "diff_from_previous_version": ""}),
+    ("a diff on a stage-unknown version is skipped", _version(11, "Odd", "unknown", None, "t" * 500, diff="d" * 120, unknown=True)),
+    ("no text yet", _version(11, "Sub", "amendment", 1, "")),
+    ("text but no archived document id", {**_version(11, "Sub", "amendment", 1, "t" * 500), "archived_document_id": None}),
+])
+async def test_the_dry_runs_size_matches_what_embed_bill_really_writes(name, version):
+    """The estimator repeats embed_bill's skip rules, so prove they agree on every one (and catch drift)."""
+    emb, _, _ = _embedder()
+    bill = _bill([version])
+    stats = await emb.embed_bill(OCD, "fl", bill)
+    documents, characters = kb._embeddable_size(bill)
+    assert (documents, characters) == (stats["documents"] + stats["diffs"], stats["chars"]), name
+
+
+async def test_the_reconcile_plan_route_needs_the_same_api_key_as_its_siblings():
+    from ddp_sync.api.auth import api_key_auth
+    from ddp_sync.api.routes.triggers import router
+
+    def requires_key(path):
+        route = next(r for r in router.routes if getattr(r, "path", "") == path)
+        return any(d.call is api_key_auth for d in route.dependant.dependencies)
+
+    assert requires_key("/trigger/knowledge-base-reconcile/{jurisdiction}")
+    assert requires_key("/trigger/knowledge-base-backfill/{jurisdiction}")  # the sibling it mirrors

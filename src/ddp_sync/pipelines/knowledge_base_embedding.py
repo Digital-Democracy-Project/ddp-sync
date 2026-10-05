@@ -381,7 +381,13 @@ async def plan_reconcile(
     Lists every archived bill, counts the ones with no record, reads a random sample of those, and
     extrapolates documents, chunks, tokens and dollars from the sample's mean size. The estimate is an
     order of magnitude, not a quote: bill sizes vary by orders of magnitude (a federal bill can be a
-    hundred times a state bill), so a small sample can be far off. Never raises."""
+    hundred times a state bill), so a small sample can be far off.
+
+    It says when it is weak instead of looking fine: `sampled` and `sample_failed` count the bills that
+    could and could not be used (a bill that cannot be read, or whose data is malformed, is skipped
+    and counted); with unrecorded bills but no usable sample the status is `error` and there is no
+    estimate; an incomplete listing makes the status `incomplete` (the counts are lower bounds). A failed
+    read never raises."""
     plan: dict[str, Any] = {"jurisdiction": jurisdiction, "status": "ok"}
     if run_id:
         plan["run_id"] = run_id  # the one the trigger returned, so the result line can be found
@@ -401,14 +407,25 @@ async def plan_reconcile(
                 plan.update(status="error", error="records_unreadable")
             else:
                 plan.update(listed=len(ids), listing_complete=complete, unrecorded=len(missing))
-                sizes = []
+                sizes: list[tuple[int, int]] = []
+                failed = 0
                 for ocd_bill_id in random.sample(missing, min(sample_size, len(missing))):
                     bill = await local_openstates_client.fetch_bill_for_embedding(
                         ocd_bill_id, api_base=api_base, api_key=api_key
                     )
-                    if bill is not None:
+                    try:
+                        if bill is None:
+                            raise ValueError("bill detail could not be read from api-v3")
                         sizes.append(_embeddable_size(bill))
-                plan["sampled"] = len(sizes)
+                    except Exception as e:  # noqa: BLE001 -- one unusable bill must not end the plan
+                        failed += 1
+                        logger.warning("knowledge_base_reconcile_plan_sample_failed", jurisdiction=jurisdiction,
+                                       ocd_bill_id=ocd_bill_id, error=str(e))
+                plan["sampled"], plan["sample_failed"] = len(sizes), failed
+                if not complete:
+                    plan.update(status="incomplete", note="the bill listing was incomplete: the counts and the estimate are lower bounds")
+                if missing and not sizes:
+                    plan.update(status="error", error="sample_unreadable")
                 if sizes:
                     mean_documents = sum(d for d, _ in sizes) / len(sizes)
                     mean_chars = sum(c for _, c in sizes) / len(sizes)
