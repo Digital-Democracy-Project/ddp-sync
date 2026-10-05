@@ -1818,3 +1818,94 @@ async def test_a_stamp_is_not_advanced_when_anything_else_in_the_bill_was_left_u
     totals, _, _ = await _run_ledger(redis, emb, [changed])
     assert totals["complete"] is True
     assert {d["source_updated_at"] for d in redis.versions[OCD]["documents"].values()} == {U2}
+
+
+# --- SYNC-95: the backlog alert --------------------------------------------------------------------------
+
+
+def test_the_alert_threshold_comes_from_yaml_and_anything_odd_means_off():
+    from ddp_sync.pipelines.openstates_archive import _alert_backlog_over
+
+    def cfg(v):
+        return {"knowledge_base_embedding": {"alert_backlog_over": v}}
+
+    assert _alert_backlog_over(None) == 0 and _alert_backlog_over({"knowledge_base_embedding": {}}) == 0
+    assert _alert_backlog_over(cfg(50)) == 50
+    for odd in ("lots", -1, True, 2.5, None):
+        assert _alert_backlog_over(cfg(odd)) == 0, odd
+
+
+def test_the_backlog_alert_text_for_a_fallback_a_backlog_and_a_healthy_run():
+    from ddp_sync.pipelines.openstates_archive import _backlog_alert_text
+
+    ledger = lambda check, selected, failed: {"mode": "ledger", "ledger": {
+        "bills_to_check": check, "selected": selected, "failed": failed}}
+    assert _backlog_alert_text("fl", {"mode": "watermark_fallback"}, 0) is None  # off means off
+    assert "could not read api-v3's ledger" in _backlog_alert_text("fl", {"mode": "watermark_fallback"}, 10)
+    assert _backlog_alert_text("fl", {"mode": "watermark"}, 10) is None  # the ledger was never asked for
+    assert _backlog_alert_text("fl", ledger(100, 100, 0), 10) is None  # everything reached
+    assert _backlog_alert_text("fl", ledger(100, 95, 3), 10) is None  # 5 over the cap + 3 failed = 8, not over 10
+    text = _backlog_alert_text("fl", ledger(100, 90, 4), 10)  # 10 + 4 = 14
+    assert "14 bills" in text and "4 failed" in text and "10 over the per-run cap" in text
+
+
+async def test_the_hook_posts_the_alert_only_when_there_is_one_and_never_raises():
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], "alert_backlog_over": 5}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    base = "ddp_sync.pipelines.openstates_archive"
+    with patch(f"{base}.get_settings", return_value=settings), \
+         patch(f"{base}._post_slack_alert") as post, \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills",
+               new=AsyncMock(return_value={"mode": "watermark_fallback"})):
+        await _maybe_embed_knowledge_base("fl", _STARTED, config)
+        assert post.call_count == 1 and "fl" in post.call_args.args[0]
+    with patch(f"{base}.get_settings", return_value=settings), \
+         patch(f"{base}._post_slack_alert") as post, \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills",
+               new=AsyncMock(return_value={"mode": "ledger", "ledger": {"bills_to_check": 0, "selected": 0, "failed": 0}})):
+        await _maybe_embed_knowledge_base("fl", _STARTED, config)
+        post.assert_not_called()
+
+
+def test_the_slack_post_never_raises_and_the_yaml_ships_the_alert_off(monkeypatch):
+    from pathlib import Path
+
+    import yaml
+
+    from ddp_sync.pipelines import openstates_archive as oa
+
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    oa._post_slack_alert("x")  # no token: logged, not raised
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "t")
+    with patch.object(oa.requests, "post", side_effect=RuntimeError("net")):
+        oa._post_slack_alert("x")
+    with patch.object(oa.requests, "post") as post:
+        post.return_value.ok, post.return_value.json.return_value = True, {"ok": True}
+        oa._post_slack_alert("hello")
+    assert post.call_args.kwargs["json"]["text"] == ":warning: hello"
+    shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
+    assert shipped["knowledge_base_embedding"]["alert_backlog_over"] == 0
+
+
+async def test_a_malformed_totals_dict_cannot_raise_into_the_hook_and_the_threshold_is_exclusive():
+    from ddp_sync.pipelines.openstates_archive import _backlog_alert_text
+
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], "alert_backlog_over": 5}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    base = "ddp_sync.pipelines.openstates_archive"
+    for bad in ({"mode": "ledger", "ledger": {"bills_to_check": 3}},
+                {"mode": "ledger", "ledger": {"bills_to_check": None, "selected": 1, "failed": 0}},
+                {"mode": "ledger", "ledger": {"bills_to_check": "9", "selected": 1, "failed": 0}}):
+        with patch(f"{base}.get_settings", return_value=settings), \
+             patch(f"{base}._post_slack_alert") as post, \
+             patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock(return_value=bad)), \
+             capture_logs() as logs:
+            await _maybe_embed_knowledge_base("fl", _STARTED, config)  # does not raise
+        post.assert_not_called()
+        assert any(e["event"] == "knowledge_base_alert_error" for e in logs)
+    ledger = lambda check, selected, failed: {"ledger": {"bills_to_check": check, "selected": selected, "failed": failed}}
+    assert _backlog_alert_text("fl", ledger(15, 10, 0), 5) is None  # exactly the threshold: no alert
+    assert _backlog_alert_text("fl", ledger(16, 10, 0), 5) is not None
+    assert _backlog_alert_text("fl", ledger(14, 10, 2), 5) is not None  # 4 over the cap + 2 failed = 6
