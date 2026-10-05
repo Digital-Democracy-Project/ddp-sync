@@ -365,7 +365,7 @@ as `already_exists_pending`, and a bill with only `rejected` sets is still regen
   that is BROKER-177 (read-only report from the prod agent first, then reject or delete with a backup).
 - Verified live 2026-10-01: a US/119 run skipped 752 of its first 868 bills as `already_exists_pending`.
 
-## The `ddp-knowledge-base` pipeline: one embedder, three off-by-default hooks (SYNC-83/87/89/90/91)
+## The `ddp-knowledge-base` pipeline: one embedder, gated per host (SYNC-83/87/89/90/91, SYNC-94)
 
 `PLAN-enterprise-search.md` 5.6 adds a **second, independent** Pinecone index, `ddp-knowledge-base`,
 keyed by canonical ids (`ocd_bill_id`, bare openstates person uuid, broker org id), next to the
@@ -420,19 +420,32 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   cache entry right before writing it and skips one another writer changed; an unreadable cache is
   *undone*, never "raced". There is no atomic compare-and-set across Pinecone and Redis, by design;
   any residual mismatch heals on the next pass.
-- **Everything is OFF until enabled, per host.** `openstates_archive.knowledge_base_embedding`
-  (bill embedding; also needs `KNOWLEDGE_BASE_INDEX_NAME`), `openstates_archive.
-  bill_search_refresh` (refresh of api-v3's `ddp_bill_search`; always the RDS-backed api-v3, never the
-  Mac's local one), and the manual routes `/trigger/knowledge-base-backfill/{jurisdiction}` and
-  `/trigger/knowledge-base-entities/organizations` (both default to `dry_run=true`).
-  Never set `KNOWLEDGE_BASE_INDEX_NAME` on the votebot/ddp-api EC2 instance.
+- **The yaml is ON since 2026-10-05; the environment is the real gate, per host.** `config/
+  sync_schedule.yaml` is shared by every ddp-sync host and now has `openstates_archive.
+  knowledge_base_embedding.enabled: true` (bill embedding) and `bill_search_refresh.enabled: true`
+  (refresh of api-v3's `ddp_bill_search`; always the RDS-backed api-v3, never the Mac's local one). A host
+  acts only if it also has the matching environment: the embedding hook needs
+  `KNOWLEDGE_BASE_INDEX_NAME` (without it the hook logs `knowledge_base_embedding_enrolled_but_index_unset`
+  and returns), the refresh needs `RDS_OPENSTATES_API_BASE` and its key. **Set the index name on exactly
+  one host**: every host has its own Redis version cache, so a second host would embed the same changes
+  again and pay twice. It is set only on the EC2 broker host; this Mac has it unset (checked 2026-10-05),
+  so the shared file is inert here. Never set it on the votebot/ddp-api EC2 instance. The manual routes
+  `/trigger/knowledge-base-backfill/{jurisdiction}` and `/trigger/knowledge-base-entities/organizations`
+  still default to `dry_run=true`.
 
-**Merged is not deployed (as of 2026-10-01).** Everything above is merged to `main` and default-off;
-the Mac's production ddp-sync was last restarted on 2026-09-29 at the SYNC-85 commit, so none of it
-is running there. Dependencies before any of it does real work: api-v3 serving `archived_document_id`
-/ `version_stage` / `version_ordinal` on **both** instances (OPEN-311 merged, **OPEN-315** is the
-deploy), `KNOWLEDGE_BASE_INDEX_NAME` set on one host, and for organizations ddp-broker-py PR #389
-(BROKER-144) deployed (until then the organization run reports incomplete with nothing written).
+**State as of 2026-10-05 (from the EC2 host's operator notes in `ddp-broker-py`'s `notes/ops-handoff`;
+re-check before relying on it).** The staged backfill is complete: all 21 stages (`current`,
+`prior-sessions`, `history` for FL, US, VA, MI, WA, AZ, UT) are done with no failed bills, and
+`ddp-knowledge-base` holds 426,166 vectors, exactly what the checkpoints recorded. **Not run:** the
+backfill's `diffs` stage (keeping version-diff documents is still undecided, SYNC-94; **but the live hook
+uses the default `EmbedScope`, which includes diffs, so once a host runs it, it writes `bill-version-diff`
+documents for every bill it touches**) and organizations (the
+ddp-broker-py Organization import, BROKER-144's data steps, has not run, so `/api/organizations/` is
+empty and an organization run would embed nothing). Votes and legislator profiles are not embedded
+(SYNC-94). api-v3 on the RDS-backed instance serves the OPEN-311 fields and the OPEN-317 XML-first
+version pick; the Mac's local api-v3 is a separate deploy. SYNC-93's routing fix (2026-10-02) and SYNC-94's
+removal of votes and legislators (2026-10-03) were deployed on the EC2 host. Whether a particular host is *running* the live hook
+depends on it having pulled the 2026-10-05 yaml and recreated ddp-sync; verify on the host.
 
 ## The shared Redis is a single point of failure for several things at once
 

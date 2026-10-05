@@ -121,14 +121,15 @@ instance) — the two have not been reconciled; see CLAUDE.md before building on
 
 `PLAN-enterprise-search.md` (ddp-infra) adds a second Pinecone index, `ddp-knowledge-base`, keyed by
 canonical ids, and keeps api-v3's `ddp_bill_search` projection fresh. The legacy `votebot-large` path
-is untouched. **Everything below is merged and OFF by default** (as of 2026-10-01 none of it is
-deployed to the Mac's production instance); see `CLAUDE.md` for the rules and `primitives.md` for the
-building blocks.
+is untouched. **As of 2026-10-05 the embedding hook and the search refresh are switched on in the
+checked-in schedule, but each only acts on a host that also has its environment gate** (the table's
+Gate column); the backfill and organizations are manual. See `CLAUDE.md` for the rules and
+`primitives.md` for the building blocks.
 
 | Piece | What it does | Gate |
 |---|---|---|
-| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text (no version diffs, no votes) | `openstates_archive.knowledge_base_embedding.enabled` **and** `KNOWLEDGE_BASE_INDEX_NAME` |
-| Search refresh (SYNC-87) | After a jurisdiction's archive: `POST /ddp/search/refresh` on the RDS-backed api-v3 until drained | `openstates_archive.bill_search_refresh.enabled`, plus `RDS_OPENSTATES_API_BASE`/`_KEY` |
+| Embedding hook (SYNC-83) | After a jurisdiction's archive: embed each bill's per-version text (no version diffs, no votes) | `openstates_archive.knowledge_base_embedding.enabled` (on in the checked-in file since 2026-10-05) **and** `KNOWLEDGE_BASE_INDEX_NAME` (the real per-host gate: set only on the EC2 broker host) |
+| Search refresh (SYNC-87) | After a jurisdiction's archive: `POST /ddp/search/refresh` on the RDS-backed api-v3 until drained | `openstates_archive.bill_search_refresh.enabled` (on in the checked-in file since 2026-10-05), plus `RDS_OPENSTATES_API_BASE`/`_KEY` (the real per-host gate) |
 | Backfill (SYNC-90) | `POST /trigger/knowledge-base-backfill/{jurisdiction}`: three default stages (current, prior-sessions, history; a `diffs` stage exists but is not run), checkpoint per jurisdiction and stage, blackout window 04:45-07:00 UTC | manual; `dry_run=true` default |
 | Reconcile plan (SYNC-95) | `POST /trigger/knowledge-base-reconcile/{jurisdiction}`: the dry run of the reconcile pass. Counts the archived bills the Redis version cache has no record of and estimates their documents, chunks, tokens and dollars from a sample of 20; writes nothing; the result is the log line `knowledge_base_reconcile_plan` | manual; always a dry run |
 | Organizations (SYNC-91) | `POST /trigger/knowledge-base-entities/organizations`; read from ddp-broker-py `/api/organizations/` (BROKER-144). Legislators are not embedded (SYNC-94) | manual; `dry_run=true` default |
@@ -154,11 +155,22 @@ votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
 `ddp:kb_embed:since:{jurisdiction}` (live-hook watermark), `ddp:kb_backfill:{jurisdiction}:{stage}`
 (backfill checkpoint), `ddp_sync:kb_backfill:lock:{jurisdiction}` (one backfill at a time).
 
-**Prerequisites before enabling anything:** api-v3 must serve the OPEN-311 fields
-(`archived_document_id`, `version_stage`, `version_ordinal`) on both the Mac's and the RDS-backed
-instance (OPEN-315); the index must exist (it does, `ddp-knowledge-base`); organizations also need
-ddp-broker-py PR #389 (BROKER-144) deployed. Enable one jurisdiction first and check the archive
-hook's duration and `knowledge_base_entities_run` counts before enabling more.
+**Status (2026-10-05, from the EC2 host's operator notes).** The staged backfill is complete: all 21
+stages (`current`, `prior-sessions`, `history` for FL, US, VA, MI, WA, AZ, UT) are done with no failed
+bills, and `ddp-knowledge-base` holds 426,166 vectors, exactly the total the checkpoints recorded.
+**Not run:** the backfill's `diffs` stage (whether to keep version-diff documents is still undecided,
+SYNC-94; **the live hook's default scope includes diffs, so a host running it writes `bill-version-diff`
+documents for each bill it touches**) and organizations (the ddp-broker-py Organization import, BROKER-144's data steps, has not run, so the broker's
+`/api/organizations/` is empty). Votes and legislator profiles are deliberately not embedded (SYNC-94).
+Whether a given host is *running* the live hook depends on that host having pulled this file and
+recreated ddp-sync, so check the host rather than assuming.
+
+**Prerequisites for the hook on a host:** an api-v3 that serves the OPEN-311 fields
+(`archived_document_id`, `version_stage`, `version_ordinal`) and the OPEN-317 XML-first version pick
+(both live on the RDS-backed instance; the Mac's local api-v3 is a separate deploy and is not needed
+while the Mac has no `KNOWLEDGE_BASE_INDEX_NAME`), plus `KNOWLEDGE_BASE_INDEX_NAME` and the OpenAI and
+Pinecone keys in that host's own environment. **Set the index name on one host only**: each host has its
+own Redis version cache, so a second host would embed the same changes again and pay twice.
 
 ## API
 
