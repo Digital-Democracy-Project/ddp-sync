@@ -177,11 +177,16 @@ async def test_each_stage_embeds_exactly_its_slice(stage, expected):
 async def test_all_stages_in_order_write_every_document_exactly_once():
     env = Env()
     result = await env.run(None)
-    assert [r["stage"] for r in result["stages"]] == list(bf.STAGES)
+    assert [r["stage"] for r in result["stages"]] == list(bf.DEFAULT_STAGES)
     assert result["status"] == "complete"
-    assert len(env.pipe.keys) == len(set(env.pipe.keys))  # history skipped what stages 1 and 4 wrote
-    assert set(env.pipe.keys) == {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7),
-                                  _d(A, 2), _d(A, 3), _d(B, 5)}
+    assert len(env.pipe.keys) == len(set(env.pipe.keys))  # history skipped what the earlier stages wrote
+    # Text only: version diffs are not embedded (Ramon, 2026-10-05), so no diff document is ever written.
+    assert set(env.pipe.keys) == {_t(A, 1), _t(A, 2), _t(A, 3), _t(B, 4), _t(B, 5), _t(C, 6), _t(C, 7)}
+
+
+async def test_a_default_run_never_includes_the_diffs_stage():
+    assert bf.DEFAULT_STAGES == ("current", "prior-sessions", "history")
+    assert "diffs" not in bf.DEFAULT_STAGES and "diffs" in bf.STAGES
 
 
 async def test_there_is_no_votes_stage_and_every_stage_has_a_scope():
@@ -199,9 +204,9 @@ async def test_a_leftover_votes_checkpoint_and_legacy_votes_totals_do_not_distur
     env.redis.checkpoints[("fl", "diffs")] = {"last_bill_id": "", "failed_ids": [], "done": False,
                                               "totals": {"documents": 0, "votes": 0}}
     result = await env.run(None)
-    assert result["status"] == "complete" and [r["stage"] for r in result["stages"]] == list(bf.STAGES)
+    assert result["status"] == "complete" and [r["stage"] for r in result["stages"]] == list(bf.DEFAULT_STAGES)
     assert env.redis.checkpoints[("fl", "votes")] == stale  # untouched, never consulted
-    assert env.redis.checkpoints[("fl", "diffs")]["done"] is True
+    assert env.redis.checkpoints[("fl", "diffs")]["done"] is False  # a default run does not touch diffs
 
 
 async def test_stage_selection_uses_the_session_filter_not_a_detail_fetch_per_bill():
@@ -394,7 +399,7 @@ async def test_dry_run_reports_counts_per_stage_and_writes_nothing():
     env = Env()
     result = await env.run(None, dry_run=True)
     counts = {r["stage"]: (r["bills_in_stage"], r["bills_remaining"]) for r in result["stages"]}
-    assert counts == {"current": (2, 2), "diffs": (3, 3), "prior-sessions": (1, 1), "history": (3, 3)}
+    assert counts == {"current": (2, 2), "prior-sessions": (1, 1), "history": (3, 3)}
     assert env.pipe.keys == [] and env.fetched == []
     assert env.redis.checkpoints == {} and env.redis._client.kv == {}  # no lock, no checkpoint
 
@@ -509,7 +514,7 @@ async def test_route_defaults_to_a_dry_run_of_every_stage():
     resp, run = _route("/trigger/knowledge-base-backfill/fl")
     assert resp.status_code == 202, resp.text
     body = resp.json()
-    assert body["dry_run"] is True and body["stages"] == list(bf.STAGES)
+    assert body["dry_run"] is True and body["stages"] == list(bf.DEFAULT_STAGES)
     assert body["run_id"].startswith("fl-kb-backfill-dry-")
     run.assert_awaited_once()
     args, kwargs = run.await_args

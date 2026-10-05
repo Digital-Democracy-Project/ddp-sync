@@ -85,10 +85,13 @@ class EmbedScope:
 
     text: "all" (every version), "current" (only the bill's current version, i.e. the highest
     `version_ordinal` among classifiable versions; stage-unknown versions are never current), or
-    None (no text documents). diffs: whether to write the version-diff documents."""
+    None (no text documents). diffs: whether to write the version-diff documents. **Off by default
+    (Ramon, 2026-10-05):** version diffs are not embedded, because a vector of a raw unified diff only captures
+    the topics of the changed lines; a "what changed" question is answered from the two versions' text or the
+    stored diff read live. The code path stays so a stage can still ask for it deliberately; nothing does."""
 
     text: str | None = "all"
-    diffs: bool = True
+    diffs: bool = False
 
 
 SCOPE_ALL = EmbedScope()
