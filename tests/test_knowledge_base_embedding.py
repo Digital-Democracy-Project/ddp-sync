@@ -979,7 +979,7 @@ async def test_the_nothing_to_embed_marker_never_replaces_a_record_written_in_th
     emb, redis, _ = _embedder()
     real = {"schema": kb.CACHE_SCHEMA, "documents": {"11": {"text_hash": "real", "chunks": 3}}}
 
-    async def embed_then_a_real_record_appears(ocd, jurisdiction, bill, scope=kb.SCOPE_ALL):
+    async def embed_then_a_real_record_appears(ocd, jurisdiction, bill, scope=kb.SCOPE_ALL, **kwargs):
         redis.versions[ocd] = real  # another writer finishes this bill while we were reading it
         return {"documents": 0, "diffs": 0, "chunks": 0, "undone": []}
 
@@ -1246,3 +1246,261 @@ async def test_the_reconcile_plan_route_needs_the_same_api_key_as_its_siblings()
 
     assert requires_key("/trigger/knowledge-base-reconcile/{jurisdiction}")
     assert requires_key("/trigger/knowledge-base-backfill/{jurisdiction}")  # the sibling it mirrors
+
+
+# --- SYNC-95: orphaned vectors ---------------------------------------------------------------------------
+
+
+def _vector_store():
+    vs = MagicMock()
+    vs.delete = AsyncMock()
+    return vs
+
+
+def _deleted_ids(vs):
+    return [i for call in vs.delete.await_args_list for i in call.kwargs["ids"]]
+
+
+def _recorded(**docs):
+    """A cache entry that records documents by archived id: _recorded(**{"11": (3, 1)}) = 3 text chunks and 1 diff chunk."""
+    return {"schema": kb.CACHE_SCHEMA, "documents": {
+        aid: {"text_hash": "h", "chunks": c, "diff_hash": "d" if dc else None, "diff_chunks": dc}
+        for aid, (c, dc) in docs.items()}}
+
+
+async def test_an_orphaned_document_is_deleted_by_exact_id_and_dropped_from_the_record():
+    """The picker re-chose row 13 for the version that was recorded as 11; 12 is untouched."""
+    emb, redis, pipe = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 1), "12": (1, 0)})
+    redis.versions[OCD]["documents"]["12"]["text_hash"] = kb.content_hash("t" * 50)  # recorded as it is now
+    vs = _vector_store()
+    bill = _bill([_version(12, "Sub", "amendment", 1, "t" * 50), _version(13, "Intro", "introduced", 0, TEXT_A)])
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+    assert sorted(_deleted_ids(vs)) == sorted(
+        [f"bill-text:{OCD}:11-chunk-{n}" for n in range(3)] + [f"bill-version-diff:{OCD}:11-chunk-0"])
+    assert stats["orphans"] == 1 and stats["undone"] == []
+    entry = redis.versions[OCD]["documents"]
+    assert set(entry) == {"12", "13"} and "11" not in entry  # 13 was embedded; the orphan is gone
+    assert f"bill-text:{OCD}:13" in pipe.keys and f"bill-text:{OCD}:12" not in pipe.keys  # 12 unchanged: not redone
+
+
+async def test_orphan_removal_is_off_unless_asked():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([_version(13, "Intro", "introduced", 0, TEXT_A)]))
+    assert vs.delete.await_count == 0 and stats["orphans"] == 0 and "11" in redis.versions[OCD]["documents"]
+
+
+async def test_a_response_that_lists_no_archived_ids_removes_nothing():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+    vs = _vector_store()
+    for versions in ([], [{"note": "Introduced", "date": "2026-01-01", "links": []}]):  # none, or none with an id
+        with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+            stats = await emb.embed_bill(OCD, "fl", _bill(versions), max_orphans=10)
+        assert stats["orphans"] == 0
+    assert vs.delete.await_count == 0 and "11" in redis.versions[OCD]["documents"]
+
+
+async def test_a_version_api_v3_still_lists_without_text_is_not_an_orphan():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+    vs = _vector_store()
+    no_text_now = _version(11, "Introduced", "introduced", 0, "")  # id still listed, text momentarily absent
+    has_text = _version(12, "Sub", "amendment", 1, TEXT_B)  # a second version, so the response is not "no ids at all"
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([no_text_now, has_text]), max_orphans=10)
+    assert vs.delete.await_count == 0 and stats["orphans"] == 0 and "11" in redis.versions[OCD]["documents"]
+
+
+async def test_a_failed_orphan_delete_keeps_the_record_so_the_next_run_retries():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+    vs = _vector_store()
+    vs.delete = AsyncMock(side_effect=RuntimeError("pinecone down"))
+    bill = _bill([_version(13, "Intro", "introduced", 0, TEXT_A)])
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+    assert stats["orphans"] == 0 and any("not removed" in u for u in stats["undone"])
+    assert "11" in redis.versions[OCD]["documents"]  # still recorded; the cache was not advanced
+    vs.delete = AsyncMock()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        retry = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+    assert retry["orphans"] == 1 and "11" not in redis.versions[OCD]["documents"]
+
+
+async def test_the_circuit_breaker_stops_orphan_removal_after_too_many_in_one_run():
+    emb, redis, _ = _embedder()
+    ids = [f"0b1c2d3e-0000-0000-0000-0000000003{n:02d}" for n in range(5)]
+    for i in ids:
+        redis.versions[i] = _recorded(**{"11": (1, 0)})  # each bill recorded one document that api-v3 no longer lists
+    bills = {i: _one_version_bill(i, doc_id=99) for i in ids}  # ...and now lists a different id
+    vs = _vector_store()
+    started = _STARTED
+    list_mock = AsyncMock(return_value=(ids, True))
+    fetch = AsyncMock(side_effect=lambda i, **kw: bills[i])
+    with patch.object(kb, "MAX_ORPHAN_DOCUMENTS_PER_RUN", 2), capture_logs() as logs, \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.list_touched_bill_ids", list_mock), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.local_openstates_client.fetch_bill_for_embedding", fetch), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.get_redis_store", return_value=redis), \
+         patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        totals = await kb.embed_archived_bills("fl", started, settings=_settings(), api_base="http://api",
+                                               embedder=emb, delete_orphans=True)
+    assert totals["orphans"] == 2 and len(_deleted_ids(vs)) == 2  # it stopped at the cap
+    assert totals["orphans_over_budget"] == 3  # the other three stay recorded
+    assert all(i in redis.versions and "11" in redis.versions[i]["documents"] for i in ids[2:])
+    paused = [e for e in logs if e["event"] == "knowledge_base_orphan_removal_paused"]
+    assert len(paused) == 1 and paused[0]["cap"] == 2 and paused[0]["left_recorded"] == 3
+
+
+def test_orphan_removal_needs_a_literal_true_in_yaml():
+    from ddp_sync.pipelines.openstates_archive import _delete_orphans
+
+    def cfg(value):
+        return {"knowledge_base_embedding": {"delete_orphans": value}}
+
+    assert _delete_orphans(cfg(True)) is True
+    for odd in (False, "true", "yes", 1, None):
+        assert _delete_orphans(cfg(odd)) is False, odd
+    assert _delete_orphans(None) is False and _delete_orphans({}) is False
+
+
+async def test_the_hook_passes_the_orphan_flag_and_the_yaml_ships_it_off():
+    from pathlib import Path
+
+    import yaml
+
+    config = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["fl"], "delete_orphans": True}}
+    settings = SyncSettings(knowledge_base_index_name="ddp-knowledge-base",
+                            rds_openstates_api_base="http://rds", rds_openstates_api_key="rk")
+    with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
+         patch("ddp_sync.pipelines.knowledge_base_embedding.embed_archived_bills", new=AsyncMock()) as run:
+        await _maybe_embed_knowledge_base("fl", _STARTED, config)
+    assert run.await_args.kwargs["delete_orphans"] is True
+    cfg = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
+    assert cfg["knowledge_base_embedding"]["delete_orphans"] is False
+
+
+async def test_the_orphan_budget_is_a_hard_cap_even_inside_one_bill():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (1, 0), "12": (1, 0), "13": (1, 0)})
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([_version(99, "Intro", "introduced", 0, TEXT_A)]), max_orphans=2)
+    assert stats["orphans"] == 2 and stats["orphans_over_budget"] == 1 and len(_deleted_ids(vs)) == 2
+    assert set(redis.versions[OCD]["documents"]) == {"13", "99"}  # one orphan left recorded, for a later run
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([_version(99, "Intro", "introduced", 0, TEXT_A)]), max_orphans=0)
+    assert stats["orphans"] == 0 and stats["orphans_over_budget"] == 1  # a zero budget detects but never deletes
+
+
+async def test_an_orphan_another_writer_changed_since_it_was_read_is_skipped_not_deleted():
+    _, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+
+    class _Concurrent(FakeRedis):
+        async def get_bill_version(self, key):
+            self.reads = getattr(self, "reads", 0) + 1
+            if self.reads == 2:  # the re-read just before the delete: someone rewrote document 11 meanwhile
+                self.versions[key]["documents"]["11"] = {"text_hash": "rewritten", "chunks": 5, "diff_chunks": 0}
+            return self.versions.get(key)
+
+    racing = _Concurrent()
+    racing.versions = redis.versions
+    emb2, _, _ = _embedder(redis=racing)
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb2.embed_bill(OCD, "fl", _bill([_version(13, "Intro", "introduced", 0, TEXT_A)]), max_orphans=10)
+    assert vs.delete.await_count == 0 and stats["orphans"] == 0 and stats["raced"] == 1
+    assert racing.versions[OCD]["documents"]["11"]["chunks"] == 5  # the other writer's entry survives
+
+
+async def test_the_final_merge_keeps_an_entry_a_writer_changed_after_the_orphan_was_deleted():
+    redis = FakeRedis()
+    redis.versions[OCD] = _recorded(**{"11": (3, 0)})
+
+    class _LateWriter(FakeRedis):
+        async def get_bill_version(self, key):
+            self.reads = getattr(self, "reads", 0) + 1
+            if self.reads == 4:  # the merge's fresh read, after the delete (read 1 initial, 2 the new document's guard, 3 the orphan re-read)
+                self.versions[key]["documents"]["11"] = {"text_hash": "late", "chunks": 7, "diff_chunks": 0}
+            return self.versions.get(key)
+
+    late = _LateWriter()
+    late.versions = redis.versions
+    emb, _, _ = _embedder(redis=late)
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([_version(13, "Intro", "introduced", 0, TEXT_A)]), max_orphans=10)
+    assert stats["orphans"] == 1 and "13" in late.versions[OCD]["documents"]
+    assert late.versions[OCD]["documents"]["11"]["chunks"] == 7  # not popped: it no longer matched what was deleted
+
+
+async def test_orphan_removal_converges_after_each_partial_failure():
+    """Text deleted then the diff delete fails; then the second of two orphans fails; then a cache write fails."""
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (2, 1), "12": (1, 0)})
+    bill = _bill([_version(13, "Intro", "introduced", 0, TEXT_A)])
+    deleted = []
+
+    def store(fail_when):
+        vs = MagicMock()
+
+        async def delete(ids):
+            if fail_when(ids):
+                raise RuntimeError("pinecone down")
+            deleted.extend(ids)
+
+        vs.delete = delete
+        return vs
+
+    # 1: the text delete of 11 works, its diff delete fails -> nothing advances, both stay recorded
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=store(lambda ids: ids[0].startswith("bill-version-diff"))):
+        first = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+    assert first["orphans"] >= 0 and first["undone"] and set(redis.versions[OCD]["documents"]) == {"11", "12"}
+    # 2: now document 12's delete fails after 11 fully succeeded
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=store(lambda ids: ids[0].startswith(f"bill-text:{OCD}:12"))):
+        second = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+    assert second["undone"] and set(redis.versions[OCD]["documents"]) == {"11", "12"}  # the cache was not advanced
+    # 3: every delete works, but the cache write fails once: vectors are gone, the record still lists them
+    real_set = redis.set_bill_version
+    calls = {"n": 0}
+
+    async def flaky_set(key, data, **kw):
+        calls["n"] += 1
+        return False if calls["n"] == 1 else await real_set(key, data, **kw)
+
+    redis.set_bill_version = flaky_set
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=store(lambda ids: False)):
+        third = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)
+        assert third["undone"] and "11" in redis.versions[OCD]["documents"]
+        fourth = await emb.embed_bill(OCD, "fl", bill, max_orphans=10)  # a rerun deletes the (absent) ids again, and converges
+    assert fourth["undone"] == [] and set(redis.versions[OCD]["documents"]) == {"13"}
+    assert deleted  # Pinecone saw exact-id deletes throughout; deleting an absent id is a no-op there
+
+
+async def test_an_archived_id_returned_as_a_number_matches_the_string_key_in_the_record():
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (1, 0)})
+    redis.versions[OCD]["documents"]["11"]["text_hash"] = kb.content_hash(TEXT_A)
+    vs = _vector_store()
+    version = _version(11, "Intro", "introduced", 0, TEXT_A)
+    assert isinstance(version["archived_document_id"], int)  # api-v3 sends the row's integer id
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([version]), max_orphans=10)
+    assert stats["orphans"] == 0 and vs.delete.await_count == 0 and "11" in redis.versions[OCD]["documents"]
+
+
+async def test_an_id_missing_from_a_non_empty_response_is_an_orphan_because_the_response_lists_every_version():
+    """api-v3 returns every version of a bill in one detail response (no pagination), each with the id of the
+    row its picker chose, so absence from a non-empty response is meaningful. This pins that contract."""
+    emb, redis, _ = _embedder()
+    redis.versions[OCD] = _recorded(**{"11": (1, 0), "12": (1, 0)})
+    redis.versions[OCD]["documents"]["12"]["text_hash"] = kb.content_hash(TEXT_A)
+    vs = _vector_store()
+    with patch("ddp_sync.services.vector_store.VectorStoreService", return_value=vs):
+        stats = await emb.embed_bill(OCD, "fl", _bill([_version(12, "Intro", "introduced", 0, TEXT_A)]), max_orphans=10)
+    assert stats["orphans"] == 1 and set(redis.versions[OCD]["documents"]) == {"12"}

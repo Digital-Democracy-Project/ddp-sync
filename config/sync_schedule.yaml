@@ -795,6 +795,12 @@ openstates_archive:
     # `knowledge_base_reconcile_backlog`.
     reconcile:
       max_bills_per_run: 0
+    # SYNC-95: delete the vectors of documents api-v3 no longer lists for a bill the run touches (the picker
+    # re-chose a different row, or a version was removed). Only vectors this path recorded, by exact id; a
+    # version api-v3 still returns with an id but no text is never an orphan; a run never deletes more than 200
+    # documents (the rest stay recorded, with a warning); a document another writer changed is skipped. Only a
+    # literal true enables it. Off until someone chooses.
+    delete_orphans: false
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
     # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
     # It pauses through this UTC window so it stays out of the 05:00 UTC archive start.
