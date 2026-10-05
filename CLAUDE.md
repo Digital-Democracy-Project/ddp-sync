@@ -398,7 +398,9 @@ and stays live until VoteBot has cut over (SYNC-92) and soaked. Read `primitives
   (off, literal `true` only) removes only vectors this path recorded, by exact id, for documents api-v3
   no longer lists for a bill. Do not widen it to a prefix or metadata delete, do not treat "listed but
   no text" as an orphan, and keep the per-run circuit breaker (`MAX_ORPHAN_DOCUMENTS_PER_RUN`): a
-  systematic change in how api-v3 returns document ids would otherwise delete real vectors en masse.
+  systematic change in how api-v3 returns document ids would otherwise delete real vectors en masse. The
+  budget is a hard cap (each bill gets only what is left of it), and each deletion re-reads the record and
+  skips a document another writer changed.
 - **Cache digests exclude timestamps.** `DocumentMetadata.to_dict()` stamps `created_at`/`updated_at`
   with "now"; hashing it raw makes every entity look changed on every run (found while building
   SYNC-91). The `embed_entity` digest covers content plus the rest of the metadata.
