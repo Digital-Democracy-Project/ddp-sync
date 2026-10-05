@@ -877,6 +877,20 @@ def get_settings() -> SyncSettings:
     if env_knowledge_base_index_name is not None:
         filtered["knowledge_base_index_name"] = env_knowledge_base_index_name.strip()
 
+    # SYNC-91 (found live on the EC2-broker host, 2026-10-05, running the organization embedding
+    # dry run): the fifth instance of the SYNC-51/OPEN-193 bug class. Which ddp-broker-py a host
+    # reaches, and with what token, is per-host (the EC2 host reaches its own broker by public hostname;
+    # the Mac has its own), and neither field is in the shared `ddp-sync/credentials` secret, so on a host
+    # where Secrets Manager succeeds `ddp_broker_api_base` came back as the `http://localhost:8080` default
+    # whatever the container's environment said, and every call to the broker failed to connect. Applied
+    # only when the variable is set, so a host that gets these from the secret or the default is unchanged.
+    env_ddp_broker_api_base = os.getenv("DDP_BROKER_API_BASE")
+    if env_ddp_broker_api_base is not None:
+        filtered["ddp_broker_api_base"] = env_ddp_broker_api_base
+    env_ddp_broker_api_token = os.getenv("DDP_BROKER_API_TOKEN")
+    if env_ddp_broker_api_token is not None:
+        filtered["ddp_broker_api_token"] = env_ddp_broker_api_token
+
     return SyncSettings(**filtered)
 
 

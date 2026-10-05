@@ -393,3 +393,47 @@ def test_patch_refresh_opt_out_applies_when_secrets_manager_supplies_the_base_co
         assert settings.openstates_patch_refresh_enabled is False
     finally:
         get_settings.cache_clear()
+
+
+# --- SYNC-91: ddp_broker_api_base / ddp_broker_api_token ------------------------------------------------
+
+
+def test_the_broker_base_and_token_come_from_the_environment_on_a_secrets_manager_host(monkeypatch):
+    """SYNC-51 bug class, found live 2026-10-05: with Secrets Manager supplying the config the container's
+    DDP_BROKER_API_BASE / DDP_BROKER_API_TOKEN were ignored and the base stayed http://localhost:8080."""
+    monkeypatch.setenv("DDP_BROKER_API_BASE", "https://broker.example.org")
+    monkeypatch.setenv("DDP_BROKER_API_TOKEN", "from-env")
+    get_settings.cache_clear()
+    with patch("ddp_sync.config._load_from_secrets_manager", return_value={"api_key": "from-secrets-manager"}):
+        settings = get_settings()
+    get_settings.cache_clear()
+    assert settings.api_key == "from-secrets-manager"  # the Secrets Manager path really was taken
+    assert settings.ddp_broker_api_base == "https://broker.example.org"
+    assert settings.ddp_broker_api_token == "from-env"
+
+
+def test_the_broker_environment_wins_over_a_conflicting_secret_value(monkeypatch):
+    monkeypatch.setenv("DDP_BROKER_API_BASE", "https://broker.example.org")
+    monkeypatch.setenv("DDP_BROKER_API_TOKEN", "from-env")
+    get_settings.cache_clear()
+    with patch("ddp_sync.config._load_from_secrets_manager", return_value={
+        "ddp_broker_api_base": "http://stale:1", "ddp_broker_api_token": "stale"}):
+        settings = get_settings()
+    get_settings.cache_clear()
+    assert (settings.ddp_broker_api_base, settings.ddp_broker_api_token) == ("https://broker.example.org", "from-env")
+
+
+def test_a_host_that_sets_neither_variable_keeps_what_the_secret_or_the_default_gives(monkeypatch):
+    """The Mac must be unchanged: no variable set means the secret's value, else the default, as before."""
+    monkeypatch.delenv("DDP_BROKER_API_BASE", raising=False)
+    monkeypatch.delenv("DDP_BROKER_API_TOKEN", raising=False)
+    get_settings.cache_clear()
+    with patch("ddp_sync.config._load_from_secrets_manager", return_value={
+        "ddp_broker_api_base": "https://from-secret", "ddp_broker_api_token": "secret-token"}):
+        from_secret = get_settings()
+    get_settings.cache_clear()
+    with patch("ddp_sync.config._load_from_secrets_manager", return_value={"api_key": "k"}):
+        defaulted = get_settings()
+    get_settings.cache_clear()
+    assert (from_secret.ddp_broker_api_base, from_secret.ddp_broker_api_token) == ("https://from-secret", "secret-token")
+    assert (defaulted.ddp_broker_api_base, defaulted.ddp_broker_api_token) == ("http://localhost:8080", "")
