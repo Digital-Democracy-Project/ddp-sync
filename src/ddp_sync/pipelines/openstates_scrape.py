@@ -31,7 +31,7 @@ import structlog
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
-from ddp_sync.slack_identity import codebot_identity
+from ddp_sync.slack_alerts import post_alert
 
 logger = structlog.get_logger()
 
@@ -115,26 +115,11 @@ def _alert_scrape_failure(label: str, error: str, duration_seconds: float) -> No
     plausibly hit this exact silent path. Never raises — same convention as every other
     alerting call site in this codebase (push_health_alert, run-scrape.sh's on_failure).
     """
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if token:
-        channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
-        text = (
-            f":red_circle: *OpenStates scrape failed: {label}* — {error} "
-            f"(after {duration_seconds:.0f}s) — check ddp-sync logs / scraper.log"
-        )
-        try:
-            resp = requests.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"channel": channel, "text": text, **codebot_identity()},
-                timeout=15,
-            )
-            if not (resp.ok and resp.json().get("ok")):
-                logger.error("openstates_scrape: Slack alert failed", response=resp.text[:200])
-        except Exception as e:  # noqa: BLE001
-            logger.error("openstates_scrape: Slack alert error", error=str(e))
-    else:
-        logger.warning("openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on scrape failure")
+    text = (
+        f":red_circle: *OpenStates scrape failed: {label}* — {error} "
+        f"(after {duration_seconds:.0f}s) — check ddp-sync logs / scraper.log"
+    )
+    post_alert(text, source="openstates_scrape.scrape_failure")
 
     cams_token = os.getenv("CAMS_API_TOKEN", "")
     if cams_token:
@@ -167,32 +152,12 @@ def _alert_sustained_block(jurisdiction: str, blocked_count: int, window: int) -
     _alert_scrape_failure -- no new secret/webhook for what's still #automation-errors.
     Never raises, same convention as every other alerting call site in this module.
     """
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not token:
-        logger.warning(
-            "openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on sustained block",
-            jurisdiction=jurisdiction,
-        )
-        return
-    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
     text = (
         f":rotating_light: *{jurisdiction} has been blocked {blocked_count} of the last "
         f"{window} weekly runs* — likely a sustained reputation-blocking window, not a "
         f"one-off failure. See OPEN-22 / README.md."
     )
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text, **codebot_identity()},
-            timeout=15,
-        )
-        if not (resp.ok and resp.json().get("ok")):
-            logger.error(
-                "openstates_scrape: sustained-block Slack alert failed", response=resp.text[:200]
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.error("openstates_scrape: sustained-block Slack alert error", error=str(e))
+    post_alert(text, source="openstates_scrape.sustained_block")
 
 
 def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
@@ -204,34 +169,13 @@ def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
     diagnose. Same channel/token convention as the other two alert paths in this module, and
     never raises.
     """
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not token:
-        logger.warning(
-            "openstates_scrape: SLACK_BOT_TOKEN not set — cannot alert on quiet jurisdiction",
-            jurisdiction=jurisdiction,
-        )
-        return
-    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
     text = (
         f":mag: *{jurisdiction} has imported no new bills in its last {quiet_window} runs* — "
         f"it was filing before that, so collection has stopped rather than the legislature "
         f"being quiet all along. Could be a stuck incremental cutoff (see AZ/OPEN-139), a "
         f"broken change signal, or a real recess. Worth a look either way."
     )
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text, **codebot_identity()},
-            timeout=15,
-        )
-        if not (resp.ok and resp.json().get("ok")):
-            logger.error(
-                "openstates_scrape: quiet-jurisdiction Slack alert failed",
-                response=resp.text[:200],
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.error("openstates_scrape: quiet-jurisdiction Slack alert error", error=str(e))
+    post_alert(text, source="openstates_scrape.quiet_jurisdiction")
 
 
 # Substring markers matched against a failed run's output tail to classify *why* it failed

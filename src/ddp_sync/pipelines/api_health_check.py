@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from ddp_sync.slack_identity import codebot_identity
+from ddp_sync.slack_alerts import post_alert
 
 logger = logging.getLogger(__name__)
 
@@ -270,9 +270,9 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
     """Post failed health checks straight to Slack via bot token. Returns True on success.
 
     Never raises. The legacy ``webhook_url`` arg (Zapier) is ignored — kept only for
-    call-site compatibility. Delivery is now a direct ``chat.postMessage`` using
-    ``SLACK_BOT_TOKEN`` (channel from ``HEALTH_ALERT_SLACK_CHANNEL``, default
-    #automation-errors), removing Zapier as a relay in the path.
+    call-site compatibility. Delivery goes through ``ddp_sync.slack_alerts.post_alert``
+    (``SLACK_BOT_TOKEN``, channel from ``HEALTH_ALERT_SLACK_CHANNEL``, default #automation-errors,
+    posted as CodeBot), removing Zapier as a relay in the path.
     """
     failures = [r for r in results if not r.passed]
     if not failures:
@@ -289,25 +289,7 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
         + f"\n\n_Checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
     )
 
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not token:
-        logger.warning("SLACK_BOT_TOKEN not set — cannot post health alert")
-        return False
-    channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
-
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text, **codebot_identity()},
-            timeout=15,
-        )
-        if resp.ok and resp.json().get("ok"):
-            return True
-        logger.error("Slack chat.postMessage failed: %s", resp.text[:200])
-    except Exception as e:  # noqa: BLE001
-        logger.error("Slack health alert error: %s", e)
-    return False
+    return post_alert(text, source="api_health_check")
 
 
 # ---------------------------------------------------------------------------

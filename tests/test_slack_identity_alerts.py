@@ -98,16 +98,19 @@ def test_the_cams_report_is_untouched_by_the_identity(monkeypatch):
     assert payload["service"] == "ddp-sync" and "username" not in payload and "icon_emoji" not in payload
 
 
-def test_no_chat_post_message_call_in_src_can_skip_the_identity():
-    """A new alert that copies the old two-key payload would post as Agent Smith again, so every
-    `chat.postMessage` call in src must carry `**codebot_identity()` (as SYNC-42's scan does for provenance)."""
+def test_only_the_alert_helper_posts_to_slack():
+    """Every alert goes through `slack_alerts.post_alert`, which owns the token, channel, timeout and
+    CodeBot identity. A second module posting to Slack directly could skip the identity and post as Agent
+    Smith again (SYNC-99), so the Slack URL may appear in no other module under src (as SYNC-42's scan does
+    for provenance)."""
     from pathlib import Path
 
     src = Path(__file__).parent.parent / "src"
-    bare = []
-    for path in src.rglob("*.py"):
-        text = path.read_text()
-        posts = text.count('"https://slack.com/api/chat.postMessage"')
-        if posts and text.count("**codebot_identity()") < posts:
-            bare.append(f"{path.relative_to(src)}: {posts} posts, {text.count('**codebot_identity()')} with the identity")
-    assert not bare, bare
+    allowed = Path("ddp_sync") / "slack_alerts.py"
+    offenders = [
+        str(path.relative_to(src))
+        for path in src.rglob("*.py")
+        if "slack.com/api/chat.postMessage" in path.read_text() and path.relative_to(src) != allowed
+    ]
+    assert not offenders, f"post through ddp_sync.slack_alerts.post_alert instead: {offenders}"
+    assert "**codebot_identity()" in (src / allowed).read_text()
