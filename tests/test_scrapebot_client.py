@@ -181,6 +181,22 @@ def test_write_cookie_cache_session_cookie_gets_ttl_fallback(tmp_path):
     assert data["x-bni-fpc"]["expires"] < before + 3700
 
 
+def test_write_cookie_cache_records_when_it_was_minted(tmp_path):
+    # OPEN-232: a real cookie's `expires` is ~1 year out, so only _meta.minted_at says how old it is.
+    cache_path = str(tmp_path / "mi_waf_cookies.json")
+    before = time_module.time()
+    write_cookie_cache(
+        cache_path,
+        cookies=[{"name": "x-bni-fpc", "value": "abc", "expires": before + 365 * 86400}],
+        user_agent="Mozilla/5.0 fake-ua",
+    )
+    after = time_module.time()
+    meta = json.loads(open(cache_path).read())["_meta"]
+    assert before <= meta["minted_at"] <= after
+    # The existing contract is unchanged: CookieProvider still finds its user_agent.
+    assert meta["user_agent"] == "Mozilla/5.0 fake-ua"
+
+
 def test_write_cookie_cache_duplicate_name_last_one_wins(tmp_path):
     cache_path = str(tmp_path / "mi_waf_cookies.json")
     write_cookie_cache(
