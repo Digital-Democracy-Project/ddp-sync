@@ -6,8 +6,8 @@ app's own name (Agent Smith) unless the post says otherwise, so the identity is 
 rather than at each call site where a new alert could forget it.
 
 Never raises: an alert that fails to send is logged, not allowed to break the pipeline that
-raised it. `tests/test_slack_alerts_single_path.py` fails if any other module posts to Slack
-directly, so a new alert can't bypass this.
+raised it. `test_only_the_alert_helper_posts_to_slack` (tests/test_slack_identity_alerts.py) fails if
+any other module posts to Slack directly, so a new alert can't bypass this.
 """
 
 from __future__ import annotations

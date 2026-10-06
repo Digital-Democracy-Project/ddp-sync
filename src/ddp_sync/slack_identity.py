@@ -6,7 +6,8 @@ ddp-agents' failure-listener triage posts already do. ddp-agents sets that with
 `cams.slack_identity.identity_kwargs("codebot")`; it is a separate service and cannot be imported here, so this
 mirrors it: the same `CODEBOT_SLACK_USERNAME` / `CODEBOT_SLACK_ICON_EMOJI` variables and the same defaults.
 
-Splat `codebot_identity()` into the `chat.postMessage` JSON of any new alert; do not write another copy.
+A new alert posts through `ddp_sync.slack_alerts.post_alert`, which applies this identity; do not call
+`chat.postMessage` directly (a test fails if any module other than `slack_alerts` does) or write another copy.
 Needs the `chat:write.customize` scope on the Slack app: without it Slack ignores `username` and `icon_emoji`
 and the post still succeeds under the default name, so this can never make an alert fail.
 """
