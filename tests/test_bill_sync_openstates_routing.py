@@ -137,3 +137,19 @@ def test_get_api_base_and_key_helper_directly():
     service = _make_service(ddp_openstates_jurisdictions=["VA"])
     assert service._get_api_base_and_key("va") == ("http://localhost:8002", "local-key", True)
     assert service._get_api_base_and_key("fl") == ("https://v3.openstates.org", "public-key", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_sends_no_header_and_does_not_raise(blank):
+    """SYNC-68: httpx raises on a None header value; the old replica branch added the key only when it was set."""
+    service = _make_service(ddp_openstates_jurisdictions=["us"])
+    service.settings.local_openstates_api_key = blank
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response({"id": "ocd-bill/123"})
+    with _patch_async_client(mock_client):
+        result = await service.fetch_bill_from_openstates("us", "119", "HR1")
+    assert result == {"id": "ocd-bill/123"}
+    _, called_kwargs = mock_client.get.call_args
+    assert not any(name.lower() == "x-api-key" for name in called_kwargs["headers"])
+    assert "apikey" not in dict(called_kwargs["params"])

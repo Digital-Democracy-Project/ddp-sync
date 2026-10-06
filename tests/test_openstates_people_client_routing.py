@@ -148,3 +148,24 @@ def test_get_api_base_and_key_helper_is_case_insensitive():
 def test_get_api_base_and_key_helper_empty_list_always_public():
     client = _make_client(ddp_openstates_jurisdictions=[])
     assert client._get_api_base_and_key("us") == ("https://v3.openstates.org", "public-key", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_sends_no_header_and_does_not_raise(blank):
+    """SYNC-68: this client's local key is typed `str | None`; a None header value makes httpx raise."""
+    client = OpenStatesPeopleClient(
+        api_key="public-key",
+        openstates_api_base="https://v3.openstates.org",
+        local_openstates_api_base="http://localhost:8002",
+        local_openstates_api_key=blank,
+        ddp_openstates_jurisdictions=["US", "VA"],
+    )
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response({"results": []})
+    with _patch_async_client(mock_client):
+        async for _ in client.iter_jurisdiction("va"):
+            pass
+    _, called_kwargs = mock_client.get.call_args
+    assert not any(name.lower() == "x-api-key" for name in called_kwargs["headers"])
+    assert "apikey" not in dict(called_kwargs["params"])

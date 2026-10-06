@@ -244,7 +244,9 @@ class OpenStatesSource:
             params = [("include", p) for p in include_params]
             # SYNC-68: the key goes in a header on every route, local replica or public API; in the query
             # string it was written into the logs with the url (api-v3's apikey_auth accepts either).
-            headers = {"accept": "application/json", "X-API-Key": api_key}
+            headers = {"accept": "application/json"}
+            if api_key:  # a None key must not become a header value (httpx raises), and an empty one adds nothing
+                headers["X-API-Key"] = api_key
 
             url = f"{api_base}/jurisdictions/{jurisdiction.lower()}"
 
@@ -483,7 +485,7 @@ class OpenStatesSource:
             api_base, api_key, _is_local_replica = self.settings.openstates_api_base, self.api_key, False
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {"X-API-Key": api_key}  # SYNC-68: a header, never the query string, on every route
+            headers = {"X-API-Key": api_key} if api_key else {}  # SYNC-68: a header, never the query string
 
             # Build query parameters
             params = {
@@ -642,7 +644,9 @@ class OpenStatesSource:
                 ("per_page", min(limit, 50)),
             ] + [("include", p) for p in include_params]
 
-            headers = {"accept": "application/json", "X-API-Key": api_key}  # SYNC-68: never the query string
+            headers = {"accept": "application/json"}
+            if api_key:  # a None key must not become a header value (httpx raises)
+                headers["X-API-Key"] = api_key
 
             logger.info(
                 "Fetching legislators from OpenStates",

@@ -319,7 +319,7 @@ class FederalLegislatorCache:
             "page": page,
             "per_page": per_page,
         }
-        headers = {"X-API-KEY": api_key}  # SYNC-68: a header on every route, never the query string
+        headers = {"X-API-KEY": api_key} if api_key else {}  # SYNC-68: a header, never the query string
 
         while True:
             params["page"] = page

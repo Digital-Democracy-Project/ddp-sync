@@ -320,7 +320,9 @@ class LegislatorSyncService:
                 params = [("id", person_id)] + [("include", p) for p in include_params]
                 # SYNC-68: the key is a header on every route (api-v3's apikey_auth accepts either); in the
                 # query string it was written into the logs with the url.
-                headers = {"accept": "application/json", "x-api-key": api_key}
+                headers = {"accept": "application/json"}
+                if api_key:  # a None key must not become a header value (httpx raises)
+                    headers["x-api-key"] = api_key
                 response = await client.get(
                     f"{api_base}/people",
                     headers=headers,
@@ -394,7 +396,7 @@ class LegislatorSyncService:
                         "page": page,
                         "include": "sponsorships",
                     }
-                    headers = {"x-api-key": api_key}  # SYNC-68: a header on every route, never the query string
+                    headers = {"x-api-key": api_key} if api_key else {}  # SYNC-68: a header, never the query string
 
                     response = await client.get(
                         f"{api_base}/bills",
@@ -498,7 +500,7 @@ class LegislatorSyncService:
                     }
                     if session:
                         list_params["session"] = session
-                    headers = {"x-api-key": api_key}  # SYNC-68: a header on every route, never the query string
+                    headers = {"x-api-key": api_key} if api_key else {}  # SYNC-68: a header, never the query string
 
                     response = await client.get(
                         f"{api_base}/bills",

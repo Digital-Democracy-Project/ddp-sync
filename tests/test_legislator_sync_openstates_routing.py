@@ -234,3 +234,27 @@ def test_get_api_base_and_key_helper_is_case_insensitive():
 def test_get_api_base_and_key_helper_empty_list_always_public():
     service = _make_service(ddp_openstates_jurisdictions=[])
     assert service._get_api_base_and_key("us") == ("https://v3.openstates.org", "public-key", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_sends_no_header_and_does_not_raise_on_every_call(blank):
+    """SYNC-68: httpx raises on a None header value; the old replica branches added the key only when it was set."""
+    service = _make_service(ddp_openstates_jurisdictions=["VA", "US"])
+    service.settings.local_openstates_api_key = blank
+    mock_client = AsyncMock()
+    list_response = _mock_response({"results": [{"id": "ocd-bill/1"}], "pagination": {"max_page": 1}})
+    detail_response = _mock_response({"id": "ocd-bill/1", "identifier": "HB1", "votes": []})
+    mock_client.get.side_effect = [
+        _mock_response({"results": [], "pagination": {"max_page": 1}}),  # fetch_sponsored_bills
+        list_response, detail_response,                                    # fetch_legislator_votes
+        _mock_response({"results": [{"family_name": "Gallagher"}]}),      # _get_sponsor_name
+    ]
+    with _patch_async_client(mock_client):
+        await service.fetch_sponsored_bills("ocd-person/123", "va", sponsor_name="Smith")
+        await service.fetch_legislator_votes("ocd-person/123", "va", max_bills=1)
+        await service._get_sponsor_name("ocd-person/123", jurisdiction="us")
+    assert len(mock_client.get.call_args_list) == 4
+    for call in mock_client.get.call_args_list:
+        assert not any(name.lower() == "x-api-key" for name in call.kwargs["headers"])
+        assert "apikey" not in dict(call.kwargs["params"])

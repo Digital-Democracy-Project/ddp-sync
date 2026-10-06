@@ -407,10 +407,9 @@ class OpenStatesPeopleClient:
 
         url = f"{api_base}{path}"
         # SYNC-68: a header on every route, never the query string (it was written into the logs with the url)
-        headers = {
-            "x-api-key": api_key,
-            "accept": "application/json",
-        }
+        headers = {"accept": "application/json"}
+        if api_key:  # the local-replica key can be None here, and a None header value makes httpx raise
+            headers["x-api-key"] = api_key
         last_resp: httpx.Response | None = None
         last_exc: Exception | None = None
 

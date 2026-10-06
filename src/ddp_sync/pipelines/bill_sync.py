@@ -423,10 +423,9 @@ class BillSyncService:
                     # SYNC-68: header-based auth on every route. api-v3's apikey_auth accepts the
                     # x-api-key header as well as ?apikey=, and a key in the query string was written
                     # into the logs with the url.
-                    headers = {
-                        "accept": "application/json",
-                        "x-api-key": api_key,
-                    }
+                    headers = {"accept": "application/json"}
+                    if api_key:  # a None key must not become a header value (httpx raises)
+                        headers["x-api-key"] = api_key
                     response = await client.get(url, headers=headers, params=params)
 
                     # Log the response for debugging
