@@ -176,6 +176,12 @@ def write_cookie_cache(cache_path: str, cookies: list[dict], user_agent: str) ->
     CookieProvider._read_cache() reads this file cold, from a fresh process,
     on the next run-scrape.sh invocation — nothing about CookieProvider
     cares who wrote it.
+
+    OPEN-232: `_meta` also carries `minted_at` (epoch seconds, when this file was written
+    from a fresh mint). A real Michigan cookie's own `expires` is about a year out, so
+    `expires` cannot say how long ago the cookie was minted; CookieProvider only reads
+    `_meta.user_agent`, so the extra key is ignored by it. cloud_collector.py (ddp-open-states)
+    logs the age from it; nothing refuses on it.
     """
     now = time.time()
     data: dict = {}
@@ -191,7 +197,7 @@ def write_cookie_cache(cache_path: str, cookies: list[dict], user_agent: str) ->
         # adding new dedup/domain-path disambiguation here would be scope
         # this PLAN was explicitly asked to guard against.
         data[c["name"]] = {"value": c["value"], "expires": expires}
-    data["_meta"] = {"user_agent": user_agent}
+    data["_meta"] = {"user_agent": user_agent, "minted_at": now}
 
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     with open(cache_path, "w") as f:
