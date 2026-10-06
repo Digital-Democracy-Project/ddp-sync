@@ -51,3 +51,12 @@ def test_a_value_already_in_the_environment_wins(bash, tmp_path):
 def test_a_missing_file_or_an_empty_value_exports_nothing_and_never_fails_the_script(bash, tmp_path):
     assert _run(bash, tmp_path, None) == {"U": "<unset>", "I": "<unset>"}  # no such file under set -e
     assert _run(bash, tmp_path, "CODEBOT_SLACK_ICON_EMOJI=\nSOMETHING_ELSE=1\n") == {"U": "<unset>", "I": "<unset>"}
+
+
+@pytest.mark.parametrize("bash", sorted(set(BASHES)))
+def test_the_whole_script_parses_and_the_block_sits_between_the_env_load_and_the_exec(bash):
+    """The block runs only if it comes after the service's own .env is sourced (so a value there wins) and
+    before the `exec` that launches uvicorn (so the process inherits it)."""
+    subprocess.run([bash, "-n", str(SCRIPT)], check=True)
+    text = SCRIPT.read_text()
+    assert text.index("source \"$PROJECT_DIR/.env\"") < text.index("# --- persona vars") < text.index("# --- end persona vars") < text.index("exec ")
