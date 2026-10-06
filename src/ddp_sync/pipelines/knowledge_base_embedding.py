@@ -188,6 +188,11 @@ class KnowledgeBaseEmbedder:
         stable = {k: v for k, v in metadata.to_dict().items() if k not in ("created_at", "updated_at")}
         digest = content_hash(content + "\n" + json.dumps(stable, sort_keys=True, default=str))
         if cache.get("hash") == digest:
+            if not dry_run:
+                # A record written before this path was persistent still carries the 90-day expiry; make it
+                # permanent now (a no-op when it already is), or an unchanged re-run would never fix it and the
+                # digest-skip would be lost after 90 days. The ledger does not cover these records.
+                await self.redis.find_unrecorded_bill_versions([key])
             return "unchanged"
         if dry_run:
             return "would_write"
@@ -198,7 +203,7 @@ class KnowledgeBaseEmbedder:
         written = await self.redis.set_bill_version(key, {
             "schema": CACHE_SCHEMA, "hash": digest, "chunks": chunks,
             "last_checked": datetime.now(timezone.utc).isoformat(),
-        })
+        }, persistent=True)  # no expiry, like the bill records: an aged-out record would look never embedded
         return "written" if written else "undone:version cache not written (Redis)"
 
     async def _cached_field(

@@ -120,6 +120,37 @@ async def test_embeds_every_broker_organization_across_pages_and_a_rerun_writes_
     assert pipe.keys == written and (second["written"], second["unchanged"]) == (0, 3)
 
 
+async def test_organization_records_never_expire_and_an_unchanged_rerun_fixes_an_old_expiring_one():
+    """The prod agent found the 5,121 organization records written with the 90-day expiry (2026-10-06): the
+    write is now persistent, and a re-run over a record that is unchanged still makes it permanent."""
+    class Recording(FakeRedis):
+        persisted: list = []
+
+        async def find_unrecorded_bill_versions(self, ids, *, persist_expiring=True):
+            self.persisted = self.persisted + [(list(ids), persist_expiring)]
+            return await super().find_unrecorded_bill_versions(ids, persist_expiring=persist_expiring)
+
+    emb, redis, _ = _embedder(redis=Recording())
+    details = {1: _org(1, "Org 1")}
+    lst, det = _patch_broker([_page([1])], details)
+    with lst, det:
+        await ent.embed_organizations(settings=_settings(), embedder=emb)
+    assert "organization:1" in redis.persistent_keys  # a fresh write has no expiry
+
+    redis.persistent_keys.clear()  # pretend it was written by the old code, with the 90-day expiry
+    lst, det = _patch_broker([_page([1])], details)
+    with lst, det:
+        again = await ent.embed_organizations(settings=_settings(), embedder=emb)
+    assert again["unchanged"] == 1 and again["written"] == 0
+    assert redis.persisted == [(["organization:1"], True)]  # the unchanged re-run asked for it to be made permanent
+
+    redis.persisted = []
+    lst, det = _patch_broker([_page([1])], details)
+    with lst, det:
+        await ent.embed_organizations(settings=_settings(), embedder=emb, dry_run=True)
+    assert redis.persisted == []  # a dry run changes nothing in Redis
+
+
 async def test_contentless_organizations_are_skipped_and_counted():
     emb, _, pipe = _embedder()
     details = {1: _org(1), 2: _org(2, description="", focus="")}
