@@ -71,8 +71,8 @@ async def test_refresh_routes_to_local_replica_when_us_flipped(tmp_path, monkeyp
     for call in mock_client.get.call_args_list:
         called_url, called_kwargs = call
         assert called_url[0] == "http://localhost:8002/people"
-        assert "X-API-KEY" not in called_kwargs["headers"]
-        assert called_kwargs["params"]["apikey"] == "local-key"
+        assert called_kwargs["headers"]["X-API-KEY"] == "local-key"  # SYNC-68: a header, never the url
+        assert "apikey" not in called_kwargs["params"]
 
 
 @pytest.mark.asyncio
@@ -147,3 +147,17 @@ def test_get_api_base_and_key_helper_is_case_insensitive(tmp_path, monkeypatch):
 def test_get_api_base_and_key_helper_empty_list_always_public(tmp_path, monkeypatch):
     cache = _make_cache(tmp_path, monkeypatch, ddp_openstates_jurisdictions=[])
     assert cache._get_api_base_and_key("us") == ("https://v3.openstates.org", "public-key", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_never_raises_or_sends_a_key_header(tmp_path, monkeypatch, blank):
+    """SYNC-68: the refresh with no usable key must end as a failed refresh, not an httpx header error."""
+    cache = _make_cache(tmp_path, monkeypatch, ddp_openstates_jurisdictions=["US"], local_openstates_api_key=blank)
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_EMPTY_PAGE)
+    with _patch_async_client(mock_client):
+        await cache.refresh()
+    for call in mock_client.get.call_args_list:
+        assert not any(name.lower() == "x-api-key" for name in call.kwargs["headers"])
+        assert "apikey" not in call.kwargs["params"]

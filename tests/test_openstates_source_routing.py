@@ -69,8 +69,8 @@ async def test_fetch_jurisdiction_routes_flipped_jurisdiction_to_local_replica()
     assert result is not None
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/jurisdictions/va"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -152,8 +152,8 @@ async def test_fetch_jurisdiction_on_the_mac_still_uses_the_local_replica():
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/jurisdictions/ut"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -207,8 +207,8 @@ async def test_fetch_legislators_routes_flipped_jurisdiction_to_local_replica():
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/people"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -244,11 +244,11 @@ async def test_fetch_with_jurisdiction_routes_list_and_detail_calls_to_local_rep
     list_call, detail_call = mock_client.get.call_args_list
     assert list_call[0][0] == "http://localhost:8002/bills"
     assert detail_call[0][0] == "http://localhost:8002/bills/ocd-bill/123"
-    # Both calls use the local replica's query-param auth, not the public
-    # header scheme.
-    assert "X-API-Key" not in list_call[1]["headers"]
-    assert list_call[1]["params"]["apikey"] == "local-key"
-    assert detail_call[1]["params"] == {"apikey": "local-key"}
+    # Both calls send the key as a header (SYNC-68), never in the query string.
+    assert list_call[1]["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert detail_call[1]["headers"]["X-API-Key"] == "local-key"
+    assert "apikey" not in list_call[1]["params"]
+    assert not detail_call[1].get("params")  # the detail call carries no query string at all
     assert docs  # bill had a title, so content extraction succeeded
 
 
@@ -315,3 +315,29 @@ def test_get_api_base_and_key_helper_is_case_insensitive():
 def test_get_api_base_and_key_helper_empty_list_always_public():
     source = _make_source(ddp_openstates_jurisdictions=[])
     assert source._get_api_base_and_key("us") == ("https://v3.openstates.org", "public-key", False)
+
+
+# --- SYNC-68: a missing local key adds no header and never raises ---------------------------------------
+
+
+def _no_key_header(headers) -> bool:
+    return not any(name.lower() == "x-api-key" for name in headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_sends_no_header_and_does_not_raise_on_every_fetch(blank):
+    """httpx raises on a None header value; the old replica branches added the key only when it was set."""
+    source = _make_source(ddp_openstates_jurisdictions=["VA"])
+    source.settings.local_openstates_api_key = blank
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response(_JURISDICTION_BODY)
+    with _patch_async_client(mock_client):
+        await source.fetch_jurisdiction("va")
+        mock_client.get.return_value = _mock_response({"results": []})
+        _ = [x async for x in source.fetch_legislators("VA")]
+        _ = [x async for x in source.fetch(jurisdiction="va")]
+    assert len(mock_client.get.call_args_list) == 3
+    for call in mock_client.get.call_args_list:
+        assert _no_key_header(call.kwargs["headers"])
+        assert "apikey" not in dict(call.kwargs.get("params") or {})

@@ -85,10 +85,9 @@ async def test_routes_flipped_jurisdiction_to_local_replica():
     assert result == {"id": "ocd-bill/123"}
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/bills/us/119/HR1"
-    # Local api-v3's apikey_auth is a query param, not the public API's
-    # x-api-key header (matches local_openstates_client.py's convention).
-    assert "x-api-key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    # SYNC-68: the key is a header on every route, never the query string (httpx logged the url).
+    assert called_kwargs["headers"]["x-api-key"] == "local-key"
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -138,3 +137,19 @@ def test_get_api_base_and_key_helper_directly():
     service = _make_service(ddp_openstates_jurisdictions=["VA"])
     assert service._get_api_base_and_key("va") == ("http://localhost:8002", "local-key", True)
     assert service._get_api_base_and_key("fl") == ("https://v3.openstates.org", "public-key", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_a_missing_local_key_sends_no_header_and_does_not_raise(blank):
+    """SYNC-68: httpx raises on a None header value; the old replica branch added the key only when it was set."""
+    service = _make_service(ddp_openstates_jurisdictions=["us"])
+    service.settings.local_openstates_api_key = blank
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _mock_response({"id": "ocd-bill/123"})
+    with _patch_async_client(mock_client):
+        result = await service.fetch_bill_from_openstates("us", "119", "HR1")
+    assert result == {"id": "ocd-bill/123"}
+    _, called_kwargs = mock_client.get.call_args
+    assert not any(name.lower() == "x-api-key" for name in called_kwargs["headers"])
+    assert "apikey" not in dict(called_kwargs["params"])

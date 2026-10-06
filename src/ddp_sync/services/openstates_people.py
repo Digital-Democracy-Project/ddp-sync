@@ -262,9 +262,9 @@ class OpenStatesPeopleClient:
 
         Returns:
             (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the local api-v3 instance's apikey_auth scheme applies --
-            it authenticates via an `apikey` query param, not the public API's
-            `x-api-key` header scheme.
+            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
+            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
+            the key is sent as a header on every route, never in the query string (it was logged there).
         """
         replica_jurisdictions = {j.upper() for j in self.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
@@ -401,22 +401,15 @@ class OpenStatesPeopleClient:
         (fetch_by_id) omit it and always get the public API.
         """
         if jurisdiction is not None:
-            api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+            api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
         else:
-            api_base, api_key, is_local_replica = self.openstates_api_base, self.api_key, False
+            api_base, api_key, _is_local_replica = self.openstates_api_base, self.api_key, False
 
         url = f"{api_base}{path}"
-        if is_local_replica:
-            # Local api-v3's apikey_auth is a query param, not the public
-            # API's x-api-key header.
-            headers = {"accept": "application/json"}
-            if api_key:
-                params = list(params) + [("apikey", api_key)]
-        else:
-            headers = {
-                "x-api-key": api_key,
-                "accept": "application/json",
-            }
+        # SYNC-68: a header on every route, never the query string (it was written into the logs with the url)
+        headers = {"accept": "application/json"}
+        if api_key:  # the local-replica key can be None here, and a None header value makes httpx raise
+            headers["x-api-key"] = api_key
         last_resp: httpx.Response | None = None
         last_exc: Exception | None = None
 

@@ -1664,7 +1664,8 @@ async def test_resolve_touched_sessions_api_base_override_reaches_that_url_not_l
     assert result == ["2026S1"]
     call = mock_client.get.await_args
     assert call.args[0] == "http://rds-api-v3.internal:8002/bills"
-    assert call.kwargs["params"]["apikey"] == "rds-key"
+    assert call.kwargs["headers"] == {"x-api-key": "rds-key"}  # SYNC-68: a header, never the url
+    assert "apikey" not in call.kwargs["params"]
 
 
 @pytest.mark.asyncio
@@ -1687,7 +1688,8 @@ async def test_resolve_touched_sessions_no_override_still_uses_local_settings():
 
     call = mock_client.get.await_args
     assert call.args[0] == "http://localhost:8002/bills"
-    assert call.kwargs["params"]["apikey"] == "test-key"
+    assert call.kwargs["headers"] == {"x-api-key": "test-key"}  # SYNC-68: a header, never the url
+    assert "apikey" not in call.kwargs["params"]
 
 
 @pytest.mark.asyncio

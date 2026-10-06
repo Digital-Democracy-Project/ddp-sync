@@ -200,9 +200,9 @@ class FederalLegislatorCache:
 
         Returns:
             (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the local api-v3 instance's apikey_auth scheme applies --
-            it authenticates via an `apikey` query param, not the public API's
-            `X-API-KEY` header scheme.
+            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
+            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
+            the key is sent as a header on every route, never in the query string (it was logged there).
         """
         replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
@@ -319,14 +319,7 @@ class FederalLegislatorCache:
             "page": page,
             "per_page": per_page,
         }
-        if is_local_replica:
-            # Local api-v3's apikey_auth is a query param, not the public
-            # API's X-API-KEY header (SYNC-8, mirrors SYNC-6's routing).
-            headers = {"accept": "application/json"}
-            if api_key:
-                params["apikey"] = api_key
-        else:
-            headers = {"X-API-KEY": api_key}
+        headers = {"X-API-KEY": api_key} if api_key else {}  # SYNC-68: a header, never the query string
 
         while True:
             params["page"] = page

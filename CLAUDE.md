@@ -210,6 +210,18 @@ problem (SYNC-76/77's validation reported a real `total_votes=3` working), but t
 assumption worth verifying, not trusting, given how wrong "the replica has full data so
 lookups must work" turned out to be for bills.
 
+## An api-v3 key never goes in a URL (SYNC-68)
+
+Every call to an api-v3 (the Mac's local one, the RDS-backed one, the public API) sends its key as the
+`x-api-key` header. It used to ride in the query string for the DDP instances (`?apikey=`), and httpx logs
+the full request URL at INFO, so the real key was written to every log sink on every call, twice noticed in
+production (2026-09-16, 2026-10-06). `local_openstates_client._auth_headers()` is the helper; the other
+modules build the header inline. `_get_api_base_and_key()`'s `is_local_replica` flag no longer selects an
+auth style, only which instance. `tests/test_api_key_never_in_url.py` fails, naming file and line, if any
+string literal `"apikey"` appears in `src/`, and runs the real httpx logging to prove the key is in no URL
+or log record; `app._configure_logging` additionally keeps httpx's INFO request line off. Treat a key that
+was logged before this as exposed: rotating it is an ops action, and old log lines persist until they rotate out.
+
 ## Recurring jobs are scheduled by ddp-sync, not by CAMS
 
 Every recurring/scheduled pipeline in this stack is meant to be scheduled by **ddp-sync's own
