@@ -48,6 +48,19 @@ async def test_configured_logging_keeps_the_url_and_the_key_out_of_the_logs(capl
     assert not [r for r in caplog.records if r.name.startswith(("httpx", "httpcore"))]
 
 
+def test_httpx_warnings_and_errors_stay_visible_and_both_loggers_are_raised(caplog, _reset_http_loggers):
+    """Only the INFO request line goes; a real httpx failure must still be logged. Asserted on the logger
+    levels too, because a mock transport does not exercise httpcore's own logging."""
+    app_module._configure_logging("INFO")
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("httpx").info("request line")
+        logging.getLogger("httpx").warning("a warning")
+        logging.getLogger("httpx").error("an error")
+    assert [r.getMessage() for r in caplog.records] == ["a warning", "an error"]
+
+
 def test_the_lifespan_uses_the_configured_logging():
     """The service's startup must go through `_configure_logging`, not its own copy of basicConfig."""
     import inspect
