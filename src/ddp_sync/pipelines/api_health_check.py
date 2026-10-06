@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from ddp_sync.slack_identity import codebot_identity
+
 logger = logging.getLogger(__name__)
 
 DDP_API_BASE_URL = os.getenv("DDP_API_BASE_URL", "https://api.digitaldemocracyproject.org")
@@ -297,7 +299,7 @@ def push_health_alert(webhook_url: str, results: list[CheckResult]) -> bool:
         resp = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text},
+            json={"channel": channel, "text": text, **codebot_identity()},
             timeout=15,
         )
         if resp.ok and resp.json().get("ok"):

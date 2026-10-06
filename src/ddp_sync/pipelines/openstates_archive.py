@@ -38,6 +38,7 @@ from ddp_sync.config import SyncSettings, get_settings
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
+from ddp_sync.slack_identity import codebot_identity
 
 logger = structlog.get_logger()
 
@@ -126,7 +127,7 @@ def _alert_archive_failure(jurisdiction: str, error: str, duration_seconds: floa
             resp = requests.post(
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"channel": channel, "text": text},
+                json={"channel": channel, "text": text, **codebot_identity()},
                 timeout=15,
             )
             if not (resp.ok and resp.json().get("ok")):
@@ -866,7 +867,7 @@ def _post_slack_alert(text: str) -> None:
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
             json={"channel": os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors"),
-                  "text": f":warning: {text}"},
+                  "text": f":warning: {text}", **codebot_identity()},
             timeout=15,
         )
         if not (resp.ok and resp.json().get("ok")):

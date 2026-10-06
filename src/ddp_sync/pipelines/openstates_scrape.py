@@ -31,6 +31,7 @@ import structlog
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
+from ddp_sync.slack_identity import codebot_identity
 
 logger = structlog.get_logger()
 
@@ -125,7 +126,7 @@ def _alert_scrape_failure(label: str, error: str, duration_seconds: float) -> No
             resp = requests.post(
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"channel": channel, "text": text},
+                json={"channel": channel, "text": text, **codebot_identity()},
                 timeout=15,
             )
             if not (resp.ok and resp.json().get("ok")):
@@ -183,7 +184,7 @@ def _alert_sustained_block(jurisdiction: str, blocked_count: int, window: int) -
         resp = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text},
+            json={"channel": channel, "text": text, **codebot_identity()},
             timeout=15,
         )
         if not (resp.ok and resp.json().get("ok")):
@@ -221,7 +222,7 @@ def _alert_quiet_jurisdiction(jurisdiction: str, quiet_window: int) -> None:
         resp = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
-            json={"channel": channel, "text": text},
+            json={"channel": channel, "text": text, **codebot_identity()},
             timeout=15,
         )
         if not (resp.ok and resp.json().get("ok")):
