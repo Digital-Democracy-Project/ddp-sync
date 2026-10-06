@@ -15,16 +15,28 @@ logger = logging.getLogger(__name__)
 API_PREFIX = "/ddp-sync/v1"
 
 
+def _configure_logging(level_name: str) -> None:
+    """Root logging, plus SYNC-68: keep httpx's and httpcore's own request logging off.
+
+    httpx logs `HTTP Request: GET <full url> "HTTP/1.1 200 OK"` at INFO for every call, and a url that
+    carries a credential in its query string (`apikey=`) writes that credential into every log sink,
+    including the host's Docker logs and anything an operator tails. Found live 2026-09-16 and again
+    2026-10-06. This is the immediate stop for that logger only; moving the key out of every url into a header
+    is the root-cause fix (SYNC-68's second PR), because a url can reach a log by other routes too."""
+    logging.basicConfig(
+        level=getattr(logging, level_name.upper(), logging.INFO),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: connect Redis, start scheduler. Shutdown: stop scheduler, disconnect."""
     settings = get_settings()
 
-    # Set up logging
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    _configure_logging(settings.log_level)
 
     # Connect Redis
     from ddp_sync.services.redis_store import get_redis_store
