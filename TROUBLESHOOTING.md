@@ -320,3 +320,17 @@ Only after ruling out schema mismatch should you suspect URL-trailing-slash, ema
 **Fix:** The classifier now additionally reads a bounded tail of `logs/scraper.log`, anchored to a byte offset captured *before* the subprocess launches. The anchor is the important part, not an incidental detail: `scraper.log` is a long-lived, cross-run file, so a naive "read the last N bytes/lines" approach could pick up a stale, already-resolved block signature from a previous run's failure and misattribute it to today's unrelated failure. Anchoring to this run's own pre-launch offset means only bytes this run's subprocess could plausibly have written are ever considered.
 
 **Files:** `pipelines/openstates_scrape.py`
+
+### A failure alert in #automation-errors shows up as "Agent Smith" instead of "CodeBot"
+
+**Symptom:** Scrape, archive or health-check failure alerts post under Agent Smith's name and icon. The failure stream is meant to read as CodeBot.
+
+**Root cause (SYNC-99):** Every `chat.postMessage` ddp-sync sent carried only `channel` and `text`. With no `username` / `icon_emoji`, Slack labels the message with the Slack app's own name, which is Agent Smith.
+
+**Fix:** All alerts go through `slack_alerts.post_alert()`, which adds CodeBot's name and icon (`CODEBOT_SLACK_USERNAME` / `CODEBOT_SLACK_ICON_EMOJI`, defaults `CodeBot` / `:robot_face:`). If an alert *still* shows as Agent Smith, check in this order:
+1. **Is the sender this service?** Alerts from the `ddp-open-states` scripts come from `lib/slack-alert.sh`; `check-replica-health.sh` still posts as Agent Smith until it adopts that helper. Zapier-relayed messages (votebot eval, bio sync, voatz-brevo) take their identity from the Zap.
+2. **Name right but icon generic (`:robot_face:`)?** The icon variable is configured only in `ddp-agents/.env`. `scripts/start-ddp-sync.sh` copies it on the Mac (PR #195), and the Mac needs a ddp-sync restart to pick it up; EC2 does not run that script and gets it only from its compose environment (per PR #195; not checked on the host).
+3. **Name and icon both ignored?** The Slack app is missing the `chat:write.customize` scope. Posts still succeed under the default name; it is a Slack app setting, not a code bug.
+4. **A new alert shows as Agent Smith?** It posts without `post_alert()`. `tests/test_slack_identity_alerts.py` fails on any other module containing the Slack post URL, so this means the test was not run or the post went through another route (webhook, SDK).
+
+**Files:** `slack_alerts.py`, `slack_identity.py`, `scripts/start-ddp-sync.sh`
