@@ -71,8 +71,8 @@ async def test_refresh_routes_to_local_replica_when_us_flipped(tmp_path, monkeyp
     for call in mock_client.get.call_args_list:
         called_url, called_kwargs = call
         assert called_url[0] == "http://localhost:8002/people"
-        assert "X-API-KEY" not in called_kwargs["headers"]
-        assert called_kwargs["params"]["apikey"] == "local-key"
+        assert called_kwargs["headers"]["X-API-KEY"] == "local-key"  # SYNC-68: a header, never the url
+        assert "apikey" not in called_kwargs["params"]
 
 
 @pytest.mark.asyncio

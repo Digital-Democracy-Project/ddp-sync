@@ -61,8 +61,8 @@ async def test_fetch_sponsored_bills_routes_flipped_jurisdiction_to_local_replic
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/bills"
-    assert "x-api-key" not in called_kwargs["headers"]
-    assert called_kwargs["params"]["apikey"] == "local-key"
+    assert called_kwargs["headers"]["x-api-key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in called_kwargs["params"]
 
 
 @pytest.mark.asyncio
@@ -117,9 +117,10 @@ async def test_fetch_legislator_votes_routes_list_and_detail_calls_to_local_repl
     list_call, detail_call = mock_client.get.call_args_list
     assert list_call[0][0] == "http://localhost:8002/bills"
     assert detail_call[0][0] == "http://localhost:8002/bills/ocd-bill/1"
-    assert "x-api-key" not in list_call[1]["headers"]
-    assert list_call[1]["params"]["apikey"] == "local-key"
-    assert ("apikey", "local-key") in detail_call[1]["params"]
+    assert list_call[1]["headers"]["x-api-key"] == "local-key"  # SYNC-68: a header, never the url
+    assert detail_call[1]["headers"]["x-api-key"] == "local-key"  # the detail call reuses the list call's headers
+    assert "apikey" not in list_call[1]["params"]
+    assert "apikey" not in dict(detail_call[1]["params"])
 
 
 @pytest.mark.asyncio
@@ -180,8 +181,8 @@ async def test_get_sponsor_name_with_flipped_jurisdiction_routes_to_local_replic
     assert name == "Gallagher"
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/people"
-    assert "x-api-key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["x-api-key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio

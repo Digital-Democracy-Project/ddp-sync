@@ -58,8 +58,8 @@ async def test_iter_jurisdiction_routes_flipped_jurisdiction_to_local_replica():
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/people"
-    assert "x-api-key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["x-api-key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio

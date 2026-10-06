@@ -85,10 +85,9 @@ async def test_routes_flipped_jurisdiction_to_local_replica():
     assert result == {"id": "ocd-bill/123"}
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/bills/us/119/HR1"
-    # Local api-v3's apikey_auth is a query param, not the public API's
-    # x-api-key header (matches local_openstates_client.py's convention).
-    assert "x-api-key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    # SYNC-68: the key is a header on every route, never the query string (httpx logged the url).
+    assert called_kwargs["headers"]["x-api-key"] == "local-key"
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio

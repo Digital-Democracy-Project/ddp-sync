@@ -69,8 +69,8 @@ async def test_fetch_jurisdiction_routes_flipped_jurisdiction_to_local_replica()
     assert result is not None
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/jurisdictions/va"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -152,8 +152,8 @@ async def test_fetch_jurisdiction_on_the_mac_still_uses_the_local_replica():
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/jurisdictions/ut"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -207,8 +207,8 @@ async def test_fetch_legislators_routes_flipped_jurisdiction_to_local_replica():
 
     called_url, called_kwargs = mock_client.get.call_args
     assert called_url[0] == "http://localhost:8002/people"
-    assert "X-API-Key" not in called_kwargs["headers"]
-    assert ("apikey", "local-key") in called_kwargs["params"]
+    assert called_kwargs["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert "apikey" not in dict(called_kwargs["params"])
 
 
 @pytest.mark.asyncio
@@ -246,9 +246,10 @@ async def test_fetch_with_jurisdiction_routes_list_and_detail_calls_to_local_rep
     assert detail_call[0][0] == "http://localhost:8002/bills/ocd-bill/123"
     # Both calls use the local replica's query-param auth, not the public
     # header scheme.
-    assert "X-API-Key" not in list_call[1]["headers"]
-    assert list_call[1]["params"]["apikey"] == "local-key"
-    assert detail_call[1]["params"] == {"apikey": "local-key"}
+    assert list_call[1]["headers"]["X-API-Key"] == "local-key"  # SYNC-68: a header, never the url
+    assert detail_call[1]["headers"]["X-API-Key"] == "local-key"
+    assert "apikey" not in list_call[1]["params"]
+    assert not detail_call[1].get("params")  # the detail call carries no query string at all
     assert docs  # bill had a title, so content extraction succeeded
 
 

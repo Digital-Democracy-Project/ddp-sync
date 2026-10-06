@@ -180,9 +180,9 @@ class OpenStatesSource:
 
         Returns:
             (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the local api-v3 instance's apikey_auth scheme applies --
-            it authenticates via an `apikey` query param, not the public API's
-            `X-API-Key` header scheme.
+            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
+            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
+            the key is sent as a header on every route, never in the query string (it was logged there).
         """
         replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
         if jurisdiction.upper() in replica_jurisdictions:
@@ -192,9 +192,8 @@ class OpenStatesSource:
             # settings) is the EC2 broker host, where localhost:8002 is the ddp-sync
             # container itself and nothing answers; its replica is the RDS-backed api-v3
             # (rds_openstates_api_base), the same split knowledge_base_embedding.read_target
-            # makes. That instance authenticates with the X-API-Key header, not the `apikey`
-            # query parameter, so is_local_replica is False for it -- the flag selects the
-            # auth style, nothing else. With no RDS base configured (dev, tests) the
+            # makes. is_local_replica is False for it; the flag no longer selects anything about auth
+            # (SYNC-68: the key is a header on every route). With no RDS base configured (dev, tests) the
             # behavior is unchanged.
             if not self.settings.cams_api_token and self.settings.rds_openstates_api_base:
                 logger.debug(
@@ -234,27 +233,18 @@ class OpenStatesSource:
         Returns:
             JurisdictionInfo or None if not found
         """
-        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Local api-v3's apikey_auth is a query param, not the public
-            # API's X-API-Key header (SYNC-8, mirrors bill_sync.py's SYNC-6
-            # routing).
             include_params = [
                 "organizations",
                 "legislative_sessions",
                 "latest_runs",
             ]
             params = [("include", p) for p in include_params]
-            if is_local_replica:
-                headers = {"accept": "application/json"}
-                if api_key:
-                    params.append(("apikey", api_key))
-            else:
-                headers = {
-                    "accept": "application/json",
-                    "X-API-Key": api_key,
-                }
+            # SYNC-68: the key goes in a header on every route, local replica or public API; in the query
+            # string it was written into the logs with the url (api-v3's apikey_auth accepts either).
+            headers = {"accept": "application/json", "X-API-Key": api_key}
 
             url = f"{api_base}/jurisdictions/{jurisdiction.lower()}"
 
@@ -488,15 +478,12 @@ class OpenStatesSource:
         # With no jurisdiction (multi-jurisdiction crawl), there's nothing to
         # route on, so this always uses the public API.
         if jurisdiction:
-            api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+            api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
         else:
-            api_base, api_key, is_local_replica = self.settings.openstates_api_base, self.api_key, False
+            api_base, api_key, _is_local_replica = self.settings.openstates_api_base, self.api_key, False
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            if is_local_replica:
-                headers = {"accept": "application/json"}
-            else:
-                headers = {"X-API-Key": api_key}
+            headers = {"X-API-Key": api_key}  # SYNC-68: a header, never the query string, on every route
 
             # Build query parameters
             params = {
@@ -506,8 +493,6 @@ class OpenStatesSource:
                 params["jurisdiction"] = jurisdiction
             if session:
                 params["session"] = session
-            if is_local_replica and api_key:
-                params["apikey"] = api_key
 
             logger.info(
                 "Fetching bills from OpenStates",
@@ -540,7 +525,6 @@ class OpenStatesSource:
                         detail_response = await client.get(
                             f"{api_base}/bills/{bill_id}",
                             headers=headers,
-                            params={"apikey": api_key} if is_local_replica and api_key else None,
                         )
                         detail_response.raise_for_status()
                         bill_detail = detail_response.json()
@@ -642,7 +626,7 @@ class OpenStatesSource:
         Yields:
             DocumentSource objects for each legislator
         """
-        api_base, api_key, is_local_replica = self._get_api_base_and_key(jurisdiction)
+        api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Include all available data for legislators
@@ -658,17 +642,7 @@ class OpenStatesSource:
                 ("per_page", min(limit, 50)),
             ] + [("include", p) for p in include_params]
 
-            if is_local_replica:
-                # Local api-v3's apikey_auth is a query param, not the public
-                # API's X-API-Key header (SYNC-8, mirrors SYNC-6's routing).
-                headers = {"accept": "application/json"}
-                if api_key:
-                    params.append(("apikey", api_key))
-            else:
-                headers = {
-                    "accept": "application/json",
-                    "X-API-Key": api_key,
-                }
+            headers = {"accept": "application/json", "X-API-Key": api_key}  # SYNC-68: never the query string
 
             logger.info(
                 "Fetching legislators from OpenStates",

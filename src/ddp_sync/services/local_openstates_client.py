@@ -70,6 +70,13 @@ logger = structlog.get_logger()
 # api-v3 shouldn't stall bill_source resolution for long before falling back.
 _REQUEST_TIMEOUT_SECONDS = 10.0
 
+
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    """The api-v3 key as the `x-api-key` header, or nothing when there is none (SYNC-68). Never put it in the
+    query string: httpx logs the full url at INFO, so `?apikey=` wrote the real key into every log sink on
+    every call. api-v3's `apikey_auth` accepts either form."""
+    return {"x-api-key": api_key} if api_key else {}
+
 # SYNC-66: a real production connection hiccup dropped an entire archive run's worth of
 # new content from ever reaching LegBot -- the same call, re-tried moments later from the
 # same container, succeeded immediately (see resolve_touched_sessions' own docstring).
@@ -110,14 +117,13 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
         return None
 
     params: dict[str, str] = {"include": "versions"}
-    if settings.local_openstates_api_key:
-        params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         logger.warning(
             "Local api-v3 unreachable -- falling back to live-fetch bill_source",
@@ -200,14 +206,13 @@ async def get_bill_version_document_text(
         return None
 
     params: dict[str, str] = {"include": "versions"}
-    if settings.local_openstates_api_key:
-        params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         logger.warning(
             "Local api-v3 unreachable -- cannot resolve version-document text",
@@ -280,14 +285,13 @@ async def get_current_version_identity(bill_openstates_id: str) -> dict | None:
         return None
 
     params: dict[str, str] = {"include": "versions"}
-    if settings.local_openstates_api_key:
-        params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         logger.warning(
             "Local api-v3 unreachable -- cannot resolve current version identity",
@@ -378,14 +382,13 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
         return None
 
     params: dict[str, str] = {"include": "versions"}
-    if settings.local_openstates_api_key:
-        params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         logger.warning(
             "Local api-v3 unreachable -- falling back to live-refetch changelog inputs",
@@ -508,14 +511,13 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
         return None
 
     params: dict[str, str] = {"include": "versions"}
-    if settings.local_openstates_api_key:
-        params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         logger.warning(
             "Local api-v3 unreachable -- falling back to live-refetch changelog inputs",
@@ -704,8 +706,7 @@ async def list_current_session_bill_candidates(
     # caller has likely been silently returning zero candidates every run.
     base_params: dict[str, str] = {"jurisdiction": jurisdiction_iso2.upper()}
     base_params["session"] = resolved_session_code
-    if settings.local_openstates_api_key:
-        base_params["apikey"] = settings.local_openstates_api_key
+    headers = _auth_headers(settings.local_openstates_api_key)
 
     # Real, separate pagination bug found designing Step 1: per_page=limit
     # was sent as the *page size* to a single GET -- silently under-covering
@@ -746,7 +747,7 @@ async def list_current_session_bill_candidates(
 
         try:
             async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-                resp = await client.get(url, params=params)
+                resp = await client.get(url, params=params, headers=headers)
         except httpx.RequestError as exc:
             logger.warning(
                 "Local api-v3 unreachable -- skipping jurisdiction for this "
@@ -935,8 +936,7 @@ async def resolve_touched_sessions(
         "jurisdiction": jurisdiction_iso2.upper(),
         since_param: since.isoformat(),
     }
-    if resolved_api_key:
-        base_params["apikey"] = resolved_api_key
+    headers = _auth_headers(resolved_api_key)
 
     session_codes: list[str] = []
     seen_sessions: set[str] = set()
@@ -954,7 +954,7 @@ async def resolve_touched_sessions(
         while True:
             try:
                 async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-                    resp = await client.get(url, params=params)
+                    resp = await client.get(url, params=params, headers=headers)
                 break
             except httpx.RequestError as exc:
                 if attempt >= _RESOLVE_SESSIONS_MAX_ATTEMPTS:
