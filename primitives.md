@@ -277,6 +277,36 @@ Pub/sub channels (hardcoded strings in callers):
   - `METRIC_UNKNOWN_YAML_KEY = "votebot_eval.unknown_yaml_key"`
 - Redis lock keys: `LOCK_KEY = "votebot:eval:running"`, `LAST_RUN_KEY = "votebot:eval:last_run"`
 
+## Slack alerts (`slack_alerts.py`, `slack_identity.py`, SYNC-99)
+
+**Every alert posted to Slack with `chat.postMessage` goes through one function. Don't write another `requests.post` to it.**
+
+- **`post_alert(text, *, source, channel=None) -> bool`** (`slack_alerts.py`) — posts to the alerts channel
+  (`HEALTH_ALERT_SLACK_CHANNEL`, default `#automation-errors`) with `SLACK_BOT_TOKEN`, 15s timeout, **as CodeBot**.
+  Never raises; returns whether Slack accepted it. `source` (e.g. `"openstates_scrape.scrape_failure"`) names the
+  caller in the log line. A missing token or a refused post logs `slack_alert_not_sent_no_token` /
+  `slack_alert_failed` / `slack_alert_error` (with `source`) instead of a per-site event.
+- **`codebot_identity() -> dict`** (`slack_identity.py`) — the `username` / `icon_emoji` fields. Mirrors
+  ddp-agents' `cams.slack_identity.identity_kwargs("codebot")` (this service can't import `cams`): same
+  `CODEBOT_SLACK_USERNAME` / `CODEBOT_SLACK_ICON_EMOJI` variables, same defaults (`CodeBot`, `:robot_face:`), and an
+  empty value means the default. Only `post_alert` should call it.
+- **Why one function:** a payload with only `channel` and `text` makes Slack use the Slack app's own name, so the alert
+  posts as **Agent Smith** instead of CodeBot. Setting the identity at each of six call sites fixed that once, but a
+  seventh alert could copy the old payload; one function can't. `tests/test_slack_identity_alerts.py` **fails if any
+  other module under `src/` contains the Slack post URL**.
+- **Callers:** `_alert_scrape_failure`, `_alert_sustained_block`, `_alert_quiet_jurisdiction`
+  (`pipelines/openstates_scrape.py`), `_alert_archive_failure` and the knowledge-base `_post_slack_alert`
+  (`pipelines/openstates_archive.py`), `push_health_alert` (`pipelines/api_health_check.py`).
+- **Not covered:** alerts relayed through **Zapier webhooks** (`push_eval_alert`, the bio-sync and voatz-brevo
+  summaries, `bill_org_sync`) never call `chat.postMessage`; their sender identity is set in the Zap, and the guard
+  test does not see them.
+- Needs the `chat:write.customize` scope on the Slack app; without it Slack ignores the two fields and the post still
+  succeeds under the default name. On the Mac, `scripts/start-ddp-sync.sh` copies the two `CODEBOT_*` variables from
+  `ddp-agents/.env` (the icon is configured only there; PR #195); EC2 does not run that script and gets them only from its compose environment (per PR #195; not checked on the host).
+- Mirrors in other repos: `ddp-open-states/lib/slack-alert.sh::post_slack_alert` (shell scripts) and the persona
+  registry in ddp-agents (`cams/slack_identity.py`). Change a default name/icon/variable in one, change all three.
+- **Merged 2026-10-06:** PRs #194 (identity), #195 (start script) and #196 (this single function). Not yet verified against live Slack.
+
 ## Scheduler (`scheduler.py`)
 
 - **`UpdateScheduler`** — APScheduler orchestrator. Singleton: `get_scheduler() -> UpdateScheduler | None`.
