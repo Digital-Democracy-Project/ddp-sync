@@ -38,7 +38,7 @@ from ddp_sync.config import SyncSettings, get_settings
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
-from ddp_sync.slack_identity import codebot_identity
+from ddp_sync.slack_alerts import post_alert
 
 logger = structlog.get_logger()
 
@@ -116,28 +116,11 @@ def _alert_archive_failure(jurisdiction: str, error: str, duration_seconds: floa
     never fired, and the orphaned os-text-extract archiver ran ~24h more with no one told.
     Never raises -- same convention as every other alerting call site in this codebase.
     """
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if token:
-        channel = os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors")
-        text = (
-            f":red_circle: *OpenStates archive failed: {jurisdiction}* — {error} "
-            f"(after {duration_seconds:.0f}s) — check ddp-sync logs / os-text-extract logs"
-        )
-        try:
-            resp = requests.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"channel": channel, "text": text, **codebot_identity()},
-                timeout=15,
-            )
-            if not (resp.ok and resp.json().get("ok")):
-                logger.error("openstates_archive: Slack alert failed", response=resp.text[:200])
-        except Exception as e:  # noqa: BLE001
-            logger.error("openstates_archive: Slack alert error", error=str(e))
-    else:
-        logger.warning(
-            "openstates_archive: SLACK_BOT_TOKEN not set — cannot alert on archive failure"
-        )
+    text = (
+        f":red_circle: *OpenStates archive failed: {jurisdiction}* — {error} "
+        f"(after {duration_seconds:.0f}s) — check ddp-sync logs / os-text-extract logs"
+    )
+    post_alert(text, source="openstates_archive.archive_failure")
 
     cams_token = os.getenv("CAMS_API_TOKEN", "")
     if cams_token:
@@ -857,23 +840,8 @@ def _backlog_alert_text(jurisdiction: str, totals: dict, threshold: int) -> str 
 
 
 def _post_slack_alert(text: str) -> None:
-    """Best-effort Slack post, the same token and channel convention as `_alert_archive_failure`. Never raises."""
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not token:
-        logger.warning("knowledge_base_alert_not_sent_no_slack_token", text=text)
-        return
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"channel": os.getenv("HEALTH_ALERT_SLACK_CHANNEL", "#automation-errors"),
-                  "text": f":warning: {text}", **codebot_identity()},
-            timeout=15,
-        )
-        if not (resp.ok and resp.json().get("ok")):
-            logger.error("knowledge_base_alert_failed", response=resp.text[:200])
-    except Exception as e:  # noqa: BLE001
-        logger.error("knowledge_base_alert_error", error=str(e))
+    """Best-effort Slack post through `post_alert` (same token, channel and CodeBot identity as `_alert_archive_failure`). Never raises."""
+    post_alert(f":warning: {text}", source="openstates_archive.knowledge_base")
 
 
 def _delete_orphans(config: dict | None) -> bool:
