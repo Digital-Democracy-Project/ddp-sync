@@ -25,10 +25,10 @@ The live ddp-api `/docs` shows only **11** ddp-sync routes: `/sync/unified`, `/s
 2. **A live confirmation I could only do by reading source.** In the ddp-api examples, `POST /trigger/legbot-analyze-bill` is pre-filled with an unknown `artifact_type` (`EXAMPLE-DO-NOT-USE`) and an all-zero bill id, on the grounds that ddp-sync rejects it before writing anything (400 for the artifact type, then 404 for the bill; 503 first if the host has no CAMS settings). If you have an instance that serves that route, please send exactly this one request **directly to that ddp-sync instance** and report only the status code:
    ```bash
    curl -s -o /dev/null -w '%{http_code}\n' -X POST "$SYNC/ddp-sync/v1/trigger/legbot-analyze-bill" \
-     -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
      -d '{"bill_openstates_id":"00000000-0000-0000-0000-000000000000","jurisdiction":"FL","session_code":"2026F","bill_source":"https://example.invalid/","artifact_type":"EXAMPLE-DO-NOT-USE"}'
    ```
-   Expect **400** (or **503** on a host without CAMS). A **202 would be a real problem**: it would mean the example is not inert, and I need to know before it ever appears on the public page. Use whatever auth header ddp-sync's `api_key_auth` expects on that host; do not paste a key. If no instance serves the route, say "not served" and skip it. Do not send the `bill-artifact-generation` or `legbot-analyze-bill-full` examples; they are dry runs by design but read real data and need no live check.
+   Expect **400** (or **503** on a host without CAMS). A **202 would be a real problem**: it would mean the example is not inert, and I need to know before it ever appears on the public page. ddp-sync's `api_key_auth` expects `Authorization: Bearer <that instance's API key>`; do not paste the key. Without it you get a 401, which tells us nothing about the route. If no instance serves the route, say "not served" and skip it. Do not send the `bill-artifact-generation` or `legbot-analyze-bill-full` examples; they are dry runs by design but read real data and need no live check.
 
 ## For whoever changes ddp-sync routes (no action from ops)
 
