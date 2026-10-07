@@ -272,3 +272,55 @@ async def test_patch_refresh_enabled_true_still_registers_the_job():
         assert "openstates_patch_refresh" in ids
     finally:
         sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_mi_cookie_publish_day_of_month_schedules_a_monthly_utc_cron():
+    """A real Michigan cookie lasts about a year, so the publish is monthly on a calendar day.
+    An interval timer restarts with the service, so it cannot express "monthly" safely."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        openstates_scrape:
+          enabled: true
+          mi_cookie_publish:
+            enabled: true
+            day_of_month: 1
+            sync_time_utc: "08:00"
+        """
+    )
+    sched.start()
+    try:
+        job = sched.scheduler.get_job("mi_cookie_publish")
+        assert job is not None
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        assert fields["day"] == "1"
+        assert fields["hour"] == "8"
+        assert fields["minute"] == "0"
+        assert str(job.trigger.timezone) == "UTC"
+    finally:
+        sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_mi_cookie_publish_without_day_of_month_keeps_the_interval_schedule():
+    """An older config that only sets interval_hours must keep working unchanged."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        openstates_scrape:
+          enabled: true
+          mi_cookie_publish:
+            enabled: true
+            interval_hours: 6
+        """
+    )
+    sched.start()
+    try:
+        job = sched.scheduler.get_job("mi_cookie_publish")
+        assert job is not None
+        assert job.trigger.interval.total_seconds() == 6 * 3600
+    finally:
+        sched.stop()
