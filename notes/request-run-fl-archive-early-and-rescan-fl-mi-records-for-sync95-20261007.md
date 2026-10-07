@@ -30,8 +30,9 @@ days earlier; there is no data risk in waiting, so **stop and report instead of 
 with your own key from the container's environment, never printed. It returns 202 and runs in the background: the archive
 Fargate task, then, in order, the LegBot hook, the knowledge-base ledger pass, and the search refresh.
 
-**One side effect to know about.** The archive hook can start LegBot generation when the archive touches sessions. FL was last
-archived on Monday 10-05 and its next scrape is Sunday 10-11, so little or nothing should be new. If the archive finds new
+**One side effect to know about.** The archive hook can start LegBot generation when the archive touches sessions. FL's archive normally
+runs on Mondays and its next scrape is Sunday 10-11 (your 10-07 note), so I expect little or nothing to be new. That is an
+expectation from the schedule, not something I checked; I do not know when FL was last archived. If the archive finds new
 documents and the LegBot hook fires, that is the normal weekly behaviour arriving early; **let it run and report the
 `archiver_triggered_legbot_*` result line.** If it logs `archiver_triggered_legbot_no_sessions_touched`, say so. Do not turn any
 flag on or off to change this.
