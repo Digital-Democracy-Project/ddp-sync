@@ -700,10 +700,12 @@ openstates_scrape:
   # mac's own local pre-seed still runs before each scheduled scrape (secondary.
   # scrapebot_fallback), and this job additionally publishes to S3 for a cloud run to read.
   #
-  # interval_hours is a conservative starting point, not a measured optimum -- ScrapeBot's
-  # mint is a real, several-minute CAPTCHA-solving task (scrapebot_client.py's own timeout
-  # budget runs to 240s+), so this trades a wider staleness window for not over-minting.
-  # Revisit once real cookie lifetimes from OPEN-189's live tests are known.
+  # Monthly, not every 6 hours: ScrapeBot's mint is a real, several-minute CAPTCHA-solving
+  # visit to Michigan's site, and a real Michigan cookie's own `expires` is about a year out
+  # (OPEN-232, observed 2026-09), so refreshing it four times a day was over-minting. The
+  # reader (cloud_collector.py) still only refuses a cookie that is missing or within 600s of
+  # `expires`. It is a fixed calendar day because an `interval_hours` timer restarts with the
+  # service and would never fire on a host that restarts more often than monthly.
   #
   # Enabled 2026-08-30: the reader-side staleness refusal this was waiting on
   # (cloud_collector.py's _mi_waf_cookies_are_fresh gate, gated on OPEN-200) is built and was
@@ -712,7 +714,8 @@ openstates_scrape:
   # publisher exists to feed.
   mi_cookie_publish:
     enabled: true
-    interval_hours: 6
+    day_of_month: 1
+    sync_time_utc: "08:00"
 
 # Split out from openstates_scrape (2026-07-31) — bill-document archiving to DDP-HOT used to
 # run as the last step of each scrape job, gating that job's incremental-cutoff marker write on

@@ -1158,14 +1158,27 @@ class UpdateScheduler:
             logger.info("mi_cookie_publish: disabled — skipping")
             return
 
-        interval_hours = publish_cfg.get("interval_hours", 6)
-
         async def _mi_cookie_publish_wrapper():
             return await run_mi_cookie_publish_job(config)
 
+        # A real Michigan cookie lives about a year, so this runs monthly on a fixed calendar
+        # day (`day_of_month` + `sync_time_utc`), not every N hours. An IntervalTrigger counts
+        # from service start and restarts with it, so a 30-day interval would never fire on a
+        # host that restarts more often than monthly. `interval_hours` is still honoured when
+        # `day_of_month` is absent, so an older config keeps working.
+        day_of_month = publish_cfg.get("day_of_month")
+        if day_of_month is not None:
+            hour, minute = map(int, publish_cfg.get("sync_time_utc", "08:00").split(":"))
+            trigger = CronTrigger(day=day_of_month, hour=hour, minute=minute, timezone=_UTC)
+            schedule = {"day_of_month": day_of_month, "sync_time_utc": f"{hour:02d}:{minute:02d}"}
+        else:
+            interval_hours = publish_cfg.get("interval_hours", 6)
+            trigger = IntervalTrigger(hours=interval_hours)
+            schedule = {"interval_hours": interval_hours}
+
         self._add_job_replacing(
             _mi_cookie_publish_wrapper,
-            trigger=IntervalTrigger(hours=interval_hours),
+            trigger=trigger,
             id="mi_cookie_publish",
             name="OpenStates: publish Michigan WAF cookies",
             replace_existing=True,
@@ -1173,7 +1186,7 @@ class UpdateScheduler:
             coalesce=True,
             misfire_grace_time=3600,
         )
-        logger.info("mi_cookie_publish: registered", interval_hours=interval_hours)
+        logger.info("mi_cookie_publish: registered", **schedule)
 
     def _register_session_pipeline_batch_job(self) -> None:
         """Register the session-targeted BillArtifact batch job (SYNC-9).
