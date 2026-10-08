@@ -156,15 +156,19 @@ votebot/ddp-api instance). Redis keys: `ddp:bill_version:{ocd_bill_id}` (bills),
 `ddp:kb_embed:since:{jurisdiction}` (live-hook watermark), `ddp:kb_backfill:{jurisdiction}:{stage}`
 (backfill checkpoint), `ddp_sync:kb_backfill:lock:{jurisdiction}` (one backfill at a time).
 
-**Status (2026-10-05, from the EC2 host's operator notes).** The staged backfill is complete: all 21
-stages (`current`, `prior-sessions`, `history` for FL, US, VA, MI, WA, AZ, UT) are done with no failed
-bills, and `ddp-knowledge-base` holds 426,166 vectors, exactly the total the checkpoints recorded.
-**Not run:** the backfill's `diffs` stage (whether to keep version-diff documents is still undecided,
-SYNC-94; **the live hook's default scope includes diffs, so a host running it writes `bill-version-diff`
-documents for each bill it touches**) and organizations (the ddp-broker-py Organization import, BROKER-144's data steps, has not run, so the broker's
-`/api/organizations/` is empty). Votes and legislator profiles are deliberately not embedded (SYNC-94).
-Whether a given host is *running* the live hook depends on that host having pulled this file and
-recreated ddp-sync, so check the host rather than assuming.
+**Shipped values in `config/sync_schedule.yaml` (2026-10-08).** `knowledge_base_embedding.enabled: true` for fl, us, va, mi, wa, az, ut;
+`reconcile.max_bills_per_run: 0` (off); `ledger.max_bills_per_run: 1000000` (the ledger pass is on, effectively uncapped);
+`alert_backlog_over: 100` (Slack alert when a run falls back from the ledger or leaves more than 100 bills out of step; was 0 until
+SYNC-95's ddp-sync #203, `91eda71`); `delete_orphans: false`. A host uses these only after it has pulled this file and recreated ddp-sync.
+
+**Status (2026-10-08, from the prod agent's `ops-handoff` notes; recorded, not re-run).** The staged backfill is complete: all 21 stages
+(`current`, `prior-sessions`, `history` for FL, US, VA, MI, WA, AZ, UT) are done with no failed bills. Version diffs are not embedded
+(decided 2026-10-05; the live hook no longer writes them) and neither are votes or legislator profiles (SYNC-94). The 5,121 organizations were
+embedded by SYNC-91. `ddp-knowledge-base` held 431,380 vectors on 2026-10-07. The live hook and ledger pass are running on the EC2 host
+(`faa9630` as of 2026-10-07 22:10 UTC, so it does not yet have the `alert_backlog_over: 100` value). Record expiry: knowledge-base entries
+written before the no-expiry change carried a 90-day Redis expiry, and each state's first ledger pass makes its records permanent. On
+2026-10-07, 62,432 of 66,539 records were permanent (Florida's pass ran early by hand); the remaining 4,107 are Michigan's and flip with its
+archive pass (05:00 UTC on 2026-10-08). Check the host rather than assuming.
 
 **Prerequisites for the hook on a host:** an api-v3 that serves the OPEN-311 fields
 (`archived_document_id`, `version_stage`, `version_ordinal`) and the OPEN-317 XML-first version pick
