@@ -1868,7 +1868,7 @@ async def test_the_hook_posts_the_alert_only_when_there_is_one_and_never_raises(
         post.assert_not_called()
 
 
-def test_the_slack_post_never_raises_and_the_yaml_ships_the_alert_off(monkeypatch):
+def test_the_slack_post_never_raises_and_the_yaml_ships_the_alert_on_at_100(monkeypatch):
     from pathlib import Path
 
     import yaml
@@ -1885,7 +1885,8 @@ def test_the_slack_post_never_raises_and_the_yaml_ships_the_alert_off(monkeypatc
         oa._post_slack_alert("hello")
     assert post.call_args.kwargs["json"]["text"] == ":warning: hello"
     shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "sync_schedule.yaml").read_text())["openstates_archive"]
-    assert shipped["knowledge_base_embedding"]["alert_backlog_over"] == 0
+    # Switched on at 100 on 2026-10-08 (SYNC-95); it shipped at 0 (off) until the ledger dry runs showed a real backlog is 0.
+    assert shipped["knowledge_base_embedding"]["alert_backlog_over"] == 100
 
 
 async def test_a_malformed_totals_dict_cannot_raise_into_the_hook_and_the_threshold_is_exclusive():
