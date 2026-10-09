@@ -56,6 +56,184 @@ def _build_claim(*, org_name: str, position: str, gov_id: str, bill_title: str, 
     return f"{org_name} {position}s {gov_id} ({bill_title}, {jurisdiction} {session_code})"
 
 
+# SYNC-100: how a rate-limited verify surfaces. LegBot degrades to {"insufficient_information":
+# True, "reason": "backend error: <upstream message>"} with no verdict (legbot_client's own
+# docstring), so the only signal is the text of the upstream error.
+_RATE_LIMIT_MARKERS = ("429", "rate_limit", "rate limit", "529", "overloaded")
+
+
+def _is_rate_limited(verify_answer: dict) -> bool:
+    reason = str(verify_answer.get("reason") or "").lower()
+    return not verify_answer.get("verdict") and any(marker in reason for marker in _RATE_LIMIT_MARKERS)
+
+
+async def verify_and_store_position(
+    *,
+    bill_openstates_id: str,
+    jurisdiction: str,
+    session_code: str,
+    version_date: str,
+    version_note: str,
+    gov_id: str,
+    bill_title: str,
+    invocation_id: str,
+    org_name: str,
+    position: str,
+    citation_url: str,
+    citation_excerpt: str = "",
+    find_model_name: str | None = None,
+    skip_write_on_rate_limit: bool = False,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Verify one organization's cited position against its page, then write one row.
+
+    The per-organization tail of generate_and_store_bill_organization_positions, split out
+    (SYNC-100) so a caller that already has a finding -- not one from find_bill_positions --
+    verifies and stores it through the same code. Failures stay isolated to this
+    organization: a verify-dispatch failure is recorded on the row, a broker-write failure
+    is reported, and neither raises.
+
+    skip_write_on_rate_limit: when True, a verify answer that was rate limited is reported
+    as outcome="retryable" and nothing is written. Off by default so find_bill_positions
+    research keeps writing the degraded row it always has.
+
+    Returns {"org_name", "position", "outcome", "position_id"}; outcome is one of
+    "written", "verification_failed", "broker_write_failed" or "retryable".
+    """
+    claim = _build_claim(
+        org_name=org_name,
+        position=position,
+        gov_id=gov_id,
+        bill_title=bill_title,
+        jurisdiction=jurisdiction,
+        session_code=session_code,
+    )
+
+    # Failures are isolated per organization, not per batch — a bad
+    # citation shouldn't cost the others.
+    verify_answer = None
+    verify_model_name = None
+    write_status = "complete"
+    failure_stage = None
+    failure_reason = None
+    try:
+        verify_result = await dispatch_bill_position_verification(citation_url, claim)
+        verify_answer = verify_result["answer"]
+        verify_model_name = verify_result.get("backend")
+    except LegBotDispatchError as exc:
+        logger.warning(
+            "verify_bill_position failed for one organization — recording a failed row",
+            bill_openstates_id=bill_openstates_id,
+            invocation_id=invocation_id,
+            org_name=org_name,
+            error=str(exc),
+        )
+        write_status = "failed"
+        failure_stage = "verification"
+        failure_reason = "legbot_dispatch_failed"
+
+    if skip_write_on_rate_limit and verify_answer is not None and _is_rate_limited(verify_answer):
+        # SYNC-100: a rate-limited answer says nothing about the citation, so it
+        # is reported and not written -- a stored row would stand for "could not
+        # be checked" forever, where nothing stored means the next run tries again.
+        logger.warning(
+            "verify_bill_position was rate limited -- writing nothing so a later run retries",
+            bill_openstates_id=bill_openstates_id,
+            invocation_id=invocation_id,
+            org_name=org_name,
+            reason=verify_answer.get("reason"),
+        )
+        return {"org_name": org_name, "position": position, "outcome": "retryable", "position_id": None}
+
+    write_kwargs = dict(
+        bill_openstates_id=bill_openstates_id,
+        jurisdiction=jurisdiction,
+        session_code=session_code,
+        version_date=version_date,
+        version_note=version_note,
+        invocation_id=invocation_id,
+        org_name=org_name,
+        position=position,
+        citation_url=citation_url,
+        citation_excerpt=citation_excerpt,
+        find_model_name=find_model_name,
+        status=write_status,
+        failure_stage=failure_stage,
+        failure_reason=failure_reason,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+    if verify_answer is not None:
+        # SYNC-41: "pending", not "" -- ddp-broker-py serializes this as
+        # a ChoiceField over pending/confirmed/not_confirmed, so a blank
+        # string is a 400, not a null. "pending" is already this field's
+        # established meaning for "verification produced no verdict"
+        # (the broker's own test_failed_verification_write_leaves_verdict
+        # _pending covers the dispatch-failure case), and it is what the
+        # else-branch below already leaves behind.
+        #
+        # LegBot omits "verdict" whenever it degrades to
+        # insufficient_information without reaching the model at all --
+        # a backend error, unparseable JSON, an unresolved URL (four
+        # such paths in ddp-agents' legbot/handlers.py). Those answers
+        # carry "reason" instead of "explanation", so fall back to it:
+        # without that, the one field saying *why* the page could not be
+        # read is dropped on the floor.
+        # `or`, not a .get() default: /pm-review noted that "verdict"
+        # can be present-but-null or blank as easily as absent, and both
+        # are a broker 400 rather than a KeyError. An *unexpected*
+        # non-empty verdict is deliberately still sent through and left
+        # to fail the broker's own ChoiceField -- that is one organization
+        # losing its write, loudly, rather than model drift being quietly
+        # rewritten to "pending" here.
+        verdict = verify_answer.get("verdict") or "pending"
+        explanation = verify_answer.get("explanation") or verify_answer.get("reason", "")
+        if not verify_answer.get("verdict"):
+            logger.warning(
+                "verify_bill_position returned no verdict — recording the "
+                "row as pending/insufficient rather than failing the bill",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                org_name=org_name,
+                citation_url=citation_url,
+                reason=explanation,
+            )
+        write_kwargs.update(
+            verification_verdict=verdict,
+            verification_insufficient_information=verify_answer.get("insufficient_information", False),
+            verification_content_incomplete=verify_answer.get("content_looks_incomplete", False),
+            verification_explanation=explanation,
+            verify_model_name=verify_model_name,
+        )
+    # else: verification_verdict stays at ddp-broker-py's own "pending"
+    # default, verify_* fields stay null -- the failure-row policy.
+
+    try:
+        write_result = await write_bill_organization_position(**write_kwargs)
+    except BrokerClientError as exc:
+        logger.warning(
+            "Broker write failed for one organization — continuing with the rest",
+            bill_openstates_id=bill_openstates_id,
+            invocation_id=invocation_id,
+            org_name=org_name,
+            error=str(exc),
+        )
+        return {
+            "org_name": org_name,
+            "position": position,
+            "outcome": "broker_write_failed",
+            "position_id": None,
+        }
+
+    return {
+        "org_name": org_name,
+        "position": position,
+        "outcome": "written" if verify_answer is not None else "verification_failed",
+        "position_id": write_result.get("id"),
+    }
+
+
 async def generate_and_store_bill_organization_positions(
     *,
     bill_openstates_id: str,
@@ -236,124 +414,24 @@ async def generate_and_store_bill_organization_positions(
             })
             continue
 
-        claim = _build_claim(
-            org_name=org_name,
-            position=position,
-            gov_id=gov_id,
-            bill_title=bill_title,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-        )
-
-        # Failures are isolated per organization, not per batch — a bad
-        # citation shouldn't cost the others.
-        verify_answer = None
-        verify_model_name = None
-        write_status = "complete"
-        failure_stage = None
-        failure_reason = None
-        try:
-            verify_result = await dispatch_bill_position_verification(citation_url, claim)
-            verify_answer = verify_result["answer"]
-            verify_model_name = verify_result.get("backend")
-        except LegBotDispatchError as exc:
-            logger.warning(
-                "verify_bill_position failed for one organization — recording a failed row",
+        results.append(
+            await verify_and_store_position(
                 bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=version_date,
+                version_note=version_note,
+                gov_id=gov_id,
+                bill_title=bill_title,
                 invocation_id=invocation_id,
                 org_name=org_name,
-                error=str(exc),
+                position=position,
+                citation_url=citation_url,
+                citation_excerpt=citation_excerpt,
+                find_model_name=find_model_name,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
             )
-            write_status = "failed"
-            failure_stage = "verification"
-            failure_reason = "legbot_dispatch_failed"
-
-        write_kwargs = dict(
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            version_date=version_date,
-            version_note=version_note,
-            invocation_id=invocation_id,
-            org_name=org_name,
-            position=position,
-            citation_url=citation_url,
-            citation_excerpt=citation_excerpt,
-            find_model_name=find_model_name,
-            status=write_status,
-            failure_stage=failure_stage,
-            failure_reason=failure_reason,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
         )
-        if verify_answer is not None:
-            # SYNC-41: "pending", not "" -- ddp-broker-py serializes this as
-            # a ChoiceField over pending/confirmed/not_confirmed, so a blank
-            # string is a 400, not a null. "pending" is already this field's
-            # established meaning for "verification produced no verdict"
-            # (the broker's own test_failed_verification_write_leaves_verdict
-            # _pending covers the dispatch-failure case), and it is what the
-            # else-branch below already leaves behind.
-            #
-            # LegBot omits "verdict" whenever it degrades to
-            # insufficient_information without reaching the model at all --
-            # a backend error, unparseable JSON, an unresolved URL (four
-            # such paths in ddp-agents' legbot/handlers.py). Those answers
-            # carry "reason" instead of "explanation", so fall back to it:
-            # without that, the one field saying *why* the page could not be
-            # read is dropped on the floor.
-            # `or`, not a .get() default: /pm-review noted that "verdict"
-            # can be present-but-null or blank as easily as absent, and both
-            # are a broker 400 rather than a KeyError. An *unexpected*
-            # non-empty verdict is deliberately still sent through and left
-            # to fail the broker's own ChoiceField -- that is one organization
-            # losing its write, loudly, rather than model drift being quietly
-            # rewritten to "pending" here.
-            verdict = verify_answer.get("verdict") or "pending"
-            explanation = verify_answer.get("explanation") or verify_answer.get("reason", "")
-            if not verify_answer.get("verdict"):
-                logger.warning(
-                    "verify_bill_position returned no verdict — recording the "
-                    "row as pending/insufficient rather than failing the bill",
-                    bill_openstates_id=bill_openstates_id,
-                    invocation_id=invocation_id,
-                    org_name=org_name,
-                    citation_url=citation_url,
-                    reason=explanation,
-                )
-            write_kwargs.update(
-                verification_verdict=verdict,
-                verification_insufficient_information=verify_answer.get("insufficient_information", False),
-                verification_content_incomplete=verify_answer.get("content_looks_incomplete", False),
-                verification_explanation=explanation,
-                verify_model_name=verify_model_name,
-            )
-        # else: verification_verdict stays at ddp-broker-py's own "pending"
-        # default, verify_* fields stay null -- the failure-row policy.
-
-        try:
-            write_result = await write_bill_organization_position(**write_kwargs)
-        except BrokerClientError as exc:
-            logger.warning(
-                "Broker write failed for one organization — continuing with the rest",
-                bill_openstates_id=bill_openstates_id,
-                invocation_id=invocation_id,
-                org_name=org_name,
-                error=str(exc),
-            )
-            results.append({
-                "org_name": org_name,
-                "position": position,
-                "outcome": "broker_write_failed",
-                "position_id": None,
-            })
-            continue
-
-        results.append({
-            "org_name": org_name,
-            "position": position,
-            "outcome": "written" if verify_answer is not None else "verification_failed",
-            "position_id": write_result.get("id"),
-        })
 
     return results
