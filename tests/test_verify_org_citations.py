@@ -178,6 +178,26 @@ async def test_a_success_resets_the_rate_limit_streak():
 
 
 @pytest.mark.asyncio
+async def test_the_same_finding_twice_in_one_request_is_verified_and_written_once():
+    """`settled` is read before the run writes anything, so a repeat inside the request has to be
+    caught separately -- otherwise it pays for a second verify call and stores a second row."""
+    items = [_item(org="Sierra Club"), _item(org="  sierra club "), _item(org="Other")]
+    summary, verify, write = await _run(items)
+
+    assert [r["outcome"] for r in summary["results"]] == ["written", "duplicate_in_request", "written"]
+    assert verify.await_count == 2
+    assert write.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_does_not_consume_the_limit():
+    items = [_item(org="A"), _item(org="A"), _item(org="B")]
+    summary, verify, _ = await _run(items, limit=2)
+    assert verify.await_count == 2
+    assert summary["counts"] == {"written": 2, "duplicate_in_request": 1}
+
+
+@pytest.mark.asyncio
 async def test_dry_run_dispatches_and_writes_nothing():
     summary, verify, write = await _run([_item(org="A"), _item(org="B")], dry_run=True, existing=[_row(org="B")])
 
@@ -253,6 +273,20 @@ async def test_a_degraded_answer_that_is_not_rate_limiting_is_still_written_with
             patch(f"{_RESEARCH}.write_bill_organization_position", new=AsyncMock(return_value={"id": 1})) as write:
         result = await verify_and_store_position(**_common_kwargs(), skip_write_on_rate_limit=True)
     assert result["outcome"] == "written"
+    assert write.await_args.kwargs["verification_verdict"] == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [
+    {"insufficient_information": True},  # no reason at all
+    {"insufficient_information": True, "reason": None},
+    {"insufficient_information": True, "reason": "backend error: could not read the page"},
+])
+async def test_a_degraded_answer_without_a_rate_limit_reason_is_written_not_retryable(answer):
+    """A missing or unrelated reason must follow the existing missing-verdict policy, never raise."""
+    verify = AsyncMock(return_value={"answer": answer, "backend": "claude"})
+    summary, _, write = await _run([_item()], verify=verify)
+    assert summary["counts"] == {"written": 1}
     assert write.await_args.kwargs["verification_verdict"] == "pending"
 
 

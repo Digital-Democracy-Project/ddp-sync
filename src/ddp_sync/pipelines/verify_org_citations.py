@@ -69,8 +69,8 @@ async def verify_org_citations(
 
     Returns a summary: counts per outcome plus the per-item list. Outcomes are the ones
     verify_and_store_position reports ("written", "verification_failed", "broker_write_failed",
-    "retryable") plus "already_settled", "no_current_version", "broker_read_failed", "dry_run"
-    and "not_attempted".
+    "retryable") plus "already_settled", "duplicate_in_request", "no_current_version",
+    "broker_read_failed", "dry_run" and "not_attempted".
     """
     run_id = run_id or f"org-citation-verify-{uuid.uuid4().hex[:12]}"
     invocation_id = str(uuid.uuid4())
@@ -80,6 +80,7 @@ async def verify_org_citations(
         by_bill.setdefault(item["bill_openstates_id"], []).append(item)
 
     results: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
     dispatched = 0
     consecutive_retryable = 0
     stopped_early = False
@@ -108,9 +109,16 @@ async def verify_org_citations(
 
         settled = _settled_keys(existing)
         for item in bill_items:
-            if _match_key(item["org_name"], item["position"], item["citation_url"]) in settled:
+            key = _match_key(item["org_name"], item["position"], item["citation_url"])
+            if key in settled:
                 results.append(_outcome(item, "already_settled"))
                 continue
+            # The same finding twice in one request: `settled` is a snapshot from before this
+            # run wrote anything, so without this both copies would be verified and stored.
+            if key in seen:
+                results.append(_outcome(item, "duplicate_in_request"))
+                continue
+            seen.add(key)
             if stopped_early or (limit is not None and dispatched >= limit):
                 results.append(_outcome(item, "not_attempted"))
                 continue
