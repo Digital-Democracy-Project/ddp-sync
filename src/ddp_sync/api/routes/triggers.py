@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import asdict
 from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -652,6 +653,102 @@ async def trigger_legbot_analyze_bill_full(
 
     result["environment"] = x_ddp_environment
     return result
+
+
+class VerifyOrgCitationItem(BaseModel):
+    bill_openstates_id: str
+    jurisdiction: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
+    session_code: str
+    gov_id: str
+    org_name: str = Field(..., min_length=1)
+    position: Literal["support", "oppose"]
+    citation_url: str = Field(..., min_length=1)
+
+
+class VerifyOrgCitationsRequest(BaseModel):
+    """Request body for POST /trigger/verify-org-citations (SYNC-100)."""
+
+    source: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "Where these citations came from, e.g. 'slack-legislation-zapier'. Stored as each "
+            "row's find_model_name, so a row says its citation was not found by a LegBot model."
+        ),
+    )
+    items: list[VerifyOrgCitationItem] = Field(..., min_length=1, max_length=500)
+    limit: int | None = Field(
+        None,
+        ge=1,
+        description="Dispatch at most this many items (already-settled ones do not count). Omit for all.",
+    )
+    dry_run: bool = Field(
+        True,
+        description=(
+            "Report what a real run would dispatch without calling LegBot or writing rows. "
+            "A real run costs one metered Claude call per item."
+        ),
+    )
+
+
+@router.post("/trigger/verify-org-citations", status_code=202)
+async def trigger_verify_org_citations(
+    body: VerifyOrgCitationsRequest,
+    background_tasks: BackgroundTasks,
+    x_ddp_environment: str | None = Header(default=None),
+    token: str = Depends(api_key_auth),
+):
+    """Verify organization-position citations from an external source and store the results
+    (SYNC-100).
+
+    For each item the broker does not already hold a settled row for (a confirmed or
+    not_confirmed verdict), runs verify_bill_position against the cited page and writes one
+    BillOrganizationPosition row, through the same code find_bill_positions research uses.
+    Serial, and it stops after three rate-limited answers in a row.
+
+    Returns 202 at once with a `run_id`; like the other long runs here, the result (counts per
+    outcome) lands in the log line `org_citation_verify_summary`, not in this response. Defaults
+    to `dry_run=true`.
+
+    Same Mac-Studio-only construction as /trigger/legbot-analyze-bill-full: the verify dispatch
+    reads CAMS results off local disk. Which broker the rows land on comes from the trusted
+    X-DDP-Environment header, never the body.
+    """
+    settings = get_settings()
+    if not settings.cams_base_url or not settings.cams_artifacts_dir:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CAMS_BASE_URL/CAMS_ARTIFACTS_DIR not configured on this instance -- this "
+                "endpoint only works on the same host as CAMS (Mac Studio)."
+            ),
+        )
+    broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
+
+    import uuid
+
+    from ddp_sync.pipelines.verify_org_citations import verify_org_citations
+
+    run_id = f"org-citation-verify-{'dry' if body.dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(
+        verify_org_citations,
+        [item.model_dump() for item in body.items],
+        source=body.source,
+        dry_run=body.dry_run,
+        limit=body.limit,
+        run_id=run_id,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+    return {
+        "status": "started",
+        "run_id": run_id,
+        "items": len(body.items),
+        "limit": body.limit,
+        "dry_run": body.dry_run,
+        "environment": x_ddp_environment,
+    }
 
 
 @router.post("/trigger/legislator-bio-sync")

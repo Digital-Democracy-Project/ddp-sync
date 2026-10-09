@@ -349,6 +349,7 @@ Use `settings.webflow_scheduler_api_key` for scheduled write operations (has bro
 | `POST /trigger/knowledge-base-reconcile/{jurisdiction}` | Calls `knowledge_base_embedding.plan_reconcile(...)` in the background | SYNC-95 dry run of the reconcile pass; always read-only; result in the log |
 | `POST /trigger/votebot-eval` | Calls `run_votebot_eval(...)` | Votebot evaluation run |
 | `POST /trigger/webflow/{job}` | Runs webflow batch job by name | CMS batch jobs |
+| `POST /trigger/verify-org-citations` | Calls `verify_org_citations(...)` in the background (SYNC-100) | Verifies + stores organization-position citations from an external source (e.g. Slack #legislation) via `verify_and_store_position`, the same tail `find_bill_positions` research uses; skips rows the broker already settled (`broker_client.get_bill_organization_positions_existing`); serial; defaults to `dry_run=true`; result in the log line `org_citation_verify_summary` |
 
 ## sync_schedule.yaml config blocks
 

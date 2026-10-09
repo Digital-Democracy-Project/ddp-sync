@@ -14,6 +14,7 @@ from ddp_sync.services.broker_client import (
     ensure_bill_exists,
     get_bill_artifact_coverage_all_versions,
     get_bill_artifacts,
+    get_bill_organization_positions_existing,
     get_bill_organization_positions_status,
     get_concept_statement_set,
     get_concept_statement_statuses,
@@ -1513,3 +1514,37 @@ def test_the_insufficient_but_populated_prefix_is_the_queryable_contract():
     from ddp_sync.services.broker_client import _INSUFFICIENT_BUT_POPULATED_NOTE
 
     assert _INSUFFICIENT_BUT_POPULATED_NOTE.startswith("flagged_but_populated")
+
+
+@pytest.mark.asyncio
+async def test_get_bill_organization_positions_existing_returns_the_rows():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    rows = [{"org_name": "Sierra Club", "position": "support", "citation_url": "https://a.invalid",
+             "status": "complete", "verification_verdict": "confirmed"}]
+    response.json.return_value = {"positions": rows}
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), \
+            _patch_async_client(mock_client):
+        result = await get_bill_organization_positions_existing(bill_openstates_id="abc")
+
+    assert result == rows
+    call = mock_client.get.await_args
+    assert call.args[0] == "http://localhost:8080/api/bill-organization-positions/existing/"
+    assert call.kwargs["params"] == {"bill_openstates_id": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_get_bill_organization_positions_existing_raises_on_error():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 401
+    response.text = "no"
+    mock_client.get = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), \
+            _patch_async_client(mock_client):
+        with pytest.raises(BrokerClientError, match="401"):
+            await get_bill_organization_positions_existing(bill_openstates_id="abc")
