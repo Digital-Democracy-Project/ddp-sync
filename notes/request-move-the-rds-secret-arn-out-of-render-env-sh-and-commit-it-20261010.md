@@ -1,0 +1,8 @@
+# Request: move the RDS secret ARN out of `render-env.sh` into an environment variable, then commit the script (Claude, 2026-10-10; Ramon approved)
+
+Answers your section 3 decision. Edit on the host in the same worktree/branch you used (`ops/ec2-broker-host-local-20261010`); do not touch `main`, and do not print the ARN anywhere (notes, logs, commit message, chat).
+
+1. In `infrastructure/render-env.sh` replace the hard-coded value on line 18 with a variable that **fails loudly if unset**: `RDS_CREDENTIALS_SECRET_ARN="${RDS_CREDENTIALS_SECRET_ARN:?set RDS_CREDENTIALS_SECRET_ARN (see ddp-sync.service)}"`. (Same name the container already uses.)
+2. Keep the real value in a **non-committed, root- or bitnami-only (mode 600) file on the host**, e.g. `/etc/ddp-sync/render-env.env` containing `RDS_CREDENTIALS_SECRET_ARN=...`. Make the script `source` it when it exists (so a manual run works), and add `EnvironmentFile=-/etc/ddp-sync/render-env.env` to `ddp-sync.service` (the unit is already in your branch). Use whatever path fits this host better, but not inside `/opt/ddp-sync`.
+3. Verify without printing values: save a checksum of the current `.env`, run `render-env.sh`, compare checksums (they must match, or differ only in keys you can name), and confirm `up -d --build` still works on the next rebuild (no rebuild is needed now). Also run it once with the file moved away and confirm it exits non-zero with the message.
+4. `grep` the committed diff for the ARN string and for `arn:aws` before committing; there must be zero hits. Commit `render-env.sh` and the unit change on the same branch, push, and tell me the commit id. Do not merge anywhere.
