@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import asdict
 from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -650,6 +651,97 @@ async def trigger_legbot_analyze_bill_full(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    result["environment"] = x_ddp_environment
+    return result
+
+
+class VerifyOrgCitationItem(BaseModel):
+    bill_openstates_id: str
+    jurisdiction: str = Field(..., description="Two-letter state code, e.g. 'FL'.")
+    session_code: str
+    gov_id: str
+    org_name: str = Field(..., min_length=1)
+    position: Literal["support", "oppose"]
+    citation_url: str = Field(..., min_length=1)
+
+
+# ddp-api's proxy gives a POST 300 seconds, and each verification is one metered Claude call that
+# fetches a page, run one after another. How long one takes is NOT measured yet (the SYNC-100 pilot
+# is what measures it), and a large PDF can be slow, so this is a conservative guess to be revisited
+# with that data. A larger batch is sent in several requests; the result of each says which items
+# were processed, so a rerun sends only the rest. If a request times out, its outcome is unknown:
+# resend that same small request (the broker's upsert makes that safe, it costs the calls again).
+VERIFY_ORG_CITATIONS_MAX_ITEMS = 3
+
+
+class VerifyOrgCitationsRequest(BaseModel):
+    """Request body for POST /trigger/verify-org-citations (SYNC-100)."""
+
+    source: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "Where these citations came from, e.g. 'slack-legislation-zapier' or 'user-form'. "
+            "Stored as find_model_name on a row this request creates, so the row says its citation "
+            "was not found by a LegBot model. An existing row keeps the source it was written with."
+        ),
+    )
+    items: list[VerifyOrgCitationItem] = Field(
+        ...,
+        min_length=1,
+        max_length=VERIFY_ORG_CITATIONS_MAX_ITEMS,
+        description=(
+            "The citations to check. EACH ONE COSTS A METERED CLAUDE CALL, whether or not it was "
+            "checked before: nothing here asks the broker if a citation is already settled, so send "
+            "only what needs checking."
+        ),
+    )
+
+
+@router.post("/trigger/verify-org-citations")
+async def trigger_verify_org_citations(
+    body: VerifyOrgCitationsRequest,
+    x_ddp_environment: str | None = Header(default=None),
+    token: str = Depends(api_key_auth),
+):
+    """Check whether each cited page shows the organization holds the stated position on the bill,
+    and store the answer on that bill's records (SYNC-100).
+
+    Each item runs verify_bill_position against its page, then the result is written through the
+    same code find_bill_positions research uses. The broker's write is an upsert on (bill version,
+    organization, position, citation_url): a citation that is not on the bill yet is added; one that
+    is has its verification updated, never duplicated. A settled answer (confirmed / not_confirmed)
+    replaces the stored one, so a re-check can demote a confirmed row and take it off the public
+    read; an inconclusive answer (page unreadable) never overwrites a settled row.
+
+    Synchronous: returns the per-item results (outcome, the broker's `result`, and the stored
+    verdict), because a caller acting on one citation needs the answer, and a batch caller needs to
+    know which items to resend. Serial, at most three items per request.
+
+    Same Mac-Studio-only construction as /trigger/legbot-analyze-bill-full: the verify dispatch
+    reads CAMS results off local disk. Which broker the rows land on comes from the trusted
+    X-DDP-Environment header, never the body.
+    """
+    settings = get_settings()
+    if not settings.cams_base_url or not settings.cams_artifacts_dir:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CAMS_BASE_URL/CAMS_ARTIFACTS_DIR not configured on this instance -- this "
+                "endpoint only works on the same host as CAMS (Mac Studio)."
+            ),
+        )
+    broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
+
+    from ddp_sync.pipelines.verify_org_citations import verify_org_citations
+
+    result = await verify_org_citations(
+        [item.model_dump() for item in body.items],
+        source=body.source,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
     result["environment"] = x_ddp_environment
     return result
 

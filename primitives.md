@@ -349,6 +349,7 @@ Use `settings.webflow_scheduler_api_key` for scheduled write operations (has bro
 | `POST /trigger/knowledge-base-reconcile/{jurisdiction}` | Calls `knowledge_base_embedding.plan_reconcile(...)` in the background | SYNC-95 dry run of the reconcile pass; always read-only; result in the log |
 | `POST /trigger/votebot-eval` | Calls `run_votebot_eval(...)` | Votebot evaluation run |
 | `POST /trigger/webflow/{job}` | Runs webflow batch job by name | CMS batch jobs |
+| `POST /trigger/verify-org-citations` | Calls `verify_org_citations(...)`, synchronously, at most 5 items (SYNC-100) | Checks whether a cited page shows an organization holds a position on a bill and stores the answer, via `verify_and_store_position` (the same tail `find_bill_positions` research uses). The broker write is an upsert on (bill version, org, position, citation_url): a citation not on the bill is added, one that is has its verification updated, and an inconclusive answer never overwrites a settled row. For a manual batch, a visitor-flagged re-check, or a user-submitted citation. Costs one Claude call per item whether or not it was checked before |
 
 ## sync_schedule.yaml config blocks
 

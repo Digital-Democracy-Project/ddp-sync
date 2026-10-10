@@ -460,15 +460,19 @@ async def write_bill_organization_position(
     Research" (approved 2026-08-01 after 4 rounds of /pm-review).
 
     Identifies the target BillVersion by its natural key, same as
-    write_bill_artifact. Unlike write_bill_artifact, this always creates a
-    new row — never an upsert. Every dispatch is a new finding; a history
-    of individual findings, not a single current-value slot.
+    write_bill_artifact. Since SYNC-100 the broker upserts on (bill version,
+    organization, position, citation_url): writing the same citation again
+    updates that row's verification rather than adding another, and a result
+    that is not settled (pending/failed) never replaces a settled one.
 
     broker_api_base/broker_api_token: optional per-call override, see
     get_bill_artifacts' own docstring for why (SYNC-15).
 
     Returns:
-        {"id": <int>} — the created row's id.
+        {"id": <int>, "result": "created" | "updated" | "unchanged",
+        "verification_verdict": <str>} — the row's id, what the write did,
+        and the row's verdict as it now stands ("unchanged" means the answer
+        was inconclusive and an existing settled row was kept).
 
     Raises:
         BrokerClientError: ddp-broker-py rejected the write or was
