@@ -162,10 +162,12 @@ class BillArtifactGenerationRequest(BaseModel):
             "existing published set (SYNC-31)."
         ),
     )
-    limit: int = Field(
+    limit: int | None = Field(
         ...,
         description=(
-            "Max bills to consider this run (must be >= 1). No upper ceiling: "
+            "Max bills to consider this run (must be >= 1), or null for no limit "
+            "(SYNC-103: every bill in the session; the key is still required, so the "
+            "caller has to choose). No upper ceiling: "
             "run_legbot_pipeline dispatches sequentially anyway, and real "
             "concurrent-load protection for MLX already exists one layer "
             "down -- CAMS's own _mlx_semaphore (ddp-agents/src/legbot/"
@@ -325,7 +327,7 @@ async def trigger_bill_artifact_generation(
     rather than an uncoordinated external script hitting the on-demand
     single-bill endpoint in a loop.
     """
-    if body.limit < 1:
+    if body.limit is not None and body.limit < 1:
         raise HTTPException(
             status_code=400,
             detail=f"limit must be >= 1, got {body.limit}.",

@@ -131,6 +131,54 @@ async def test_one_resolved_session_triggers_once_with_org_research_disabled(mon
 
 
 @pytest.mark.asyncio
+async def test_no_trigger_limit_setting_means_no_limit_in_process(monkeypatch):
+    """SYNC-103: with the setting unset (None), the Mac's in-process trigger gets None, not a cap."""
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.openstates_archive.get_settings",
+        lambda: _enabled_settings(legbot_scrape_completion_trigger_limit=None),
+    )
+    with (
+        patch(
+            "ddp_sync.services.local_openstates_client.resolve_touched_sessions",
+            new=AsyncMock(return_value=["194th"]),
+        ),
+        patch(
+            "ddp_sync.pipelines.scraper_triggered_legbot.trigger_scraper_session_pipeline",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_trigger,
+    ):
+        await _maybe_trigger_legbot_for_archive("ma", datetime.now(timezone.utc))
+
+    mock_trigger.assert_awaited_once_with(
+        "MA", "194th", ["bill_summary", "bill_changelog"], False, None,
+        include_concept_statements=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_wireguard_helper_sends_a_null_limit_when_none_is_configured():
+    """SYNC-103: the EC2 relay sends JSON null (not a number, not a missing key) so the Mac's
+    endpoint, which requires the key, reads it as 'no limit'."""
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+    mock_resp.json = lambda: {"success": True}
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    from ddp_sync.pipelines.openstates_archive import _trigger_legbot_session_via_mac_wireguard
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _trigger_legbot_session_via_mac_wireguard(
+            "US", "119", _enabled_ec2_settings(legbot_scrape_completion_trigger_limit=None)
+        )
+
+    body = mock_client.post.await_args.kwargs["json"]
+    assert "limit" in body and body["limit"] is None
+
+
+@pytest.mark.asyncio
 async def test_resolution_uses_document_updated_since_not_updated_since(monkeypatch):
     """The actual bug pm-review caught in this ticket's first version:
     archive_bill_versions() (openstates-core) never touches Bill.updated_at,

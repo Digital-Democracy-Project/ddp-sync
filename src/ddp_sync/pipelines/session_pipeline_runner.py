@@ -964,7 +964,7 @@ async def run_legbot_pipeline(
     session_code: str,
     artifact_types: list[str],
     include_org_research: bool,
-    limit: int,
+    limit: int | None,
     *,
     include_concept_statements: bool,
     retry_failed: bool,
@@ -1079,7 +1079,7 @@ async def run_legbot_pipeline(
     Not a mandatory first step; just cheap to call.
 
     Raises:
-        ValueError: jurisdiction_iso2/session_code empty, limit <= 0, or
+        ValueError: jurisdiction_iso2/session_code empty, limit <= 0 (None = no limit), or
             artifact_types empty/contains an unrecognized type -- ordinary
             function-signature hygiene, checked before any lister/dispatch
             call.
@@ -1160,8 +1160,8 @@ async def run_legbot_pipeline(
         raise ValueError("jurisdiction_iso2 is required")
     if not session_code:
         raise ValueError("session_code is required")
-    if limit <= 0:
-        raise ValueError("limit must be a positive integer")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be a positive integer, or None for no limit")
     if not artifact_types:
         raise ValueError("artifact_types must be non-empty")
     unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
@@ -1244,12 +1244,16 @@ async def run_legbot_pipeline(
         # Request limit + 1 so truncated is actually computable: if more than
         # `limit` candidates come back, we know more exist beyond what's
         # considered, without misreporting a specific further count (a
-        # limit + 1 probe only proves "more than limit exist").
+        # limit + 1 probe only proves "more than limit exist"). SYNC-103: with no
+        # limit, every candidate is considered and nothing is truncated.
         candidates = await list_current_session_bill_candidates(
-            jurisdiction_iso2, session_code=session_code, limit=limit + 1
+            jurisdiction_iso2,
+            session_code=session_code,
+            limit=None if limit is None else limit + 1,
         )
-        truncated = len(candidates) > limit
-        candidates = candidates[:limit]
+        truncated = limit is not None and len(candidates) > limit
+        if limit is not None:
+            candidates = candidates[:limit]
     bills_considered = len(candidates)
 
     # Bounded concurrency (2026-08-18, made process-wide by SYNC-72 on

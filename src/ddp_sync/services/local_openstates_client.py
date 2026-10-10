@@ -588,7 +588,7 @@ async def list_current_session_bill_candidates(
     jurisdiction_iso2: str,
     *,
     session_code: str | None = None,
-    limit: int,
+    limit: int | None,
 ) -> list[dict]:
     """List bill identities for a jurisdiction's session, read from the
     local api-v3 instance's paginated bill list -- the bill-enumeration half
@@ -623,7 +623,9 @@ async def list_current_session_bill_candidates(
             existing caller passes nothing, behavior is unchanged.
         limit: maximum number of candidates to return, across however many
             pages that takes -- NOT a single request's page size (see the
-            real pagination bug fixed below).
+            real pagination bug fixed below). None (SYNC-103) means no limit:
+            page until api-v3 reports the last page. It is still a required
+            argument, so a caller has to choose "no limit" on purpose.
 
     Returns:
         A list of dicts, each {"gov_id", "bill_openstates_id", "session_code",
@@ -668,7 +670,7 @@ async def list_current_session_bill_candidates(
         failure for one jurisdiction should skip that jurisdiction for this
         run, not crash the whole batch.
     """
-    if limit <= 0:
+    if limit is not None and limit <= 0:
         return []
 
     resolved_session_code = session_code
@@ -739,8 +741,8 @@ async def list_current_session_bill_candidates(
     seen_bill_openstates_ids: set[str] = set()
     duplicates_dropped = 0
     page = 1
-    per_page = str(min(_API_V3_MAX_PER_PAGE, limit))
-    while len(candidates) < limit:
+    per_page = str(_API_V3_MAX_PER_PAGE if limit is None else min(_API_V3_MAX_PER_PAGE, limit))
+    while limit is None or len(candidates) < limit:
         params = dict(base_params)
         params["per_page"] = per_page
         params["page"] = str(page)
@@ -797,7 +799,7 @@ async def list_current_session_bill_candidates(
 
         pagination = data.get("pagination") or {}
         max_page = pagination.get("max_page", page)
-        if page >= max_page or len(candidates) >= limit:
+        if page >= max_page or (limit is not None and len(candidates) >= limit):
             break
         page += 1
 
@@ -823,7 +825,7 @@ async def list_current_session_bill_candidates(
             api_reported_max_page=max_page,
         )
 
-    return candidates[:limit]
+    return candidates if limit is None else candidates[:limit]
 
 
 async def resolve_touched_sessions(

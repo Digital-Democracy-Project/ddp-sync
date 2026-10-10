@@ -144,6 +144,41 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
     )
 
 
+def test_null_limit_means_no_limit_and_reaches_the_pipeline_as_none():
+    """SYNC-103: the EC2 instance relays the (now unset) trigger limit as JSON null. An explicit
+    null is accepted and means every bill; the key itself stays required."""
+    client = _make_authed_client()
+    payload = dict(_VALID_PAYLOAD, limit=None)
+
+    with _patch_redis(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 11720, "results": []}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 200
+    mock_run.assert_awaited_once_with(
+        "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, None,
+        include_concept_statements=False, retry_failed=False, dry_run=False,
+        broker_api_base=None, broker_api_token=None, bill_candidates=None,
+    )
+
+
+def test_a_missing_limit_key_is_still_rejected():
+    """Nullable is not optional: a caller must say 'no limit' on purpose."""
+    client = _make_authed_client()
+    payload = {k: v for k, v in _VALID_PAYLOAD.items() if k != "limit"}
+
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=payload)
+
+    assert response.status_code == 422
+    mock_run.assert_not_awaited()
+
+
 def test_limit_zero_returns_400_without_calling_pipeline():
     client = _make_authed_client()
     payload = dict(_VALID_PAYLOAD, limit=0)

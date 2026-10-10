@@ -146,6 +146,19 @@ before extending the expiry, so it can never resurrect a lock a newer trigger ha
 legitimately acquired. Real side benefit: a hard-crashed process (no clean shutdown) now
 loses its lock within about one TTL window instead of up to 4 hours.
 
+**SYNC-103 (2026-10-10): a scraper-triggered run has NO bill limit by default.**
+`legbot_scrape_completion_trigger_limit` used to default to 10,000, and a cap there is a cut
+of the session's bill list in api-v3's default order (`updated_desc`) taken *before* any
+"artifacts already present" skipping — so on a session bigger than the cap (MA 194th ≈ 11.7k
+bills, US 119th ≈ 18.5k) it left out the least recently updated bills, run after run, until
+something touched them. It is now `None` (unlimited) unless `LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT`
+is set to a positive integer (blank = unlimited; a non-integer or ≤ 0 raises at startup). The
+EC2 relay sends that value as JSON `null` to `/trigger/bill-artifact-generation`, whose `limit`
+field is nullable but still required — **deploy the Mac first**, or an EC2 host that has the
+new code will get a 422 from a Mac that doesn't. Expect long runs: ~170 bills/hour per run
+(MA ≈ 66 h, US ≈ 107 h), holding the shared worker slots the whole time, so another
+triggered run queues behind it.
+
 **SYNC-66 (2026-09-16, caught live in production): `resolve_touched_sessions()` used to
 return `[]` both when nothing was genuinely touched AND when it couldn't check at all**
 (api-v3 unreachable, rejected the request, or returned a malformed body) — logged at the

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from ddp_sync.config import _load_from_env, get_settings
+import pytest
+
+from ddp_sync.config import SyncSettings, _load_from_env, _parse_trigger_limit, get_settings
 
 
 def test_load_from_env_defaults_session_pipeline_concurrency_to_one(monkeypatch):
@@ -437,3 +439,54 @@ def test_a_host_that_sets_neither_variable_keeps_what_the_secret_or_the_default_
     get_settings.cache_clear()
     assert (from_secret.ddp_broker_api_base, from_secret.ddp_broker_api_token) == ("https://from-secret", "secret-token")
     assert (defaulted.ddp_broker_api_base, defaulted.ddp_broker_api_token) == ("http://localhost:8080", "")
+
+
+# --- SYNC-103: the scraper-trigger bill limit has no default ----------------------------------
+
+_LIMIT_ENV = "LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT"
+
+
+def test_trigger_limit_defaults_to_no_limit(monkeypatch):
+    """Both literals that used to say 10000 (the dataclass default and _load_from_env's
+    fallback) must now agree on None, or one host would be capped and another not."""
+    monkeypatch.delenv(_LIMIT_ENV, raising=False)
+    assert SyncSettings().legbot_scrape_completion_trigger_limit is None
+    assert _load_from_env()["legbot_scrape_completion_trigger_limit"] is None
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_blank_trigger_limit_means_no_limit(monkeypatch, raw):
+    monkeypatch.setenv(_LIMIT_ENV, raw)
+    assert _load_from_env()["legbot_scrape_completion_trigger_limit"] is None
+
+
+def test_a_positive_trigger_limit_is_still_honored(monkeypatch):
+    monkeypatch.setenv(_LIMIT_ENV, "2500")
+    assert _load_from_env()["legbot_scrape_completion_trigger_limit"] == 2500
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-5", "1.5", "10k"])
+def test_an_invalid_trigger_limit_fails_loudly_instead_of_meaning_unlimited(monkeypatch, raw):
+    """A typo must not quietly turn a capped host into an unlimited one."""
+    monkeypatch.setenv(_LIMIT_ENV, raw)
+    with pytest.raises(ValueError, match=_LIMIT_ENV):
+        _load_from_env()
+    with pytest.raises(ValueError, match=_LIMIT_ENV):
+        _parse_trigger_limit(raw)
+
+
+def test_a_blank_env_var_overrides_a_secret_supplied_limit(monkeypatch):
+    """The Secrets Manager override pass (EC2) uses the same parser: an explicitly blank
+    variable on the host means no limit, whatever the shared secret says."""
+    monkeypatch.setenv(_LIMIT_ENV, "")
+    get_settings.cache_clear()
+    with patch(
+        "ddp_sync.config._load_from_secrets_manager",
+        return_value={"api_key": "from-secrets-manager", "legbot_scrape_completion_trigger_limit": 999999},
+    ):
+        settings = get_settings()
+    try:
+        assert settings.legbot_scrape_completion_trigger_limit is None
+    finally:
+        get_settings.cache_clear()
+

@@ -525,12 +525,14 @@ class SyncSettings:
     # -- a real 24/7 pipeline has no principled reason to leave one out by default.
     legbot_scrape_completion_trigger_artifact_types: list = field(default_factory=list)
 
-    # SYNC-50: per-trigger bill limit, same "no real ceiling needed" reasoning
-    # SYNC-9's own limit field already documents (run_legbot_pipeline dispatches
-    # sequentially, and MLX concurrency protection already lives one layer down)
-    # -- sized generously above any single tracked jurisdiction's real session
-    # size (Virginia's own 2026 regular session: 3,637 bills).
-    legbot_scrape_completion_trigger_limit: int = 10000
+    # SYNC-50 / SYNC-103: per-trigger bill limit. None (the default) means NO limit: every bill
+    # in the session is considered. It used to default to 10,000, sized for Virginia's 3,637-bill
+    # session, but a cap here is a cut of the session's bill list in api-v3's default order
+    # (updated_desc), so on a session larger than the cap (MA 194th: ~11.7k bills, US 119th:
+    # ~18.5k) it silently left out the least recently updated bills. Set
+    # LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT to a positive integer to cap a host again; a
+    # run is then as long as that many bills (about 170 an hour per run at the measured pace).
+    legbot_scrape_completion_trigger_limit: int | None = None
 
     # SYNC-50: concept_statements is already part of the standard automated flow
     # elsewhere (session_pipeline_batch's own include_concept_statements) --
@@ -609,6 +611,26 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
 _TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled"}
+
+
+def _parse_trigger_limit(raw: str | None) -> int | None:
+    """LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT (SYNC-103): unset or blank = no limit, a positive
+    integer = that cap. Anything else raises, so a typo fails at startup instead of quietly
+    meaning "unlimited" (or "zero bills"). Shared by _load_from_env() and get_settings()'s
+    override pass so the two can never drift."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT must be a positive integer or empty, got {raw!r}"
+        ) from None
+    if value <= 0:
+        raise ValueError(
+            f"LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT must be a positive integer or empty, got {raw!r}"
+        )
+    return value
 
 
 def _load_from_env() -> dict:
@@ -741,8 +763,8 @@ def _load_from_env() -> dict:
             ).split(",")
             if t.strip()
         ],
-        "legbot_scrape_completion_trigger_limit": int(
-            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT", "10000")
+        "legbot_scrape_completion_trigger_limit": _parse_trigger_limit(
+            os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT")
         ),
         "legbot_scrape_completion_trigger_include_concept_statements": (
             os.getenv(
@@ -848,7 +870,9 @@ def get_settings() -> SyncSettings:
         ]
     env_legbot_trigger_limit = os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT")
     if env_legbot_trigger_limit is not None:
-        filtered["legbot_scrape_completion_trigger_limit"] = int(env_legbot_trigger_limit)
+        filtered["legbot_scrape_completion_trigger_limit"] = _parse_trigger_limit(
+            env_legbot_trigger_limit
+        )
     env_legbot_trigger_include_concept_statements = os.getenv(
         "LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS"
     )
