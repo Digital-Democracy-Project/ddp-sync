@@ -1248,54 +1248,6 @@ async def get_bill_organization_positions_status(
     return resp.json()
 
 
-async def get_bill_organization_positions_existing(
-    *,
-    bill_openstates_id: str,
-    broker_api_base: str | None = None,
-    broker_api_token: str | None = None,
-) -> list[dict]:
-    """Every BillOrganizationPosition row for a bill, whatever its status or verdict (SYNC-100).
-
-    Calls GET /api/bill-organization-positions/existing/. The public `current/` read only
-    returns confirmed rows, so it cannot tell a batch writer which findings it has already
-    stored -- an unconfirmed or failed row is invisible there.
-
-    broker_api_base/broker_api_token: optional per-call override, see get_bill_artifacts'
-    own docstring for why (SYNC-15).
-
-    Returns:
-        A list of {"org_name", "position", "citation_url", "status", "verification_verdict"};
-        empty for a bill the broker does not know.
-
-    Raises:
-        BrokerClientError: ddp-broker-py rejected the request or was unreachable.
-    """
-    settings = get_settings()
-    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
-    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
-    if not resolved_api_base:
-        raise BrokerClientError(
-            "DDP_BROKER_API_BASE is not configured — cannot read existing organization positions."
-        )
-
-    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            resp = await client.get(
-                f"{resolved_api_base}/api/bill-organization-positions/existing/",
-                headers={"Authorization": f"Bearer {resolved_api_token}"},
-                params={"bill_openstates_id": bill_openstates_id},
-            )
-        except httpx.RequestError as exc:
-            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
-
-    if resp.status_code >= 400:
-        raise BrokerClientError(
-            f"ddp-broker-py rejected the existing-positions read ({resp.status_code}): {resp.text}"
-        )
-
-    return resp.json()["positions"]
-
-
 async def write_bill_organization_research_run(
     *,
     bill_openstates_id: str,

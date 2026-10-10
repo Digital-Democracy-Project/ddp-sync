@@ -677,11 +677,15 @@ class VerifyOrgCitationsRequest(BaseModel):
             "row's find_model_name, so a row says its citation was not found by a LegBot model."
         ),
     )
-    items: list[VerifyOrgCitationItem] = Field(..., min_length=1, max_length=500)
-    limit: int | None = Field(
-        None,
-        ge=1,
-        description="Dispatch at most this many items (already-settled ones do not count). Omit for all.",
+    items: list[VerifyOrgCitationItem] = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description=(
+            "Send ALL of a bill's citations together. A bill that already has organization-position "
+            "rows is skipped whole, so citations for it sent in a later request would be skipped. "
+            "The size of the run is the size of this list."
+        ),
     )
     dry_run: bool = Field(
         True,
@@ -702,10 +706,11 @@ async def trigger_verify_org_citations(
     """Verify organization-position citations from an external source and store the results
     (SYNC-100).
 
-    For each item the broker does not already hold a settled row for (a confirmed or
-    not_confirmed verdict), runs verify_bill_position against the cited page and writes one
-    BillOrganizationPosition row, through the same code find_bill_positions research uses.
-    Serial, and it stops after three rate-limited answers in a row.
+    Each bill is one unit, as in find_bill_positions research: a bill that already has
+    organization-position rows is skipped whole. For every other bill, each citation is run through
+    verify_bill_position against the cited page and written as one BillOrganizationPosition row,
+    through the same code that research uses. Serial, and it stops after three rate-limited
+    answers in a row.
 
     Returns 202 at once with a `run_id`; like the other long runs here, the result (counts per
     outcome) lands in the log line `org_citation_verify_summary`, not in this response. Defaults
@@ -736,7 +741,6 @@ async def trigger_verify_org_citations(
         [item.model_dump() for item in body.items],
         source=body.source,
         dry_run=body.dry_run,
-        limit=body.limit,
         run_id=run_id,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
@@ -745,7 +749,6 @@ async def trigger_verify_org_citations(
         "status": "started",
         "run_id": run_id,
         "items": len(body.items),
-        "limit": body.limit,
         "dry_run": body.dry_run,
         "environment": x_ddp_environment,
     }

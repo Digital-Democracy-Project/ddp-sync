@@ -1,8 +1,9 @@
 """Tests for SYNC-100: verifying and storing organization-position citations from an external source.
 
 The verify-and-write mechanics have their own coverage in test_bill_organization_position_research.py
-(it runs through the same verify_and_store_position). These cover what is new: skipping what the
-broker already settled, the rate-limit path, dry run, the limit, and the trigger's guards.
+(it runs through the same verify_and_store_position). These cover what is new: a bill as one unit
+(skipped whole if it already has rows), the rate-limit path, partial bills, dry run, and the
+trigger's guards.
 """
 
 from __future__ import annotations
@@ -38,16 +39,6 @@ def _item(org="Sierra Club", position="support", url="https://a.invalid", bill="
     }
 
 
-def _row(org="Sierra Club", position="support", url="https://a.invalid", status="complete", verdict="confirmed"):
-    return {
-        "org_name": org,
-        "position": position,
-        "citation_url": url,
-        "status": status,
-        "verification_verdict": verdict,
-    }
-
-
 def _confirmed():
     return {
         "answer": {"verdict": "confirmed", "insufficient_information": False, "explanation": "says so"},
@@ -62,19 +53,22 @@ def _rate_limited():
     }
 
 
-def _patches(*, existing=None, version=_VERSION, verify=None, write=None):
+def _patches(*, has_rows=False, version=_VERSION, verify=None, write=None):
     return (
-        patch(f"{_BATCH}.get_bill_organization_positions_existing", new=AsyncMock(return_value=existing or [])),
+        patch(
+            f"{_BATCH}.get_bill_organization_positions_status",
+            new=AsyncMock(return_value={"has_rows": has_rows, "row_count": 1 if has_rows else 0}),
+        ),
         patch(f"{_BATCH}.get_current_version_identity", new=AsyncMock(return_value=version)),
         patch(f"{_RESEARCH}.dispatch_bill_position_verification", new=verify or AsyncMock(return_value=_confirmed())),
         patch(f"{_RESEARCH}.write_bill_organization_position", new=write or AsyncMock(return_value={"id": 7})),
     )
 
 
-async def _run(items, *, dry_run=False, limit=None, **patch_kwargs):
+async def _run(items, *, dry_run=False, **patch_kwargs):
     p_existing, p_version, p_verify, p_write = _patches(**patch_kwargs)
     with p_existing, p_version, p_verify as verify, p_write as write:
-        summary = await verify_org_citations(items, source="slack-legislation-zapier", dry_run=dry_run, limit=limit)
+        summary = await verify_org_citations(items, source="slack-legislation-zapier", dry_run=dry_run)
     return summary, verify, write
 
 
@@ -93,42 +87,37 @@ async def test_verifies_and_writes_with_the_external_source_as_provenance():
 
 
 @pytest.mark.asyncio
-async def test_second_run_over_the_same_batch_writes_nothing():
-    """Acceptance criterion 2: the broker's settled rows are what make a rerun a no-op."""
-    summary, verify, write = await _run([_item()], existing=[_row()])
+async def test_a_bill_that_already_has_rows_is_skipped_whole():
+    """Acceptance criterion 2, the way find_bill_positions research does it: the bill is the unit,
+    so a second run over the same batch dispatches and writes nothing."""
+    items = [_item(org="A"), _item(org="B"), _item(org="C")]
+    summary, verify, write = await _run(items, has_rows=True)
 
-    assert summary["counts"] == {"already_settled": 1}
+    assert summary["counts"] == {"bill_already_researched": 3}
     verify.assert_not_awaited()
     write.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_match_ignores_org_name_case_and_whitespace():
-    summary, verify, _ = await _run([_item(org="  sierra club ")], existing=[_row(org="Sierra Club")])
-    assert summary["counts"] == {"already_settled": 1}
+async def test_every_organization_of_a_new_bill_is_processed_not_just_the_first():
+    """A bill with several supporting organizations is handled completely in one pass."""
+    items = [_item(org="A"), _item(org="B"), _item(org="C")]
+    summary, verify, write = await _run(items)
+
+    assert summary["counts"] == {"written": 3}
+    assert verify.await_count == 3
+    assert write.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_a_not_confirmed_row_is_settled_too():
-    """A verdict was reached, so there is nothing to retry."""
-    summary, verify, _ = await _run([_item()], existing=[_row(verdict="not_confirmed")])
-    assert summary["counts"] == {"already_settled": 1}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "existing_row",
-    [
-        _row(verdict="pending"),  # could not be checked
-        _row(status="failed", verdict="pending"),
-        _row(position="oppose"),  # same org and page, other stance
-        _row(url="https://other.invalid"),  # same org and stance, other page
-    ],
-)
-async def test_unsettled_or_different_rows_are_retried(existing_row):
-    summary, verify, _ = await _run([_item()], existing=[existing_row])
-    assert summary["counts"] == {"written": 1}
-    verify.assert_awaited_once()
+async def test_each_bill_is_judged_on_its_own_rows():
+    status = AsyncMock(side_effect=[{"has_rows": True, "row_count": 2}, {"has_rows": False, "row_count": 0}])
+    _, p_version, p_verify, p_write = _patches()
+    with patch(f"{_BATCH}.get_bill_organization_positions_status", new=status), p_version, p_verify, p_write:
+        summary = await verify_org_citations(
+            [_item(bill="done-bill"), _item(bill="new-bill")], source="s", dry_run=False
+        )
+    assert [r["outcome"] for r in summary["results"]] == ["bill_already_researched", "written"]
 
 
 @pytest.mark.asyncio
@@ -168,6 +157,26 @@ async def test_stops_after_consecutive_rate_limited_answers():
 
 
 @pytest.mark.asyncio
+async def test_a_bill_cut_short_by_rate_limiting_is_reported_as_partial():
+    """It now has rows, so a later run would skip it -- the operator has to be told."""
+    verify = AsyncMock(side_effect=[_confirmed(), _rate_limited(), _rate_limited(), _rate_limited()])
+    items = [_item(org=f"Org {i}") for i in range(5)]
+    summary, _, _ = await _run(items, verify=verify)
+
+    assert summary["stopped_early"] is True
+    assert summary["partial_bills"] == ["bill-1"]
+    assert summary["counts"] == {"written": 1, "retryable": 3, "not_attempted": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_bill_where_nothing_was_stored_is_not_partial():
+    """Nothing written means the bill still looks unresearched, so a later run retries all of it."""
+    verify = AsyncMock(return_value=_rate_limited())
+    summary, _, _ = await _run([_item(org=f"Org {i}") for i in range(4)], verify=verify)
+    assert summary["partial_bills"] == []
+
+
+@pytest.mark.asyncio
 async def test_a_success_resets_the_rate_limit_streak():
     verify = AsyncMock(
         side_effect=[_rate_limited(), _rate_limited(), _confirmed(), _rate_limited(), _rate_limited()]
@@ -190,29 +199,12 @@ async def test_the_same_finding_twice_in_one_request_is_verified_and_written_onc
 
 
 @pytest.mark.asyncio
-async def test_a_duplicate_does_not_consume_the_limit():
-    items = [_item(org="A"), _item(org="A"), _item(org="B")]
-    summary, verify, _ = await _run(items, limit=2)
-    assert verify.await_count == 2
-    assert summary["counts"] == {"written": 2, "duplicate_in_request": 1}
-
-
-@pytest.mark.asyncio
 async def test_dry_run_dispatches_and_writes_nothing():
-    summary, verify, write = await _run([_item(org="A"), _item(org="B")], dry_run=True, existing=[_row(org="B")])
+    summary, verify, write = await _run([_item(org="A"), _item(org="B")], dry_run=True)
 
-    assert summary["counts"] == {"dry_run": 1, "already_settled": 1}
+    assert summary["counts"] == {"dry_run": 2}
     verify.assert_not_awaited()
     write.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_limit_counts_dispatches_not_skipped_items():
-    items = [_item(org="Settled"), _item(org="A"), _item(org="B"), _item(org="C")]
-    summary, verify, _ = await _run(items, limit=2, existing=[_row(org="Settled")])
-
-    assert verify.await_count == 2
-    assert summary["counts"] == {"already_settled": 1, "written": 2, "not_attempted": 1}
 
 
 @pytest.mark.asyncio
@@ -223,10 +215,10 @@ async def test_a_bill_with_no_current_version_is_skipped_not_fatal():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_broker_read_skips_that_bill_and_continues():
-    existing = AsyncMock(side_effect=[BrokerClientError("down"), []])
-    p_existing, p_version, p_verify, p_write = _patches()
-    with patch(f"{_BATCH}.get_bill_organization_positions_existing", new=existing), p_version, p_verify, p_write:
+async def test_a_failed_status_read_skips_that_bill_and_continues():
+    status = AsyncMock(side_effect=[BrokerClientError("down"), {"has_rows": False, "row_count": 0}])
+    _, p_version, p_verify, p_write = _patches()
+    with patch(f"{_BATCH}.get_bill_organization_positions_status", new=status), p_version, p_verify, p_write:
         summary = await verify_org_citations(
             [_item(bill="bill-1"), _item(bill="bill-2")], source="s", dry_run=False
         )
@@ -234,12 +226,12 @@ async def test_a_failed_broker_read_skips_that_bill_and_continues():
 
 
 @pytest.mark.asyncio
-async def test_the_bills_existing_rows_are_read_once_per_bill():
-    existing = AsyncMock(return_value=[])
+async def test_the_bills_status_is_read_once_per_bill():
+    status = AsyncMock(return_value={"has_rows": False, "row_count": 0})
     _, p_version, p_verify, p_write = _patches()
-    with patch(f"{_BATCH}.get_bill_organization_positions_existing", new=existing), p_version, p_verify, p_write:
+    with patch(f"{_BATCH}.get_bill_organization_positions_status", new=status), p_version, p_verify, p_write:
         await verify_org_citations([_item(org="A"), _item(org="B"), _item(org="C")], source="s", dry_run=False)
-    existing.assert_awaited_once()
+    status.assert_awaited_once()
 
 
 # -- the flag that makes a rate-limited answer retryable, on the shared function ---------------
@@ -292,7 +284,7 @@ async def test_a_degraded_answer_without_a_rate_limit_reason_is_written_not_retr
 
 # -- the trigger -------------------------------------------------------------------------------
 
-_BODY = {"source": "slack-legislation-zapier", "items": [_item()], "limit": 5}
+_BODY = {"source": "slack-legislation-zapier", "items": [_item()]}
 
 
 def _client():
