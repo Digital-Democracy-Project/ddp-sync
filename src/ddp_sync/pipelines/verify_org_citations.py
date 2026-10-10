@@ -67,8 +67,9 @@ async def verify_org_citations(
     inconclusive and an existing settled row was kept), "verification_failed" (a failed row was
     stored), "broker_write_failed", "retryable" (rate limited; nothing was stored, try again later),
     "no_current_version" (nothing was dispatched) or "duplicate_in_request" (the same citation
-    earlier in this request; verified once). `verification_verdict` is the stored row's verdict as
-    it now stands.
+    earlier in this request; verified once). Two verdicts are reported, because they differ when an
+    inconclusive re-check is refused permission to overwrite a settled row: `attempted_verdict` is
+    what this check concluded, `verification_verdict` is the stored row's verdict as it now stands.
     """
     run_id = run_id or f"org-citation-verify-{uuid.uuid4().hex[:12]}"
     invocation_id = str(uuid.uuid4())
@@ -116,11 +117,13 @@ async def verify_org_citations(
                 position_id=stored["position_id"],
                 result=stored["result"],
                 verification_verdict=stored["verification_verdict"],
+                attempted_verdict=stored["attempted_verdict"],
             )
         )
         logger.info("org_citation_verify_item", run_id=run_id, bill_openstates_id=bill_openstates_id,
                     org_name=item["org_name"], outcome=stored["outcome"], result=stored["result"],
-                    verification_verdict=stored["verification_verdict"])
+                    verification_verdict=stored["verification_verdict"],
+                    attempted_verdict=stored["attempted_verdict"])
 
     counts: dict[str, int] = {}
     for result in results:
@@ -136,6 +139,7 @@ def _outcome(
     position_id: int | None = None,
     result: str | None = None,
     verification_verdict: str | None = None,
+    attempted_verdict: str | None = None,
 ) -> dict:
     return {
         "bill_openstates_id": item["bill_openstates_id"],
@@ -145,5 +149,6 @@ def _outcome(
         "outcome": outcome,
         "result": result,
         "verification_verdict": verification_verdict,
+        "attempted_verdict": attempted_verdict,
         "position_id": position_id,
     }

@@ -93,6 +93,7 @@ async def test_a_new_row_is_reported_as_created_with_its_verdict():
     assert (row["outcome"], row["result"], row["verification_verdict"], row["position_id"]) == (
         "written", "created", "confirmed", 7,
     )
+    assert row["attempted_verdict"] == "confirmed"
 
 
 @pytest.mark.asyncio
@@ -104,6 +105,7 @@ async def test_a_recheck_that_demotes_a_confirmed_row_says_so():
 
     row = summary["results"][0]
     assert (row["result"], row["verification_verdict"], row["position_id"]) == ("updated", "not_confirmed", 3)
+    assert row["attempted_verdict"] == "not_confirmed"
 
 
 @pytest.mark.asyncio
@@ -114,6 +116,9 @@ async def test_an_inconclusive_recheck_reports_the_settled_verdict_it_kept():
 
     row = summary["results"][0]
     assert (row["result"], row["verification_verdict"]) == ("unchanged", "confirmed")
+    # what this check concluded is not the stored verdict: the caller must not read the stored
+    # "confirmed" as the result of the new check
+    assert row["attempted_verdict"] == "pending"
     # the inconclusive answer is what was sent; the broker is what refuses to overwrite with it
     assert write.await_args.kwargs["verification_verdict"] == "pending"
 

@@ -99,10 +99,12 @@ async def verify_and_store_position(
     research keeps writing the degraded row it always has.
 
     Returns {"org_name", "position", "outcome", "position_id", "result",
-    "verification_verdict"}; outcome is one of "written", "verification_failed",
-    "broker_write_failed" or "retryable". `result` ("created"/"updated"/"unchanged") and
-    `verification_verdict` are the broker's answer about the stored row, so a caller can see
-    whether a re-check changed it; both are None when nothing was written.
+    "verification_verdict", "attempted_verdict"}; outcome is one of "written",
+    "verification_failed", "broker_write_failed" or "retryable". `attempted_verdict` is what THIS
+    check concluded ("confirmed", "not_confirmed", or "pending" when it could not tell; None when it
+    never got an answer). `result` ("created"/"updated"/"unchanged") and `verification_verdict` are
+    the broker's answer about the STORED row, which differ when an inconclusive check was refused
+    permission to overwrite a settled row. Both are None when nothing was written.
     """
     claim = _build_claim(
         org_name=org_name,
@@ -116,6 +118,7 @@ async def verify_and_store_position(
     # Failures are isolated per organization, not per batch — a bad
     # citation shouldn't cost the others.
     verify_answer = None
+    attempted_verdict = None
     verify_model_name = None
     write_status = "complete"
     failure_stage = None
@@ -154,6 +157,7 @@ async def verify_and_store_position(
             "position_id": None,
             "result": None,
             "verification_verdict": None,
+            "attempted_verdict": None,
         }
 
     write_kwargs = dict(
@@ -198,6 +202,7 @@ async def verify_and_store_position(
         # losing its write, loudly, rather than model drift being quietly
         # rewritten to "pending" here.
         verdict = verify_answer.get("verdict") or "pending"
+        attempted_verdict = verdict
         explanation = verify_answer.get("explanation") or verify_answer.get("reason", "")
         if not verify_answer.get("verdict"):
             logger.warning(
@@ -236,6 +241,7 @@ async def verify_and_store_position(
             "position_id": None,
             "result": None,
             "verification_verdict": None,
+            "attempted_verdict": attempted_verdict,
         }
 
     return {
@@ -245,6 +251,7 @@ async def verify_and_store_position(
         "position_id": write_result.get("id"),
         "result": write_result.get("result"),
         "verification_verdict": write_result.get("verification_verdict"),
+        "attempted_verdict": attempted_verdict,
     }
 
 
