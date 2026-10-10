@@ -98,8 +98,11 @@ async def verify_and_store_position(
     as outcome="retryable" and nothing is written. Off by default so find_bill_positions
     research keeps writing the degraded row it always has.
 
-    Returns {"org_name", "position", "outcome", "position_id"}; outcome is one of
-    "written", "verification_failed", "broker_write_failed" or "retryable".
+    Returns {"org_name", "position", "outcome", "position_id", "result",
+    "verification_verdict"}; outcome is one of "written", "verification_failed",
+    "broker_write_failed" or "retryable". `result` ("created"/"updated"/"unchanged") and
+    `verification_verdict` are the broker's answer about the stored row, so a caller can see
+    whether a re-check changed it; both are None when nothing was written.
     """
     claim = _build_claim(
         org_name=org_name,
@@ -144,7 +147,14 @@ async def verify_and_store_position(
             org_name=org_name,
             reason=verify_answer.get("reason"),
         )
-        return {"org_name": org_name, "position": position, "outcome": "retryable", "position_id": None}
+        return {
+            "org_name": org_name,
+            "position": position,
+            "outcome": "retryable",
+            "position_id": None,
+            "result": None,
+            "verification_verdict": None,
+        }
 
     write_kwargs = dict(
         bill_openstates_id=bill_openstates_id,
@@ -224,6 +234,8 @@ async def verify_and_store_position(
             "position": position,
             "outcome": "broker_write_failed",
             "position_id": None,
+            "result": None,
+            "verification_verdict": None,
         }
 
     return {
@@ -231,6 +243,8 @@ async def verify_and_store_position(
         "position": position,
         "outcome": "written" if verify_answer is not None else "verification_failed",
         "position_id": write_result.get("id"),
+        "result": write_result.get("result"),
+        "verification_verdict": write_result.get("verification_verdict"),
     }
 
 

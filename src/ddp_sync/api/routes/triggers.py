@@ -665,6 +665,13 @@ class VerifyOrgCitationItem(BaseModel):
     citation_url: str = Field(..., min_length=1)
 
 
+# ddp-api's proxy gives a POST 300 seconds, and each verification is one metered Claude call that
+# fetches a page (a few tens of seconds), run one after another. Five keeps a request inside that
+# with room to spare. A larger batch is sent in several requests; the result of each says which
+# items were processed, so a rerun sends only the rest.
+VERIFY_ORG_CITATIONS_MAX_ITEMS = 5
+
+
 class VerifyOrgCitationsRequest(BaseModel):
     """Request body for POST /trigger/verify-org-citations (SYNC-100)."""
 
@@ -673,48 +680,42 @@ class VerifyOrgCitationsRequest(BaseModel):
         min_length=1,
         max_length=100,
         description=(
-            "Where these citations came from, e.g. 'slack-legislation-zapier'. Stored as each "
-            "row's find_model_name, so a row says its citation was not found by a LegBot model."
+            "Where these citations came from, e.g. 'slack-legislation-zapier' or 'user-form'. "
+            "Stored as find_model_name on a row this request creates, so the row says its citation "
+            "was not found by a LegBot model. An existing row keeps the source it was written with."
         ),
     )
     items: list[VerifyOrgCitationItem] = Field(
         ...,
         min_length=1,
-        max_length=500,
+        max_length=VERIFY_ORG_CITATIONS_MAX_ITEMS,
         description=(
-            "Send ALL of a bill's citations together. A bill that already has organization-position "
-            "rows is skipped whole, so citations for it sent in a later request would be skipped. "
-            "The size of the run is the size of this list."
-        ),
-    )
-    dry_run: bool = Field(
-        True,
-        description=(
-            "Report what a real run would dispatch without calling LegBot or writing rows. "
-            "A real run costs one metered Claude call per item."
+            "The citations to check. EACH ONE COSTS A METERED CLAUDE CALL, whether or not it was "
+            "checked before: nothing here asks the broker if a citation is already settled, so send "
+            "only what needs checking."
         ),
     )
 
 
-@router.post("/trigger/verify-org-citations", status_code=202)
+@router.post("/trigger/verify-org-citations")
 async def trigger_verify_org_citations(
     body: VerifyOrgCitationsRequest,
-    background_tasks: BackgroundTasks,
     x_ddp_environment: str | None = Header(default=None),
     token: str = Depends(api_key_auth),
 ):
-    """Verify organization-position citations from an external source and store the results
-    (SYNC-100).
+    """Check whether each cited page shows the organization holds the stated position on the bill,
+    and store the answer on that bill's records (SYNC-100).
 
-    Each bill is one unit, as in find_bill_positions research: a bill that already has
-    organization-position rows is skipped whole. For every other bill, each citation is run through
-    verify_bill_position against the cited page and written as one BillOrganizationPosition row,
-    through the same code that research uses. Serial, and it stops after three rate-limited
-    answers in a row.
+    Each item runs verify_bill_position against its page, then the result is written through the
+    same code find_bill_positions research uses. The broker's write is an upsert on (bill version,
+    organization, position, citation_url): a citation that is not on the bill yet is added; one that
+    is has its verification updated, never duplicated. A settled answer (confirmed / not_confirmed)
+    replaces the stored one, so a re-check can demote a confirmed row and take it off the public
+    read; an inconclusive answer (page unreadable) never overwrites a settled row.
 
-    Returns 202 at once with a `run_id`; like the other long runs here, the result (counts per
-    outcome) lands in the log line `org_citation_verify_summary`, not in this response. Defaults
-    to `dry_run=true`.
+    Synchronous: returns the per-item results (outcome, the broker's `result`, and the stored
+    verdict), because a caller acting on one citation needs the answer, and a batch caller needs to
+    know which items to resend. Serial, at most five items per request.
 
     Same Mac-Studio-only construction as /trigger/legbot-analyze-bill-full: the verify dispatch
     reads CAMS results off local disk. Which broker the rows land on comes from the trusted
@@ -731,27 +732,16 @@ async def trigger_verify_org_citations(
         )
     broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
 
-    import uuid
-
     from ddp_sync.pipelines.verify_org_citations import verify_org_citations
 
-    run_id = f"org-citation-verify-{'dry' if body.dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
-    background_tasks.add_task(
-        verify_org_citations,
+    result = await verify_org_citations(
         [item.model_dump() for item in body.items],
         source=body.source,
-        dry_run=body.dry_run,
-        run_id=run_id,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
-    return {
-        "status": "started",
-        "run_id": run_id,
-        "items": len(body.items),
-        "dry_run": body.dry_run,
-        "environment": x_ddp_environment,
-    }
+    result["environment"] = x_ddp_environment
+    return result
 
 
 @router.post("/trigger/legislator-bio-sync")
