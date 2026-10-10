@@ -1028,7 +1028,7 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
 # ---------------------------------------------------------------------------
 
 # Targets that map to a named job function.
-_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people"}
+_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people", "people-pull"}
 
 # Individual secondary-state codes accepted as single-jurisdiction triggers.
 _OPENSTATES_SINGLE_JURISDICTION = {"va", "mi", "ma", "ut", "az"}
@@ -1053,6 +1053,7 @@ async def trigger_openstates_scrape(
         usa         — USA lower then upper sequentially
         secondary   — VA, MI, MA, UT, AZ concurrently
         people      — git pull people repo + os-people to-database for all states
+        people-pull — git pull --ff-only of the people checkout only (SYNC-102)
         va|mi|ma|ut|az — single secondary-state scrape + import
     """
     from ddp_sync.pipelines.openstates_scrape import (
@@ -1061,6 +1062,7 @@ async def trigger_openstates_scrape(
         run_wa_scrape_job,
         run_usa_scrapes_job,
         run_secondary_scrapes_job,
+        run_people_pull_job,
         run_people_refresh_job,
         run_single_scrape_job,
     )
@@ -1077,6 +1079,7 @@ async def trigger_openstates_scrape(
             "usa": run_usa_scrapes_job,
             "secondary": run_secondary_scrapes_job,
             "people": run_people_refresh_job,
+            "people-pull": run_people_pull_job,
         }
         background_tasks.add_task(job_map[target], config)
         return {"status": "started", "target": target}

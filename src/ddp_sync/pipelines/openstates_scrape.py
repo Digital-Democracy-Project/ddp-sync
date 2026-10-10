@@ -1869,3 +1869,91 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
         logger.error("openstates_people_refresh: error", error=str(e), duration_seconds=duration)
         # Deliberately NOT alerting here — see the matching note in run_patch_refresh_job.
         return {"success": False, "error": str(e), "duration_seconds": duration}
+
+
+_PEOPLE_PULL_TIMEOUT_SECONDS = 300
+
+
+def _people_head(people_dir: str) -> dict[str, str]:
+    """Best-effort `git log -1` of the checkout: {"sha": ..., "date": ...} (empty on failure)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", people_dir, "log", "-1", "--format=%H %cI"],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        ).stdout.split()
+        return {"sha": out[0], "date": out[1]} if len(out) == 2 else {}
+    except Exception:
+        return {}
+
+
+def _people_branch(people_dir: str) -> str:
+    try:
+        return subprocess.run(
+            ["git", "-C", people_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+async def run_people_pull_job(config: dict | None = None) -> dict[str, Any]:
+    """SYNC-102: fast-forward the people checkout (`git pull --ff-only`), nothing else.
+
+    Unlike run_people_refresh_job this does not import anything into a database; it only keeps
+    the on-disk checkout current for readers of that folder (e.g. the broker's roster sync).
+    Never rebases, forces, resets, checks out or merges: a checkout that cannot fast-forward
+    fails loudly instead of being rewritten. Every failure path writes a `failed` flow status
+    and alerts.
+    """
+    people_dir = os.path.join(_get_root(config), "people")
+    start_time = datetime.now(timezone.utc)
+    t = time.monotonic()
+    logger.info("openstates_people_pull: starting", path=people_dir)
+
+    async def _finish(status: str, error: str | None = None, **extra: Any) -> dict[str, Any]:
+        duration = round(time.monotonic() - t, 1)
+        record: dict[str, Any] = {
+            "flow": "openstates_people_pull",
+            "started_at": start_time.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "error": error,
+            "duration_seconds": duration,
+            "path": people_dir,
+            **extra,
+        }
+        await _write_flow_status("openstates_people_pull", record)
+        if status == "failed":
+            logger.error("openstates_people_pull: failed", error=error, duration_seconds=duration)
+            _alert_scrape_failure("people pull", error or "unknown error", duration)
+        return {"success": status == "completed", "error": error, "duration_seconds": duration, **extra}
+
+    try:
+        before = await asyncio.to_thread(_people_head, people_dir)
+        returncode, stdout_bytes, stderr_bytes, timed_out, _stalled = await asyncio.to_thread(
+            _run_with_group_kill,
+            ["git", "-C", people_dir, "pull", "--ff-only"],
+            {**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            _PEOPLE_PULL_TIMEOUT_SECONDS,
+        )
+        if timed_out:
+            return await _finish("failed", f"timed out after {_PEOPLE_PULL_TIMEOUT_SECONDS}s")
+        if returncode != 0:
+            tail = (stderr_bytes or b"").decode(errors="replace")[-300:].strip()
+            return await _finish("failed", f"exit_code_{returncode}: {tail}")
+        after = await asyncio.to_thread(_people_head, people_dir)
+        lines = (stdout_bytes or b"").decode(errors="replace").strip().splitlines()
+        branch = await asyncio.to_thread(_people_branch, people_dir)
+        logger.info("openstates_people_pull: done", head_after=after.get("sha"))
+        return await _finish(
+            "completed",
+            branch=branch,
+            summary=lines[-1] if lines else "",
+            head_sha_before=before.get("sha"),
+            head_commit_date_before=before.get("date"),
+            head_sha_after=after.get("sha"),
+            head_commit_date_after=after.get("date"),
+        )
+    except Exception as e:  # git missing, folder missing, Redis down, ...
+        return await _finish("failed", f"{type(e).__name__}: {e}")

@@ -58,7 +58,7 @@ async def health():
         from ddp_sync.services.redis_store import get_redis_store as _get_redis
         _store = _get_redis()
         flow_statuses = {}
-        for flow_name in ("daily_bill_sync", "webflow_status", "pinecone_ingestion"):
+        for flow_name in ("daily_bill_sync", "webflow_status", "pinecone_ingestion", "openstates_people_pull"):
             flow_data = await _store.get_flow_status(flow_name)
             if flow_data:
                 flow_statuses[flow_name] = {

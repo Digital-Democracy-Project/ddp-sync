@@ -692,6 +692,12 @@ openstates_scrape:
     sync_day: sunday
     sync_time_utc: "10:00"     # after secondary (~06:00) and USA (~09:00) finish
 
+  # SYNC-102: daily fast-forward of the people checkout only. Off unless the host sets
+  # OPENSTATES_PEOPLE_PULL_ENABLED=true (per-host, like the other flags).
+  people_pull:
+    enabled: true
+    sync_time_utc: "03:00"
+
   # OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory store on
   # an independent schedule (PLAN-scraper-execution-migration.md §6, "publish, do not call
   # in"). Runs regardless of whether a Michigan scrape is happening right now -- no inbound

@@ -184,6 +184,8 @@ class SyncSettings:
     # host that scrapes through baked-in Fargate images has none, so opts out here.
     openstates_patch_refresh_enabled: bool = True
     mi_cookie_publish_enabled: bool = True
+    # SYNC-102: default OFF (unlike the flags above) -- a host must opt in to pulling its checkout.
+    openstates_people_pull_enabled: bool = False
     session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
 
@@ -602,7 +604,11 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "mi_cookie_publish_enabled": "MI_COOKIE_PUBLISH_ENABLED",
     "session_pipeline_batch_enabled": "SESSION_PIPELINE_BATCH_ENABLED",
     "grantbot_scrape_enabled": "GRANTBOT_SCRAPE_ENABLED",
+    "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",
 }
+
+# SYNC-102: flags that stay off unless the host's environment says "true".
+_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled"}
 
 
 def _load_from_env() -> dict:
@@ -652,7 +658,9 @@ def _load_from_env() -> dict:
         "debug": os.getenv("DEBUG", "false").lower() == "true",
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
         **{
-            field: os.getenv(env_var, "true").lower() == "true"
+            field: os.getenv(
+                env_var, "false" if field in _TASK_FLAGS_DEFAULT_OFF else "true"
+            ).lower() == "true"
             for field, env_var in _TASK_ENABLE_FLAG_ENV_VARS.items()
         },
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
