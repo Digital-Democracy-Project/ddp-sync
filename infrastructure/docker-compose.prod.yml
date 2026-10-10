@@ -64,22 +64,21 @@ services:
       - VOTEBOT_EVAL_ENABLED=false
       - API_HEALTH_CHECK_ENABLED=false
       - SESSION_PIPELINE_BATCH_ENABLED=false
-      # OPENSTATES_SCRAPE_ENABLED=false (NOT left unset): unset/default-true turned out to mean
-      # something much bigger than "the one job this host owns" -- it registers SIX recurring
-      # scheduled jobs (FL, WA, USA, secondary states including MI, people refresh, patch
-      # apply), independently of whatever already runs those same jurisdictions elsewhere, with
-      # zero cross-host coordination. Found live 2026-09-02 (notes/ops-handoff) before any of
-      # them could actually fire. POST /trigger/openstates-scrape/{target}
-      # (api/routes/triggers.py:825) never checks this flag at all -- it's a separate, always-on
-      # code path -- so disabling the scheduled jobs here does not affect OPEN-193's actual
-      # need (the manual FL trigger).
-      - OPENSTATES_SCRAPE_ENABLED=false
+      # OPENSTATES_SCRAPE_ENABLED=true (OPEN-253, 2026-09-03): flipped from the canary-era
+      # false above once Ramon moved live scheduled scraping from the Mac host to this one
+      # (Mac's own scrape runs stopped the same night). Registers the SIX recurring scheduled
+      # jobs this flag controls (FL, WA, USA, secondary states including MI, people refresh,
+      # patch apply) -- now intentional, not the accidental-enable this comment originally
+      # warned about. POST /trigger/openstates-scrape/{target} (api/routes/triggers.py:825)
+      # never checks this flag at all -- it's a separate, always-on code path, unaffected
+      # either way.
+      - OPENSTATES_SCRAPE_ENABLED=true
       # OPENSTATES_ARCHIVE_ENABLED/MI_COOKIE_PUBLISH_ENABLED: the handoff note left these as
       # "your call" (OpenStates-domain, not Voatz/Webflow/LegBot, so plausible either way) --
       # defaulted to false here too, since this host's mandate is specifically the OPEN-193
       # canary, not general OpenStates archive/MI-cookie maintenance. Flagged back on
       # notes/ops-handoff in case that call should go the other way.
-      - OPENSTATES_ARCHIVE_ENABLED=false
+      - OPENSTATES_ARCHIVE_ENABLED=true
       - MI_COOKIE_PUBLISH_ENABLED=false
       # OPEN-320: patch refresh runs apply-local-patches.sh, which keeps the Mac's LIVE editable
       # openstates checkouts on their forks' main. This host scrapes through baked-in Fargate
@@ -87,6 +86,60 @@ services:
       # failed (and alerted) every night at 01:00 UTC. Opt out regardless of the scrape flag
       # above, which can be flipped independently.
       - OPENSTATES_PATCH_REFRESH_ENABLED=false
+      # SYNC-91 (2026-10-05, local to this host): organizations are read from this host's own broker's
+      # PUBLIC /api/organizations/ (no auth). The base must be an address reachable from inside this
+      # container (localhost:8080, the default, is not). The client always sends `Authorization: Bearer <token>`
+      # and an EMPTY token makes the request invalid, so the token is a non-secret placeholder the public
+      # endpoint ignores. Host-wide: broker_client callers that are triggered by hand would also use it.
+      - DDP_BROKER_API_BASE=https://mapapp.digitaldemocracyproject.org
+      - DDP_BROKER_API_TOKEN=public-endpoint-no-auth
+      # SYNC-59: this host's own target for the Mac Studio's ddp-sync itself, over the
+      # existing WireGuard mesh (same 10.0.0.8 address API-6's proxy uses, but port 8001 --
+      # that's ddp-sync's own port, matching this EC2 host's own ddp-sync (also 8001);
+      # 8002 on the Mac is a DIFFERENT service, its local api-v3 (config.py's
+      # local_openstates_api_base default), not ddp-sync -- caught and corrected 2026-09-13
+      # after initially conflating the two ports. Not a secret, just a resource address --
+      # MAC_DDP_SYNC_API_KEY (the actual credential) comes from render-env.sh instead.
+      # LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED=true (2026-09-15): flipped back on with
+      # Ramon's explicit direction, alongside deploying PR #157 (OPEN-291) -- the real fix
+      # for the MI archiving-lag gap that motivated the 09-14 pause (newly-introduced bills
+      # no longer wait for MI's weekly archive cron; archive now fires right after scrape
+      # completes). Was off 2026-09-14 -> 2026-09-15 pending that fix; also ran a real
+      # one-off full-session MI LegBot dispatch against production (via the Mac's ddp-sync)
+      # the same night, separate from this automated path. See notes/ops-handoff for both
+      # threads. Note: this endpoint's automated caller sends X-DDP-Automated-Trigger=true,
+      # which the RECEIVING side (the Mac) gates on ITS OWN copy of this same flag,
+      # independent of this value -- unconfirmed whether the Mac's copy is currently true or
+      # still false from the 09-14 pause ask (`mac-flag-flip-not-needed-ec2-gates-it-
+      # 20260914.md` said not to touch it while EC2 stayed off, which no longer applies now
+      # that EC2 is on) -- flagged to the dev agent to confirm/flip if needed.
+      - LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED=true
+      - MAC_DDP_SYNC_BASE_URL=http://10.0.0.8:8001
+      # SYNC-59/SYNC-65's "known partial-rollout gap": this host's own RDS-backed api-v3
+      # (OPEN-279), on the host's own network (different Docker network than this container,
+      # confirmed reachable via this address, not localhost). RDS_OPENSTATES_API_KEY (the
+      # credential) comes from render-env.sh instead.
+      - RDS_OPENSTATES_API_BASE=http://10.0.0.11:8002
+      # OPEN-290: 4th instance of the same config-override gap (PR #153) -- these three were
+      # silently inert here even when set, since _load_from_env() never runs on a host where
+      # Secrets Manager succeeds. Now fixed in get_settings()'s override loop; setting them
+      # explicitly here (matching the Mac's real values) rather than relying on the dataclass
+      # defaults, which only coincidentally match for limit/include_concept_statements and
+      # not at all for artifact_types (bare default is an empty list, not the 9-type default
+      # that only lives inside the dead _load_from_env() fallback).
+      - LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES=bill_summary,bill_pros_cons,bill_vote_yes_frame,bill_vote_no_frame,bill_supporting_orgs,bill_opposing_orgs,bill_impact_analysis,bill_topics,bill_changelog
+      - LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT=10000
+      - LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS=true
+      # SYNC-89 / Wave 3 step E (2026-10-02): which Pinecone index the knowledge-base embedding
+      # path (backfill endpoints and, later, the post-archive hook) writes to. Deliberately set
+      # HERE, per host, and NOT in the shared `ddp-sync/credentials` secret every host reads:
+      # config.py says the votebot/ddp-api instance must never enable this path, so the process
+      # environment has to win over the shared secret. The code refuses the legacy
+      # `votebot-large` index and an unset name. Setting it only enables the manually
+      # triggered backfill endpoints; the scheduled hook stays off while
+      # openstates_archive.knowledge_base_embedding.enabled is false in sync_schedule.yaml.
+      # Rollback: remove this line and recreate the service.
+      - KNOWLEDGE_BASE_INDEX_NAME=ddp-knowledge-base
     volumes:
       # config/sync_schedule.yaml is never baked into the image (Dockerfile only COPYs
       # pyproject.toml + src/) -- mounted read-only instead so an ordinary git pull on the host
