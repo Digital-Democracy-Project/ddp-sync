@@ -141,6 +141,7 @@ async def test_registered_daily_at_0300_utc_when_flag_on():
     fields = {f.name: str(f) for f in job.trigger.fields}
     assert fields["hour"] == "3" and fields["minute"] == "0" and fields["day_of_week"] == "*"
     assert job.misfire_grace_time == 3600 and job.max_instances == 1
+    assert str(job.trigger.timezone) == "UTC"
 
 
 @pytest.mark.asyncio
@@ -164,6 +165,14 @@ def test_flag_defaults_off_but_env_true_turns_it_on(monkeypatch):
     assert config._load_from_env()["openstates_patch_refresh_enabled"] is True
     monkeypatch.setenv("OPENSTATES_PEOPLE_PULL_ENABLED", "true")
     assert config._load_from_env()["openstates_people_pull_enabled"] is True
+
+
+@pytest.mark.parametrize("value", ["", "false", "False", "0", "no"])
+def test_only_the_word_true_enables_it(monkeypatch, value):
+    from ddp_sync import config
+
+    monkeypatch.setenv("OPENSTATES_PEOPLE_PULL_ENABLED", value)
+    assert config._load_from_env()["openstates_people_pull_enabled"] is False
 
 
 def test_shipped_yaml_has_people_pull_block():
