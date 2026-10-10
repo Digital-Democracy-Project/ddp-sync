@@ -551,6 +551,7 @@ class UpdateScheduler:
             run_wa_scrape_job,
             run_usa_scrapes_job,
             run_secondary_scrapes_job,
+            run_people_pull_job,
             run_people_refresh_job,
         )
 
@@ -819,6 +820,29 @@ class UpdateScheduler:
                 sync_day=p_day,
                 sync_time=p_time,
             )
+
+        # --- people pull (daily, SYNC-102) ---
+        # Default-off per-host flag, ANDed with the shared YAML gate (same pattern as the patch
+        # refresh above). Keeps the people checkout current between weekly refreshes.
+        pull_cfg = config.get("people_pull", {})
+        if self.settings.openstates_people_pull_enabled and pull_cfg.get("enabled", True):
+            pull_time = pull_cfg.get("sync_time_utc", "03:00")
+            pullh, pullm = map(int, pull_time.split(":"))
+
+            async def _people_pull_wrapper():
+                return await run_people_pull_job(config)
+
+            self._add_job_replacing(
+                _people_pull_wrapper,
+                trigger=CronTrigger(hour=pullh, minute=pullm, timezone=_UTC),
+                id="openstates_people_pull",
+                name="OpenStates: people pull",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("openstates_people_pull: registered", sync_time=pull_time)
 
         self._openstates_cadence = effective
 

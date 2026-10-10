@@ -246,6 +246,10 @@ Pub/sub channels (hardcoded strings in callers):
 - **`OpenStatesPerson`** — bio data shape
 - **`OpenStatesError`** / **`OpenStatesRateLimitError`** — exception hierarchy
 
+## People checkout pull (`pipelines/openstates_scrape.py`)
+
+- **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
+
 ## Congress legislators source (`services/congress_legislators.py`)
 
 - **`CongressLegislatorsSource`** — pre-warmed at app startup (reads 8.6 MB unitedstates YAML). Accessed from `app.state.congress_legislators`. **Do not re-read the YAML** — always pass the pre-warmed instance.
