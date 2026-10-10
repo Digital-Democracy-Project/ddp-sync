@@ -232,6 +232,56 @@ async def test_pagination_collects_across_pages_up_to_limit():
 
 
 @pytest.mark.asyncio
+async def test_no_limit_pages_until_the_api_reports_the_last_page():
+    """SYNC-103: limit=None means every bill in the session, however many pages that is --
+    including past the old 10,000-bill default. Three pages here, no bill dropped."""
+    def _page(number, start, stop):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {
+            "results": [{"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []} for n in range(start, stop)],
+            "pagination": {"per_page": 20, "page": number, "max_page": 3, "total_items": 45},
+        }
+        return r
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[_page(1, 0, 20), _page(2, 20, 40), _page(3, 40, 45)])
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("ma", limit=None)
+
+    assert [c["gov_id"] for c in result] == [f"HB {n}" for n in range(45)]
+    assert mock_client.get.await_count == 3
+    # one fixed page size for every page (the SYNC-23 rule), at the API's own maximum
+    assert {c.kwargs["params"]["per_page"] for c in mock_client.get.await_args_list} == {"20"}
+
+
+@pytest.mark.asyncio
+async def test_a_numeric_limit_still_stops_at_the_limit():
+    """The cap is unchanged when one is set: only None removed it."""
+    page = MagicMock()
+    page.status_code = 200
+    page.json.return_value = {
+        "results": [{"id": f"ocd-bill/{n}", "identifier": f"HB {n}", "sources": []} for n in range(20)],
+        "pagination": {"per_page": 20, "page": 1, "max_page": 50, "total_items": 1000},
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=page)
+
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client), _patch_current_session("2026"):
+        result = await list_current_session_bill_candidates("ma", limit=5)
+
+    assert len(result) == 5
+    assert mock_client.get.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_per_page_never_exceeds_api_max_even_when_limit_is_larger():
     """api-v3 itself rejects per_page > 20 (confirmed live) -- this must
     never be sent even when the caller's limit is much larger."""

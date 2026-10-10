@@ -224,6 +224,60 @@ async def test_truncated_is_true_when_more_candidates_exist_than_limit():
 
 
 @pytest.mark.asyncio
+async def test_no_limit_asks_the_lister_for_no_limit_and_never_truncates():
+    """SYNC-103: limit=None is 'every bill in the session'. The lister gets no limit (not
+    None + 1), nothing is sliced, and truncated is False."""
+    candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(3)]
+    with _patch_lister(candidates) as lister, _patch_coverage(None), _patch_version():
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=None, dry_run=True,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert lister.await_args.kwargs["limit"] is None
+    assert result["bills_considered"] == 3
+    assert result["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_limit_considers_more_bills_than_the_old_10000_default():
+    candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(10_001)]
+    with _patch_lister(candidates), _patch_coverage(None), _patch_version():
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=None, dry_run=True,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert result["bills_considered"] == 10_001
+    assert result["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_numeric_limit_still_asks_for_one_extra_to_detect_truncation():
+    candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(3)]
+    with _patch_lister(candidates) as lister, _patch_coverage(None), _patch_version():
+        await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], False, limit=2, dry_run=True,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+    assert lister.await_args.kwargs["limit"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_zero_or_negative_limit_is_still_rejected():
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="limit"):
+            await run_legbot_pipeline(
+                "fl", "2026F", ["bill_summary"], False, limit=bad, dry_run=True,
+                include_concept_statements=False,
+                retry_failed=False,
+            )
+
+
+@pytest.mark.asyncio
 async def test_truncated_is_false_when_exactly_limit_candidates_exist():
     candidates = [dict(_CANDIDATE, gov_id=f"HB {n}") for n in range(2)]
     with _patch_lister(candidates), _patch_coverage(None), _patch_version(), patch(

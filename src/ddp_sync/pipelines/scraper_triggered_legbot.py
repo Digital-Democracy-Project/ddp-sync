@@ -159,7 +159,7 @@ async def trigger_scraper_session_pipeline(
     session_code: str,
     artifact_types: list[str],
     include_org_research: bool,
-    limit: int,
+    limit: int | None,
     *,
     include_concept_statements: bool,
     retry_failed: bool = False,
