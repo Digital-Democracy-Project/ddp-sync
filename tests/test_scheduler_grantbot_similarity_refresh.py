@@ -75,7 +75,9 @@ async def test_registers_a_cron_job_for_the_middle_of_march_and_september_at_070
         fields = {f.name: str(f) for f in job.trigger.fields}
         assert fields["month"] == "3,9" and fields["day"] == "15"
         assert fields["hour"] == "7" and fields["minute"] == "0"
-        assert job.max_instances == 1 and job.next_run_time is not None
+        assert job.max_instances == 1 and str(job.trigger.timezone) == "UTC"
+        nxt = job.next_run_time
+        assert (nxt.month in (3, 9), nxt.day, nxt.hour, nxt.minute) == (True, 15, 7, 0)
     finally:
         sched.stop()
 

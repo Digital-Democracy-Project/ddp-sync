@@ -46,12 +46,15 @@ _MAX_ATTEMPTS = 3
 _RETRY_DELAY_S = 30.0
 
 
-async def _post_to_cams(path: str, label: str, *, trigger: str) -> dict:
+async def _post_to_cams(path: str, label: str, *, trigger: str, conflict_is_success: bool = False) -> dict:
     """POST to one of CAMS's admin endpoints (``/api/v1/admin/<path>``).
 
     Never raises -- a bad tick must not crash the scheduler, matching every
     other job in this file's family (see mi_cookie_publish.py's own
     established shape). ``label`` prefixes the log lines so each job reads as its own.
+    ``conflict_is_success``: a 409 means "a run is already in progress" (the similarity refresh holds a lock),
+    which is a fine outcome and is not retried. Off by default, so the funder scrape treats a 409 as the
+    error it always did.
 
     Retries a connection failure or a 5xx up to _MAX_ATTEMPTS times,
     _RETRY_DELAY_S apart -- enough to survive CAMS being mid-restart, not a
@@ -78,7 +81,7 @@ async def _post_to_cams(path: str, label: str, *, trigger: str) -> dict:
                 response = await client.post(url, headers=headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 409:
+            if conflict_is_success and e.response.status_code == 409:
                 logger.info(f"{label}: CAMS says a run is already in progress", trigger=trigger)
                 return {"success": True, "status": "already_running"}
             if e.response.status_code < 500 or last_attempt:
@@ -149,4 +152,6 @@ async def run_grantbot_similarity_refresh_job(
     recompute similarity for every funder). CAMS runs it in the background for a day or more, and
     answers 409 if one is already running, which counts as success here.
     """
-    return await _post_to_cams("refresh-grantee-similarity", "grantbot_similarity_refresh", trigger=trigger)
+    return await _post_to_cams(
+        "refresh-grantee-similarity", "grantbot_similarity_refresh", trigger=trigger, conflict_is_success=True,
+    )

@@ -84,6 +84,25 @@ async def test_a_409_means_a_refresh_is_already_running_and_is_not_an_error_or_r
 
 
 @pytest.mark.asyncio
+async def test_the_funder_scrape_job_still_treats_a_409_as_the_error_it_always_did():
+    post = AsyncMock(return_value=MagicMock(raise_for_status=MagicMock(side_effect=_status_error(409))))
+    a, b, c = _patched(post)
+    with a, b, c:
+        result = await run_grantbot_scrape_job()
+    assert result["success"] is False and result["error"] == "cams_error" and result["status_code"] == 409
+    assert post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_5xx_is_attempted_exactly_three_times_then_reported():
+    post = AsyncMock(return_value=MagicMock(raise_for_status=MagicMock(side_effect=_status_error(503))))
+    a, b, c = _patched(post)
+    with a, b, c:
+        result = await run_grantbot_similarity_refresh_job()
+    assert result["error"] == "cams_error" and result["status_code"] == 503 and post.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_other_4xx_is_an_error_and_not_retried_but_5xx_is_retried():
     post = AsyncMock(return_value=MagicMock(raise_for_status=MagicMock(side_effect=_status_error(401))))
     a, b, c = _patched(post)
