@@ -336,6 +336,8 @@ class UpdateScheduler:
 
         # --- GrantBot funder scrape + Kindora enrichment (SYNC-36/AGENTS-54) ---
         self._register_grantbot_scrape_job()
+        # --- GrantBot twice-yearly grantee-similarity refresh (AGENTS-128) ---
+        self._register_grantbot_similarity_refresh_job()
 
         self.scheduler.start()
         self._is_running = True
@@ -1298,6 +1300,48 @@ class UpdateScheduler:
             session_code=config.get("session_code"),
             artifact_types=config.get("artifact_types"),
             limit=config.get("limit"),
+        )
+
+    def _register_grantbot_similarity_refresh_job(self) -> None:
+        """Register GrantBot's twice-yearly grantee-similarity refresh trigger (AGENTS-128).
+
+        Same shape as the funder-scrape job above and the same CAMS co-location rule: it no-ops
+        and logs when CAMS_API_TOKEN isn't configured. CAMS runs the refresh in the background for a
+        day or more (recollect stale grant history through Kindora's rate limit, then recompute
+        similarity for every funder) and answers 409 if one is already running. It is scheduled in the
+        middle of March and September so it has finished before the next monthly funder scrape on the
+        1st, which then scores and posts with fresh similarity.
+        """
+        from ddp_sync.pipelines.grantbot_scrape import run_grantbot_similarity_refresh_job
+
+        config = self._sync_config.get("grantbot_similarity_refresh", {})
+        if not (self.settings.grantbot_similarity_refresh_enabled and config.get("enabled", False)):
+            logger.info("grantbot_similarity_refresh: disabled — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "07:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        day_of_month = config.get("day_of_month", 15)
+        months = ",".join(str(m) for m in config.get("months", [3, 9]))
+
+        async def _grantbot_similarity_refresh_wrapper():
+            return await run_grantbot_similarity_refresh_job(config, trigger="scheduled")
+
+        self._add_job_replacing(
+            _grantbot_similarity_refresh_wrapper,
+            trigger=CronTrigger(month=months, day=day_of_month, hour=hour, minute=minute, timezone=_UTC),
+            id="grantbot_similarity_refresh",
+            name="GrantBot: grantee-similarity refresh (twice yearly)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            "grantbot_similarity_refresh: registered",
+            months=months,
+            day_of_month=day_of_month,
+            sync_time=sync_time_str,
         )
 
     def _register_grantbot_scrape_job(self) -> None:

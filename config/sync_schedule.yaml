@@ -999,3 +999,17 @@ grantbot_scrape:
   frequency: monthly
   day_of_month: 1
   sync_time_utc: "07:00"   # matches the old weekly cron's own 7am UTC (2am ET)
+
+# AGENTS-128: GrantBot's twice-yearly grantee-similarity refresh. Similarity is 30% of the fit score and
+# only this job (plus a small monthly top-up inside the funder pipeline) keeps it current. CAMS runs it in
+# the background for a day or more: recollect stale grant history through Kindora's 100-calls-an-hour
+# limit, then recompute similarity for every funder. Mid-March and mid-September on purpose, so it
+# finishes before the monthly funder scrape on the 1st scores and posts the shortlist. Mac-Studio-only
+# like grantbot_scrape above (no-ops without CAMS_API_TOKEN); GRANTBOT_SIMILARITY_REFRESH_ENABLED=false
+# in a host's .env opts that host out.
+grantbot_similarity_refresh:
+  enabled: true
+  frequency: semiannual
+  months: [3, 9]
+  day_of_month: 15
+  sync_time_utc: "07:00"

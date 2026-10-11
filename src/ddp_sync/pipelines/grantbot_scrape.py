@@ -1,5 +1,6 @@
 """SYNC-36: monthly trigger for GrantBot's Notion funder-scrape + Kindora
-enrichment + shortlist pipeline.
+enrichment + shortlist pipeline (and, since AGENTS-128, the twice-yearly
+grantee-similarity refresh, which reuses the same CAMS call).
 
 GrantBot's job used to self-schedule weekly entirely inside CAMS's own
 internal CronScheduler -- the only recurring pipeline in the stack that
@@ -45,16 +46,12 @@ _MAX_ATTEMPTS = 3
 _RETRY_DELAY_S = 30.0
 
 
-async def run_grantbot_scrape_job(
-    config: dict | None = None, *, trigger: str = "scheduled",
-) -> dict:
-    """POST to CAMS's admin/scrape-funders endpoint.
+async def _post_to_cams(path: str, label: str, *, trigger: str) -> dict:
+    """POST to one of CAMS's admin endpoints (``/api/v1/admin/<path>``).
 
     Never raises -- a bad tick must not crash the scheduler, matching every
     other job in this file's family (see mi_cookie_publish.py's own
-    established shape). `config` is accepted for parity with every other
-    scheduled job's wrapper signature but currently unused -- there is no
-    per-run parameter to pass; CAMS runs the same closure every time.
+    established shape). ``label`` prefixes the log lines so each job reads as its own.
 
     Retries a connection failure or a 5xx up to _MAX_ATTEMPTS times,
     _RETRY_DELAY_S apart -- enough to survive CAMS being mid-restart, not a
@@ -64,14 +61,14 @@ async def run_grantbot_scrape_job(
     settings = get_settings()
     if not settings.cams_api_token:
         logger.error(
-            "grantbot_scrape: CAMS_API_TOKEN not configured -- skipping "
+            f"{label}: CAMS_API_TOKEN not configured -- skipping "
             "(this job only runs on the Mac Studio instance, co-located "
             "with CAMS)",
             trigger=trigger,
         )
         return {"success": False, "error": "cams_not_configured"}
 
-    url = f"{settings.cams_base_url.rstrip('/')}/api/v1/admin/scrape-funders"
+    url = f"{settings.cams_base_url.rstrip('/')}/api/v1/admin/{path}"
     headers = {"Authorization": f"Bearer {settings.cams_api_token}"}
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -81,9 +78,12 @@ async def run_grantbot_scrape_job(
                 response = await client.post(url, headers=headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 409:
+                logger.info(f"{label}: CAMS says a run is already in progress", trigger=trigger)
+                return {"success": True, "status": "already_running"}
             if e.response.status_code < 500 or last_attempt:
                 logger.error(
-                    "grantbot_scrape: CAMS returned an error",
+                    f"{label}: CAMS returned an error",
                     trigger=trigger,
                     attempt=attempt,
                     status_code=e.response.status_code,
@@ -95,7 +95,7 @@ async def run_grantbot_scrape_job(
                     "status_code": e.response.status_code,
                 }
             logger.warning(
-                "grantbot_scrape: CAMS returned a 5xx -- retrying",
+                f"{label}: CAMS returned a 5xx -- retrying",
                 trigger=trigger, attempt=attempt, status_code=e.response.status_code,
             )
             await asyncio.sleep(_RETRY_DELAY_S)
@@ -103,12 +103,12 @@ async def run_grantbot_scrape_job(
         except httpx.RequestError as e:
             if last_attempt:
                 logger.error(
-                    "grantbot_scrape: could not reach CAMS",
+                    f"{label}: could not reach CAMS",
                     trigger=trigger, attempt=attempt, error=str(e),
                 )
                 return {"success": False, "error": "cams_unreachable", "detail": str(e)}
             logger.warning(
-                "grantbot_scrape: could not reach CAMS -- retrying",
+                f"{label}: could not reach CAMS -- retrying",
                 trigger=trigger, attempt=attempt, error=str(e),
             )
             await asyncio.sleep(_RETRY_DELAY_S)
@@ -116,7 +116,7 @@ async def run_grantbot_scrape_job(
 
         result = response.json()
         logger.info(
-            "grantbot_scrape: dispatched to CAMS",
+            f"{label}: dispatched to CAMS",
             trigger=trigger,
             attempt=attempt,
             status=result.get("status"),
@@ -124,4 +124,29 @@ async def run_grantbot_scrape_job(
         return {"success": True, **result}
 
     # Unreachable: the loop above always returns on its last_attempt branch.
-    raise AssertionError("run_grantbot_scrape_job: retry loop exited without returning")
+    raise AssertionError("_post_to_cams: retry loop exited without returning")
+
+
+async def run_grantbot_scrape_job(
+    config: dict | None = None, *, trigger: str = "scheduled",
+) -> dict:
+    """POST to CAMS's admin/scrape-funders endpoint (monthly funder scrape + Kindora enrichment).
+
+    `config` is accepted for parity with every other scheduled job's wrapper
+    signature but currently unused -- there is no per-run parameter to pass;
+    CAMS runs the same closure every time. See ``_post_to_cams`` for the
+    retry and never-raises behavior.
+    """
+    return await _post_to_cams("scrape-funders", "grantbot_scrape", trigger=trigger)
+
+
+async def run_grantbot_similarity_refresh_job(
+    config: dict | None = None, *, trigger: str = "scheduled",
+) -> dict:
+    """POST to CAMS's admin/refresh-grantee-similarity endpoint (AGENTS-128).
+
+    The twice-yearly full refresh of grantee similarity (recollect stale grant history, then
+    recompute similarity for every funder). CAMS runs it in the background for a day or more, and
+    answers 409 if one is already running, which counts as success here.
+    """
+    return await _post_to_cams("refresh-grantee-similarity", "grantbot_similarity_refresh", trigger=trigger)
