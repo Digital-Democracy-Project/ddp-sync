@@ -124,6 +124,39 @@ class RedisStore:
             logger.error("Redis: failed to get sync task", task_id=task_id, error=str(e))
         return None
 
+    # -- Background verify-org-citations runs (SYNC-106) --
+    #
+    # Its own namespace on purpose: NOT SYNC_TASK_PREFIX, which _zombie_sync_watchdog scans and
+    # auto-resumes, and NOT LEGBOT_TASK_PREFIX, which the LegBot recovery sweep scans. A run record
+    # here is progress for a caller to read (how far, which verdicts, finished or not), nothing
+    # restarts it.
+
+    VERIFY_RUN_PREFIX = "ddp:verify_org_citations:run:"
+    VERIFY_RUN_TTL = 86400 * 7
+
+    async def set_verify_run(self, run_id: str, run_data: dict) -> None:
+        """Record (or update) a background verify-org-citations run's progress."""
+        if not self._client:
+            return
+        try:
+            await self._client.set(
+                f"{self.VERIFY_RUN_PREFIX}{run_id}", json.dumps(run_data), ex=self.VERIFY_RUN_TTL
+            )
+        except Exception as e:
+            logger.error("Redis: failed to set verify run", run_id=run_id, error=str(e))
+
+    async def get_verify_run(self, run_id: str) -> dict | None:
+        """A background verify-org-citations run's recorded progress, or None."""
+        if not self._client:
+            return None
+        try:
+            data = await self._client.get(f"{self.VERIFY_RUN_PREFIX}{run_id}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.error("Redis: failed to get verify run", run_id=run_id, error=str(e))
+        return None
+
     # -- LegBot dispatch tracking (SYNC-61) --
     #
     # Sibling namespace to SYNC_TASK_PREFIX above, same shape of problem: an

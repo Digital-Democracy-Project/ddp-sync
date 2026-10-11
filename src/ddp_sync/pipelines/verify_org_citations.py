@@ -25,12 +25,16 @@ sending one that is already settled pays for the verification again. Send only w
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 import structlog
 
 from ddp_sync.pipelines.bill_organization_position_research import verify_and_store_position
 from ddp_sync.services.local_openstates_client import get_current_version_identity
+from ddp_sync.services.redis_store import get_redis_store
 
 logger = structlog.get_logger()
 
@@ -52,6 +56,7 @@ async def verify_org_citations(
     run_id: str | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    progress: Callable[[int, dict[str, int]], Awaitable[None]] | None = None,
 ) -> dict:
     """Verify each item's citation and store the result, one item at a time.
 
@@ -61,6 +66,8 @@ async def verify_org_citations(
     source: recorded as the row's find_model_name when a row is created, so it says where the
         citation came from (e.g. "slack-legislation-zapier", "user-form") rather than naming a
         LegBot model that never ran. An existing row keeps the source it was first written with.
+    progress: awaited after each item with (items handled so far, outcome counts so far), for a
+        background run to record how far it has got.
 
     Returns {"run_id", "source", "counts", "results"}. Each result carries the item and its
     "outcome": "written" (see its `result`: "created", "updated", or "unchanged" when the answer was
@@ -77,11 +84,18 @@ async def verify_org_citations(
     versions: dict[str, dict | None] = {}
     seen: set[tuple[str, str, str, str]] = set()
     results: list[dict] = []
+    counts: dict[str, int] = {}
+
+    async def _record(result: dict) -> None:
+        results.append(result)
+        counts[result["outcome"]] = counts.get(result["outcome"], 0) + 1
+        if progress is not None:
+            await progress(len(results), counts)
 
     for item in items:
         key = _match_key(item)
         if key in seen:
-            results.append(_outcome(item, "duplicate_in_request"))
+            await _record(_outcome(item, "duplicate_in_request"))
             continue
         seen.add(key)
 
@@ -90,7 +104,7 @@ async def verify_org_citations(
             versions[bill_openstates_id] = await get_current_version_identity(bill_openstates_id)
         version = versions[bill_openstates_id]
         if version is None:
-            results.append(_outcome(item, "no_current_version"))
+            await _record(_outcome(item, "no_current_version"))
             continue
 
         stored = await verify_and_store_position(
@@ -110,7 +124,7 @@ async def verify_org_citations(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
-        results.append(
+        await _record(
             _outcome(
                 item,
                 stored["outcome"],
@@ -125,9 +139,6 @@ async def verify_org_citations(
                     verification_verdict=stored["verification_verdict"],
                     attempted_verdict=stored["attempted_verdict"])
 
-    counts: dict[str, int] = {}
-    for result in results:
-        counts[result["outcome"]] = counts.get(result["outcome"], 0) + 1
     logger.info("org_citation_verify_summary", run_id=run_id, counts=counts)
     return {"run_id": run_id, "source": source, "counts": counts, "results": results}
 
@@ -152,3 +163,79 @@ def _outcome(
         "attempted_verdict": attempted_verdict,
         "position_id": position_id,
     }
+
+
+# One background run at a time per process: a second one waits its turn instead of starting beside it.
+# verify_bill_position fetches pages through Claude, and the AGENTS-74 corpus found concurrent fetches
+# get rate limited (see the module docstring), so two long runs would slow and blur each other.
+_background_run_lock = asyncio.Lock()
+
+
+def new_run_record(run_id: str, *, source: str, environment: str | None, total: int) -> dict:
+    """The progress record for a background run that has been accepted and is waiting to start."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "source": source,
+        "environment": environment,
+        "total": total,
+        "processed": 0,
+        "counts": {},
+        "started_at": None,
+        "updated_at": now,
+        "finished_at": None,
+        "error": None,
+    }
+
+
+async def run_verify_org_citations_in_background(
+    items: list[dict],
+    *,
+    source: str,
+    run_id: str,
+    environment: str | None,
+    broker_api_base: str | None,
+    broker_api_token: str | None,
+) -> None:
+    """Run verify_org_citations for a 202 caller, recording progress in Redis after every item.
+
+    The record says how many items have been handled in order (`processed`), so a run that was
+    interrupted (ddp-sync restarted) can be resumed by resending the list from that index: the
+    broker's upsert makes a repeated item an update, not a duplicate. A record whose `updated_at`
+    stops moving while status is "running" is a run that died with the process; nothing restarts it.
+    """
+    store = get_redis_store()
+    record = new_run_record(run_id, source=source, environment=environment, total=len(items))
+
+    async def _save() -> None:
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await store.set_verify_run(run_id, record)
+
+    async def _progress(processed: int, counts: dict[str, int]) -> None:
+        record["processed"] = processed
+        record["counts"] = dict(counts)
+        await _save()
+
+    await _save()
+    async with _background_run_lock:
+        record["status"] = "running"
+        record["started_at"] = datetime.now(timezone.utc).isoformat()
+        await _save()
+        try:
+            await verify_org_citations(
+                items,
+                source=source,
+                run_id=run_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+                progress=_progress,
+            )
+        except Exception as exc:
+            logger.exception("org_citation_verify_run_failed", run_id=run_id)
+            record["status"] = "failed"
+            record["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        else:
+            record["status"] = "finished"
+        record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        await _save()
