@@ -667,15 +667,6 @@ class VerifyOrgCitationItem(BaseModel):
     citation_url: str = Field(..., min_length=1)
 
 
-# ddp-api's proxy gives a POST 300 seconds, and each verification is one metered Claude call that
-# fetches a page, run one after another. How long one takes is NOT measured yet (the SYNC-100 pilot
-# is what measures it), and a large PDF can be slow, so this is a conservative guess to be revisited
-# with that data. A larger batch is sent in several requests; the result of each says which items
-# were processed, so a rerun sends only the rest. If a request times out, its outcome is unknown:
-# resend that same small request (the broker's upsert makes that safe, it costs the calls again).
-VERIFY_ORG_CITATIONS_MAX_ITEMS = 3
-
-
 class VerifyOrgCitationsRequest(BaseModel):
     """Request body for POST /trigger/verify-org-citations (SYNC-100)."""
 
@@ -692,11 +683,12 @@ class VerifyOrgCitationsRequest(BaseModel):
     items: list[VerifyOrgCitationItem] = Field(
         ...,
         min_length=1,
-        max_length=VERIFY_ORG_CITATIONS_MAX_ITEMS,
         description=(
-            "The citations to check. EACH ONE COSTS A METERED CLAUDE CALL, whether or not it was "
-            "checked before: nothing here asks the broker if a citation is already settled, so send "
-            "only what needs checking."
+            "The citations to check, one after another, with no limit on how many. EACH ONE COSTS A "
+            "METERED CLAUDE CALL, whether or not it was checked before: nothing here asks the broker "
+            "if a citation is already settled, so send only what needs checking. A large list is one "
+            "long request (about 6 seconds per item); a caller that goes through ddp-api's proxy has "
+            "300 seconds and should send small batches."
         ),
     )
 
@@ -719,7 +711,8 @@ async def trigger_verify_org_citations(
 
     Synchronous: returns the per-item results (outcome, the broker's `result`, and the stored
     verdict), because a caller acting on one citation needs the answer, and a batch caller needs to
-    know which items to resend. Serial, at most three items per request.
+    know which items to resend. Serial, with no cap on items (like /trigger/bill-artifact-generation,
+    a big list is one long request; each item logs org_citation_verify_item as it finishes).
 
     Same Mac-Studio-only construction as /trigger/legbot-analyze-bill-full: the verify dispatch
     reads CAMS results off local disk. Which broker the rows land on comes from the trusted

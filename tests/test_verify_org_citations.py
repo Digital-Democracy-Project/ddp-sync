@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ddp_sync.api.auth import api_key_auth
-from ddp_sync.api.routes.triggers import VERIFY_ORG_CITATIONS_MAX_ITEMS, router
+from ddp_sync.api.routes.triggers import router
 from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.bill_organization_position_research import verify_and_store_position
 from ddp_sync.pipelines.verify_org_citations import verify_org_citations
@@ -281,13 +281,21 @@ def test_trigger_rejects_a_malformed_item(bad_item):
     assert response.status_code == 422
 
 
-def test_trigger_rejects_more_items_than_fit_inside_the_proxy_timeout():
-    body = {**_BODY, "items": [_item(org=f"Org {i}") for i in range(VERIFY_ORG_CITATIONS_MAX_ITEMS + 1)]}
+def test_trigger_accepts_a_long_list_of_items():
+    body = {**_BODY, "items": [_item(org=f"Org {i}") for i in range(50)]}
+    fake = {"run_id": "r1", "source": body["source"], "counts": {"written": 50}, "results": []}
     with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()), \
-            patch(f"{_BATCH}.verify_org_citations", new=AsyncMock()) as run:
+            patch(f"{_BATCH}.verify_org_citations", new=AsyncMock(return_value=fake)) as run:
+        response = _client().post("/trigger/verify-org-citations", json=body, headers={"X-DDP-Environment": "dev"})
+    assert response.status_code == 200, response.text
+    assert len(run.await_args.args[0]) == 50
+
+
+def test_trigger_rejects_an_empty_list():
+    body = {**_BODY, "items": []}
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()):
         response = _client().post("/trigger/verify-org-citations", json=body, headers={"X-DDP-Environment": "dev"})
     assert response.status_code == 422
-    run.assert_not_awaited()
 
 
 def test_trigger_returns_the_results_synchronously_against_the_dev_broker():
