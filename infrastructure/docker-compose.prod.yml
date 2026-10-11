@@ -73,6 +73,8 @@ services:
       # never checks this flag at all -- it's a separate, always-on code path, unaffected
       # either way.
       - OPENSTATES_SCRAPE_ENABLED=true
+      # SYNC-102 (PR #206): nightly pull of the people checkout at 03:00 UTC (default off; per-instance)
+      - OPENSTATES_PEOPLE_PULL_ENABLED=true
       # OPENSTATES_ARCHIVE_ENABLED/MI_COOKIE_PUBLISH_ENABLED: the handoff note left these as
       # "your call" (OpenStates-domain, not Voatz/Webflow/LegBot, so plausible either way) --
       # defaulted to false here too, since this host's mandate is specifically the OPEN-193
@@ -128,7 +130,6 @@ services:
       # not at all for artifact_types (bare default is an empty list, not the 9-type default
       # that only lives inside the dead _load_from_env() fallback).
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES=bill_summary,bill_pros_cons,bill_vote_yes_frame,bill_vote_no_frame,bill_supporting_orgs,bill_opposing_orgs,bill_impact_analysis,bill_topics,bill_changelog
-      - LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT=10000
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_INCLUDE_CONCEPT_STATEMENTS=true
       # SYNC-89 / Wave 3 step E (2026-10-02): which Pinecone index the knowledge-base embedding
       # path (backfill endpoints and, later, the post-archive hook) writes to. Deliberately set
