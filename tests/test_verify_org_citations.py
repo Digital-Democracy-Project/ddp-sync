@@ -309,3 +309,114 @@ def test_trigger_returns_the_results_synchronously_against_the_dev_broker():
     assert run.await_args.kwargs["source"] == "slack-legislation-zapier"
     assert run.await_args.kwargs["broker_api_base"] == "http://localhost:8080"
     assert run.await_args.kwargs["broker_api_token"] == "dev-token"
+
+
+# ---- SYNC-106: background runs --------------------------------------------------------------------
+
+
+class _FakeStore:
+    """In-memory stand-in for the Redis run records."""
+
+    def __init__(self):
+        self.runs: dict[str, dict] = {}
+
+    async def set_verify_run(self, run_id, data):
+        self.runs[run_id] = dict(data)
+
+    async def get_verify_run(self, run_id):
+        return self.runs.get(run_id)
+
+
+@pytest.fixture
+def store():
+    fake = _FakeStore()
+    with patch("ddp_sync.pipelines.verify_org_citations.get_redis_store", return_value=fake), \
+            patch("ddp_sync.services.redis_store.get_redis_store", return_value=fake):
+        yield fake
+
+
+@pytest.mark.asyncio
+async def test_progress_is_reported_after_every_item_including_a_duplicate():
+    seen = []
+
+    async def progress(processed, counts):
+        seen.append((processed, dict(counts)))
+
+    items = [_item(org="A"), _item(org="A"), _item(org="B")]
+    with patch(f"{_BATCH}.get_current_version_identity", new=AsyncMock(return_value=_VERSION)), \
+            patch(f"{_RESEARCH}.dispatch_bill_position_verification", new=AsyncMock(return_value=_confirmed())), \
+            patch(f"{_RESEARCH}.write_bill_organization_position", new=AsyncMock(return_value=_stored())):
+        await verify_org_citations(items, source="s", progress=progress)
+
+    assert [p for p, _ in seen] == [1, 2, 3]
+    assert seen[-1][1] == {"written": 2, "duplicate_in_request": 1}
+
+
+def test_a_background_request_answers_202_and_the_run_finishes_with_its_counts(store):
+    body = {**_BODY, "background": True, "items": [_item(org="A"), _item(org="B")]}
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()), \
+            patch(f"{_BATCH}.get_current_version_identity", new=AsyncMock(return_value=_VERSION)), \
+            patch(f"{_RESEARCH}.dispatch_bill_position_verification", new=AsyncMock(return_value=_confirmed())), \
+            patch(f"{_RESEARCH}.write_bill_organization_position", new=AsyncMock(return_value=_stored())) as store_call:
+        response = _client().post("/trigger/verify-org-citations", json=body, headers={"X-DDP-Environment": "dev"})
+        run_id = response.json()["run_id"]
+        read = _client().get(f"/trigger/verify-org-citations/{run_id}")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "started", "run_id": run_id, "total": 2, "environment": "dev"}
+    assert store_call.await_count == 2
+    run = read.json()
+    assert (run["status"], run["total"], run["processed"], run["counts"]) == ("finished", 2, 2, {"written": 2})
+    assert run["environment"] == "dev" and run["finished_at"] and run["error"] is None
+
+
+def test_a_background_request_keeps_the_guards_of_the_synchronous_one(store):
+    body = {**_BODY, "background": True}
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()):
+        response = _client().post("/trigger/verify-org-citations", json=body)  # no environment header
+    assert response.status_code == 400
+    assert store.runs == {}
+
+
+def test_a_background_run_that_raises_is_recorded_as_failed(store):
+    body = {**_BODY, "background": True}
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()), \
+            patch(f"{_BATCH}.get_current_version_identity", new=AsyncMock(side_effect=RuntimeError("api-v3 down"))):
+        response = _client().post("/trigger/verify-org-citations", json=body, headers={"X-DDP-Environment": "dev"})
+        run = _client().get(f"/trigger/verify-org-citations/{response.json()['run_id']}").json()
+
+    assert run["status"] == "failed"
+    assert "api-v3 down" in run["error"]
+
+
+def test_reading_an_unknown_run_is_a_404(store):
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_settings()):
+        assert _client().get("/trigger/verify-org-citations/nope").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_second_background_run_waits_for_the_first(store):
+    import asyncio
+
+    from ddp_sync.pipelines.verify_org_citations import run_verify_org_citations_in_background
+
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def fake_verify(items, *, run_id, **_):
+        started.append(run_id)
+        await release.wait()
+
+    kwargs = dict(source="s", environment="dev", broker_api_base="b", broker_api_token="t")
+    with patch(f"{_BATCH}.verify_org_citations", new=fake_verify):
+        first = asyncio.create_task(run_verify_org_citations_in_background([_item()], run_id="r1", **kwargs))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(run_verify_org_citations_in_background([_item()], run_id="r2", **kwargs))
+        await asyncio.sleep(0.01)
+        assert started == ["r1"]
+        assert (store.runs["r1"]["status"], store.runs["r2"]["status"]) == ("running", "queued")
+        release.set()
+        await asyncio.gather(first, second)
+
+    assert started == ["r1", "r2"]
+    assert (store.runs["r1"]["status"], store.runs["r2"]["status"]) == ("finished", "finished")

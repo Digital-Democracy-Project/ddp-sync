@@ -6,7 +6,7 @@ from dataclasses import asdict
 from datetime import date
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from ddp_sync.api.auth import api_key_auth
@@ -687,8 +687,18 @@ class VerifyOrgCitationsRequest(BaseModel):
             "The citations to check, one after another, with no limit on how many. EACH ONE COSTS A "
             "METERED CLAUDE CALL, whether or not it was checked before: nothing here asks the broker "
             "if a citation is already settled, so send only what needs checking. A large list is one "
-            "long request (about 6 seconds per item); a caller that goes through ddp-api's proxy has "
-            "300 seconds and should send small batches."
+            "long request (about 6 seconds per item) unless `background` is set; a caller that goes "
+            "through ddp-api's proxy has 300 seconds and should send small batches or set `background`."
+        ),
+    )
+    background: bool = Field(
+        default=False,
+        description=(
+            "False (default): the request answers with the per-item verdicts when every item is "
+            "checked, which is what a caller acting on one citation needs. True (SYNC-106): answer "
+            "202 with a run_id right away and run the checks in the background, one run at a time "
+            "(a second waits for the first); read progress with GET /trigger/verify-org-citations/{run_id}. "
+            "Use it for a long list."
         ),
     )
 
@@ -696,6 +706,8 @@ class VerifyOrgCitationsRequest(BaseModel):
 @router.post("/trigger/verify-org-citations")
 async def trigger_verify_org_citations(
     body: VerifyOrgCitationsRequest,
+    response: Response,
+    background_tasks: BackgroundTasks,
     x_ddp_environment: str | None = Header(default=None),
     token: str = Depends(api_key_auth),
 ):
@@ -711,8 +723,14 @@ async def trigger_verify_org_citations(
 
     Synchronous: returns the per-item results (outcome, the broker's `result`, and the stored
     verdict), because a caller acting on one citation needs the answer, and a batch caller needs to
-    know which items to resend. Serial, with no cap on items (like /trigger/bill-artifact-generation,
-    a big list is one long request; each item logs org_citation_verify_item as it finishes).
+    know which items to resend. Serial, with no cap on items; each item logs
+    org_citation_verify_item as it finishes.
+
+    background=true (SYNC-106) is for a long list: it answers 202 with a `run_id` at once and runs the
+    same serial checks afterwards, recording progress that GET /trigger/verify-org-citations/{run_id}
+    returns (`processed` is how many items, in the order sent, have been handled, so an interrupted
+    run is resumed by resending the list from there; a repeated item is an update, not a duplicate).
+    Results of a background run are the broker rows (tagged with `source`) and the per-item log lines.
 
     Same Mac-Studio-only construction as /trigger/legbot-analyze-bill-full: the verify dispatch
     reads CAMS results off local disk. Which broker the rows land on comes from the trusted
@@ -729,7 +747,34 @@ async def trigger_verify_org_citations(
         )
     broker_api_base, broker_api_token = _resolve_ondemand_broker_target(x_ddp_environment)
 
-    from ddp_sync.pipelines.verify_org_citations import verify_org_citations
+    from ddp_sync.pipelines.verify_org_citations import (
+        new_run_record,
+        run_verify_org_citations_in_background,
+        verify_org_citations,
+    )
+
+    if body.background:
+        import uuid
+
+        from ddp_sync.services.redis_store import get_redis_store
+
+        run_id = f"org-citation-verify-{uuid.uuid4().hex[:12]}"
+        # Written before the 202 so a read straight after finds the run.
+        await get_redis_store().set_verify_run(
+            run_id,
+            new_run_record(run_id, source=body.source, environment=x_ddp_environment, total=len(body.items)),
+        )
+        background_tasks.add_task(
+            run_verify_org_citations_in_background,
+            [item.model_dump() for item in body.items],
+            source=body.source,
+            run_id=run_id,
+            environment=x_ddp_environment,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+        response.status_code = 202
+        return {"status": "started", "run_id": run_id, "total": len(body.items), "environment": x_ddp_environment}
 
     result = await verify_org_citations(
         [item.model_dump() for item in body.items],
@@ -739,6 +784,18 @@ async def trigger_verify_org_citations(
     )
     result["environment"] = x_ddp_environment
     return result
+
+
+@router.get("/trigger/verify-org-citations/{run_id}")
+async def get_verify_org_citations_run(run_id: str, token: str = Depends(api_key_auth)):
+    """Progress of a background verify-org-citations run (SYNC-106): status (queued / running /
+    finished / failed), total, processed, outcome counts, timestamps. Kept 7 days."""
+    from ddp_sync.services.redis_store import get_redis_store
+
+    run = await get_redis_store().get_verify_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"No background verify-org-citations run {run_id!r}.")
+    return run
 
 
 @router.post("/trigger/legislator-bio-sync")
