@@ -1550,6 +1550,30 @@ async def trigger_open304_lis_identifiers(
     return {"status": "started", "run_id": run_id, "mode": mode}
 
 
+@router.post("/trigger/grantbot-similarity-refresh")
+async def trigger_grantbot_similarity_refresh(token: str = Depends(api_key_auth)):
+    """Start GrantBot's full grantee-similarity refresh on demand (AGENTS-128).
+
+    Mirrors the twice-yearly scheduled job (scheduler.py's grantbot_similarity_refresh): same wrapper,
+    same CAMS endpoint. CAMS runs the work in its own background for a day or more and answers 409 when
+    one is already running, which this reports as success with ``status: already_running``.
+    """
+    from ddp_sync.pipelines.grantbot_scrape import run_grantbot_similarity_refresh_job
+
+    result = await run_grantbot_similarity_refresh_job(trigger="manual")
+    if result.get("success"):
+        return result
+
+    if result.get("error") == "cams_not_configured":
+        raise HTTPException(
+            status_code=503,
+            detail="CAMS_API_TOKEN not configured on this instance -- this "
+            "endpoint only works on the Mac Studio instance, co-located "
+            "with CAMS.",
+        )
+    raise HTTPException(status_code=502, detail=result)
+
+
 @router.post("/trigger/grantbot-scrape-funders")
 async def trigger_grantbot_scrape_funders(token: str = Depends(api_key_auth)):
     """Fire GrantBot's funder-scrape + Kindora enrichment job on demand (SYNC-36).
