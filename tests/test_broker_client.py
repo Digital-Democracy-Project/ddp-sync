@@ -20,6 +20,7 @@ from ddp_sync.services.broker_client import (
     get_latest_bill_version,
     write_bill_artifact,
     write_bill_organization_position,
+    write_organization_content,
     write_bill_organization_research_run,
     write_bill_version,
 )
@@ -1513,3 +1514,43 @@ def test_the_insufficient_but_populated_prefix_is_the_queryable_contract():
     from ddp_sync.services.broker_client import _INSUFFICIENT_BUT_POPULATED_NOTE
 
     assert _INSUFFICIENT_BUT_POPULATED_NOTE.startswith("flagged_but_populated")
+
+
+@pytest.mark.asyncio
+async def test_write_organization_content_posts_only_non_blank_fields_and_the_source():
+    """SYNC-107 / BROKER-204."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"id": 7, "written": ["description"], "skipped": []}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), _patch_async_client(
+        mock_client
+    ):
+        result = await write_organization_content(
+            organization_id=7,
+            content={"description": "A group.", "funding": "  ", "website": "", "affiliates": None},
+            source="legbot:organization_about:claude",
+        )
+
+    assert result == {"id": 7, "written": ["description"], "skipped": []}
+    call = mock_client.post.await_args
+    assert call.args[0] == "http://localhost:8080/api/organizations/7/content/"
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert call.kwargs["json"] == {"description": "A group.", "source": "legbot:organization_about:claude"}
+
+
+@pytest.mark.asyncio
+async def test_write_organization_content_error_status_raises():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 404
+    response.text = '{"detail": "Not found."}'
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), _patch_async_client(
+        mock_client
+    ):
+        with pytest.raises(BrokerClientError):
+            await write_organization_content(organization_id=999, content={"description": "x"}, source="s")

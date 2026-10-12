@@ -546,6 +546,64 @@ async def write_bill_organization_position(
     return result
 
 
+async def write_organization_content(
+    *,
+    organization_id: int,
+    content: dict,
+    source: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Save LegBot-written descriptive text onto a broker Organization (SYNC-107 / BROKER-204).
+
+    `content` uses the broker's field names (org_type, description, policy_focus_areas, funding,
+    affiliates, website, email, contact_page_url); blank values are dropped before sending. The
+    broker writes only fields that are still empty and never replaces text already there.
+
+    broker_api_base/broker_api_token: optional per-call override, see get_bill_artifacts' own
+    docstring for why (SYNC-15).
+
+    Returns:
+        {"id": <int>, "written": [<field>, ...], "skipped": [<field>, ...]}.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the write or was unreachable.
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError("DDP_BROKER_API_BASE is not configured — cannot write organization content.")
+
+    payload = {key: value for key, value in content.items() if isinstance(value, str) and value.strip()}
+    payload["source"] = source
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{resolved_api_base}/api/organizations/{organization_id}/content/",
+                headers=headers,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the organization content write ({resp.status_code}): {resp.text}"
+        )
+
+    result = resp.json()
+    logger.info(
+        "Organization content written",
+        organization_id=organization_id,
+        written=result.get("written"),
+        skipped=result.get("skipped"),
+    )
+    return result
+
+
 async def get_latest_bill_version(
     bill_openstates_id: str,
     *,

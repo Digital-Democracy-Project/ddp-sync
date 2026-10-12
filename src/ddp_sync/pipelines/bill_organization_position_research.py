@@ -35,11 +35,13 @@ from ddp_sync.services.broker_client import (
     BrokerClientError,
     write_bill_organization_position,
     write_bill_organization_research_run,
+    write_organization_content,
 )
 from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     dispatch_bill_position_verification,
     dispatch_bill_question,
+    dispatch_organization_about,
 )
 
 logger = structlog.get_logger()
@@ -99,7 +101,9 @@ async def verify_and_store_position(
     research keeps writing the degraded row it always has.
 
     Returns {"org_name", "position", "outcome", "position_id", "result",
-    "verification_verdict", "attempted_verdict"}; outcome is one of "written",
+    "verification_verdict", "attempted_verdict", "organization_id",
+    "organization_needs_content"} (the last two are the broker's answer about the organization the
+    finding resolved to, SYNC-107; None/False when nothing was written); outcome is one of "written",
     "verification_failed", "broker_write_failed" or "retryable". `attempted_verdict` is what THIS
     check concluded ("confirmed", "not_confirmed", or "pending" when it could not tell; None when it
     never got an answer). `result` ("created"/"updated"/"unchanged") and `verification_verdict` are
@@ -158,6 +162,8 @@ async def verify_and_store_position(
             "result": None,
             "verification_verdict": None,
             "attempted_verdict": None,
+            "organization_id": None,
+            "organization_needs_content": False,
         }
 
     write_kwargs = dict(
@@ -242,6 +248,8 @@ async def verify_and_store_position(
             "result": None,
             "verification_verdict": None,
             "attempted_verdict": attempted_verdict,
+            "organization_id": None,
+            "organization_needs_content": False,
         }
 
     return {
@@ -252,7 +260,85 @@ async def verify_and_store_position(
         "result": write_result.get("result"),
         "verification_verdict": write_result.get("verification_verdict"),
         "attempted_verdict": attempted_verdict,
+        "organization_id": write_result.get("organization_id"),
+        "organization_needs_content": bool(write_result.get("organization_needs_content")),
     }
+
+
+# SYNC-107: LegBot's organization_about answer key -> the broker Organization field it fills.
+_ABOUT_FIELDS = {
+    "description": "description",
+    "type": "org_type",
+    "policies": "policy_focus_areas",
+    "funding": "funding",
+    "affiliates": "affiliates",
+    "website": "website",
+    "email": "email",
+    "contact_page": "contact_page_url",
+}
+
+
+def _as_text(value) -> str:
+    """A model may answer a list-shaped field (policies, affiliates) as a list; the broker stores text."""
+    if isinstance(value, list):
+        return "; ".join(str(item).strip() for item in value if str(item).strip())
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def generate_and_store_organization_content(
+    *,
+    organization_id: int,
+    org_name: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Ask LegBot for one organization's "About" content and save it (SYNC-107, with AGENTS-104 and BROKER-204).
+
+    The broker fills only fields that are still empty, so this never overwrites Webflow-sourced or
+    staff-edited text. Failures stay isolated to this organization and never raise.
+
+    Returns {"organization_id", "outcome", "written"}; outcome is one of "written", "nothing_written"
+    (LegBot had nothing, or the broker found every field already filled), "dispatch_failed" or
+    "broker_write_failed".
+    """
+    outcome = {"organization_id": organization_id, "outcome": "nothing_written", "written": []}
+    try:
+        result = await dispatch_organization_about(org_name)
+    except LegBotDispatchError as exc:
+        logger.warning(
+            "organization_about dispatch failed -- organization left without content",
+            organization_id=organization_id, org_name=org_name, error=str(exc),
+        )
+        outcome["outcome"] = "dispatch_failed"
+        return outcome
+
+    answer = result["answer"]
+    if answer.get("insufficient_information"):
+        return outcome
+    content = {field: _as_text(answer.get(key)) for key, field in _ABOUT_FIELDS.items()}
+    if not any(content.values()):
+        return outcome
+
+    source = f"legbot:organization_about:{result.get('backend') or 'unknown'}"
+    try:
+        written = await write_organization_content(
+            organization_id=organization_id,
+            content=content,
+            source=source,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
+        )
+    except BrokerClientError as exc:
+        logger.warning(
+            "Broker rejected organization content -- continuing",
+            organization_id=organization_id, org_name=org_name, error=str(exc),
+        )
+        outcome["outcome"] = "broker_write_failed"
+        return outcome
+    outcome["written"] = written.get("written", [])
+    if outcome["written"]:
+        outcome["outcome"] = "written"
+    return outcome
 
 
 async def generate_and_store_bill_organization_positions(
@@ -454,5 +540,27 @@ async def generate_and_store_bill_organization_positions(
                 broker_api_token=broker_api_token,
             )
         )
+
+    # SYNC-107: an organization this run just confirmed a position for, and that still has no
+    # description (typically a stub the run created), gets its "About" content once. Only here, not in
+    # verify_and_store_position: verify_org_citations shares that function and never creates
+    # organizations. The first confirmed finding for the organization carries the outcome.
+    if get_settings().organization_content_enabled:
+        asked: set[int] = set()
+        for result in results:
+            organization_id = result.get("organization_id")
+            if (
+                result.get("verification_verdict") != "confirmed"
+                or not result.get("organization_needs_content")
+                or organization_id in asked
+            ):
+                continue
+            asked.add(organization_id)
+            result["about_content"] = await generate_and_store_organization_content(
+                organization_id=organization_id,
+                org_name=result["org_name"],
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
 
     return results

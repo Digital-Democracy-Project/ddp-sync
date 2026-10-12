@@ -311,6 +311,38 @@ async def dispatch_bill_position_verification(
     )
 
 
+async def dispatch_organization_about(
+    org_name: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict:
+    """Dispatch an organization_about task to LegBot and return its structured answer (SYNC-107).
+
+    The question type is AGENTS-104's: LegBot researches the named organization with live web search
+    and answers with description, type, policies, funding, affiliates, website, email and
+    contact-page. The payload mirrors dispatch_bill_position_verification (an organization name
+    instead of a url and a claim); AGENTS-104 owns the final shape, so check it before turning
+    `organization_content_enabled` on.
+
+    Returns:
+        See _dispatch_and_await. When LegBot cannot answer, the answer carries
+        {"insufficient_information": True, ...} and no content fields; callers must not read the
+        fields as bare subscripts.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "org_name": org_name,
+            "question_type": "organization_about",
+            "caller": "ddp_sync",
+        },
+        question_type="organization_about",
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _dispatch_and_await(
     payload: dict,
     *,
