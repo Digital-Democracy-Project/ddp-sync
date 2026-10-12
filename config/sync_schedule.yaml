@@ -1003,7 +1003,10 @@ grantbot_scrape:
 # AGENTS-128: GrantBot's twice-yearly grantee-similarity refresh. Similarity is 30% of the fit score and
 # only this job (plus a small monthly top-up inside the funder pipeline) keeps it current. CAMS runs it in
 # the background for a day or more: recollect stale grant history through Kindora's 100-calls-an-hour
-# limit, then recompute similarity for every funder. Mid-March and mid-September on purpose, so it
+# limit, then recompute similarity for every funder. NOTE: Kindora's MCP also enforces a hard monthly cap
+# (500 profile/grants lookups, found 2026-10-12); a full recollection of ~750 funders does not fit inside
+# it, so unless the ceiling is raised the run ends early (CAMS reports history_rate_limited); finish it by
+# POSTing /trigger/grantbot-similarity-refresh again after the cap resets. Mid-March and mid-September on purpose, so it
 # finishes before the monthly funder scrape on the 1st scores and posts the shortlist. Mac-Studio-only
 # like grantbot_scrape above (no-ops without CAMS_API_TOKEN); GRANTBOT_SIMILARITY_REFRESH_ENABLED=false
 # in a host's .env opts that host out.
