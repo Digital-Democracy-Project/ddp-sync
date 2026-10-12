@@ -1010,8 +1010,12 @@ grantbot_scrape:
 # finishes before the monthly funder scrape on the 1st scores and posts the shortlist. Mac-Studio-only
 # like grantbot_scrape above (no-ops without CAMS_API_TOKEN); GRANTBOT_SIMILARITY_REFRESH_ENABLED=false
 # in a host's .env opts that host out.
+# DISABLED until ddp-agents' refresh endpoint (PR #324) is deployed AND Kindora's monthly cap is dealt with
+# (a higher ceiling or a data license), because a full run cannot finish inside 500 lookups and nothing
+# schedules the continuation. Set enabled: true to turn the schedule on; POST
+# /trigger/grantbot-similarity-refresh works regardless.
 grantbot_similarity_refresh:
-  enabled: true
+  enabled: false
   frequency: semiannual
   months: [3, 9]
   day_of_month: 15
