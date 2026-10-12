@@ -1012,8 +1012,8 @@ grantbot_scrape:
 # in a host's .env opts that host out.
 # DISABLED until ddp-agents' refresh endpoint (PR #324) is deployed AND Kindora's monthly cap is dealt with
 # (a higher ceiling or a data license), because a full run cannot finish inside 500 lookups and nothing
-# schedules the continuation. Set enabled: true to turn the schedule on; POST
-# /trigger/grantbot-similarity-refresh works regardless.
+# schedules the continuation. Set enabled: true to turn the schedule on; the manual trigger, POST
+# /trigger/grantbot-similarity-refresh, does not depend on this setting (it still needs CAMS_API_TOKEN and the endpoint).
 grantbot_similarity_refresh:
   enabled: false
   frequency: semiannual
