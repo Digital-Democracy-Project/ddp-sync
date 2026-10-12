@@ -1080,7 +1080,7 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
 # ---------------------------------------------------------------------------
 
 # Targets that map to a named job function.
-_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people", "people-pull"}
+_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people", "people-pull", "fork-check"}
 
 # Individual secondary-state codes accepted as single-jurisdiction triggers.
 _OPENSTATES_SINGLE_JURISDICTION = {"va", "mi", "ma", "ut", "az"}
@@ -1106,6 +1106,7 @@ async def trigger_openstates_scrape(
         secondary   — VA, MI, MA, UT, AZ concurrently
         people      — git pull people repo + os-people to-database for all states
         people-pull — git pull --ff-only of the people checkout only (SYNC-102)
+        fork-check  — how far each DDP fork is behind its upstream (measure and alert only)
         va|mi|ma|ut|az — single secondary-state scrape + import
     """
     from ddp_sync.pipelines.openstates_scrape import (
@@ -1118,6 +1119,7 @@ async def trigger_openstates_scrape(
         run_people_refresh_job,
         run_single_scrape_job,
     )
+    from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
     from ddp_sync.scheduler import get_scheduler
 
     scheduler = get_scheduler()
@@ -1132,6 +1134,7 @@ async def trigger_openstates_scrape(
             "secondary": run_secondary_scrapes_job,
             "people": run_people_refresh_job,
             "people-pull": run_people_pull_job,
+            "fork-check": run_fork_upstream_check_job,
         }
         background_tasks.add_task(job_map[target], config)
         return {"status": "started", "target": target}

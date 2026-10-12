@@ -698,6 +698,18 @@ openstates_scrape:
     enabled: true
     sync_time_utc: "03:00"
 
+  # Daily check of how far each DDP fork (people, openstates-core, openstates-scrapers, api-v3)
+  # is behind its public upstream. Measures and alerts only: never merges, opens PRs or pushes
+  # (catch-ups are reviewed pull requests, ddp-infra PLAN-fork-management.md §8). Off unless the
+  # host sets FORK_UPSTREAM_CHECK_ENABLED=true (Mac Studio only). Alerts when a fork lacks an
+  # upstream commit older than the first tier, again at each later tier, then every repeat_days.
+  # Status for reviewers: <openstates_root>/logs/fork-upstream-status.json
+  fork_upstream_check:
+    enabled: true
+    sync_time_utc: "01:30"
+    alert_tiers_days: [3, 7, 14]
+    repeat_days: 7
+
   # OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory store on
   # an independent schedule (PLAN-scraper-execution-migration.md §6, "publish, do not call
   # in"). Runs regardless of whether a Michigan scrape is happening right now -- no inbound

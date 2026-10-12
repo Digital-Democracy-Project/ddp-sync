@@ -250,6 +250,10 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
+## Fork upstream check (`pipelines/fork_upstream_check.py`)
+
+- **`run_fork_upstream_check_job(config)`** — Daily (01:30 UTC, `openstates_scrape.fork_upstream_check` in `sync_schedule.yaml`). For each DDP fork (people, openstates-core, openstates-scrapers, api-v3) fetches the fork's `main` and its upstream's `main` over public https into a job-owned bare cache (`<OPENSTATES_ROOT>/logs/fork-upstream-cache/`, no credentials, never the live working trees) and counts upstream commits the fork lacks. Writes `<OPENSTATES_ROOT>/logs/fork-upstream-status.json` (per repo: `behind_count`, `oldest_age_days`, `titles`, `areas_changed`, `sensitive_paths_changed` for workflows/migrations/dependency files) for a reviewer to read, and flow status `fork_upstream_check` (shown by `/health`). Alerts through `post_alert` when the oldest missing commit is 3+ days old (tiers 3/7/14 days, then weekly) or a fetch fails (nights 1, 3, then weekly); the previous status file is the de-dup memory. Never merges, opens PRs or pushes. Registered only when `FORK_UPSTREAM_CHECK_ENABLED=true` on the host (default off; Mac Studio only). Manual: `POST /trigger/openstates-scrape/fork-check`. This is the stalled-sync check SYNC-104 asked for.
+
 ## Congress legislators source (`services/congress_legislators.py`)
 
 - **`CongressLegislatorsSource`** — pre-warmed at app startup (reads 8.6 MB unitedstates YAML). Accessed from `app.state.congress_legislators`. **Do not re-read the YAML** — always pass the pre-warmed instance.
