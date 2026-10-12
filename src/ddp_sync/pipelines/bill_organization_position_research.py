@@ -22,6 +22,7 @@ adding it would be scope beyond what was approved.
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 
 import structlog
 
@@ -561,6 +562,16 @@ async def generate_and_store_bill_organization_positions(
                 org_name=result["org_name"],
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
+            )
+        if asked:
+            # One line per bill, so a LegBot or broker contract that fails every organization is
+            # visible instead of looking like a quiet success.
+            logger.info(
+                "organization_about_summary",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                asked=len(asked),
+                outcomes=dict(Counter(r["about_content"]["outcome"] for r in results if "about_content" in r)),
             )
 
     return results

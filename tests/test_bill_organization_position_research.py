@@ -773,3 +773,14 @@ async def test_list_answers_are_joined_and_the_broker_is_told_which_fields_it_sk
 
     assert content_write.await_args.kwargs["content"]["policy_focus_areas"] == "Housing; Zoning"
     assert outcome == {"organization_id": 7, "outcome": "written", "written": ["website"]}
+
+
+@pytest.mark.asyncio
+async def test_a_broker_that_does_not_return_the_new_fields_triggers_nothing():
+    """Mixed rollout: ddp-sync ahead of BROKER-204 means no organization_id, so nothing is asked."""
+    old_broker_answer = {"id": 1, "result": "created", "verification_verdict": "confirmed"}
+    results, about, content_write = await _run(_ONE, [old_broker_answer])
+
+    about.assert_not_awaited()
+    content_write.assert_not_awaited()
+    assert results[0]["organization_id"] is None and results[0]["organization_needs_content"] is False
