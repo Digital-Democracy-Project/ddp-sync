@@ -556,6 +556,7 @@ class UpdateScheduler:
             run_people_pull_job,
             run_people_refresh_job,
         )
+        from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
 
         config = self._sync_config.get("openstates_scrape", {})
         # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate -- applies
@@ -845,6 +846,29 @@ class UpdateScheduler:
                 misfire_grace_time=3600,
             )
             logger.info("openstates_people_pull: registered", sync_time=pull_time)
+
+        # --- fork upstream check (daily) ---
+        # Default-off per-host flag ANDed with the shared YAML gate, like the people pull above.
+        # Runs well before the 03:00 people pull and the 04:00 chain; it only measures and alerts.
+        fork_cfg = config.get("fork_upstream_check", {})
+        if self.settings.fork_upstream_check_enabled and fork_cfg.get("enabled", True):
+            fork_time = fork_cfg.get("sync_time_utc", "01:30")
+            forkh, forkm = map(int, fork_time.split(":"))
+
+            async def _fork_upstream_check_wrapper():
+                return await run_fork_upstream_check_job(config)
+
+            self._add_job_replacing(
+                _fork_upstream_check_wrapper,
+                trigger=CronTrigger(hour=forkh, minute=forkm, timezone=_UTC),
+                id="fork_upstream_check",
+                name="OpenStates: fork upstream check",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("fork_upstream_check: registered", sync_time=fork_time)
 
         self._openstates_cadence = effective
 

@@ -186,6 +186,9 @@ class SyncSettings:
     mi_cookie_publish_enabled: bool = True
     # SYNC-102: default OFF (unlike the flags above) -- a host must opt in to pulling its checkout.
     openstates_people_pull_enabled: bool = False
+    # Daily fork-vs-upstream gap check (fork_upstream_check.py). Default OFF like the people pull:
+    # only the Mac Studio instance opts in, so the EC2 instances never run it.
+    fork_upstream_check_enabled: bool = False
     session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
     grantbot_similarity_refresh_enabled: bool = True
@@ -609,10 +612,11 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "grantbot_scrape_enabled": "GRANTBOT_SCRAPE_ENABLED",
     "grantbot_similarity_refresh_enabled": "GRANTBOT_SIMILARITY_REFRESH_ENABLED",
     "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",
+    "fork_upstream_check_enabled": "FORK_UPSTREAM_CHECK_ENABLED",
 }
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
-_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled"}
+_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled"}
 
 
 def _parse_trigger_limit(raw: str | None) -> int | None:
