@@ -394,6 +394,12 @@ class SyncSettings:
     # bill's real positions with only a log warning to show for it.
     org_research_max_organizations: int = 500
 
+    # SYNC-107: after a find_bill_positions research run confirms a position for an organization that
+    # still has no description (typically a stub the run just created), ask LegBot for its "About"
+    # content and save it through the broker. Off until LegBot has the `describe_organization` question
+    # type (AGENTS-104); with it off, research runs behave exactly as before.
+    organization_content_enabled: bool = False
+
     # How many bills run_legbot_pipeline (session_pipeline_runner.py)
     # processes concurrently, instead of one at a time. Bounded, not
     # unbounded -- _process_bill() also fires several non-MLX HTTP calls per
@@ -733,6 +739,9 @@ def _load_from_env() -> dict:
         ),
         "org_research_max_organizations": int(
             os.getenv("LEGBOT_ORG_RESEARCH_MAX_ORGANIZATIONS", "500")
+        ),
+        "organization_content_enabled": (
+            os.getenv("LEGBOT_ORGANIZATION_CONTENT_ENABLED", "false").lower() == "true"
         ),
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
         "replica_freshness_check_enabled": (

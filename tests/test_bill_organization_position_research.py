@@ -12,6 +12,7 @@ import pytest
 
 from ddp_sync.pipelines.bill_organization_position_research import (
     generate_and_store_bill_organization_positions,
+    generate_and_store_organization_content,
 )
 from ddp_sync.services.broker_client import BrokerClientError
 from ddp_sync.services.legbot_client import LegBotDispatchError
@@ -281,7 +282,7 @@ async def test_truncates_to_cap_and_logs():
     ]
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research.get_settings",
-        return_value=SimpleNamespace(org_research_max_organizations=test_cap),
+        return_value=SimpleNamespace(org_research_max_organizations=test_cap, organization_content_enabled=False),
     ), patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(return_value=_find_result(many_positions)),
@@ -632,3 +633,172 @@ async def test_null_verdict_is_treated_as_no_verdict():
     # And a blank explanation falls through to reason, rather than writing
     # the empty string -- pinning the `or` rather than fallback-on-missing.
     assert write_kwargs["verification_explanation"] == "backend error: could not read the page"
+
+
+# ---------------------------------------------------------------------------
+# SYNC-107: "About" content for an organization a research run confirmed a position for
+# ---------------------------------------------------------------------------
+
+_P = "ddp_sync.pipelines.bill_organization_position_research"
+
+
+def _position_write(position_id, organization_id, needs_content, verdict="confirmed"):
+    return {
+        "id": position_id, "result": "created", "verification_verdict": verdict,
+        "organization_id": organization_id, "organization_needs_content": needs_content,
+    }
+
+
+def _about_result(**fields):
+    return {"answer": fields, "backend": "claude"}
+
+
+async def _run(positions, writes, *, enabled=True, about=None, content_write=None):
+    about = about or AsyncMock(return_value=_about_result(description="A group.", org_type="Advocacy nonprofit", sources=["https://a.invalid"]))
+    content_write = content_write or AsyncMock(
+        return_value={"id": 7, "written": ["description", "org_type"], "skipped": []}
+    )
+    with patch(
+        f"{_P}.get_settings",
+        return_value=SimpleNamespace(org_research_max_organizations=500, organization_content_enabled=enabled),
+    ), patch(f"{_P}.dispatch_bill_question", new=AsyncMock(return_value=_find_result(positions))), patch(
+        f"{_P}.dispatch_bill_position_verification", new=AsyncMock(return_value=_verify_result())
+    ), patch(f"{_P}.write_bill_organization_position", new=AsyncMock(side_effect=writes)), patch(
+        f"{_P}.dispatch_describe_organization", new=about
+    ), patch(f"{_P}.write_organization_content", new=content_write):
+        results = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+    return results, about, content_write
+
+
+_ONE = [{"org_name": "New Group", "position": "support", "citation_url": "https://a.invalid"}]
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_position_for_an_organization_without_content_asks_for_and_saves_its_about_text():
+    results, about, content_write = await _run(_ONE, [_position_write(1, 7, True)])
+
+    about.assert_awaited_once_with("New Group")
+    kwargs = content_write.await_args.kwargs
+    assert kwargs["organization_id"] == 7
+    assert kwargs["content"]["description"] == "A group."
+    assert kwargs["content"]["org_type"] == "Advocacy nonprofit"  # LegBot answers in the broker's own field names
+    assert "sources" not in kwargs["content"]  # LegBot's `sources` is not a broker field
+    assert kwargs["source"] == "legbot:describe_organization:claude"
+    assert results[0]["about_content"] == {
+        "organization_id": 7, "outcome": "written", "written": ["description", "org_type"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_asked_when_the_switch_is_off():
+    results, about, content_write = await _run(_ONE, [_position_write(1, 7, True)], enabled=False)
+
+    about.assert_not_awaited()
+    content_write.assert_not_awaited()
+    assert "about_content" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_an_organization_that_already_has_a_description_is_left_alone():
+    _, about, content_write = await _run(_ONE, [_position_write(1, 7, False)])
+
+    about.assert_not_awaited()
+    content_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_position_does_not_trigger_content():
+    _, about, _ = await _run(_ONE, [_position_write(1, 7, True, verdict="not_confirmed")])
+
+    about.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_organization_named_in_two_findings_is_asked_once():
+    two = [
+        {"org_name": "New Group", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "new group", "position": "support", "citation_url": "https://b.invalid"},
+    ]
+    results, about, _ = await _run(two, [_position_write(1, 7, True), _position_write(2, 7, True)])
+
+    about.assert_awaited_once()
+    assert "about_content" in results[0] and "about_content" not in results[1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_about_dispatch_keeps_the_position_and_the_rest_of_the_run():
+    two = [
+        {"org_name": "First Group", "position": "support", "citation_url": "https://a.invalid"},
+        {"org_name": "Second Group", "position": "oppose", "citation_url": "https://b.invalid"},
+    ]
+    about = AsyncMock(side_effect=[LegBotDispatchError("timed out"), _about_result(description="Second.")])
+    results, about, content_write = await _run(
+        two, [_position_write(1, 7, True), _position_write(2, 8, True)], about=about
+    )
+
+    assert [r["outcome"] for r in results] == ["written", "written"]
+    assert results[0]["about_content"]["outcome"] == "dispatch_failed"
+    assert results[1]["about_content"]["outcome"] == "written"
+    assert content_write.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_broker_rejection_of_the_content_is_reported_not_raised():
+    results, _, _ = await _run(
+        _ONE, [_position_write(1, 7, True)],
+        content_write=AsyncMock(side_effect=BrokerClientError("400")),
+    )
+
+    assert results[0]["outcome"] == "written"
+    assert results[0]["about_content"]["outcome"] == "broker_write_failed"
+
+
+@pytest.mark.asyncio
+async def test_legbot_having_nothing_writes_nothing():
+    for answer in ({"insufficient_information": True, "reason": "no results"}, {}, {"description": "  "}):
+        _, _, content_write = await _run(
+            _ONE, [_position_write(1, 7, True)], about=AsyncMock(return_value={"answer": answer, "backend": "claude"})
+        )
+        content_write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_list_answers_are_joined_and_the_broker_is_told_which_fields_it_skipped():
+    about = AsyncMock(return_value=_about_result(policy_focus_areas=["Housing", "Zoning"], website="https://g.example.org"))
+    content_write = AsyncMock(return_value={"id": 7, "written": ["website"], "skipped": ["policy_focus_areas"]})
+    outcome = None
+    with patch(f"{_P}.dispatch_describe_organization", new=about), patch(
+        f"{_P}.write_organization_content", new=content_write
+    ):
+        outcome = await generate_and_store_organization_content(organization_id=7, org_name="G")
+
+    assert content_write.await_args.kwargs["content"]["policy_focus_areas"] == "Housing; Zoning"
+    assert outcome == {"organization_id": 7, "outcome": "written", "written": ["website"]}
+
+
+@pytest.mark.asyncio
+async def test_a_broker_that_does_not_return_the_new_fields_triggers_nothing():
+    """Mixed rollout: ddp-sync ahead of BROKER-204 means no organization_id, so nothing is asked."""
+    old_broker_answer = {"id": 1, "result": "created", "verification_verdict": "confirmed"}
+    results, about, content_write = await _run(_ONE, [old_broker_answer])
+
+    about.assert_not_awaited()
+    content_write.assert_not_awaited()
+    assert results[0]["organization_id"] is None and results[0]["organization_needs_content"] is False
+
+
+@pytest.mark.asyncio
+async def test_all_eight_broker_fields_pass_through_under_their_own_names():
+    fields = {
+        "description": "d", "org_type": "t", "policy_focus_areas": "p", "funding": "f",
+        "affiliates": "a", "website": "https://w.example.org", "email": "e@w.example.org",
+        "contact_page_url": "https://w.example.org/contact",
+    }
+    content_write = AsyncMock(return_value={"id": 7, "written": list(fields), "skipped": []})
+    with patch(
+        f"{_P}.dispatch_describe_organization",
+        new=AsyncMock(return_value=_about_result(**fields, sources=["https://s.invalid"])),
+    ), patch(f"{_P}.write_organization_content", new=content_write):
+        await generate_and_store_organization_content(organization_id=7, org_name="G")
+
+    assert content_write.await_args.kwargs["content"] == fields
