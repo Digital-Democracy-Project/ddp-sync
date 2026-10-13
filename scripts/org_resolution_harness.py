@@ -21,7 +21,10 @@ candidate filters or broker checks):
   (the reviewed organizations plus one stub per case that needs the model), so a real broker is not written to
   by mistake.
   `--limit` scores only a subset: the run is reported INCOMPLETE and exits 1 whatever the subset scores.
-  `--results-out` writes one JSON line per case that scripts/org_resolution_gates.py offline can re-score.
+  `--results-out` writes one JSON line per case that scripts/org_resolution_gates.py offline can re-score
+  (with the same loaded.json); `--report-out` writes the gate result as JSON (seed sha256, seed_version,
+  verdicts_source, scoring_version). A fixture whose group verdicts are not `reviewed` is reported PROVISIONAL
+  and exits 1: it is never a gate result. loaded.json must be a group-aware (version 2) fixture; an old one is refused.
   The model and prompt version of every attempt are recorded by the broker on its attempt rows.
 """
 
@@ -37,7 +40,7 @@ from pathlib import Path
 
 import httpx
 
-from ddp_sync.pipelines.org_resolution_gates import MIN_RECALL
+from ddp_sync.pipelines.org_resolution_gates import MIN_RECALL, Groups
 from ddp_sync.pipelines.org_resolution_harness import run_harness
 
 
@@ -49,6 +52,7 @@ def main() -> int:
     parser.add_argument("--min-recall", type=float, default=MIN_RECALL)
     parser.add_argument("--limit", type=int, default=None, help="Only the first N cases that need the model (smoke run)")
     parser.add_argument("--results-out", help="Write the per-case results as JSONL")
+    parser.add_argument("--report-out", help="Write the gate result (with the fixture's identity) as JSON")
     args = parser.parse_args()
 
     if not args.broker_is_throwaway:
@@ -58,6 +62,10 @@ def main() -> int:
         parser.error("set DDP_EVAL_BROKER_TOKEN to the throwaway broker's service token")
 
     loaded = json.loads(Path(args.loaded).read_text())
+    try:
+        Groups.from_loaded(loaded)  # refuse an old fixture before anything is asked of the broker
+    except ValueError as exc:
+        parser.error(str(exc))
     broker_base = args.broker_base.rstrip("/")
 
     # --broker-is-throwaway is a claim; this is the check. The loader writes `organizations` reviewed
@@ -86,6 +94,8 @@ def main() -> int:
     )
     if args.results_out:
         Path(args.results_out).write_text("\n".join(json.dumps(asdict(r)) for r in run.results) + "\n")
+    if args.report_out:
+        Path(args.report_out).write_text(json.dumps(run.gate(min_recall=args.min_recall).to_dict(), indent=2) + "\n")
     print(run.render(min_recall=args.min_recall))
     return 0 if run.passed(min_recall=args.min_recall) else 1
 
