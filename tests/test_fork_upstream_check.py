@@ -257,10 +257,10 @@ YAML = """
 """
 
 
-def _jobs(flag: bool, yaml_text: str = YAML):
+def _jobs(flag: bool, yaml_text: str = YAML, **extra):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(textwrap.dedent(yaml_text))
-    sched = UpdateScheduler(settings=_settings(fork_upstream_check_enabled=flag), config_path=Path(f.name))
+    sched = UpdateScheduler(settings=_settings(fork_upstream_check_enabled=flag, **extra), config_path=Path(f.name))
     sched.start()
     try:
         return {j.id: j for j in sched.scheduler.get_jobs()}
@@ -275,6 +275,33 @@ async def test_registered_daily_at_0130_utc_when_flag_on():
     fields = {f.name: str(f) for f in job.trigger.fields}
     assert fields["hour"] == "1" and fields["minute"] == "30" and fields["day_of_week"] == "*"
     assert job.max_instances == 1 and str(job.trigger.timezone) == "UTC"
+
+
+@pytest.mark.asyncio
+async def test_registered_even_when_this_host_runs_no_scrapes():
+    # The Mac has OPENSTATES_SCRAPE_ENABLED=false (scraping runs in the cloud); the check must
+    # still switch on there.
+    jobs = _jobs(True, openstates_scrape_enabled=False)
+    assert "fork_upstream_check" in jobs
+    assert "openstates_fl_scrape" not in jobs
+
+
+@pytest.mark.asyncio
+async def test_registered_job_actually_runs_with_the_scrape_config(monkeypatch):
+    # Guards the 2026-10-13 review finding: the wrapper once referenced a variable that only
+    # existed in the old registration method, so it registered fine and died at 01:30 UTC.
+    from ddp_sync.pipelines import fork_upstream_check as mod
+
+    seen = {}
+
+    async def fake_run(config=None):
+        seen["config"] = config
+        return {"success": True}
+
+    monkeypatch.setattr(mod, "run_fork_upstream_check_job", fake_run)
+    job = _jobs(True)["fork_upstream_check"]
+    assert await job.func() == {"success": True}
+    assert seen["config"]["fork_upstream_check"]["sync_time_utc"] == "01:30"
 
 
 @pytest.mark.asyncio

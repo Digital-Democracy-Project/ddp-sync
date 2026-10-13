@@ -319,6 +319,9 @@ class UpdateScheduler:
         # --- OpenStates jurisdiction scrapes ---
         self._register_openstates_scrape_jobs()
 
+        # --- Fork upstream check (independent of whether this host runs scrapes) ---
+        self._register_fork_upstream_check_job()
+
         # --- OpenStates bill-document archive (independent of scrape schedule) ---
         self._register_openstates_archive_jobs()
 
@@ -556,7 +559,6 @@ class UpdateScheduler:
             run_people_pull_job,
             run_people_refresh_job,
         )
-        from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
 
         config = self._sync_config.get("openstates_scrape", {})
         # SYNC-51: env flag ANDs with the existing (shared, checked-in) YAML gate -- applies
@@ -847,9 +849,27 @@ class UpdateScheduler:
             )
             logger.info("openstates_people_pull: registered", sync_time=pull_time)
 
-        # --- fork upstream check (daily) ---
+        self._openstates_cadence = effective
+
+        # --- cadence review (OPEN-140) ---
+        self._register_cadence_review_job(config, startup=is_startup)
+
+    def _remove_job_if_present(self, job_id: str) -> None:
+        try:
+            self.scheduler.remove_job(job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError variant
+            pass
+
+    def _register_fork_upstream_check_job(self) -> None:
+        """Daily fork-vs-upstream gap check. Deliberately NOT inside
+        _register_openstates_scrape_jobs: that method returns early when this host's scrapes are
+        off (OPENSTATES_SCRAPE_ENABLED=false, as on the Mac now that scraping runs in the cloud),
+        and the check must still be switchable on there."""
+        from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
+
         # Default-off per-host flag ANDed with the shared YAML gate, like the people pull above.
         # Runs well before the 03:00 people pull and the 04:00 chain; it only measures and alerts.
+        config = self._sync_config.get("openstates_scrape", {})
         fork_cfg = config.get("fork_upstream_check", {})
         if self.settings.fork_upstream_check_enabled and fork_cfg.get("enabled", True):
             fork_time = fork_cfg.get("sync_time_utc", "01:30")
@@ -869,17 +889,6 @@ class UpdateScheduler:
                 misfire_grace_time=3600,
             )
             logger.info("fork_upstream_check: registered", sync_time=fork_time)
-
-        self._openstates_cadence = effective
-
-        # --- cadence review (OPEN-140) ---
-        self._register_cadence_review_job(config, startup=is_startup)
-
-    def _remove_job_if_present(self, job_id: str) -> None:
-        try:
-            self.scheduler.remove_job(job_id)
-        except Exception:  # noqa: BLE001 — JobLookupError variant
-            pass
 
     def _add_job_replacing(self, func, **kwargs) -> None:
         """add_job that is idempotent whether or not the scheduler has started.
