@@ -785,3 +785,20 @@ async def test_a_broker_that_does_not_return_the_new_fields_triggers_nothing():
     about.assert_not_awaited()
     content_write.assert_not_awaited()
     assert results[0]["organization_id"] is None and results[0]["organization_needs_content"] is False
+
+
+@pytest.mark.asyncio
+async def test_all_eight_broker_fields_pass_through_under_their_own_names():
+    fields = {
+        "description": "d", "org_type": "t", "policy_focus_areas": "p", "funding": "f",
+        "affiliates": "a", "website": "https://w.example.org", "email": "e@w.example.org",
+        "contact_page_url": "https://w.example.org/contact",
+    }
+    content_write = AsyncMock(return_value={"id": 7, "written": list(fields), "skipped": []})
+    with patch(
+        f"{_P}.dispatch_describe_organization",
+        new=AsyncMock(return_value=_about_result(**fields, sources=["https://s.invalid"])),
+    ), patch(f"{_P}.write_organization_content", new=content_write):
+        await generate_and_store_organization_content(organization_id=7, org_name="G")
+
+    assert content_write.await_args.kwargs["content"] == fields
