@@ -76,6 +76,17 @@ def test_exact_cases_are_reported_but_not_counted_in_recall():
     assert report.passed and (report.exact_cases, report.exact_correct) == (2, 0) and report.recall == 1.0
 
 
+def test_malformed_cases_and_duplicate_attempts_are_rejected_not_scored():
+    with pytest.raises(ValueError):
+        CaseResult("x", "positve", 1, 1)           # a typo in the kind would drop out of recall
+    with pytest.raises(ValueError):
+        CaseResult("x", POSITIVE, None, None)      # a positive needs an expected organization
+    with pytest.raises(ValueError):
+        CaseResult("x", NEGATIVE, 5, None)         # a negative must not have one
+    with pytest.raises(ValueError):
+        evaluate_shadow_gate([Attempt(1, 5), Attempt(1, 6)], {1: "right"})
+
+
 def test_an_empty_run_or_a_run_without_positives_cannot_pass():
     assert not evaluate_offline_gate([]).passed
     assert not evaluate_offline_gate([CaseResult("n", NEGATIVE, None, None)]).passed

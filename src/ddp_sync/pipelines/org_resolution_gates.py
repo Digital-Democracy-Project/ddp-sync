@@ -46,6 +46,13 @@ class CaseResult:
     tier: str = "none"
     held_out: bool = False
 
+    def __post_init__(self):
+        # A malformed label must not quietly drop out of the recall denominator.
+        if self.kind not in (POSITIVE, NEGATIVE, EXACT):
+            raise ValueError(f"case {self.case_id}: unknown kind {self.kind!r}")
+        if (self.kind == NEGATIVE) != (self.expected_org_id is None):
+            raise ValueError(f"case {self.case_id}: a negative has no expected organization, the others need one")
+
     @property
     def is_wrong(self) -> bool:
         return self.answered_org_id is not None and self.answered_org_id != self.expected_org_id
@@ -154,6 +161,9 @@ def evaluate_shadow_gate(
 ) -> ShadowGateReport:
     """Score suggest-mode traffic. `reviews` maps attempt id to a person's verdict, "right" or "wrong";
     any other value counts as not yet reviewed."""
+    ids = [a.attempt_id for a in attempts]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate attempt ids: one review could cover several suggestions")
     eligible = [a for a in attempts if a.eligible]
     non_null = [a for a in eligible if a.choice is not None]
     awaiting = [a for a in non_null if reviews.get(a.attempt_id) not in ("right", "wrong")]
