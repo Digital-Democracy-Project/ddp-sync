@@ -342,6 +342,38 @@ async def dispatch_describe_organization(
     )
 
 
+async def dispatch_resolve_organization(
+    org_name: str,
+    candidates: list[dict],
+    *,
+    citation_url: str = "",
+    citation_excerpt: str = "",
+    timeout_seconds: float | None = None,
+) -> dict:
+    """Dispatch a resolve_organization task to LegBot and return its structured answer (SYNC-97).
+
+    LegBot chooses which of `candidates` (existing organizations: id, name, aliases, website, parent,
+    chapters) is the same real-world organization as `org_name`, or answers null. The question type is
+    AGENTS-112's. The answer is {"choice": <candidate id> | None, "reason": <str>} and may carry a
+    `prompt_version`.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "org_name": org_name,
+            "citation_url": citation_url,
+            "citation_excerpt": citation_excerpt,
+            "candidates": candidates,
+            "question_type": "resolve_organization",
+            "caller": "ddp_sync",
+        },
+        question_type="resolve_organization",
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _dispatch_and_await(
     payload: dict,
     *,

@@ -604,6 +604,106 @@ async def write_organization_content(
     return result
 
 
+async def _post_organization_resolution(
+    path: str,
+    payload: dict,
+    *,
+    what: str,
+    broker_api_base: str | None,
+    broker_api_token: str | None,
+) -> dict:
+    """POST one organization-resolution call (SYNC-97 / BROKER-191) and return its JSON body.
+
+    Raises BrokerClientError for a missing base URL, an unreachable broker or any status >= 400, so a
+    caller can treat every failure the same way (the resolve step never blocks publication).
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError(f"DDP_BROKER_API_BASE is not configured — cannot {what}.")
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{resolved_api_base}/api/organization-resolution/{path}",
+                headers={"Authorization": f"Bearer {resolved_api_token}"},
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+    if resp.status_code >= 400:
+        raise BrokerClientError(f"ddp-broker-py rejected the {what} ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
+async def get_organization_resolution_shortlist(
+    *,
+    position_id: int,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Open a resolution attempt for one position and get its shortlist (SYNC-97 / BROKER-191).
+
+    The broker decides eligibility (a verified position whose organization is a pipeline-created stub
+    and that has not been resolved before) and creates the attempt record.
+
+    Returns:
+        {"attempt_id": <int> | None, "candidates": [{"id", "name", "aliases", "website", "parent",
+        "chapters"}, ...]}; `attempt_id` is None when the position is not eligible.
+    """
+    return await _post_organization_resolution(
+        "shortlist/",
+        {"position_id": position_id},
+        what="organization shortlist request",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
+async def report_organization_resolution_answer(
+    *,
+    attempt_id: int,
+    model: str | None,
+    resolver_prompt_rev: str | None,
+    choice: int | None,
+    reason: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Report the model's answer to an attempt, once (SYNC-97 / BROKER-191). `choice` is a candidate
+    organization id or None."""
+    return await _post_organization_resolution(
+        f"attempts/{attempt_id}/answer/",
+        {"model": model, "prompt_version": resolver_prompt_rev, "choice": choice, "reason": reason},
+        what="organization resolution answer",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
+async def request_organization_resolution_act(
+    *,
+    attempt_id: int,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Ask the broker to apply an attempt's recorded answer (SYNC-97 / BROKER-191), by attempt id.
+
+    The broker may refuse (its own act setting is off by default, among other checks); a refusal is a
+    normal 200 answer, not an error.
+
+    Returns:
+        {"acted": <bool>, "reason": <str>, "organization_id": <int> | None}.
+    """
+    return await _post_organization_resolution(
+        f"attempts/{attempt_id}/act/",
+        {},
+        what="organization resolution act request",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
 async def get_latest_bill_version(
     bill_openstates_id: str,
     *,

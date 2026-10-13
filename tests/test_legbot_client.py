@@ -16,6 +16,7 @@ from ddp_sync.services.legbot_client import (
     dispatch_bill_changelog,
     dispatch_bill_position_verification,
     dispatch_describe_organization,
+    dispatch_resolve_organization,
     dispatch_bill_question,
 )
 
@@ -1035,5 +1036,37 @@ async def test_describe_organization_sends_the_organization_name(tmp_path):
     assert mock_client.post.await_args.kwargs["json"]["payload"] == {
         "org_name": "Sierra Club",
         "question_type": "describe_organization",
+        "caller": "ddp_sync",
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_organization_sends_the_name_the_citation_and_the_candidates(tmp_path):
+    """SYNC-97: the payload carries what the model needs to choose among the candidates."""
+    task_id = "resolve123"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"choice": 41, "reason": "same group"}
+    (artifacts_dir / task_id / "task_result.json").write_text(json.dumps({"answer": answer, "backend": "claude"}))
+    candidates = [{"id": 41, "name": "Example Association", "aliases": [], "website": "", "parent": None, "chapters": []}]
+
+    mock_client = _mock_client(statuses=["queued", "completed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        result = await dispatch_resolve_organization(
+            "Example Assn", candidates, citation_url="https://a.invalid", citation_excerpt="Example Assn opposes."
+        )
+
+    assert result == {"answer": answer, "backend": "claude"}
+    assert mock_client.post.await_args.kwargs["json"]["payload"] == {
+        "org_name": "Example Assn",
+        "citation_url": "https://a.invalid",
+        "citation_excerpt": "Example Assn opposes.",
+        "candidates": candidates,
+        "question_type": "resolve_organization",
         "caller": "ddp_sync",
     }

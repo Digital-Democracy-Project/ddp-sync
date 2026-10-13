@@ -490,3 +490,16 @@ def test_a_blank_env_var_overrides_a_secret_supplied_limit(monkeypatch):
     finally:
         get_settings.cache_clear()
 
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(None, "off"), ("suggest", "suggest"), (" ACT ", "act"), ("off", "off"), ("on", "off"), ("", "off")],
+)
+def test_organization_resolution_mode_is_off_unless_a_known_value_is_set(monkeypatch, value, expected):
+    """SYNC-97: a typo must fall back to the safe value, never to act."""
+    if value is None:
+        monkeypatch.delenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", raising=False)
+    else:
+        monkeypatch.setenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", value)
+    assert _load_from_env()["organization_resolution_mode"] == expected

@@ -282,7 +282,7 @@ async def test_truncates_to_cap_and_logs():
     ]
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research.get_settings",
-        return_value=SimpleNamespace(org_research_max_organizations=test_cap, organization_content_enabled=False),
+        return_value=SimpleNamespace(org_research_max_organizations=test_cap, organization_resolution_mode="off", organization_content_enabled=False),
     ), patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(return_value=_find_result(many_positions)),
@@ -660,7 +660,7 @@ async def _run(positions, writes, *, enabled=True, about=None, content_write=Non
     )
     with patch(
         f"{_P}.get_settings",
-        return_value=SimpleNamespace(org_research_max_organizations=500, organization_content_enabled=enabled),
+        return_value=SimpleNamespace(org_research_max_organizations=500, organization_resolution_mode="off", organization_content_enabled=enabled),
     ), patch(f"{_P}.dispatch_bill_question", new=AsyncMock(return_value=_find_result(positions))), patch(
         f"{_P}.dispatch_bill_position_verification", new=AsyncMock(return_value=_verify_result())
     ), patch(f"{_P}.write_bill_organization_position", new=AsyncMock(side_effect=writes)), patch(
@@ -802,3 +802,204 @@ async def test_all_eight_broker_fields_pass_through_under_their_own_names():
         await generate_and_store_organization_content(organization_id=7, org_name="G")
 
     assert content_write.await_args.kwargs["content"] == fields
+
+
+# ---------------------------------------------------------------------------
+# SYNC-97: the resolve step
+# ---------------------------------------------------------------------------
+
+_CANDIDATES = [
+    {"id": 41, "name": "Example Teachers Association", "aliases": [], "website": "", "parent": None, "chapters": []},
+    {"id": 42, "name": "Example Teachers Association of Ohio", "aliases": [], "website": "", "parent": 41, "chapters": []},
+]
+
+
+def _shortlist(attempt_id=900, candidates=None):
+    return {"attempt_id": attempt_id, "candidates": _CANDIDATES if candidates is None else candidates}
+
+
+def _answer(choice, reason="same organization", backend="claude", **extra):
+    return {"answer": {"choice": choice, "reason": reason, **extra}, "backend": backend}
+
+
+async def _run_resolve(
+    *, mode="suggest", shortlist=None, answer=None, act=None, writes=None, about_enabled=False,
+    positions=None, report=None,
+):
+    shortlist = shortlist or AsyncMock(return_value=_shortlist())
+    answer = answer or AsyncMock(return_value=_answer(None))
+    report = report or AsyncMock(return_value={})
+    act = act or AsyncMock(return_value={"acted": False, "reason": "act mode is off", "organization_id": None})
+    about = AsyncMock(return_value=_about_result(description="A group."))
+    with patch(
+        f"{_P}.get_settings",
+        return_value=SimpleNamespace(
+            org_research_max_organizations=500, organization_resolution_mode=mode,
+            organization_content_enabled=about_enabled,
+        ),
+    ), patch(
+        f"{_P}.dispatch_bill_question", new=AsyncMock(return_value=_find_result(positions or _ONE))
+    ), patch(
+        f"{_P}.dispatch_bill_position_verification", new=AsyncMock(return_value=_verify_result())
+    ), patch(
+        f"{_P}.write_bill_organization_position",
+        new=AsyncMock(side_effect=writes or [_position_write(1, 7, True)]),
+    ), patch(f"{_P}.get_organization_resolution_shortlist", new=shortlist), patch(
+        f"{_P}.dispatch_resolve_organization", new=answer
+    ), patch(f"{_P}.report_organization_resolution_answer", new=report), patch(
+        f"{_P}.request_organization_resolution_act", new=act
+    ), patch(f"{_P}.dispatch_describe_organization", new=about), patch(
+        f"{_P}.write_organization_content", new=AsyncMock(return_value={"id": 7, "written": ["description"], "skipped": []})
+    ):
+        results = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
+    return results, shortlist, answer, report, act, about
+
+
+@pytest.mark.asyncio
+async def test_suggest_mode_records_the_answer_once_and_never_calls_the_act_endpoint():
+    results, shortlist, answer, report, act, _ = await _run_resolve(
+        mode="suggest", answer=AsyncMock(return_value=_answer(41, prompt_version="v1"))
+    )
+
+    shortlist.assert_awaited_once()
+    assert shortlist.await_args.kwargs["position_id"] == 1
+    assert answer.await_args.args == ("New Group", _CANDIDATES)
+    assert answer.await_args.kwargs["citation_url"] == "https://a.invalid"
+    report.assert_awaited_once()
+    assert report.await_args.kwargs == {
+        "attempt_id": 900, "model": "claude", "resolver_prompt_rev": "v1", "choice": 41,
+        "reason": "same organization", "broker_api_base": None, "broker_api_token": None,
+    }
+    act.assert_not_awaited()
+    assert results[0]["resolution"]["outcome"] == "suggested"
+    assert results[0]["position_id"] == 1  # the position is still there, as published
+
+
+@pytest.mark.asyncio
+async def test_act_mode_asks_the_broker_to_act_by_attempt_id_for_a_non_null_answer():
+    act = AsyncMock(return_value={"acted": True, "reason": "", "organization_id": 41})
+    results, _, _, report, act, about = await _run_resolve(
+        mode="act", answer=AsyncMock(return_value=_answer(41)), act=act, about_enabled=True
+    )
+
+    report.assert_awaited_once()
+    act.assert_awaited_once()
+    assert act.await_args.kwargs["attempt_id"] == 900
+    assert results[0]["resolution"]["outcome"] == "acted"
+    assert results[0]["organization_id"] == 41
+    about.assert_not_awaited()  # the position now belongs to a reviewed organization
+
+
+@pytest.mark.asyncio
+async def test_act_mode_does_not_act_on_a_null_answer():
+    results, _, _, report, act, _ = await _run_resolve(mode="act", answer=AsyncMock(return_value=_answer(None)))
+
+    report.assert_awaited_once()
+    act.assert_not_awaited()
+    assert results[0]["resolution"]["outcome"] == "null_answer"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_act_request_is_a_normal_outcome():
+    results, *_ = await _run_resolve(mode="act", answer=AsyncMock(return_value=_answer(41)))
+
+    assert results[0]["resolution"]["outcome"] == "act_refused"
+    assert results[0]["organization_id"] == 7  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_a_choice_outside_the_shortlist_is_reported_as_null_and_never_acted_on():
+    results, _, _, report, act, _ = await _run_resolve(mode="act", answer=AsyncMock(return_value=_answer(999)))
+
+    assert report.await_args.kwargs["choice"] is None
+    assert "999" in report.await_args.kwargs["reason"]
+    act.assert_not_awaited()
+    assert results[0]["resolution"]["outcome"] == "null_answer"
+
+
+@pytest.mark.asyncio
+async def test_an_ineligible_position_asks_nothing():
+    results, _, answer, report, act, _ = await _run_resolve(
+        shortlist=AsyncMock(return_value={"attempt_id": None, "candidates": []})
+    )
+
+    answer.assert_not_awaited()
+    report.assert_not_awaited()
+    act.assert_not_awaited()
+    assert results[0]["resolution"]["outcome"] == "not_eligible"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_shortlist_completes_the_attempt_without_asking_the_model():
+    results, _, answer, report, _, _ = await _run_resolve(shortlist=AsyncMock(return_value=_shortlist(candidates=[])))
+
+    answer.assert_not_awaited()
+    assert report.await_args.kwargs["choice"] is None
+    assert results[0]["resolution"]["outcome"] == "no_candidates"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs, outcome, reported",
+    [
+        ({"shortlist": AsyncMock(side_effect=BrokerClientError("404"))}, "shortlist_failed", False),
+        ({"answer": AsyncMock(side_effect=LegBotDispatchError("timeout"))}, "dispatch_failed", False),
+        ({"answer": AsyncMock(return_value=_answer(41)), "report": AsyncMock(side_effect=BrokerClientError("409"))},
+         "report_failed", True),
+    ],
+)
+async def test_a_failure_leaves_the_stub_and_the_position_is_still_returned(kwargs, outcome, reported):
+    results, _, _, report, act, _ = await _run_resolve(mode="act", **kwargs)
+
+    assert results[0]["resolution"]["outcome"] == outcome
+    assert results[0]["position_id"] == 1 and results[0]["organization_id"] == 7
+    act.assert_not_awaited()
+    assert report.await_count == (1 if reported else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_act_request_leaves_the_stub():
+    results, *_ = await _run_resolve(
+        mode="act", answer=AsyncMock(return_value=_answer(41)),
+        act=AsyncMock(side_effect=BrokerClientError("500")),
+    )
+
+    assert results[0]["resolution"]["outcome"] == "act_failed"
+    assert results[0]["organization_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_the_step_does_not_fail_the_bill():
+    results, *_ = await _run_resolve(shortlist=AsyncMock(side_effect=RuntimeError("boom")))
+
+    assert results[0]["position_id"] == 1
+    assert results[0]["resolution"]["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_the_step_is_off_by_default_and_asks_nothing():
+    results, shortlist, answer, report, act, _ = await _run_resolve(mode="off")
+
+    for mock in (shortlist, answer, report, act):
+        mock.assert_not_awaited()
+    assert "resolution" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_only_newly_created_confirmed_positions_are_resolved():
+    unconfirmed = _position_write(1, 7, True, verdict="not_confirmed")
+    existing = {**_position_write(2, 8, True), "result": "updated"}
+    for write in (unconfirmed, existing):
+        results, shortlist, *_ = await _run_resolve(writes=[write])
+        shortlist.assert_not_awaited()
+        assert "resolution" not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_makes_a_new_attempt():
+    shortlist = AsyncMock(side_effect=[_shortlist(attempt_id=900), _shortlist(attempt_id=901)])
+    _, _, _, report1, *_ = await _run_resolve(shortlist=shortlist)
+    _, _, _, report2, *_ = await _run_resolve(shortlist=shortlist)
+
+    assert report1.await_args.kwargs["attempt_id"] == 900
+    assert report2.await_args.kwargs["attempt_id"] == 901
