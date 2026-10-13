@@ -1155,6 +1155,134 @@ async def test_version_transitions_none_when_no_local_api_base_configured():
     assert result is None
 
 
+# ---------------------------------------------------------------------------
+# SYNC-110: a transition's old side is the version its diff was taken against
+# ---------------------------------------------------------------------------
+
+_DIFF = "--- \n+++ \n@@ -1 +1 @@\n-a\n+b"
+
+
+def _ver(note, *, diff=None, text=True, media_type=None, date=""):
+    """One entry of api-v3's `versions` array. `diff=None` omits the key, as
+    api-v3 does (response_model_exclude_none); `diff=""` is kept ("identical")."""
+    link = {"url": f"https://x/{note}"}
+    if media_type is not None:
+        link["media_type"] = media_type
+    if text:
+        link["raw_text"] = f"text of {note}"
+    version = {"note": note, "date": date, "links": [link]}
+    if diff is not None:
+        version["diff_from_previous_version"] = diff
+    return version
+
+
+async def _transitions_for(versions):
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"versions": versions}
+    mock_client.get = AsyncMock(return_value=response)
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), _patch_async_client(mock_client):
+        result = await get_archived_version_transitions("some-uuid")
+    return None if result is None else [
+        (t["old_version_note"], t["new_version_note"], t["old_bill_source"])
+        for t in result["transitions"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_old_side_skips_a_version_outside_the_diff_lineage():
+    """Utah: an excluded short document (no diff, but not the lineage's first
+    document either) sits between two real drafts. The later draft's diff was
+    taken against the earlier real draft, so that is its old side -- not the
+    excerpt right before it in the array."""
+    result = await _transitions_for([
+        _ver("Introduced"),
+        _ver("Substitute #1", diff=_DIFF),
+        _ver("House Amendment 1"),            # excluded: no diff, never a baseline
+        _ver("Substitute #2", diff=_DIFF),
+    ])
+    assert result == [
+        ("Introduced", "Substitute #1", "text of Introduced"),
+        ("Substitute #1", "Substitute #2", "text of Substitute #1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_old_side_is_the_first_document_when_excluded_ones_precede_the_first_diff():
+    """The lineage's first document has no diff either, so with nothing before
+    the first diff but excluded documents and that first document, the old side
+    is the first version with archived text."""
+    result = await _transitions_for([
+        _ver("Introduced"),
+        _ver("Comparison to Original Bill"),  # excluded
+        _ver("House Amendment 1"),            # excluded
+        _ver("Substitute #1", diff=_DIFF),
+    ])
+    assert result == [("Introduced", "Substitute #1", "text of Introduced")]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_diff_still_marks_a_version_as_part_of_the_lineage():
+    """`""` means the text was identical to its baseline -- the version is in
+    the lineage (and is the baseline for the next one), it just has nothing to
+    say, so no changelog is made for it."""
+    result = await _transitions_for([
+        _ver("Introduced"),
+        _ver("Substitute #1", diff=""),
+        _ver("House Amendment 1"),
+        _ver("Substitute #2", diff=_DIFF),
+    ])
+    assert result == [("Substitute #1", "Substitute #2", "text of Substitute #1")]
+
+
+@pytest.mark.asyncio
+async def test_unknown_stage_entries_without_link_text_are_never_a_baseline():
+    """api-v3 puts unknown-stage versions first and gives them no link-level
+    raw_text (only archived_raw_text), so they cannot be picked."""
+    unknown = _ver("Mystery note", text=False)
+    unknown["archived_raw_text"] = "text api-v3 keeps outside the links"
+    result = await _transitions_for([
+        unknown,
+        _ver("Introduced"),
+        _ver("Substitute #1", diff=_DIFF),
+    ])
+    assert result == [("Introduced", "Substitute #1", "text of Introduced")]
+
+
+@pytest.mark.asyncio
+async def test_a_pair_whose_documents_are_of_different_media_types_is_skipped():
+    """The archiver diffs each media type against its own earlier documents and
+    api-v3 returns one document per version, so when the baseline's returned
+    document is of another type the true baseline's text is not available."""
+    result = await _transitions_for([
+        _ver("Introduced", media_type="text/xml"),
+        _ver("Substitute #1", diff=_DIFF, media_type="application/pdf"),
+    ])
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_a_pair_with_the_same_media_type_is_kept():
+    result = await _transitions_for([
+        _ver("Introduced", media_type="text/xml"),
+        _ver("Substitute #1", diff=_DIFF, media_type="text/xml"),
+    ])
+    assert result == [("Introduced", "Substitute #1", "text of Introduced")]
+
+
+@pytest.mark.asyncio
+async def test_no_baseline_with_archived_text_means_no_transition():
+    result = await _transitions_for([
+        _ver("Introduced", text=False),
+        _ver("Substitute #1", diff=_DIFF),
+    ])
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_current_version_identity_picks_latest_and_title():
     mock_client = AsyncMock()

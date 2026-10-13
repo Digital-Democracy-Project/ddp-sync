@@ -402,10 +402,12 @@ async def _changelog_fully_covered(
     getting it wrong would make a partially-covered bill look done and the fix
     inert). Two contracts combine:
 
-    * ``get_archived_version_transitions`` walks **consecutive pairs of api-v3's
-      own array** and keeps only pairs api-v3 already attached a diff to. It
-      never classifies a stage itself. api-v3 orders that array unknown-stage
-      entries first, then classifiable versions chronologically.
+    * ``get_archived_version_transitions`` walks **api-v3's own array** and
+      makes a transition for each version api-v3 already attached a diff to
+      (its old side is the version that diff was taken against, SYNC-110, not
+      always the entry before it; that does not change which versions are
+      targets). It never classifies a stage itself. api-v3 orders that array
+      unknown-stage entries first, then classifiable versions chronologically.
     * openstates-core gives an unknown-stage version
       ``diff_from_previous_version=None`` unconditionally -- it "never updates or
       reads a baseline at all" (``archive_bill_versions``). So no unclassified

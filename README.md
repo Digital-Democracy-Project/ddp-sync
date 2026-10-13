@@ -340,6 +340,25 @@ simply undiffed) didn't match the last transition's target ("Substitute #2"). Fi
 caller — instead. A genuinely stale caller (a requested version absent from the bill's archived list
 entirely) still raises and still writes nothing, unchanged.
 
+**Updated 2026-10-13 (SYNC-110): a transition's *old* version is the one its diff was taken against, not
+the entry before it in api-v3's array.** The walk used to pair each version with `versions[i - 1]`. But
+openstates-core keeps some documents out of the diff lineage (a short procedural document, OPEN-224/246):
+they get no diff and are never the baseline for the next version, so the entry before a version can be
+one its diff was never computed against. The old text sent to LegBot, and the `compare_version` recorded
+on the artifact, were then those of the wrong document. The old side is now the nearest earlier version
+that carries a diff (`""` counts: identical text), or, with none, the first version with archived text
+(`_diff_baseline_index`, `services/local_openstates_client.py`). api-v3 does not return the baseline, so
+this is read off what it does return; nothing is classified or re-ordered here. Replaying the archiver
+read-only over the stored documents (21,804 transitions, VA/FL/WA/MI/AL/AZ/US plus a Utah what-if) the
+old rule was wrong for 131 of Virginia's 3,184 transitions and for about half of Utah's once its redline
+and excerpt documents are excluded; this rule named the true baseline every time except one Michigan
+transition. A pair whose two returned documents are of different media types is skipped
+(`bill_changelog_transition_skipped_media_type_mismatch`): the archiver diffs each media type against its
+own earlier documents (OPEN-217) and api-v3 returns one document per version, so that baseline's text is
+not available. Not fixed here: bills whose versions share a sort key (Utah's "Comparison to Sub #N" and
+"Substitute #N" are one, 491 of 1,021 Utah bills), whose lineage order the archiver took from the
+database's unspecified row order.
+
 **Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
 **blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and
 `ensure_bill_exists()` has run — the latest point it can start, since both can still return early —
