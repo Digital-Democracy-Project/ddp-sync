@@ -286,7 +286,8 @@ async def resolve_organization_for_position(
     may change. Steps: the broker opens an attempt and returns a shortlist of existing organizations;
     LegBot chooses one or answers null; the answer is reported to the attempt once; only in `act` mode,
     and only for a non-null answer, the broker is asked to apply it by attempt id (it may refuse).
-    Every failure leaves the stub exactly as it is and never raises.
+    Every failure leaves the stub exactly as it is and never raises. "Never blocks publication" means
+    the position row is already written before this runs, so nothing here can undo or hold it back.
 
     Returns {"position_id", "attempt_id", "outcome", "choice", "organization_id"}; outcome is one of
     "not_eligible", "no_candidates", "null_answer", "suggested", "acted", "act_refused",
@@ -352,8 +353,8 @@ async def resolve_organization_for_position(
     answer = result["answer"]
     choice = answer.get("choice")
     reason = str(answer.get("reason") or "")
-    if choice is not None and (
-        isinstance(choice, bool) or choice not in {candidate.get("id") for candidate in candidates}
+    if choice is not None and not (
+        type(choice) is int and choice in {candidate.get("id") for candidate in candidates}
     ):
         # An invalid answer is the same as null: the model only chooses among the candidates.
         reason = f"invalid choice {choice!r} (not in the shortlist); {reason}"

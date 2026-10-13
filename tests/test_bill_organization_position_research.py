@@ -918,6 +918,16 @@ async def test_a_choice_outside_the_shortlist_is_reported_as_null_and_never_acte
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_choice", [[41], "41", True, 41.0])
+async def test_a_malformed_choice_is_reported_as_null_and_never_reaches_the_act_endpoint(bad_choice):
+    results, _, _, report, act, _ = await _run_resolve(mode="act", answer=AsyncMock(return_value=_answer(bad_choice)))
+
+    assert report.await_args.kwargs["choice"] is None
+    act.assert_not_awaited()
+    assert results[0]["resolution"]["outcome"] == "null_answer"
+
+
+@pytest.mark.asyncio
 async def test_an_ineligible_position_asks_nothing():
     results, _, answer, report, act, _ = await _run_resolve(
         shortlist=AsyncMock(return_value={"attempt_id": None, "candidates": []})
