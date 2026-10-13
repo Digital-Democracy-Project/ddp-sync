@@ -121,11 +121,11 @@ YAML = """
 """
 
 
-def _jobs(flag: bool, yaml_text: str = YAML):
+def _jobs(flag: bool, yaml_text: str = YAML, **extra):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(textwrap.dedent(yaml_text))
     sched = UpdateScheduler(
-        settings=_settings(openstates_people_pull_enabled=flag), config_path=Path(f.name)
+        settings=_settings(openstates_people_pull_enabled=flag, **extra), config_path=Path(f.name)
     )
     sched.start()
     try:
@@ -142,6 +142,29 @@ async def test_registered_daily_at_0300_utc_when_flag_on():
     assert fields["hour"] == "3" and fields["minute"] == "0" and fields["day_of_week"] == "*"
     assert job.misfire_grace_time == 3600 and job.max_instances == 1
     assert str(job.trigger.timezone) == "UTC"
+
+
+@pytest.mark.asyncio
+async def test_registered_even_when_this_host_runs_no_scrapes():
+    # SYNC-108: the Mac has OPENSTATES_SCRAPE_ENABLED=false; the pull must still register there.
+    assert "openstates_people_pull" in _jobs(True, openstates_scrape_enabled=False)
+
+
+@pytest.mark.asyncio
+async def test_registered_job_actually_runs_with_the_scrape_config(monkeypatch):
+    # The wrapper once lost a variable in a move like this one (fork check, 2026-10-13).
+    from ddp_sync.pipelines import openstates_scrape as mod
+
+    seen = {}
+
+    async def fake_run(config=None):
+        seen["config"] = config
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "run_people_pull_job", fake_run)
+    job = _jobs(True, openstates_scrape_enabled=False)["openstates_people_pull"]
+    assert await job.func() == {"ok": True}
+    assert seen["config"]["people_pull"]["sync_time_utc"] == "03:00"
 
 
 @pytest.mark.asyncio
