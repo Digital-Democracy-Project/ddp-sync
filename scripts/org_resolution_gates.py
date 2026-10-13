@@ -60,9 +60,15 @@ def main() -> int:
             parser.error(str(exc))
         cases = {case["case_id"]: case for case in loaded["cases"]}
         rows = _read_jsonl(args.results)
-        unknown = [row["case_id"] for row in rows if row["case_id"] not in cases]
-        if unknown:
-            parser.error(f"results for cases that are not in {args.loaded}: {unknown[:5]}")
+        ids = [row["case_id"] for row in rows]
+        unknown, missing = [i for i in ids if i not in cases], [i for i in cases if i not in set(ids)]
+        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        if unknown or missing or duplicated:
+            # Scoring a subset would hide wrong matches or misses, so the results must be exactly the fixture's cases.
+            parser.error(
+                f"results do not match the cases in {args.loaded}: {len(unknown)} unknown {unknown[:3]}, "
+                f"{len(missing)} missing {missing[:3]}, {len(duplicated)} duplicated {duplicated[:3]}"
+            )
         report = evaluate_offline_gate(
             [groups.result(cases[row["case_id"]], answered_org_id=row["answered_org_id"], tier=row.get("tier", "none"))
              for row in rows],

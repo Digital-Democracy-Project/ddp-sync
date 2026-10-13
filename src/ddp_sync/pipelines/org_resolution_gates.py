@@ -31,6 +31,7 @@ MIN_ELIGIBLE = 200
 MIN_NON_NULL = 30
 
 POSITIVE, NEGATIVE, EXACT = "positive", "negative", "exact"
+_UNMAPPED = "unmapped:"  # the group label of an answered record the fixture does not know (never a real group)
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ class Groups:
                 "organization id): rebuild the seed and loaded.json with the group-aware seed (BROKER-206) "
                 "before scoring"
             )
+        cls._check_fixture(loaded)
         stubs = loaded.get("stub_org_ids")
         return cls(
             org_groups={str(k): v for k, v in loaded["org_groups"].items()},
@@ -117,6 +119,31 @@ class Groups:
             stub_org_ids=frozenset(stubs) if stubs is not None else None,
         )
 
+    @staticmethod
+    def _check_fixture(loaded: dict) -> None:
+        """A malformed version 2 file can turn wrong matches into correct ones, so it is refused at load rather
+        than scored through a fallback: every group is a plain string (and none can collide with the label an
+        unmapped answer gets), case ids are unique, and each case's expected group is the group its expected
+        organization is actually in."""
+        org_groups = loaded["org_groups"]
+        bad = [k for k, v in org_groups.items() if not isinstance(v, str) or not v or v.startswith(_UNMAPPED)]
+        if bad:
+            raise ValueError(f"loaded.json: org_groups has an empty, non-text or reserved group for organizations {bad[:5]}")
+        seen: set[str] = set()
+        for case in loaded.get("cases", []):
+            cid, org_id, group = case["case_id"], case.get("expected_org_id"), case.get("expected_group_id")
+            if cid in seen:
+                raise ValueError(f"loaded.json: case {cid} appears twice")
+            seen.add(cid)
+            if org_id is None:
+                if group is not None:
+                    raise ValueError(f"loaded.json: case {cid} expects no organization but names group {group!r}")
+            elif org_groups.get(str(org_id)) != group or group is None:
+                raise ValueError(
+                    f"loaded.json: case {cid} expects organization {org_id} in group {group!r}, but org_groups "
+                    f"puts that organization in {org_groups.get(str(org_id))!r}"
+                )
+
     def is_stub(self, org_id: int) -> bool:
         """The loader lists the stubs when it can; otherwise rely on its creation order: the reviewed organizations
         take the first `organizations` ids of the fresh scratch database and the per-case stubs come after."""
@@ -126,7 +153,7 @@ class Groups:
 
     def group_of(self, org_id: int) -> str:
         # An id outside the map cannot equal a real group, so it scores as a wrong match.
-        return self.org_groups.get(str(org_id), f"unmapped:{org_id}")
+        return self.org_groups.get(str(org_id), f"{_UNMAPPED}{org_id}")
 
     def result(self, case: dict, *, answered_org_id: int | None, tier: str) -> CaseResult:
         return CaseResult(

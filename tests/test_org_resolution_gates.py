@@ -196,14 +196,27 @@ def test_the_command_passes_when_another_record_of_the_right_organization_is_cho
 
 
 def test_the_command_refuses_an_old_fixture_and_results_for_unknown_cases(tmp_path):
-    rows = [{"case_id": "p1", "answered_org_id": 1, "tier": "model"}]
+    rows = [{"case_id": "p1", "answered_org_id": 1, "tier": "model"}, {"case_id": "n1", "answered_org_id": None}]
     old = {k: v for k, v in _loaded().items() if k not in ("org_groups", "seed_version")}
 
     refused = _run_command(tmp_path, rows, old)
-    unknown = _run_command(tmp_path, [{"case_id": "zzz", "answered_org_id": 1}], _loaded())
+    unknown = _run_command(tmp_path, [*rows, {"case_id": "zzz", "answered_org_id": 1}], _loaded())
 
     assert refused.returncode == 2 and "no org_groups" in refused.stderr and "BROKER-206" in refused.stderr
     assert unknown.returncode == 2 and "zzz" in unknown.stderr
+
+
+def test_the_command_refuses_results_that_omit_or_repeat_a_case(tmp_path):
+    """Scoring a favourable subset would hide wrong matches, so the results must be exactly the fixture's cases."""
+    omitted = _run_command(tmp_path, [{"case_id": "p1", "answered_org_id": 1, "tier": "model"}], _loaded())
+    repeated = _run_command(
+        tmp_path,
+        [{"case_id": "p1", "answered_org_id": 1}, {"case_id": "p1", "answered_org_id": 1}, {"case_id": "n1", "answered_org_id": None}],
+        _loaded(),
+    )
+
+    assert omitted.returncode == 2 and "1 missing ['n1']" in omitted.stderr
+    assert repeated.returncode == 2 and "1 duplicated ['p1']" in repeated.stderr
 
 
 def test_a_provisional_fixture_is_never_a_gate_result(tmp_path):
@@ -289,3 +302,32 @@ def test_provisional_and_the_report_json_carry_the_fixture_identity():
     assert report.scored_pass and not report.passed and report.provisional
     assert report.to_dict()["passed"] is False and report.to_dict()["verdicts_source"] == "provisional"
     assert report.render().startswith("offline gate: PROVISIONAL")
+
+
+def test_a_malformed_version_2_fixture_is_refused_at_load():
+    def with_case(**fields):
+        loaded = _loaded()
+        loaded["cases"][0].update(fields)
+        return loaded
+
+    with pytest.raises(ValueError, match="puts that organization in 'g1'"):
+        Groups.from_loaded(with_case(expected_group_id="g2"))          # the label disagrees with the membership
+    with pytest.raises(ValueError, match="puts that organization in None"):
+        Groups.from_loaded(with_case(expected_org_id=99, expected_group_id="g99"))   # expected organization unmapped
+    with pytest.raises(ValueError, match="names group"):
+        Groups.from_loaded(_loaded(cases=[{"case_id": "n1", "kind": "negative", "expected_org_id": None,
+                                           "expected_group_id": "g1"}]))
+    with pytest.raises(ValueError, match="appears twice"):
+        Groups.from_loaded(_loaded(cases=_loaded()["cases"] * 2))
+    with pytest.raises(ValueError, match="reserved group"):
+        Groups.from_loaded(_loaded(org_groups={"1": "unmapped:5"}, cases=[]))   # could equal an unmapped answer's label
+    with pytest.raises(ValueError, match="empty, non-text"):
+        Groups.from_loaded(_loaded(org_groups={"1": 7}, cases=[]))
+
+
+def test_the_stub_flag_never_changes_a_verdict():
+    """answered_is_stub is only reported: the same answers pass or fail identically whatever it says."""
+    for stub in (False, True):
+        passing = [_case("p1", POSITIVE, 1, 5, answered_group="g1", answered_is_stub=stub), _case("n1", NEGATIVE, None, None)]
+        failing = [_case("p1", POSITIVE, 1, 5, answered_group="g9", answered_is_stub=stub), _case("n1", NEGATIVE, None, None)]
+        assert evaluate_offline_gate(passing).passed and not evaluate_offline_gate(failing).passed
