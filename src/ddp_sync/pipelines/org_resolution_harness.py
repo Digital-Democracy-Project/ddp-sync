@@ -30,19 +30,25 @@ class HarnessRun:
     errors: list[tuple[str, str]] = field(default_factory=list)  # (case_id, outcome)
     seed_sha256: str = ""
     skipped_by_loader: int = 0
+    limit: int | None = None  # a smoke run: scored a subset, so it is never a gate result
 
     def gate(self, *, min_recall: float) -> OfflineGateReport:
         return evaluate_offline_gate(self.results, min_recall=min_recall)
 
     def passed(self, *, min_recall: float) -> bool:
-        return not self.errors and self.gate(min_recall=min_recall).passed
+        return self.limit is None and not self.errors and self.gate(min_recall=min_recall).passed
 
     def render(self, *, min_recall: float) -> str:
         report = self.gate(min_recall=min_recall)
+        kinds = {kind: sum(r.kind == kind for r in self.results) for kind in ("positive", "negative", "exact")}
         header = [
-            f"seed sha256: {self.seed_sha256 or '(unknown)'}; cases scored: {len(self.results)}; "
+            f"seed sha256: {self.seed_sha256 or '(unknown)'}; cases scored: {len(self.results)} {kinds}; "
             f"skipped by the loader: {self.skipped_by_loader}; held out: {sum(r.held_out for r in self.results)}",
         ]
+        if self.limit is not None:
+            header.append(
+                f"INCOMPLETE: --limit {self.limit} scored only a subset of the cases; a smoke run is never a gate result"
+            )
         if self.errors:
             header.append(
                 f"INCOMPLETE: {len(self.errors)} case(s) the resolver could not finish (counted as null; the run "
@@ -64,7 +70,8 @@ async def run_harness(
 ) -> HarnessRun:
     """Score every case in `loaded`. `limit` runs only the first N cases that need the model (a smoke run)."""
     run = HarnessRun(
-        results=[], seed_sha256=loaded.get("seed_sha256", ""), skipped_by_loader=len(loaded.get("skipped", []))
+        results=[], seed_sha256=loaded.get("seed_sha256", ""), skipped_by_loader=len(loaded.get("skipped", [])),
+        limit=limit,
     )
     asked = 0
     for case in loaded["cases"]:

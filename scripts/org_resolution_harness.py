@@ -17,6 +17,10 @@ candidate filters or broker checks):
        DDP_EVAL_BROKER_TOKEN=... .venv/bin/python scripts/org_resolution_harness.py loaded.json \
            --broker-base http://localhost:8090 --broker-is-throwaway [--min-recall 0.8] [--limit N] \
            [--results-out results.jsonl]
+  Before running it reads the broker's public organization count and refuses unless it equals the fixture's
+  (the reviewed organizations plus one stub per case that needs the model), so a real broker is not written to
+  by mistake.
+  `--limit` scores only a subset: the run is reported INCOMPLETE and exits 1 whatever the subset scores.
   `--results-out` writes one JSON line per case that scripts/org_resolution_gates.py offline can re-score.
   The model and prompt version of every attempt are recorded by the broker on its attempt rows.
 """
@@ -30,6 +34,8 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
+
+import httpx
 
 from ddp_sync.pipelines.org_resolution_gates import MIN_RECALL
 from ddp_sync.pipelines.org_resolution_harness import run_harness
@@ -52,6 +58,21 @@ def main() -> int:
         parser.error("set DDP_EVAL_BROKER_TOKEN to the throwaway broker's service token")
 
     loaded = json.loads(Path(args.loaded).read_text())
+    broker_base = args.broker_base.rstrip("/")
+
+    # --broker-is-throwaway is a claim; this is the check. The loader writes `organizations` reviewed
+    # organizations plus one stub (each holding a verified position, so public) per case that needs the model;
+    # the public list of the broker holding the fixture has exactly that count and a real broker does not.
+    expected_public = loaded["organizations"] + sum(1 for case in loaded["cases"] if case.get("position_id"))
+    try:
+        public_count = httpx.get(f"{broker_base}/api/organizations/", params={"page_size": 1}, timeout=30).json()["count"]
+    except Exception as exc:  # noqa: BLE001
+        parser.error(f"could not read {broker_base}/api/organizations/ to check it holds the fixture: {exc}")
+    if public_count != expected_public:
+        parser.error(
+            f"{broker_base} lists {public_count} organizations but the fixture has {expected_public}: this "
+            "does not look like the throwaway broker the fixture was loaded into; refusing to write to it"
+        )
 
     def progress(done, case_id, outcome):
         if done % 25 == 0:
@@ -59,7 +80,7 @@ def main() -> int:
 
     run = asyncio.run(
         run_harness(
-            loaded, broker_api_base=args.broker_base.rstrip("/"), broker_api_token=token,
+            loaded, broker_api_base=broker_base, broker_api_token=token,
             limit=args.limit, progress=progress,
         )
     )

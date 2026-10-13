@@ -105,6 +105,41 @@ async def test_limit_runs_only_the_first_n_model_cases():
 
     assert resolver.await_count == 3
     assert len(run.results) == 3 + 2  # plus the exact and alias cases
+    # a perfect subset is still not a gate result
+    assert not run.passed(min_recall=0.8) and "INCOMPLETE: --limit 3" in run.render(min_recall=0.8)
+
+
+def test_the_command_refuses_a_broker_that_does_not_hold_the_fixture(tmp_path):
+    """The throwaway flag is a claim; the public organization count has to match the fixture's."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # a real broker: thousands of organizations
+            body = json.dumps({"count": 5239, "results": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    loaded = tmp_path / "loaded.json"
+    loaded.write_text(json.dumps({**_loaded(), "organizations": 4887}))
+    try:
+        done = subprocess.run(
+            [sys.executable, "scripts/org_resolution_harness.py", str(loaded), "--broker-base",
+             f"http://127.0.0.1:{server.server_port}", "--broker-is-throwaway"],
+            capture_output=True, text=True, env={"PYTHONPATH": "src", "PATH": "", "DDP_EVAL_BROKER_TOKEN": "t"},
+        )
+    finally:
+        server.shutdown()
+
+    assert done.returncode == 2 and "does not look like the throwaway broker" in done.stderr
 
 
 def test_the_command_refuses_a_broker_not_declared_throwaway_and_a_missing_token(tmp_path):
