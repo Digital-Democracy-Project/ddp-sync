@@ -1531,14 +1531,14 @@ async def test_write_organization_content_posts_only_non_blank_fields_and_the_so
         result = await write_organization_content(
             organization_id=7,
             content={"description": "A group.", "funding": "  ", "website": "", "affiliates": None},
-            source="legbot:organization_about:claude",
+            source="legbot:describe_organization:claude",
         )
 
     assert result == {"id": 7, "written": ["description"], "skipped": []}
     call = mock_client.post.await_args
     assert call.args[0] == "http://localhost:8080/api/organizations/7/content/"
     assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
-    assert call.kwargs["json"] == {"description": "A group.", "source": "legbot:organization_about:claude"}
+    assert call.kwargs["json"] == {"description": "A group.", "source": "legbot:describe_organization:claude"}
 
 
 @pytest.mark.asyncio

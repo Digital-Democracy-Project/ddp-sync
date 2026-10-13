@@ -42,7 +42,7 @@ from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     dispatch_bill_position_verification,
     dispatch_bill_question,
-    dispatch_organization_about,
+    dispatch_describe_organization,
 )
 
 logger = structlog.get_logger()
@@ -266,21 +266,23 @@ async def verify_and_store_position(
     }
 
 
-# SYNC-107: LegBot's organization_about answer key -> the broker Organization field it fills.
-_ABOUT_FIELDS = {
-    "description": "description",
-    "type": "org_type",
-    "policies": "policy_focus_areas",
-    "funding": "funding",
-    "affiliates": "affiliates",
-    "website": "website",
-    "email": "email",
-    "contact_page": "contact_page_url",
-}
+# SYNC-107: the broker Organization fields LegBot's describe_organization answer fills. LegBot's answer
+# keys are the broker's own field names (AGENTS-104), so nothing is renamed; its `sources` list is not a
+# broker field and is ignored.
+_ABOUT_FIELDS = (
+    "description",
+    "org_type",
+    "policy_focus_areas",
+    "funding",
+    "affiliates",
+    "website",
+    "email",
+    "contact_page_url",
+)
 
 
 def _as_text(value) -> str:
-    """A model may answer a list-shaped field (policies, affiliates) as a list; the broker stores text."""
+    """A model may answer a list-shaped field (policy_focus_areas, affiliates) as a list; the broker stores text."""
     if isinstance(value, list):
         return "; ".join(str(item).strip() for item in value if str(item).strip())
     return value.strip() if isinstance(value, str) else ""
@@ -304,10 +306,10 @@ async def generate_and_store_organization_content(
     """
     outcome = {"organization_id": organization_id, "outcome": "nothing_written", "written": []}
     try:
-        result = await dispatch_organization_about(org_name)
+        result = await dispatch_describe_organization(org_name)
     except LegBotDispatchError as exc:
         logger.warning(
-            "organization_about dispatch failed -- organization left without content",
+            "describe_organization dispatch failed -- organization left without content",
             organization_id=organization_id, org_name=org_name, error=str(exc),
         )
         outcome["outcome"] = "dispatch_failed"
@@ -316,11 +318,11 @@ async def generate_and_store_organization_content(
     answer = result["answer"]
     if answer.get("insufficient_information"):
         return outcome
-    content = {field: _as_text(answer.get(key)) for key, field in _ABOUT_FIELDS.items()}
+    content = {field: _as_text(answer.get(field)) for field in _ABOUT_FIELDS}
     if not any(content.values()):
         return outcome
 
-    source = f"legbot:organization_about:{result.get('backend') or 'unknown'}"
+    source = f"legbot:describe_organization:{result.get('backend') or 'unknown'}"
     try:
         written = await write_organization_content(
             organization_id=organization_id,

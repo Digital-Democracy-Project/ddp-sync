@@ -396,7 +396,7 @@ class SyncSettings:
 
     # SYNC-107: after a find_bill_positions research run confirms a position for an organization that
     # still has no description (typically a stub the run just created), ask LegBot for its "About"
-    # content and save it through the broker. Off until LegBot has the `organization_about` question
+    # content and save it through the broker. Off until LegBot has the `describe_organization` question
     # type (AGENTS-104); with it off, research runs behave exactly as before.
     organization_content_enabled: bool = False
 

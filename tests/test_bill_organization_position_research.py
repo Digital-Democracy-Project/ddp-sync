@@ -654,7 +654,7 @@ def _about_result(**fields):
 
 
 async def _run(positions, writes, *, enabled=True, about=None, content_write=None):
-    about = about or AsyncMock(return_value=_about_result(description="A group.", type="Advocacy nonprofit"))
+    about = about or AsyncMock(return_value=_about_result(description="A group.", org_type="Advocacy nonprofit", sources=["https://a.invalid"]))
     content_write = content_write or AsyncMock(
         return_value={"id": 7, "written": ["description", "org_type"], "skipped": []}
     )
@@ -664,7 +664,7 @@ async def _run(positions, writes, *, enabled=True, about=None, content_write=Non
     ), patch(f"{_P}.dispatch_bill_question", new=AsyncMock(return_value=_find_result(positions))), patch(
         f"{_P}.dispatch_bill_position_verification", new=AsyncMock(return_value=_verify_result())
     ), patch(f"{_P}.write_bill_organization_position", new=AsyncMock(side_effect=writes)), patch(
-        f"{_P}.dispatch_organization_about", new=about
+        f"{_P}.dispatch_describe_organization", new=about
     ), patch(f"{_P}.write_organization_content", new=content_write):
         results = await generate_and_store_bill_organization_positions(**_COMMON_KWARGS)
     return results, about, content_write
@@ -681,8 +681,9 @@ async def test_a_confirmed_position_for_an_organization_without_content_asks_for
     kwargs = content_write.await_args.kwargs
     assert kwargs["organization_id"] == 7
     assert kwargs["content"]["description"] == "A group."
-    assert kwargs["content"]["org_type"] == "Advocacy nonprofit"  # LegBot's "type" is the broker's org_type
-    assert kwargs["source"] == "legbot:organization_about:claude"
+    assert kwargs["content"]["org_type"] == "Advocacy nonprofit"  # LegBot answers in the broker's own field names
+    assert "sources" not in kwargs["content"]  # LegBot's `sources` is not a broker field
+    assert kwargs["source"] == "legbot:describe_organization:claude"
     assert results[0]["about_content"] == {
         "organization_id": 7, "outcome": "written", "written": ["description", "org_type"],
     }
@@ -763,10 +764,10 @@ async def test_legbot_having_nothing_writes_nothing():
 
 @pytest.mark.asyncio
 async def test_list_answers_are_joined_and_the_broker_is_told_which_fields_it_skipped():
-    about = AsyncMock(return_value=_about_result(policies=["Housing", "Zoning"], website="https://g.example.org"))
+    about = AsyncMock(return_value=_about_result(policy_focus_areas=["Housing", "Zoning"], website="https://g.example.org"))
     content_write = AsyncMock(return_value={"id": 7, "written": ["website"], "skipped": ["policy_focus_areas"]})
     outcome = None
-    with patch(f"{_P}.dispatch_organization_about", new=about), patch(
+    with patch(f"{_P}.dispatch_describe_organization", new=about), patch(
         f"{_P}.write_organization_content", new=content_write
     ):
         outcome = await generate_and_store_organization_content(organization_id=7, org_name="G")
