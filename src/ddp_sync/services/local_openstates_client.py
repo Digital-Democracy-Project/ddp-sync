@@ -524,9 +524,10 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
     (a short procedural document, OPEN-224/246), and then its text and its
     note would be shown, and recorded as `compare_version`, next to a diff
     computed against a different document. A pair whose two chosen documents
-    are of different media types is skipped: the archiver diffs each media
-    type against its own earlier documents (OPEN-217), and api-v3 returns only
-    one document per version, so the true baseline's text is not available.
+    are known to be of different media types is skipped: the archiver diffs
+    each media type against its own earlier documents (OPEN-217), and api-v3
+    returns only one document per version, so the true baseline's text is not
+    available. A missing media type is unknown, not different.
     Still unrecoverable here, and left alone: bills whose versions share a sort
     key (the archiver's order among them was whatever the database returned).
 
@@ -610,14 +611,17 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
         older = versions[baseline]
         old_link = _text_link(older)
         new_link = _text_link(newer)
-        if new_link is not None and old_link.get("media_type") != new_link.get("media_type"):
+        old_media_type = old_link.get("media_type")
+        new_media_type = new_link.get("media_type") if new_link else None
+        # Skip only when both types are known and differ; an absent one proves nothing.
+        if old_media_type and new_media_type and old_media_type != new_media_type:
             logger.info(
                 "bill_changelog_transition_skipped_media_type_mismatch",
                 bill_openstates_id=bill_openstates_id,
                 old_version_note=older.get("note", ""),
                 new_version_note=newer.get("note", ""),
-                old_media_type=old_link.get("media_type"),
-                new_media_type=new_link.get("media_type"),
+                old_media_type=old_media_type,
+                new_media_type=new_media_type,
             )
             continue
         transitions.append({

@@ -352,7 +352,7 @@ this is read off what it does return; nothing is classified or re-ordered here. 
 read-only over the stored documents (21,804 transitions, VA/FL/WA/MI/AL/AZ/US plus a Utah what-if) the
 old rule was wrong for 131 of Virginia's 3,184 transitions and for about half of Utah's once its redline
 and excerpt documents are excluded; this rule named the true baseline every time except one Michigan
-transition. A pair whose two returned documents are of different media types is skipped
+transition. A pair whose two returned documents are known to be of different media types is skipped
 (`bill_changelog_transition_skipped_media_type_mismatch`): the archiver diffs each media type against its
 own earlier documents (OPEN-217) and api-v3 returns one document per version, so that baseline's text is
 not available. Not fixed here: bills whose versions share a sort key (Utah's "Comparison to Sub #N" and

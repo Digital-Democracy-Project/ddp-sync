@@ -1275,6 +1275,21 @@ async def test_a_pair_with_the_same_media_type_is_kept():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_type, new_type",
+    [(None, "application/pdf"), ("text/xml", None), ("", "application/pdf"), (None, None)],
+)
+async def test_a_missing_media_type_is_unknown_not_different(old_type, new_type):
+    """Absence proves nothing about the two documents' types, so the pair is
+    kept (the old behaviour) rather than skipped."""
+    result = await _transitions_for([
+        _ver("Introduced", media_type=old_type),
+        _ver("Substitute #1", diff=_DIFF, media_type=new_type),
+    ])
+    assert result == [("Introduced", "Substitute #1", "text of Introduced")]
+
+
+@pytest.mark.asyncio
 async def test_no_baseline_with_archived_text_means_no_transition():
     result = await _transitions_for([
         _ver("Introduced", text=False),
