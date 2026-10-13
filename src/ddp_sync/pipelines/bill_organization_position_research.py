@@ -34,6 +34,9 @@ from ddp_sync.config import get_settings
 from ddp_sync.pipelines.bill_artifact_generation import _resolve_bill_source
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    get_organization_resolution_shortlist,
+    report_organization_resolution_answer,
+    request_organization_resolution_act,
     write_bill_organization_position,
     write_bill_organization_research_run,
     write_organization_content,
@@ -43,6 +46,7 @@ from ddp_sync.services.legbot_client import (
     dispatch_bill_position_verification,
     dispatch_bill_question,
     dispatch_describe_organization,
+    dispatch_resolve_organization,
 )
 
 logger = structlog.get_logger()
@@ -266,6 +270,130 @@ async def verify_and_store_position(
     }
 
 
+async def resolve_organization_for_position(
+    *,
+    position_id: int,
+    org_name: str,
+    citation_url: str,
+    citation_excerpt: str,
+    mode: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """The resolve step for one newly verified position (SYNC-97, PLAN-notifications-alert-engine.md 6.7.4).
+
+    ddp-sync orchestrates; the broker is the only writer and decides eligibility and whether anything
+    may change. Steps: the broker opens an attempt and returns a shortlist of existing organizations;
+    LegBot chooses one or answers null; the answer is reported to the attempt once; only in `act` mode,
+    and only for a non-null answer, the broker is asked to apply it by attempt id (it may refuse).
+    Every failure leaves the stub exactly as it is and never raises. "Never blocks publication" means
+    the position row is already written before this runs, so nothing here can undo or hold it back.
+
+    Returns {"position_id", "attempt_id", "outcome", "choice", "organization_id"}; outcome is one of
+    "not_eligible", "no_candidates", "null_answer", "suggested", "acted", "act_refused",
+    "shortlist_failed", "dispatch_failed", "report_failed", "act_failed". `organization_id` is set only
+    when the position was moved.
+    """
+    out = {
+        "position_id": position_id, "attempt_id": None, "outcome": None, "choice": None,
+        "organization_id": None,
+    }
+    broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
+
+    async def _report(choice, reason, model=None, resolver_prompt_rev=None) -> bool:
+        try:
+            await report_organization_resolution_answer(
+                attempt_id=out["attempt_id"], model=model, resolver_prompt_rev=resolver_prompt_rev,
+                choice=choice, reason=reason, **broker,
+            )
+        except BrokerClientError as exc:
+            logger.warning(
+                "Broker rejected the resolution answer -- stub left as is",
+                position_id=position_id, attempt_id=out["attempt_id"], error=str(exc),
+            )
+            out["outcome"] = "report_failed"
+            return False
+        return True
+
+    try:
+        shortlist = await get_organization_resolution_shortlist(position_id=position_id, **broker)
+    except BrokerClientError as exc:
+        logger.warning(
+            "Organization shortlist failed -- stub left as is",
+            position_id=position_id, org_name=org_name, error=str(exc),
+        )
+        out["outcome"] = "shortlist_failed"
+        return out
+
+    out["attempt_id"] = shortlist.get("attempt_id")
+    if out["attempt_id"] is None:
+        out["outcome"] = "not_eligible"
+        return out
+
+    candidates = shortlist.get("candidates") or []
+    if not candidates:
+        # Nothing to choose among: complete the attempt without asking the model.
+        if await _report(None, "no candidates"):
+            out["outcome"] = "no_candidates"
+        return out
+
+    try:
+        result = await dispatch_resolve_organization(
+            org_name, candidates, citation_url=citation_url, citation_excerpt=citation_excerpt,
+        )
+    except LegBotDispatchError as exc:
+        # Not reported: a retry is a new attempt, and this one stays unanswered.
+        logger.warning(
+            "resolve_organization dispatch failed -- stub left as is",
+            position_id=position_id, attempt_id=out["attempt_id"], error=str(exc),
+        )
+        out["outcome"] = "dispatch_failed"
+        return out
+
+    answer = result["answer"]
+    choice = answer.get("choice")
+    reason = str(answer.get("reason") or "")
+    if choice is not None and not (
+        type(choice) is int and choice in {candidate.get("id") for candidate in candidates}
+    ):
+        # An invalid answer is the same as null: the model only chooses among the candidates.
+        reason = f"invalid choice {choice!r} (not in the shortlist); {reason}"
+        choice = None
+    if not await _report(
+        choice, reason, model=result.get("backend"), resolver_prompt_rev=answer.get("prompt_version"),
+    ):
+        return out
+
+    out["choice"] = choice
+    if choice is None:
+        out["outcome"] = "null_answer"
+        return out
+    if mode != "act":
+        out["outcome"] = "suggested"
+        return out
+
+    try:
+        acted = await request_organization_resolution_act(attempt_id=out["attempt_id"], **broker)
+    except BrokerClientError as exc:
+        logger.warning(
+            "Broker failed the resolution act request -- stub left as is",
+            position_id=position_id, attempt_id=out["attempt_id"], error=str(exc),
+        )
+        out["outcome"] = "act_failed"
+        return out
+    if acted.get("acted"):
+        out["outcome"] = "acted"
+        out["organization_id"] = acted.get("organization_id")
+    else:
+        # The broker's own act setting is off by default, so a refusal is normal.
+        logger.info(
+            "Broker declined the resolution act request",
+            position_id=position_id, attempt_id=out["attempt_id"], reason=acted.get("reason"),
+        )
+        out["outcome"] = "act_refused"
+    return out
+
+
 # SYNC-107: the broker Organization fields LegBot's describe_organization answer fills. LegBot's answer
 # keys are the broker's own field names (AGENTS-104), so nothing is renamed; its `sources` list is not a
 # broker field and is ignored.
@@ -479,6 +607,7 @@ async def generate_and_store_bill_organization_positions(
         positions = positions[:max_organizations]
 
     results = []
+    finding_by_position_id: dict[int, dict] = {}  # for the resolve step below
     for finding in positions:
         # SYNC-41: a finding is model-produced, so neither its shape nor
         # any of its fields is guaranteed. A malformed entry skips itself
@@ -524,25 +653,75 @@ async def generate_and_store_bill_organization_positions(
             })
             continue
 
-        results.append(
-            await verify_and_store_position(
-                bill_openstates_id=bill_openstates_id,
-                jurisdiction=jurisdiction,
-                session_code=session_code,
-                version_date=version_date,
-                version_note=version_note,
-                gov_id=gov_id,
-                bill_title=bill_title,
-                invocation_id=invocation_id,
-                org_name=org_name,
-                position=position,
-                citation_url=citation_url,
-                citation_excerpt=citation_excerpt,
-                find_model_name=find_model_name,
-                broker_api_base=broker_api_base,
-                broker_api_token=broker_api_token,
-            )
+        result = await verify_and_store_position(
+            bill_openstates_id=bill_openstates_id,
+            jurisdiction=jurisdiction,
+            session_code=session_code,
+            version_date=version_date,
+            version_note=version_note,
+            gov_id=gov_id,
+            bill_title=bill_title,
+            invocation_id=invocation_id,
+            org_name=org_name,
+            position=position,
+            citation_url=citation_url,
+            citation_excerpt=citation_excerpt,
+            find_model_name=find_model_name,
+            broker_api_base=broker_api_base,
+            broker_api_token=broker_api_token,
         )
+        results.append(result)
+        if result.get("position_id") is not None:
+            finding_by_position_id[result["position_id"]] = finding
+
+    # SYNC-97: the resolve step. Before the About step: a position that moves to an existing reviewed
+    # organization does not need a generated description for the stub.
+    mode = get_settings().organization_resolution_mode
+    if mode != "off":
+        for result in results:
+            if (
+                result.get("outcome") != "written"
+                or result.get("result") != "created"
+                or result.get("verification_verdict") != "confirmed"
+                or result.get("position_id") not in finding_by_position_id
+            ):
+                continue
+            finding = finding_by_position_id[result["position_id"]]
+            try:
+                resolution = await resolve_organization_for_position(
+                    position_id=result["position_id"],
+                    org_name=result["org_name"],
+                    citation_url=finding.get("citation_url", ""),
+                    citation_excerpt=finding.get("citation_excerpt", ""),
+                    mode=mode,
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
+                )
+            except Exception as exc:  # the step must never block or fail position publication
+                logger.warning(
+                    "organization resolution raised -- stub left as is",
+                    position_id=result["position_id"], error=str(exc),
+                )
+                resolution = {
+                    "position_id": result["position_id"], "attempt_id": None, "outcome": "failed",
+                    "choice": None, "organization_id": None,
+                }
+            result["resolution"] = resolution
+            logger.info(
+                "organization_resolution_attempt",
+                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
+                org_name=result["org_name"], **resolution,
+            )
+            if resolution["outcome"] == "acted":
+                # The position now belongs to a reviewed organization: no About text for the stub.
+                result["organization_id"] = resolution["organization_id"]
+                result["organization_needs_content"] = False
+        if any("resolution" in r for r in results):
+            logger.info(
+                "organization_resolution_summary",
+                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
+                outcomes=dict(Counter(r["resolution"]["outcome"] for r in results if "resolution" in r)),
+            )
 
     # SYNC-107: an organization this run just confirmed a position for, and that still has no
     # description (typically a stub the run created), gets its "About" content once. Only here, not in

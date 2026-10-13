@@ -23,6 +23,9 @@ from ddp_sync.services.broker_client import (
     write_organization_content,
     write_bill_organization_research_run,
     write_bill_version,
+    get_organization_resolution_shortlist,
+    report_organization_resolution_answer,
+    request_organization_resolution_act,
 )
 
 
@@ -1554,3 +1557,49 @@ async def test_write_organization_content_error_status_raises():
     ):
         with pytest.raises(BrokerClientError):
             await write_organization_content(organization_id=999, content={"description": "x"}, source="s")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call, path, payload",
+    [
+        (lambda: get_organization_resolution_shortlist(position_id=5),
+         "shortlist/", {"position_id": 5}),
+        (lambda: report_organization_resolution_answer(
+            attempt_id=9, model="claude", resolver_prompt_rev=None, choice=41, reason="same"),
+         "attempts/9/answer/", {"model": "claude", "prompt_version": None, "choice": 41, "reason": "same"}),
+        (lambda: request_organization_resolution_act(attempt_id=9), "attempts/9/act/", {}),
+    ],
+)
+async def test_organization_resolution_calls_post_to_the_resolution_routes(call, path, payload):
+    """SYNC-97 / BROKER-191."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"ok": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), _patch_async_client(
+        mock_client
+    ):
+        assert await call() == {"ok": True}
+
+    request = mock_client.post.await_args
+    assert request.args[0] == f"http://localhost:8080/api/organization-resolution/{path}"
+    assert request.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert request.kwargs["json"] == payload
+
+
+@pytest.mark.asyncio
+async def test_organization_resolution_error_status_raises():
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 404
+    response.text = "not found"
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), _patch_async_client(
+        mock_client
+    ):
+        with pytest.raises(BrokerClientError):
+            await get_organization_resolution_shortlist(position_id=5)

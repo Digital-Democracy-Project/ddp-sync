@@ -400,6 +400,15 @@ class SyncSettings:
     # type (AGENTS-104); with it off, research runs behave exactly as before.
     organization_content_enabled: bool = False
 
+    # SYNC-97: the resolve step after verify (PLAN-notifications-alert-engine.md 6.7.4). A newly verified
+    # position whose organization is a pipeline-created stub is shown to LegBot's resolve_organization
+    # with a shortlist of existing organizations. `off`: nothing is asked. `suggest`: the answer is
+    # recorded by the broker and nothing changes. `act`: ddp-sync also asks the broker to apply a
+    # non-null answer (the broker's own act setting, off by default, decides whether it may). This only
+    # says what ddp-sync ASKS for. Defaults to off (not the ticket's suggest) until the broker's resolve
+    # endpoints (BROKER-191) exist; the rollout turns on suggest first.
+    organization_resolution_mode: str = "off"
+
     # How many bills run_legbot_pipeline (session_pipeline_runner.py)
     # processes concurrently, instead of one at a time. Bounded, not
     # unbounded -- _process_bill() also fires several non-MLX HTTP calls per
@@ -742,6 +751,11 @@ def _load_from_env() -> dict:
         ),
         "organization_content_enabled": (
             os.getenv("LEGBOT_ORGANIZATION_CONTENT_ENABLED", "false").lower() == "true"
+        ),
+        "organization_resolution_mode": (
+            mode if (mode := os.getenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", "off").strip().lower())
+            in ("off", "suggest", "act")
+            else "off"
         ),
         "session_pipeline_concurrency": int(os.getenv("SESSION_PIPELINE_CONCURRENCY", "1")),
         "replica_freshness_check_enabled": (
