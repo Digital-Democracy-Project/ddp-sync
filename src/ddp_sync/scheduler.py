@@ -869,7 +869,8 @@ class UpdateScheduler:
 
         # Default-off per-host flag ANDed with the shared YAML gate, like the people pull above.
         # Runs well before the 03:00 people pull and the 04:00 chain; it only measures and alerts.
-        fork_cfg = self._sync_config.get("openstates_scrape", {}).get("fork_upstream_check", {})
+        config = self._sync_config.get("openstates_scrape", {})
+        fork_cfg = config.get("fork_upstream_check", {})
         if self.settings.fork_upstream_check_enabled and fork_cfg.get("enabled", True):
             fork_time = fork_cfg.get("sync_time_utc", "01:30")
             forkh, forkm = map(int, fork_time.split(":"))

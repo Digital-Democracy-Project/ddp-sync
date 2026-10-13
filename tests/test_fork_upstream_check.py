@@ -287,6 +287,24 @@ async def test_registered_even_when_this_host_runs_no_scrapes():
 
 
 @pytest.mark.asyncio
+async def test_registered_job_actually_runs_with_the_scrape_config(monkeypatch):
+    # Guards the 2026-10-13 review finding: the wrapper once referenced a variable that only
+    # existed in the old registration method, so it registered fine and died at 01:30 UTC.
+    from ddp_sync.pipelines import fork_upstream_check as mod
+
+    seen = {}
+
+    async def fake_run(config=None):
+        seen["config"] = config
+        return {"success": True}
+
+    monkeypatch.setattr(mod, "run_fork_upstream_check_job", fake_run)
+    job = _jobs(True)["fork_upstream_check"]
+    assert await job.func() == {"success": True}
+    assert seen["config"]["fork_upstream_check"]["sync_time_utc"] == "01:30"
+
+
+@pytest.mark.asyncio
 async def test_not_registered_when_flag_off_or_yaml_disabled():
     assert "fork_upstream_check" not in _jobs(False)
     off = YAML.replace("fork_upstream_check:\n        enabled: true", "fork_upstream_check:\n        enabled: false")
