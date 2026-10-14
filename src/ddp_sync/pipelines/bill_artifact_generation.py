@@ -66,6 +66,7 @@ import structlog
 from ddp_sync.config import get_settings
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    artifact_counts_as_present,
     get_bill_artifact_coverage_all_versions,
     write_bill_artifact,
 )
@@ -1368,7 +1369,8 @@ async def generate_and_store_bill_changelog(
             for entry in (
                 (coverage.get("versions") or []) + (coverage.get("unclassified_versions") or [])
             )
-            if "bill_changelog" in (entry.get("artifacts") or {})
+            # SYNC-115: a rejected changelog does not cover its transition.
+            if artifact_counts_as_present((entry.get("artifacts") or {}).get("bill_changelog"))
         } if coverage is not None else set()
 
         transitions = [

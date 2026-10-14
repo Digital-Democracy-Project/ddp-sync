@@ -1294,6 +1294,58 @@ async def test_changelog_skips_a_transition_already_covered_when_gov_id_given():
 
 
 @pytest.mark.asyncio
+async def test_changelog_rewrites_a_transition_whose_changelog_was_rejected():
+    """SYNC-115: staff rejected the changelog on "Introduced", so that transition
+    is no longer covered and is dispatched again (the broker overwrites the
+    rejected row in place); the covered "Engrossed" one stays skipped."""
+    coverage = {
+        "versions": [
+            {
+                "bill_version_id": 19, "version_note": "Introduced",
+                "artifacts": {"bill_changelog": {
+                    "status": "complete", "review_status": "rejected", "compare_version_id": 380,
+                }},
+            },
+            {
+                "bill_version_id": 18, "version_note": "Engrossed",
+                "artifacts": {"bill_changelog": {
+                    "status": "complete", "review_status": "approved", "compare_version_id": 19,
+                }},
+            },
+        ],
+        "unclassified_versions": [],
+    }
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        dispatch_calls.append(old_bill_source)
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_TWO_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=coverage),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": False}),
+    ):
+        result = await generate_and_store_bill_changelog(
+            **_CHANGELOG_KWARGS, gov_id="SJR 2F",
+        )
+
+    assert len(dispatch_calls) == 1
+    assert result["status"] == "complete"
+
+
+@pytest.mark.asyncio
 async def test_changelog_returns_not_applicable_when_every_transition_already_covered():
     coverage = {
         "versions": [

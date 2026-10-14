@@ -635,6 +635,73 @@ async def test_missing_row_is_dispatched():
     assert bill_result["artifacts_generated"] == ["bill_summary"]
 
 
+# --- SYNC-115: a rejected row counts as missing -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_complete_row_is_dispatched_again():
+    """BROKER-217 reports review_status. A row staff rejected is written again,
+    with retry_failed off: a rejection is deliberate and needs no flag."""
+    rejected = {"status": "complete", "review_status": "rejected"}
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": rejected}}
+    ), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_artifact.assert_awaited_once()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["artifacts_skipped_present"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_review_status_still_counts_as_present():
+    """A broker that predates BROKER-217 omits the field: today's behaviour."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
+    ), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_artifact.assert_not_awaited()
+    assert result["results"][0]["artifacts_skipped_present"] == ["bill_summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_transition_holding_only_a_rejected_changelog_is_not_covered():
+    """The Utah case: every later version holds a changelog, but one of them was
+    rejected, so the bill is dispatched to the changelog function."""
+    versions = _versions(("S 7026 Filed", False), ("S 7026 e1", True), ("S 7026 er", True))
+    versions["versions"][1]["artifacts"]["bill_changelog"]["review_status"] = "rejected"
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 3, "artifacts": {"bill_changelog": {"status": "complete"}}}
+    ), _patch_all_versions(versions), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_changelog",
+        new=AsyncMock(return_value={"status": "complete"}),
+    ) as mock_changelog, _patch_org_status({"has_rows": True, "row_count": 3}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_changelog.assert_awaited_once()
+    assert result["results"][0]["artifacts_skipped_present"] == []
+
+
 @pytest.mark.asyncio
 async def test_bill_changelog_dispatches_via_the_changelog_function_not_the_artifact_one():
     with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(), patch(
