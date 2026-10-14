@@ -662,6 +662,31 @@ async def test_a_rejected_complete_row_is_dispatched_again():
 
 
 @pytest.mark.asyncio
+async def test_a_rejected_failed_row_is_dispatched_without_retry_failed():
+    """The one deliberate exception to the failed branch: a rejection is a human
+    decision, so it is rewritten even when retry_failed is off. A failed row that
+    was NOT rejected is still skipped (test_previously_failed_row_is_skipped_not_retried)."""
+    with _patch_lister([_CANDIDATE]), _patch_coverage(
+        {"bill_version_id": 2, "artifacts": {
+            "bill_summary": {"status": "failed", "review_status": "rejected"},
+        }}
+    ), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ) as mock_artifact, _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_summary"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    mock_artifact.assert_awaited_once()
+    bill_result = result["results"][0]
+    assert bill_result["artifacts_generated"] == ["bill_summary"]
+    assert bill_result["artifacts_skipped_failed_previously"] == []
+
+
+@pytest.mark.asyncio
 async def test_a_row_without_review_status_still_counts_as_present():
     """A broker that predates BROKER-217 omits the field: today's behaviour."""
     with _patch_lister([_CANDIDATE]), _patch_coverage(
