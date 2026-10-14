@@ -446,6 +446,47 @@ async def get_archived_changelog_inputs(bill_openstates_id: str) -> dict | None:
     }
 
 
+def _text_link(version: dict) -> dict | None:
+    """The link carrying the archived document api-v3 chose for this version --
+    the only link it attaches `raw_text` to."""
+    for link in version.get("links") or []:
+        if link.get("raw_text"):
+            return link
+    return None
+
+
+def _diff_baseline_index(versions: list[dict], i: int) -> int | None:
+    """Index of the version `versions[i]`'s `diff_from_previous_version` was
+    taken against (SYNC-110), or None if none can be named.
+
+    Not necessarily `i - 1`. openstates-core's `archive_bill_versions()` gives
+    a version a diff only if it is in the diff lineage, and a version outside
+    it (an unknown stage, or a short procedural document per OPEN-224/246)
+    gets none and is never the baseline for the next one. So the baseline is
+    the nearest earlier version that itself carries a diff -- `""` counts, it
+    means "identical text" -- and, when no earlier version does, the lineage's
+    first document: the first version with archived text. api-v3 does not
+    return the baseline, and this is read off what it does return rather than
+    re-derived: no stage classification and no re-ordering happens here.
+
+    Measured 2026-10-13 by replaying that archiver over the stored documents
+    (read-only; VA, FL, WA, MI, AL, AZ, US and a Utah what-if with its redline
+    and excerpt documents excluded; 21,804 transitions; bills whose versions
+    share a sort key are left out, their lineage order is not recoverable):
+    this rule named the true baseline every time except one Michigan transition
+    in a media-type-split chain, which the caller's media-type check turns into
+    a skip. "The previous array entry" was wrong for 131 of Virginia's 3,184
+    transitions and for about half of Utah's in the what-if.
+    """
+    for j in range(i - 1, -1, -1):
+        if versions[j].get("diff_from_previous_version") is not None and _text_link(versions[j]):
+            return j
+    for j in range(i):
+        if _text_link(versions[j]):
+            return j
+    return None
+
+
 async def get_archived_version_transitions(bill_openstates_id: str) -> dict | None:
     """Look up EVERY already-archived version transition for bill_changelog --
     SYNC-44's full-history walk. A sibling of get_archived_changelog_inputs
@@ -470,13 +511,25 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
     its own precomputed `diff_from_previous_version` (against its real diff
     -lineage predecessor, not necessarily the literal previous array index)
     and archived `raw_text`. So this function never classifies a version's
-    stage itself -- it only walks consecutive array pairs and trusts
-    whichever of those pairs api-v3 already attached a diff to. A pair
-    api-v3 never diffed (an unknown-stage version, a version whose true
-    predecessor's text isn't archived yet, or the very first classifiable
-    version, which has nothing to diff against by definition) is simply
-    skipped -- self-correcting once the missing input actually appears
-    archived on a later run, never guessed at.
+    stage itself -- it only walks the array and trusts whichever versions
+    api-v3 already attached a diff to. A version api-v3 never diffed (an
+    unknown-stage version, a version whose true predecessor's text isn't
+    archived yet, or the very first classifiable version, which has nothing to
+    diff against by definition) is simply skipped -- self-correcting once the
+    missing input actually appears archived on a later run, never guessed at.
+
+    SYNC-110: the OLD side of a transition is the version that diff was taken
+    against (`_diff_baseline_index`), not blindly the previous array entry. The
+    entry before a version can be one the archiver kept out of the diff lineage
+    (a short procedural document, OPEN-224/246), and then its text and its
+    note would be shown, and recorded as `compare_version`, next to a diff
+    computed against a different document. A pair whose two chosen documents
+    are known to be of different media types is skipped: the archiver diffs
+    each media type against its own earlier documents (OPEN-217), and api-v3
+    returns only one document per version, so the true baseline's text is not
+    available. A missing media type is unknown, not different.
+    Still unrecoverable here, and left alone: bills whose versions share a sort
+    key (the archiver's order among them was whatever the database returned).
 
     Args:
         bill_openstates_id: bare UUID, same convention as
@@ -552,17 +605,27 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
             # predecessor's text simply isn't archived yet -- either way,
             # nothing to generate for this hop right now.
             continue
-        older = versions[i - 1]
-        old_bill_source = None
-        for link in older.get("links") or []:
-            raw_text = link.get("raw_text")
-            if raw_text:
-                old_bill_source = raw_text
-                break
-        if not old_bill_source:
+        baseline = _diff_baseline_index(versions, i)
+        if baseline is None:
+            continue
+        older = versions[baseline]
+        old_link = _text_link(older)
+        new_link = _text_link(newer)
+        old_media_type = old_link.get("media_type")
+        new_media_type = new_link.get("media_type") if new_link else None
+        # Skip only when both types are known and differ; an absent one proves nothing.
+        if old_media_type and new_media_type and old_media_type != new_media_type:
+            logger.info(
+                "bill_changelog_transition_skipped_media_type_mismatch",
+                bill_openstates_id=bill_openstates_id,
+                old_version_note=older.get("note", ""),
+                new_version_note=newer.get("note", ""),
+                old_media_type=old_media_type,
+                new_media_type=new_media_type,
+            )
             continue
         transitions.append({
-            "old_bill_source": old_bill_source,
+            "old_bill_source": old_link["raw_text"],
             "diff_source": diff_source,
             "old_version_date": older.get("date", ""),
             "old_version_note": older.get("note", ""),
