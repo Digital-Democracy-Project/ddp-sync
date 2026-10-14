@@ -595,6 +595,39 @@ check, use the same helper.
   (see "Writing BillArtifacts" above: leave `model_version`/`prompt_version`/`prompt_hash` unset so a
   rewrite lands on the same row).
 
+**State and procedure as of 2026-10-14 (the Utah 2026 cleanup, SYNC-111; re-check before relying on it).**
+BROKER-217 is deployed on the production broker (`643bd802`, 14:22 UTC) and a real status read shows
+`review_status` in both shapes. Production runs `BILL_ARTIFACT_REQUIRE_REVIEW=false` and
+`CONCEPT_STATEMENT_REQUIRE_REVIEW=false`. The production agent rejected all 1,567 Utah 2026
+`bill_changelog` rows (311 bills; none deleted) and the Utah run was started from the Mac the same
+evening: `/trigger/bill-artifact-generation`, `jurisdiction_iso2=ut`, `session_code=2026`,
+`artifact_types=["bill_changelog"]`, no org research, no concept statements, `limit=null`.
+- **Reject the whole set, not just the bad rows.** A first plan matched each stored changelog's
+  (compared-against, new) version pair to what api-v3 returns now, but it matched by version note, so
+  it could wrongly *keep* a bad row. Rejecting everything is simpler and has one count to check. The
+  prod agent does it row by row with `.save()` (as the admin's `mark_rejected` does, not a queryset
+  `.update()`), after a backup of each row's review fields and a one-row test.
+- **A rewrite overwrites the row in place, so the old text is gone.** The backup restores only the
+  review fields; the old wording survives only in the broker database's 7-day restore. Save any text
+  you want to compare *before* the run.
+- **To test one bill against the dev broker**, send `X-DDP-Environment: dev` to
+  `/trigger/bill-artifact-generation` (it reads `ONDEMAND_BROKER_API_*_DEV`; without the header it uses
+  the global `DDP_BROKER_API_BASE`, which is **production** in the Mac's `.env`: the last duplicate
+  line wins). The dev broker is a copy of production data, so **reject that bill's rows in dev first**
+  or the run skips them as present. A real run took 141 s for 5 changelogs (about 28 s each).
+- **A rejected row that is not a real version pair stays rejected on purpose.** After the fixes, the
+  "Comparison to ..." and "Amended Excerpts ..." documents are outside the diff lineage, so they get no
+  transition and nothing rewrites their changelogs; they remain `rejected` and never show publicly.
+- **The EC2-broker host's ddp-sync cannot read artifact status.** Its `DDP_BROKER_API_TOKEN` is the
+  placeholder `public-endpoint-no-auth` (`infrastructure/docker-compose.prod.yml`), so a status read
+  there returns 401. That host relays LegBot to the Mac and does not generate; it is on `c822058`
+  (2026-10-14). Do not run bill artifact generation on it without fixing that first.
+- **Known quality gaps in the rewritten text** (SYNC-117, not part of the cleanup): the closing "Key
+  Policy Implications" paragraph can contradict the diff; a change can land under the wrong heading;
+  date-only changes read as "None added, none removed". Separate and not Utah-specific:
+  `recover_stale_legbot_dispatches` retries a recovered answer forever when the broker has no such bill
+  (SYNC-116, seen as three refused `POST /api/bill-artifacts/` every 30 minutes).
+
 ## No CI
 
 None of `ddp-open-states`, `openstates-core`, `openstates-scrapers`, or `ddp-sync` have CI
