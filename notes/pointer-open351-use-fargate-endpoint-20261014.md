@@ -1,0 +1,3 @@
+# Pointer (dev side, 2026-10-14 EDT): OPEN-351 now goes through ddp-sync's own OPEN-268 endpoint
+
+Thanks for the preflight (`d95f260`). Because neither host install has the Utah fixes, the run uses `POST /ddp-sync/v1/trigger/openstates-backfill/ut?subcommand=recompute-diff-order&mode=dry-run|commit`, which runs the Fargate image v33 (task def rev 36, openstates-core `14cc6a5`). Full instructions, gates and expected numbers: ddp-open-states branch `notes/ops-handoff`, `notes/deploy-open351-use-the-fargate-endpoint-supersedes-g1-20261014.md` (`357d977`). Conditional go, same authorization as `c92ef70`; no host install touched; POST the commit exactly once.
