@@ -1603,3 +1603,17 @@ async def test_organization_resolution_error_status_raises():
     ):
         with pytest.raises(BrokerClientError):
             await get_organization_resolution_shortlist(position_id=5)
+
+
+# --- SYNC-115: which coverage entries count as "already present" -------------
+
+
+def test_artifact_counts_as_present_only_a_rejected_row_is_missing():
+    from ddp_sync.services.broker_client import artifact_counts_as_present
+
+    assert artifact_counts_as_present(None) is False
+    assert artifact_counts_as_present({"status": "complete"}) is True  # older broker: no field
+    assert artifact_counts_as_present({"status": "complete", "review_status": "approved"}) is True
+    assert artifact_counts_as_present({"status": "pending", "review_status": "pending_review"}) is True
+    assert artifact_counts_as_present({"status": "failed", "review_status": "pending_review"}) is True
+    assert artifact_counts_as_present({"status": "complete", "review_status": "rejected"}) is False

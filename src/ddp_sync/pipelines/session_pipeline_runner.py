@@ -82,6 +82,7 @@ from ddp_sync.pipelines.concept_statement_dispatch import (
 )
 from ddp_sync.services.broker_client import (
     BrokerClientError,
+    artifact_counts_as_present,
     ensure_bill_exists,
     get_bill_artifact_coverage_all_versions,
     get_bill_artifacts,
@@ -477,8 +478,10 @@ async def _changelog_fully_covered(
 
     # `versions` is oldest-first by ddp-broker-py's stage-aware ordering. Skip
     # the oldest: it has no predecessor, so it can never carry a changelog.
+    # SYNC-115: a rejected changelog does not count as holding one.
     return all(
-        "bill_changelog" in (entry.get("artifacts") or {}) for entry in versions[1:]
+        artifact_counts_as_present((entry.get("artifacts") or {}).get("bill_changelog"))
+        for entry in versions[1:]
     )
 
 
@@ -606,8 +609,14 @@ async def _process_bill_inner(
     existing = coverage["artifacts"] if coverage else {}
     needs_dispatch = []
     for artifact_type in artifact_types:
-        status = (existing.get(artifact_type) or {}).get("status")
-        if status == "failed":
+        entry = existing.get(artifact_type)
+        status = (entry or {}).get("status")
+        if status is not None and not artifact_counts_as_present(entry):
+            # SYNC-115: staff rejected this row, so it counts as missing and is
+            # written again (before the failed branch: a rejection is deliberate
+            # and needs no retry_failed).
+            needs_dispatch.append(artifact_type)
+        elif status == "failed":
             # SYNC-42: the only status retry_failed reaches. Before it, a row
             # recorded failed stayed failed forever -- a failure caused by a
             # bug or outage since fixed could only be recovered by deleting

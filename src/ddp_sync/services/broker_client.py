@@ -1186,6 +1186,21 @@ async def _get_organization_json(
     return body
 
 
+def artifact_counts_as_present(entry: dict | None) -> bool:
+    """SYNC-115: does a coverage entry from ``/api/bill-artifacts/status/`` mean
+    "this artifact already exists, do not write it again"?
+
+    True for any row except one staff REJECTED (BROKER-217 added
+    ``review_status`` to the entry). A rejected row counts as missing, so LegBot
+    writes it again: ddp-broker-py overwrites a rejected row in place and queues
+    a pending revision beside an approved one, so regenerating never destroys
+    approved text. ``status`` is deliberately not consulted: ``failed`` handling
+    (``retry_failed``) stays exactly where it was. A broker that predates the
+    field omits it, which reads as "not rejected", i.e. today's behaviour.
+    """
+    return entry is not None and entry.get("review_status") != "rejected"
+
+
 async def get_bill_artifacts(
     *,
     jurisdiction: str,
