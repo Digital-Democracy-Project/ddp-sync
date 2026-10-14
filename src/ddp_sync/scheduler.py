@@ -320,6 +320,7 @@ class UpdateScheduler:
         self._register_openstates_scrape_jobs()
 
         # --- Fork upstream check (independent of whether this host runs scrapes) ---
+        self._register_people_pull_job()
         self._register_fork_upstream_check_job()
 
         # --- OpenStates bill-document archive (independent of scrape schedule) ---
@@ -556,7 +557,6 @@ class UpdateScheduler:
             run_wa_scrape_job,
             run_usa_scrapes_job,
             run_secondary_scrapes_job,
-            run_people_pull_job,
             run_people_refresh_job,
         )
 
@@ -826,9 +826,27 @@ class UpdateScheduler:
                 sync_time=p_time,
             )
 
-        # --- people pull (daily, SYNC-102) ---
+        self._openstates_cadence = effective
+
+        # --- cadence review (OPEN-140) ---
+        self._register_cadence_review_job(config, startup=is_startup)
+
+    def _remove_job_if_present(self, job_id: str) -> None:
+        try:
+            self.scheduler.remove_job(job_id)
+        except Exception:  # noqa: BLE001 — JobLookupError variant
+            pass
+
+    def _register_people_pull_job(self) -> None:
+        """Daily fast-forward of the people checkout (SYNC-102). Deliberately NOT inside
+        _register_openstates_scrape_jobs: that method returns early when this host's scrapes are
+        off (OPENSTATES_SCRAPE_ENABLED=false, as on the Mac), which meant this job never
+        registered there (SYNC-108)."""
+        from ddp_sync.pipelines.openstates_scrape import run_people_pull_job
+
         # Default-off per-host flag, ANDed with the shared YAML gate (same pattern as the patch
         # refresh above). Keeps the people checkout current between weekly refreshes.
+        config = self._sync_config.get("openstates_scrape", {})
         pull_cfg = config.get("people_pull", {})
         if self.settings.openstates_people_pull_enabled and pull_cfg.get("enabled", True):
             pull_time = pull_cfg.get("sync_time_utc", "03:00")
@@ -848,17 +866,6 @@ class UpdateScheduler:
                 misfire_grace_time=3600,
             )
             logger.info("openstates_people_pull: registered", sync_time=pull_time)
-
-        self._openstates_cadence = effective
-
-        # --- cadence review (OPEN-140) ---
-        self._register_cadence_review_job(config, startup=is_startup)
-
-    def _remove_job_if_present(self, job_id: str) -> None:
-        try:
-            self.scheduler.remove_job(job_id)
-        except Exception:  # noqa: BLE001 — JobLookupError variant
-            pass
 
     def _register_fork_upstream_check_job(self) -> None:
         """Daily fork-vs-upstream gap check. Deliberately NOT inside
