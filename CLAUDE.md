@@ -569,6 +569,32 @@ convention of a `source_support=inferred: ...` prefix there, queried with
 `bill_version__session_code` — note `session_code` lives on `BillVersion`, not
 `BillArtifact`, and the obvious spelling raises `FieldError`.
 
+## A rejected BillArtifact is rewritten on the next run (SYNC-115, 2026-10-14)
+
+Every "is this artifact already generated?" check used to count any row that is not `failed` as
+present, so a row staff had rejected in the broker was skipped forever. They now share
+`broker_client.artifact_counts_as_present(entry)`: only a row whose `review_status` is `rejected`
+counts as missing. It is used in three places that must agree: the per-type gate in
+`session_pipeline_runner._process_bill_inner`, `_changelog_fully_covered` (SYNC-45), and the
+per-transition filter in `generate_and_store_bill_changelog` (SYNC-44). If you add a fourth coverage
+check, use the same helper.
+
+- **It applies to every bill artifact type, not just `bill_changelog`** (Ramon's decision). A row
+  rejected on purpose is written again on the next run, for any jurisdiction (ConceptStatementSet has
+  always behaved this way, SYNC-85). A rejection beats `failed`: it needs no `retry_failed`.
+- **It needs ddp-broker-py's BROKER-217** (`/api/bill-artifacts/status/` reporting `review_status` in
+  both shapes). A broker without it omits the field, which reads as "not rejected": exactly the old
+  behaviour, silently. If rejected rows are still skipped after rejecting them, check that the
+  production broker has BROKER-217 before looking anywhere else.
+- **Why this is safe:** the broker's write path overwrites a rejected row in place, and queues a new
+  pending revision beside an *approved* one instead of replacing it, so regenerating never destroys
+  approved text. Production auto-approves new rows (`BILL_ARTIFACT_REQUIRE_REVIEW` off), so a rewritten
+  row goes live immediately, and a rejected row is off the public site until it is rewritten.
+- **The use case:** bulk-rejecting a known-bad set (Utah's redline-based changelogs, SYNC-111) and then
+  running the normal pipeline with `bill_candidates` or a session scan. Do not delete rows for this
+  (see "Writing BillArtifacts" above: leave `model_version`/`prompt_version`/`prompt_hash` unset so a
+  rewrite lands on the same row).
+
 ## No CI
 
 None of `ddp-open-states`, `openstates-core`, `openstates-scrapers`, or `ddp-sync` have CI
