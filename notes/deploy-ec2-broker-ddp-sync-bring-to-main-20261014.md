@@ -5,10 +5,10 @@
 **This is the EC2-broker host's ddp-sync ONLY** (the one next to production ddp-broker-py, OPEN-193). **Do NOT touch the votebot/ddp-api EC2 instance**: it runs its own permanently diverged branch (`feat/rds-openstates-routing-standalone`) on purpose, and CLAUDE.md says never to pull it up to `main`.
 
 ## 1. Why, and what changes
-That host's ddp-sync was at `fe04095` (2026-10-10, the SYNC-103 merge). `main` is now `7dbd216`, 46 commits later. The ones that matter for LegBot's bill changelogs:
+That host's ddp-sync was at `fe04095` (2026-10-10, the SYNC-103 merge). `main` is now `7dbd216`, 44 commits later. The ones that matter for LegBot's bill changelogs:
 - **SYNC-110** (`0f473b1`): a changelog's old side is the version its diff was taken against.
 - **SYNC-115** (`7dbd216`): a rejected BillArtifact counts as missing and is written again. It needs ddp-broker-py's BROKER-217 (the status read reporting review_status) to do anything; against a broker without it, it behaves exactly as today, so **the order of the two deployments does not matter for safety**.
-You said earlier that you believe this host only relays LegBot triggers to the Mac and does not run generation itself; the pull is still worth doing so the host is not left on a different generation path, and so SYNC-110/115 are in place if anyone ever runs generation there. Everything else in the range is below.
+Whether this host only relays LegBot triggers to the Mac (where LegBot lives) or can also run generation itself is **not confirmed**: that is the dev side's reading of CLAUDE.md, and you earlier noted the SYNC-110 code path exists on this host. Please say in your reply what you know. The pull is worth doing either way, so the host is not left on a different generation path and SYNC-110/115 are in place if anyone ever runs generation there. Everything else in the range is below.
 
 Verified from the diff (`fe04095..main`), all inert on this host unless an environment setting says otherwise:
 - **No dependency changes** (no pyproject/requirements/Docker file in the range).
