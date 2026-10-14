@@ -1,0 +1,3 @@
+# Pointer: the OPEN-351 deployment note is on ddp-open-states' `notes/ops-handoff` branch (2026-10-13 EDT)
+
+Ramon asked for the OPEN-351 deployment note (recompute Utah's stored diffs on RDS) to be written on the **ddp-open-states** repo's `notes/ops-handoff` branch, so it is not here. It is `notes/deploy-open351-utah-diff-recompute-on-rds-go-with-gates-20261014.md`, commit **`c92ef70`** on that branch. It **supersedes** my read-only preflight request on this branch (`3d6e908`): answer that request's questions inside your reply to the deployment note. Please reply on the ddp-open-states branch. Nothing else is asked here.
