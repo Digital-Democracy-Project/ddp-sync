@@ -628,6 +628,24 @@ evening: `/trigger/bill-artifact-generation`, `jurisdiction_iso2=ut`, `session_c
   `recover_stale_legbot_dispatches` retries a recovered answer forever when the broker has no such bill
   (SYNC-116, seen as three refused `POST /api/bill-artifacts/` every 30 minutes).
 
+**Outcome of that run (2026-10-15; the review-status count has not been done yet).** It started 19:21 UTC
+on 10-14 and ended itself at 12:11 UTC on 10-15 (16.8 h, all 1,016 bills considered). Utah needs 2,041
+changelogs on 761 bills, not the 1,567 that were rejected: the run also writes for bills that never had
+one (444 new rows, `created=True`). It wrote 2,020. **Six bills are still short (21 changelogs):** HB 475
+(the answer came back as a string, not a dict) and HB 68, SB 38, HB 474, HB 361, SB 41 (each hit the
+10,000 s inference timeout, holding a worker about 2.8 h for nothing). Redo only those six with
+`bill_candidates`; the timeouts are the biggest bills (4 to 14 versions) and may repeat.
+- **Count progress from the log, not by guessing.** Log times are local (EDT). In `logs/ddp-sync.log`,
+  count `BillArtifact written ... artifact_type=bill_changelog` after the `scraper_triggered_legbot_start`
+  line, and compare per bill with `get_archived_version_transitions` (what api-v3 says each bill needs).
+  The run's own end line is `scraper_triggered_legbot_complete`.
+- **A scheduled US 119 scan shares the workers and is mostly skipping.** It checks all 19,643 bills in
+  about 3.5 h but generates almost nothing (already covered), so MLX looks idle. Bills with no archived
+  text yet show as "failed" in its counts (`session_pipeline_no_version_identity`); that is not a failure.
+- **`LEGBOT_POLL_RETRY_MAX_ATTEMPTS=60` is set in the Mac's `.env`** (code default 5, 2 s apart): about two
+  minutes of CAMS downtime no longer fails a bill. It is host config, not code, and a longer reload still
+  falls through to the queue-wait and dispatch deadlines.
+
 ## No CI
 
 None of `ddp-open-states`, `openstates-core`, `openstates-scrapers`, or `ddp-sync` have CI
