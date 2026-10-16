@@ -179,10 +179,13 @@ def get_session_pipeline_semaphore() -> asyncio.Semaphore:
 # The count is dropped rather than corrected to nine, so it cannot go stale the
 # same way a third time.
 #
-# bill_topics is deliberately NOT part of any default artifact_types list yet
-# (see config/sync_schedule.yaml's session_pipeline_batch, which hand-picks
-# its own small subset -- nothing here auto-widens to "every recognized
-# type").
+# Nothing here auto-widens a caller's list to "every recognized type"; each
+# caller names its own. The scrape-completion trigger's default
+# (config.legbot_scrape_completion_trigger_artifact_types, SYNC-50) names all
+# of them, bill_topics included; it applies only where that trigger is enabled,
+# and a host's LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES replaces it.
+# config/sync_schedule.yaml's session_pipeline_batch hand-picks a small subset
+# without bill_topics (SYNC-123).
 ALL_ARTIFACT_TYPES = frozenset({
     "bill_summary",
     "bill_pros_cons",
