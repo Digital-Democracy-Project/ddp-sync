@@ -358,6 +358,10 @@ def add_contacts_to_brevo(api_key: str, list_id: int, users: list[dict],
             logger.warning(f"Skipping contact with invalid email: {raw_email}")
             continue
 
+        # SYNC-121: never send emailBlacklisted/smsBlacklisted. The monthly full sync
+        # re-imports every existing contact, and `false` there could clear a block the
+        # person chose (Brevo does not document whether the import honours it). New
+        # contacts start unblocked anyway, so leaving the fields out changes nothing else.
         contact = {
             "email": email,
             "attributes": {
@@ -373,8 +377,6 @@ def add_contacts_to_brevo(api_key: str, list_id: int, users: list[dict],
             },
             "listIds": list_ids,
             "updateEnabled": True,
-            "emailBlacklisted": False,
-            "smsBlacklisted": False
         }
 
         # Add phone/SMS if available. Brevo treats both `sms` and
