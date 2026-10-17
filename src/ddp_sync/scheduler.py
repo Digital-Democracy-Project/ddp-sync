@@ -392,7 +392,6 @@ class UpdateScheduler:
                 run_webflow_fill_map_url,
                 run_webflow_fill_session_code,
                 run_webflow_find_duplicates,
-                run_webflow_merge_duplicate_orgs,
                 run_webflow_org_about_parse,
             )
 
@@ -405,7 +404,6 @@ class UpdateScheduler:
                 ("webflow_org_about_parse", "Webflow: org about-field parse", run_webflow_org_about_parse),
                 ("webflow_check_org_missing", "Webflow: check org missing fields", run_webflow_check_org_missing),
                 ("webflow_find_duplicates", "Webflow: find duplicate bills", run_webflow_find_duplicates),
-                ("webflow_merge_duplicate_orgs", "Webflow: merge duplicate orgs", run_webflow_merge_duplicate_orgs),
             ]
 
             for job_id, name, func in webflow_jobs:

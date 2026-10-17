@@ -54,20 +54,6 @@ class SyncResult:
 
 
 @dataclass
-class MergeResult:
-    """Result of merging a duplicate org into a canonical org."""
-
-    duplicate_id: str
-    canonical_id: str
-    duplicate_name: str
-    canonical_name: str
-    fields_migrated: list[str] = field(default_factory=list)
-    bill_refs_repointed: int = 0
-    deleted: bool = False
-    error: str = ""
-
-
-@dataclass
 class DuplicateGroup:
     """A group of duplicate or companion bills."""
 
