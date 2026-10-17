@@ -152,13 +152,12 @@ Pub/sub channels (hardcoded strings in callers):
 ## Webflow CMS client (`webflow_cms/client.py`)
 
 - **`WebflowClient`** — low-level paginated fetcher for the CMS. Used by the `webflow_cms/` services subpackage.
-- **`webflow_cms/models.py`** — shared result shapes: `UpdateResult, DeleteResult, FillResult, SyncResult, MergeResult, DuplicateGroup`
+- **`webflow_cms/models.py`** — shared result shapes: `UpdateResult, DeleteResult, FillResult, SyncResult, DuplicateGroup`
 - **`webflow_cms/exceptions.py`** — `WebflowCMSError, WebflowAPIError, WebflowConflictError, ConfigurationError, ParseError`
 
 ## Webflow CMS batch services (`webflow_cms/services/`)
 
 - **`BillOrgSyncService`** — syncs organization references on bill items
-- **`OrgMergeService`** — deduplicates Member Organizations by name (weekly cron). `run_merge() -> MergeResult`
 - **`DuplicateBillsService`** — detects and reports duplicate bills
 - **`SessionCodeService`** — fills `session-code` field from OpenStates URL
 - **`MapUrlService`** — fills `map-url` field

@@ -495,3 +495,29 @@ async def test_run_legislator_bio_sync_invalid_historical_since_falls_back():
 
     options = instance.run.call_args.args[0]
     assert str(options.historical_since) == "2023-01-01"
+
+
+@pytest.mark.asyncio
+async def test_webflow_batch_never_registers_the_org_merge():
+    """SYNC-113: the Webflow organization merge (which deleted organizations in Webflow) is
+    retired; organization de-duplication belongs to ddp-broker-py. The other six Webflow
+    batch jobs still register; no merge job does."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        """
+    )
+    sched.start()
+    try:
+        webflow_ids = {j.id for j in sched.scheduler.get_jobs() if j.id.startswith("webflow_")}
+        assert webflow_ids == {
+            "webflow_fill_session_code",
+            "webflow_fill_map_url",
+            "webflow_bill_org_sync",
+            "webflow_org_about_parse",
+            "webflow_check_org_missing",
+            "webflow_find_duplicates",
+        }
+    finally:
+        sched.stop()
