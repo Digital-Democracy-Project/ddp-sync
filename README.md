@@ -25,7 +25,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
 - **Organization sync** (monthly 1st 08:00 UTC): Webflow → Pinecone
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
 - **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): Full re-import
-- **Webflow CMS batch jobs** (weekly Mon 03:00 UTC): Fill fields, sync refs, detect bill duplicates, merge duplicate organizations
+- **Webflow CMS batch jobs** (weekly Mon 03:00 UTC): Fill fields, sync refs, detect bill duplicates
 - **API health check** (nightly 09:00 UTC): POSTs to `/get_events` for every configured Voatz org, asserts non-empty JSON results, and fires a Zapier alert on any failure. Manual run: `.venv/bin/python scripts/check_api_health.py [--dry-run]`
 
 ### Service Topology
@@ -58,7 +58,7 @@ Config is loaded once at startup. Source priority: Secrets Manager → `.env` �
 
 ### Webflow CMS package
 
-All Webflow CMS batch logic lives in `src/ddp_sync/webflow_cms/` — a self-contained subpackage with `WebflowClient`, service classes (`BillOrgSyncService`, `DuplicateBillsService`, `OrgMergeService`, fill services), models, and utilities. It was previously maintained as a separate repo (`FillWebflowFields`, now deprecated) and absorbed here on 2026-06-03 so all cron-facing code lives in one place.
+All Webflow CMS batch logic lives in `src/ddp_sync/webflow_cms/` — a self-contained subpackage with `WebflowClient`, service classes (`BillOrgSyncService`, `DuplicateBillsService`, fill services), models, and utilities. It was previously maintained as a separate repo (`FillWebflowFields`, now deprecated) and absorbed here on 2026-06-03 so all cron-facing code lives in one place.
 
 ### Webflow API tokens
 
@@ -129,9 +129,9 @@ Phase 1 + 2.5 + 3 + 4 (V1) shipped 2026-04-30 → 2026-05-01 against the FL cong
 
 **⚠ Schema-change checklist for the Legislators CMS:** when adding a new field to the Webflow Legislators collection, **publish the Webflow site** before running the bio sync. The schema endpoint reflects new fields immediately, but the items endpoint silently ignores writes to unpublished fields (PATCHes return 200 but the value doesn't persist). Verify with `scripts/probe_webflow_legislators.py` after the first sync run.
 
-Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`, `merge-duplicate-orgs`
+Available Webflow jobs: `fill-session-code`, `fill-map-url`, `bill-org-sync`, `org-about-parse`, `check-org-missing`, `find-duplicates`
 
-`merge-duplicate-orgs` detects exact-name duplicates across the Member Organizations collection (after normalization for "The", "&"→"and", Inc/LLC/Foundation suffixes, punctuation), merges bill references bidirectionally, and deletes the sparse copy. Canonical record is chosen by richness score (bill refs + populated fields). Safe to re-run — a second pass cleans up any stale references that blocked deletion on the first pass.
+The Webflow organization merge (`merge-duplicate-orgs`, which deleted duplicate organizations in Webflow) was removed in SYNC-113: organization de-duplication belongs to ddp-broker-py (BROKER-189: dry run, tombstone, undo), and nothing in ddp-sync deletes an organization in Webflow.
 
 ### API Health Check
 
