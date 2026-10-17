@@ -324,3 +324,29 @@ async def test_mi_cookie_publish_without_day_of_month_keeps_the_interval_schedul
         assert job.trigger.interval.total_seconds() == 6 * 3600
     finally:
         sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_webflow_batch_never_registers_the_org_merge():
+    """SYNC-113: the Webflow organization merge (which deleted organizations in Webflow) is
+    retired; organization de-duplication belongs to ddp-broker-py. With the Webflow batch on,
+    the other batch jobs still register and no merge job does."""
+    sched = _scheduler_with_yaml(
+        """
+        bill_sync:
+          sync_time_utc: "04:00"
+        """,
+    )
+    sched.start()
+    try:
+        webflow_ids = {j.id for j in sched.scheduler.get_jobs() if j.id.startswith("webflow_")}
+        assert webflow_ids == {
+            "webflow_fill_session_code",
+            "webflow_fill_map_url",
+            "webflow_bill_org_sync",
+            "webflow_org_about_parse",
+            "webflow_check_org_missing",
+            "webflow_find_duplicates",
+        }
+    finally:
+        sched.stop()
