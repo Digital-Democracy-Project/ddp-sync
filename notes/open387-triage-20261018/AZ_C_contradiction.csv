@@ -1,0 +1,41 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+316892,AZ,57th-2nd-regular,HB4167,HOUSE - Floor Amend to Bill - Livingston - passed,House Engrossed Version,approved,complete,2393,possible_contradiction
+317411,AZ,57th-2nd-regular,SB1849,Senate Engrossed Version,Introduced Version,approved,complete,2213,possible_contradiction
+317424,AZ,57th-2nd-regular,SB1860,SENATE - Farnsworth flr amend (ref Bill) adopted,Senate Engrossed Version,approved,complete,2393,possible_contradiction
+317466,AZ,57th-2nd-regular,HB2015,House Engrossed Version,Introduced Version,approved,complete,2382,possible_contradiction
+318091,AZ,57th-2nd-regular,SB1620,HOUSE - Government - Strike Everything,House Engrossed Version,approved,complete,10283,"possible_contradiction,possible_unnamed_addition"
+318310,AZ,57th-2nd-regular,SB1271,SENATE - Gowan flr amend (ref Bill) adopted,Senate Engrossed Version,approved,complete,2048,possible_contradiction
+318477,AZ,57th-2nd-regular,HB4156,House Engrossed Version,Introduced Version,approved,complete,2213,possible_contradiction
+319027,AZ,57th-2nd-regular,SB1327,SENATE - Education - Strike Everything,Senate Engrossed Version,approved,complete,15860,possible_contradiction
+319083,AZ,57th-2nd-regular,HB2028,SENATE - Judiciary and Elections - Strike Everything,Senate Engrossed Version,approved,complete,3247,possible_contradiction
+319111,AZ,57th-2nd-regular,SB1429,"HOUSE - Federalism, Military Affairs & Elections - Strike Everything",House Engrossed Version,approved,complete,25178,"possible_contradiction,possible_unnamed_addition"
+319130,AZ,57th-2nd-regular,SB1456,HOUSE - Transportation & Infrastructure - Strike Everything,House Engrossed Version,approved,complete,5020,possible_contradiction
+319814,AZ,57th-2nd-regular,HB2091,SENATE - Finance,House Engrossed Version,approved,complete,5167,possible_contradiction
+319907,AZ,57th-2nd-regular,HB2364,HOUSE - Floor Amend to Bill - Keshel - passed,House Engrossed Version,approved,complete,1805,possible_contradiction
+320178,AZ,57th-2nd-regular,HB2190,House Engrossed Version,Introduced Version,approved,complete,9176,possible_contradiction
+320224,AZ,57th-2nd-regular,SB1538,HOUSE - Floor Amend to PSLE - Biasiucci - passed,House Engrossed Version,approved,complete,2026,possible_contradiction
+320484,AZ,57th-2nd-regular,SB1066,SENATE - Rogers flr amend (ref Bill) adopted,Senate Engrossed Version,approved,complete,2635,possible_contradiction
+321134,AZ,57th-2nd-regular,HB2451,House Engrossed Version,Introduced Version,approved,complete,843,possible_contradiction
+321806,AZ,57th-2nd-regular,HB2478,HOUSE - Education,HOUSE - Appropriations,approved,complete,7597,possible_contradiction
+323578,AZ,57th-2nd-regular,SB1041,HOUSE - Appropriations - Strike Everything,House Engrossed Version,approved,complete,23380,"possible_contradiction,possible_unnamed_addition"
+323613,AZ,57th-2nd-regular,HB2440,SENATE - Rogers flr amend (ref House Engrossed Bill) adopted,Senate Engrossed Version,approved,complete,1616,possible_contradiction
+323615,AZ,57th-2nd-regular,HB2440,Chaptered Version,SENATE - Rogers flr amend (ref House Engrossed Bill) adopted,approved,complete,1616,possible_contradiction
+323670,AZ,57th-2nd-regular,HB2686,HOUSE - Floor Amend to Bill - Heap - passed,House Engrossed Version,approved,complete,3387,possible_contradiction
+323770,AZ,57th-2nd-regular,SB1831,Senate Engrossed Version,Introduced Version,approved,complete,3759,possible_contradiction
+324066,AZ,57th-2nd-regular,HB4130,HOUSE - Floor Amend to GOV - Blackman - passed,House Engrossed Version,approved,complete,1571,possible_contradiction
+324517,AZ,57th-2nd-regular,SB1365,SENATE - Military Affairs and Border Security - Strike Everything,Senate Engrossed Version,approved,complete,12077,"possible_contradiction,possible_unnamed_addition"
+325277,AZ,57th-2nd-regular,HB2906,HOUSE - Floor Amend to Bill - Heap - passed,House Engrossed Version,approved,complete,2056,possible_contradiction
+326059,AZ,57th-2nd-regular,HB2273,HOUSE - Ways & Means - Strike Everything,House Engrossed Version,approved,complete,6172,possible_contradiction
+328416,AZ,57th-2nd-regular,SB1503,HOUSE - Appropriations - Strike Everything,House Engrossed Version,approved,complete,3106,possible_contradiction
+329408,AZ,57th-2nd-regular,SB1813,SENATE - Health and Human Services - Strike Everything,Senate Engrossed Version,approved,complete,213787,possible_contradiction
+329801,AZ,57th-2nd-regular,HB2951,HOUSE - Commerce - Strike Everything,House Engrossed Version,approved,complete,10258,possible_contradiction
+330678,AZ,57th-2nd-regular,SB1293,Senate Engrossed Version,Introduced Version,approved,complete,2392,possible_contradiction
+331187,AZ,57th-2nd-regular,HB4138,House Engrossed Version,Introduced Version,approved,complete,3759,possible_contradiction
+331870,AZ,57th-2nd-regular,SB1036,Senate Engrossed Version,Introduced Version,approved,complete,3112,possible_contradiction
+332786,AZ,57th-2nd-regular,HB2932,SENATE - Health and Human Services - Strike Everything,Senate Engrossed Version,approved,complete,7420,possible_contradiction
+332891,AZ,57th-2nd-regular,HB2673,SENATE - Public Safety,HOUSE - Floor Amend to Bill - Hernandez C - passed,approved,complete,10891,possible_contradiction
+333506,AZ,57th-2nd-regular,HB2775,"HOUSE - Federalism, Military Affairs & Elections",House Engrossed Version,approved,complete,4416,"possible_contradiction,possible_unnamed_addition"
+333580,AZ,57th-2nd-regular,SB1192,SENATE - Health and Human Services,Senate Engrossed Version,approved,complete,1904,possible_contradiction
+333667,AZ,57th-2nd-regular,SCR1029,Senate Engrossed Version,Introduced Version,approved,complete,1178,possible_contradiction
+334820,AZ,57th-2nd-regular,HB2784,HOUSE - Floor Amend to WM - Olson - passed,House Engrossed Version,approved,complete,3471,possible_contradiction
+334847,AZ,57th-2nd-regular,HB2857,HOUSE - Government - Strike Everything,House Engrossed Version,approved,complete,1214,possible_contradiction

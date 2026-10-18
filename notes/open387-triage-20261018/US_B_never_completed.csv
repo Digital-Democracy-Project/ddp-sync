@@ -1,0 +1,6 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+66912,US,119,S1071,Engrossed Amendment House,Engrossed in Senate,pending_review,failed,3443121,
+66914,US,119,S1071,Enrolled Bill,Engrossed Amendment House,pending_review,failed,2093,
+216137,US,119,HR6644,Placed on Calendar Senate,Engrossed in House,pending_review,failed,553,
+234576,US,119,HR6644,Enrolled Bill,Engrossed Amendment Senate,pending_review,failed,1118,
+234849,US,119,S524,Engrossed in Senate,Introduced in Senate,pending_review,failed,2188,

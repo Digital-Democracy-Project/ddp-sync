@@ -1,0 +1,61 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+60423,US,119,S4668,Reported to Senate,Introduced in Senate,approved,complete,128205,possible_unnamed_addition
+60997,US,119,HR5334,Engrossed Amendment Senate,Placed on Calendar Senate,approved,complete,65368,possible_unnamed_addition
+61043,US,119,HR6644,Reported in House,Introduced in House,approved,complete,119378,possible_unnamed_addition
+61060,US,119,HR6644,Engrossed in House,Reported in House,approved,complete,86555,possible_unnamed_addition
+61089,US,119,HR9497,Reported in House,Introduced in House,approved,complete,176589,possible_unnamed_addition
+63885,US,119,HR3633,Reported in House,Introduced in House,approved,complete,300572,possible_unnamed_addition
+63899,US,119,HR3633,Engrossed in House,Reported in House,approved,complete,409622,possible_unnamed_addition
+63940,US,119,HR3633,Reported to Senate,Referred in Senate,approved,complete,346120,possible_unnamed_addition
+67576,US,119,HR8800,Reported in House,Introduced in House,approved,complete,1905713,possible_unnamed_addition
+72483,US,119,HR6500,Engrossed Amendment Senate,Placed on Calendar Senate,approved,complete,66453,possible_unnamed_addition
+74785,US,119,HR8469,Engrossed in House,Reported in House,approved,complete,56005,possible_unnamed_addition
+75116,US,119,HR7613,Reported in House,Introduced in House,approved,complete,189416,"possible_unnamed_addition,possible_unsourced_number"
+81112,US,119,HR7567,Reported in House,Introduced in House,approved,complete,226392,possible_unnamed_addition
+81115,US,119,HR7567,Engrossed in House,Reported in House,approved,complete,153466,possible_unnamed_addition
+81912,US,119,S1383,Engrossed Amendment House,Engrossed in Senate,approved,complete,41855,possible_unnamed_addition
+83391,US,119,S1547,Reported to Senate,Introduced in Senate,approved,complete,34550,"possible_unnamed_addition,possible_unsourced_number"
+85507,US,119,S2355,Reported to Senate,Introduced in Senate,approved,complete,104208,possible_unnamed_addition
+85833,US,119,HR8463,Engrossed in House,Introduced in House,approved,complete,38757,possible_unnamed_addition
+86620,US,119,HR7148,Engrossed in House,Introduced in House,approved,complete,703312,possible_unnamed_addition
+86623,US,119,HR7148,Enrolled Bill,Engrossed Amendment Senate,approved,complete,1667958,possible_unnamed_addition
+90073,US,119,HR6955,Reported in House,Introduced in House,approved,complete,138810,possible_unnamed_addition
+94335,US,119,HR4275,Reported in House,Introduced in House,approved,complete,89566,"possible_unnamed_addition,possible_unsourced_number"
+94514,US,119,S4949,Reported to Senate,Introduced in Senate,approved,complete,270079,possible_unnamed_addition
+94758,US,119,HR5167,Reported in House,Introduced in House,approved,complete,141968,"possible_unnamed_addition,possible_unsourced_number"
+96112,US,119,HR7757,Engrossed in House,Introduced in House,approved,complete,123683,"possible_unnamed_addition,possible_unsourced_number"
+98815,US,119,HR1048,Engrossed in House,Reported in House,approved,complete,43686,possible_unnamed_addition
+100234,US,119,HR2137,Reported in House,Introduced in House,approved,complete,30526,possible_unnamed_addition
+106402,US,119,S1462,Reported to Senate,Introduced in Senate,approved,complete,230224,possible_unnamed_addition
+109298,US,119,S3249,Reported to Senate,Introduced in Senate,approved,complete,41514,possible_unnamed_addition
+116636,US,119,S2503,Reported to Senate,Introduced in Senate,approved,complete,43033,possible_unnamed_addition
+123533,US,119,S2292,Reported to Senate,Introduced in Senate,approved,complete,29204,possible_unnamed_addition
+132289,US,119,S688,Engrossed in Senate,Reported to Senate,approved,complete,47943,possible_unnamed_addition
+136614,US,119,S1498,Reported to Senate,Introduced in Senate,approved,complete,29491,possible_unnamed_addition
+143961,US,119,HR4553,Engrossed in House,Reported in House,approved,complete,37840,possible_unnamed_addition
+144986,US,119,HR1968,Public Law,Enrolled Bill,approved,complete,195240,"possible_unnamed_addition,possible_unsourced_number"
+151470,US,119,HR4016,Engrossed in House,Reported in House,approved,complete,80630,possible_unnamed_addition
+155268,US,119,HCONRES14,Engrossed Amendment Senate,Placed on Calendar Senate,approved,complete,88435,possible_unnamed_addition
+156186,US,119,HR4776,Reported in House,Introduced in House,approved,complete,32898,possible_unnamed_addition
+162498,US,119,HR3838,Reported in House,Introduced in House,approved,complete,1468851,possible_unnamed_addition
+163250,US,119,HR4312,Reported in House,Introduced in House,approved,complete,68383,possible_unnamed_addition
+164707,US,119,HR7147,Engrossed Amendment Senate,Engrossed Amendment House,approved,complete,112408,"possible_unnamed_addition,possible_unsourced_number"
+165403,US,119,HR3898,Reported in House,Introduced in House,approved,complete,39358,possible_unnamed_addition
+181044,US,119,HR1,Engrossed in House,Reported in House,approved,complete,457360,"possible_unnamed_addition,possible_unsourced_number"
+183612,US,119,HR2289,Reported in House,Introduced in House,approved,complete,93399,possible_unnamed_addition
+188416,US,119,HR2483,Public Law,Enrolled Bill,approved,complete,100493,possible_unnamed_addition
+192260,US,119,HR8646,Engrossed in House,Reported in House,approved,complete,79653,possible_unnamed_addition
+204191,US,119,HR3383,Engrossed in House,Reported in House,approved,complete,62947,"possible_unnamed_addition,possible_unsourced_number"
+209399,US,119,HR3944,Engrossed in House,Reported in House,approved,complete,54390,possible_unnamed_addition
+215775,US,119,S4429,Reported to Senate,Introduced in Senate,approved,complete,42374,possible_unnamed_addition
+234294,US,119,S3923,Reported to Senate,Introduced in Senate,approved,complete,54626,possible_unnamed_addition
+234551,US,119,HR6644,Engrossed Amendment House,Engrossed Amendment Senate,approved,complete,310505,possible_unnamed_addition
+234577,US,119,HR6644,Public Law,Enrolled Bill,approved,complete,577092,"possible_unnamed_addition,possible_unsourced_number"
+234684,US,119,HR8595,Engrossed in House,Reported in House,approved,complete,58300,possible_unnamed_addition
+234689,US,119,HR5371,Engrossed Amendment Senate,Placed on Calendar Senate,approved,complete,462267,possible_unnamed_addition
+234691,US,119,HR5371,Public Law,Enrolled Bill,approved,complete,806809,"possible_unnamed_addition,possible_unsourced_number"
+234833,US,119,HR6938,Public Law,Enrolled Bill,approved,complete,859317,"possible_unnamed_addition,possible_unsourced_number"
+236626,US,119,HR3838,Engrossed in House,Reported in House,approved,complete,631990,possible_unnamed_addition
+236661,US,119,HR6993,Reported in House,Introduced in House,approved,complete,25765,possible_unnamed_addition
+341274,US,119,S4668,Engrossed in Senate,Reported to Senate,approved,complete,228931,"possible_unnamed_addition,possible_unsourced_number"
+341644,US,119,HR3944,Engrossed Amendment Senate,Reported to Senate,approved,complete,336221,possible_unnamed_addition

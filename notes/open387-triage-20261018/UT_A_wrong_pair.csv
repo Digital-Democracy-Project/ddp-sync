@@ -1,0 +1,10 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+336030,UT,2026,HB475,Substitute #1,Comparison to Original Bill,rejected,complete,495667,possible_unnamed_addition
+336047,UT,2026,HB475,Substitute #2,Comparison to Sub #1,rejected,complete,5316,
+336057,UT,2026,HB475,Substitute #3,Comparison to Sub #2,rejected,complete,45635,
+336064,UT,2026,HB475,Substitute #4,Comparison to Sub #3,rejected,complete,51140,possible_unnamed_addition
+337265,UT,2026,HB68,Substitute #2,Comparison to Sub #1,rejected,complete,71014,"possible_unnamed_addition,possible_unsourced_number"
+337284,UT,2026,HB68,Substitute #3,Comparison to Sub #2,rejected,complete,12724,
+337319,UT,2026,HB68,Substitute #4,Comparison to Sub #3,rejected,complete,116615,
+337338,UT,2026,HB68,Substitute #5,Comparison to Sub #4,rejected,complete,89261,
+337365,UT,2026,HB68,Substitute #6,Comparison to Sub #5,rejected,complete,52219,possible_unnamed_addition

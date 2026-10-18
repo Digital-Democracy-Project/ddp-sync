@@ -1,0 +1,12 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+815,MI,2025-2026,HB5359,As Passed by the House,Substitute (H-1),approved,complete,,
+5341,MI,2025-2026,SB2,Substitute (S-1),Senate Introduced Bill,approved,complete,,
+5342,MI,2025-2026,SB2,As Passed by the Senate,Substitute (S-1),pending_review,failed,,
+5358,MI,2025-2026,SB1,Substitute (S-1),Senate Introduced Bill,approved,complete,,
+5359,MI,2025-2026,SB1,As Passed by the Senate,Substitute (S-1),pending_review,failed,,
+43674,MI,2025-2026,HB5921,As Passed by the House,Substitute (H-1) - 2,approved,complete,,
+213823,MI,2025-2026,SB569,Public Act,As Passed by the House,approved,complete,,
+213959,MI,2025-2026,SB373,Public Act,As Passed by the House,approved,complete,,
+214206,MI,2025-2026,SB527,Public Act,As Passed by the House,approved,complete,,
+214229,MI,2025-2026,SB22,Public Act,As Passed by the House,approved,complete,,
+214395,MI,2025-2026,SB1052,Public Act,As Passed by the House,approved,complete,,

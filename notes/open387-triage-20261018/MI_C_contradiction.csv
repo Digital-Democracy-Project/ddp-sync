@@ -1,0 +1,24 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+1623,MI,2025-2026,SB903,Public Act,Senate Concurred Bill,approved,complete,13446,possible_contradiction
+1682,MI,2025-2026,SB501,Public Act,As Passed by the House,approved,complete,8986,possible_contradiction
+1904,MI,2025-2026,HB4042,Public Act,House Concurred Bill,approved,complete,16199,possible_contradiction
+1960,MI,2025-2026,HB4103,Public Act,House Concurred Bill,approved,complete,95709,possible_contradiction
+2601,MI,2025-2026,HB6074,Public Act,House Concurred Bill,approved,complete,14429,possible_contradiction
+2814,MI,2025-2026,HB4101,Public Act,House Concurred Bill,approved,complete,77293,possible_contradiction
+2889,MI,2025-2026,HB5233,Public Act,House Concurred Bill,approved,complete,10075,possible_contradiction
+2890,MI,2025-2026,HB4750,Public Act,House Concurred Bill,approved,complete,14536,possible_contradiction
+4869,MI,2025-2026,SB311,As Passed by the Senate,Substitute (S-1) - 3,approved,complete,509,possible_contradiction
+8819,MI,2025-2026,HB4282,Public Act,House Concurred Bill,approved,complete,17687,possible_contradiction
+12599,MI,2025-2026,HB4099,Public Act,House Concurred Bill,approved,complete,17335,possible_contradiction
+13413,MI,2025-2026,HB5455,Public Act,House Concurred Bill,approved,complete,79769,possible_contradiction
+14068,MI,2025-2026,SB23,Public Act,Senate Concurred Bill,approved,complete,7210,possible_contradiction
+14847,MI,2025-2026,HB4301,As Passed by the House,House Introduced Bill,approved,complete,469,possible_contradiction
+18206,MI,2025-2026,HB4182,Public Act,House Concurred Bill,approved,complete,16414,possible_contradiction
+26447,MI,2025-2026,HB4543,Public Act,House Concurred Bill,approved,complete,46829,possible_contradiction
+31632,MI,2025-2026,HB4090,Public Act,House Concurred Bill,approved,complete,22272,possible_contradiction
+33160,MI,2025-2026,HB4420,Public Act,Senate Concurred Bill,approved,complete,6156,possible_contradiction
+213446,MI,2025-2026,HB4135,House Concurred Bill,House Enrolled Bill,approved,complete,18700,possible_contradiction
+214081,MI,2025-2026,HB5109,Public Act,House Concurred Bill,approved,complete,5054,possible_contradiction
+316266,MI,2025-2026,SB433,Public Act,Senate Concurred Bill,approved,complete,6552,possible_contradiction
+316350,MI,2025-2026,HB4302,Public Act,House Concurred Bill,approved,complete,28018,possible_contradiction
+316372,MI,2025-2026,SB198,Public Act,As Passed by the House,approved,complete,31700,possible_contradiction

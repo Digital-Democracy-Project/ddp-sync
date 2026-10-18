@@ -1,0 +1,4 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+175012,US,119,HR3426,Referred in Senate,Engrossed in House,approved,complete,,
+175015,US,119,HR3426,Referred in Senate,Referred in Senate,approved,complete,,
+234165,US,119,HR6644,Engrossed Amendment Senate,Placed on Calendar Senate,pending_review,failed,,

@@ -1,0 +1,50 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+335631,UT,2026,HCR10,Enrolled,Amended 3/3/2026 08:03:243,approved,complete,3409,possible_contradiction
+335678,UT,2026,SB170,Amended 3/3/2026 19:03:272,Substitute #4,approved,complete,805,possible_contradiction
+335809,UT,2026,HB546,Enrolled,Amended 2/27/2026 09:02:256,approved,complete,2765,possible_contradiction
+335850,UT,2026,SB181,Enrolled,Amended 3/6/2026 23:03:488,approved,complete,2628,possible_contradiction
+335962,UT,2026,SB193,Amended 3/3/2026 11:03:872,Substitute #3,approved,complete,1120,possible_contradiction
+336118,UT,2026,SB31,Amended 3/3/2026 19:03:217,Amended 2/25/2026 16:02:990,approved,complete,7760,possible_contradiction
+336408,UT,2026,HB317,Amended 2/5/2026 11:02:182,Substitute #1,approved,complete,1634,possible_contradiction
+336923,UT,2026,SB71,Enrolled,Introduced,approved,complete,4200,possible_contradiction
+337119,UT,2026,HB284,Enrolled,Introduced,approved,complete,956,possible_contradiction
+337180,UT,2026,HB557,Enrolled,Introduced,approved,complete,1493,possible_contradiction
+337472,UT,2026,HB101,Enrolled,Amended 2/13/2026 11:02:409,approved,complete,1424,possible_contradiction
+337897,UT,2026,HB30,Amended 1/26/2026 10:01:914,Substitute #1,approved,complete,1660,possible_contradiction
+338021,UT,2026,HB97,Amended 2/10/2026 15:02:175,Substitute #2,approved,complete,1239,possible_contradiction
+338025,UT,2026,HB97,Enrolled,Amended 2/10/2026 15:02:175,approved,complete,1770,possible_contradiction
+338206,UT,2026,SB154,Amended 2/24/2026 11:02:229,Substitute #2,approved,complete,1113,possible_contradiction
+338411,UT,2026,HB393,Enrolled,Substitute #2,approved,complete,1415,possible_contradiction
+338443,UT,2026,HB382,Enrolled,Introduced,approved,complete,15670,possible_contradiction
+339003,UT,2026,HB302,Amended 2/17/2026 09:02:161,Substitute #1,approved,complete,1705,possible_contradiction
+339147,UT,2026,HB462,Amended 2/24/2026 15:02:11,Introduced,approved,complete,3168,possible_contradiction
+339278,UT,2026,HB567,Enrolled,Introduced,approved,complete,244,possible_contradiction
+339455,UT,2026,HB26,Enrolled,Substitute #1,approved,complete,734,possible_contradiction
+339637,UT,2026,HB240,Enrolled,Amended 2/10/2026 09:02:898,approved,complete,1206,possible_contradiction
+339680,UT,2026,HB126,Enrolled,Substitute #1,approved,complete,284,possible_contradiction
+339701,UT,2026,HB352,Enrolled,Amended 2/10/2026 15:02:308,approved,complete,877,possible_contradiction
+339708,UT,2026,SB283,Enrolled,Substitute #1,approved,complete,225,possible_contradiction
+339761,UT,2026,SB4,Enrolled,Introduced,approved,complete,1444,possible_contradiction
+339766,UT,2026,HB129,Enrolled,Amended 3/3/2026 08:03:37,approved,complete,757,possible_contradiction
+339823,UT,2026,HB280,Enrolled,Substitute #3,approved,complete,1235,possible_contradiction
+339825,UT,2026,SB244,Enrolled,Substitute #1,approved,complete,974,possible_contradiction
+339832,UT,2026,HB246,Enrolled,Introduced,approved,complete,1029,possible_contradiction
+339855,UT,2026,HB46,Amended 2/11/2026 11:02:222,Substitute #2,approved,complete,4307,possible_contradiction
+339889,UT,2026,SB292,Enrolled,Substitute #2,approved,complete,1314,possible_contradiction
+339900,UT,2026,SB155,Enrolled,Substitute #2,approved,complete,385,possible_contradiction
+339929,UT,2026,SJR1,Enrolled,Substitute #1,approved,complete,5173,possible_contradiction
+339950,UT,2026,HB520,Enrolled,Amended 2/26/2026 19:02:896,approved,complete,1185,possible_contradiction
+339972,UT,2026,HB380,Amended 2/18/2026 15:02:209,Introduced,approved,complete,661,possible_contradiction
+340146,UT,2026,SB286,Enrolled,Introduced,approved,complete,282,possible_contradiction
+340262,UT,2026,HB264,Enrolled,Amended 2/18/2026 15:02:20,approved,complete,2776,possible_contradiction
+340293,UT,2026,SB96,Enrolled,Substitute #1,approved,complete,1025,possible_contradiction
+340326,UT,2026,SB20,Enrolled,Introduced,approved,complete,28556,possible_contradiction
+340368,UT,2026,HB545,Enrolled,Substitute #4,approved,complete,946,possible_contradiction
+340463,UT,2026,SJR8,Enrolled,Amended 3/2/2026 10:03:29,approved,complete,5353,possible_contradiction
+340468,UT,2026,HB540,Amended 3/4/2026 19:03:105,Substitute #2,approved,complete,1170,possible_contradiction
+340546,UT,2026,HB182,Enrolled,Amended 2/19/2026 11:02:974,approved,complete,810,possible_contradiction
+340606,UT,2026,HB143,Enrolled,Substitute #1,approved,complete,842,possible_contradiction
+340626,UT,2026,SB217,Enrolled,Substitute #1,approved,complete,149,possible_contradiction
+340632,UT,2026,HB128,Amended 1/26/2026 10:01:659,Introduced,approved,complete,991,possible_contradiction
+340635,UT,2026,SB80,Enrolled,Amended 2/13/2026 11:02:453,approved,complete,2583,possible_contradiction
+340695,UT,2026,HB559,Amended 2/26/2026 08:02:456,Substitute #1,approved,complete,874,possible_contradiction

@@ -1,0 +1,158 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+335679,UT,2026,HB381,Substitute #3,Substitute #2,approved,complete,46303,"possible_unnamed_addition,possible_unsourced_number"
+335701,UT,2026,HB572,Substitute #1,Introduced,approved,complete,144226,possible_unnamed_addition
+335711,UT,2026,HB572,Substitute #6,Substitute #5,approved,complete,40734,possible_unnamed_addition
+335724,UT,2026,HB370,Substitute #1,Introduced,approved,complete,43777,possible_unnamed_addition
+335767,UT,2026,HB389,Substitute #1,Introduced,approved,complete,60269,possible_unnamed_addition
+335771,UT,2026,HB389,Substitute #3,Substitute #2,approved,complete,82256,possible_unnamed_addition
+335905,UT,2026,HB479,Substitute #1,Introduced,approved,complete,169012,possible_unnamed_addition
+336030,UT,2026,HB475,Substitute #1,Comparison to Original Bill,rejected,complete,495667,possible_unnamed_addition
+336064,UT,2026,HB475,Substitute #4,Comparison to Sub #3,rejected,complete,51140,possible_unnamed_addition
+336200,UT,2026,SB275,Substitute #2,Substitute #1,approved,complete,72571,possible_unnamed_addition
+336207,UT,2026,SB275,Enrolled,Amended 3/2/2026 10:03:725,approved,complete,71975,possible_unnamed_addition
+336303,UT,2026,SB34,Substitute #1,Introduced,approved,complete,32140,possible_unnamed_addition
+336304,UT,2026,HB399,Substitute #1,Introduced,approved,complete,38107,possible_unnamed_addition
+336306,UT,2026,SB34,Substitute #2,Substitute #1,approved,complete,35741,possible_unnamed_addition
+336323,UT,2026,HB265,Substitute #1,Introduced,approved,complete,39991,possible_unnamed_addition
+336328,UT,2026,HB265,Substitute #2,Substitute #1,approved,complete,28509,possible_unnamed_addition
+336340,UT,2026,HB265,Enrolled,Amended 2/2/2026 11:02:738,approved,complete,28774,possible_unnamed_addition
+336407,UT,2026,HB179,Substitute #4,Substitute #3,approved,complete,40098,possible_unnamed_addition
+336688,UT,2026,HB185,Substitute #4,Substitute #3,approved,complete,29223,possible_unnamed_addition
+336775,UT,2026,SB149,Substitute #1,Introduced,approved,complete,229760,possible_unnamed_addition
+337135,UT,2026,SB267,Substitute #4,Substitute #3,approved,complete,42063,possible_unnamed_addition
+337138,UT,2026,SB267,Amended 3/5/2026 20:03:229,Amended 3/5/2026 15:03:922,approved,complete,44289,possible_unnamed_addition
+337140,UT,2026,SB267,Amended 3/5/2026 15:03:922,Substitute #5,approved,complete,43350,possible_unnamed_addition
+337243,UT,2026,HB68,Substitute #1,Introduced,approved,complete,192316,possible_unnamed_addition
+337265,UT,2026,HB68,Substitute #2,Comparison to Sub #1,rejected,complete,71014,"possible_unnamed_addition,possible_unsourced_number"
+337317,UT,2026,HB457,Substitute #1,Introduced,approved,complete,34880,possible_unnamed_addition
+337321,UT,2026,HB457,Substitute #3,Substitute #2,approved,complete,44532,possible_unnamed_addition
+337365,UT,2026,HB68,Substitute #6,Comparison to Sub #5,rejected,complete,52219,possible_unnamed_addition
+337713,UT,2026,HB22,Substitute #1,Introduced,approved,complete,55984,possible_unnamed_addition
+337714,UT,2026,HB44,Substitute #7,Substitute #6,approved,complete,35383,possible_unnamed_addition
+337725,UT,2026,HB44,Enrolled,Amended 3/3/2026 19:03:400,approved,complete,39720,possible_unnamed_addition
+337820,UT,2026,SB61,Substitute #1,Introduced,approved,complete,29609,possible_unnamed_addition
+337842,UT,2026,HB423,Substitute #1,Introduced,approved,complete,94747,possible_unnamed_addition
+337848,UT,2026,SB174,Substitute #1,Introduced,approved,complete,39780,possible_unnamed_addition
+337994,UT,2026,HB107,Substitute #1,Introduced,approved,complete,32200,possible_unnamed_addition
+337998,UT,2026,HB107,Substitute #2,Substitute #1,approved,complete,73467,possible_unnamed_addition
+338005,UT,2026,HB596,Amended 3/2/2026 14:03:549,Substitute #2,approved,complete,32645,possible_unnamed_addition
+338108,UT,2026,HB72,Substitute #1,Introduced,approved,complete,27905,possible_unnamed_addition
+338234,UT,2026,HB431,Substitute #1,Introduced,approved,complete,84216,possible_unnamed_addition
+338240,UT,2026,HB431,Amended 2/12/2026 10:02:409,Substitute #2,approved,complete,42836,possible_unnamed_addition
+338241,UT,2026,HB438,Substitute #1,Introduced,approved,complete,52363,possible_unnamed_addition
+338444,UT,2026,SB45,Substitute #2,Substitute #1,approved,complete,55921,possible_unnamed_addition
+338465,UT,2026,SB45,Enrolled,Substitute #5,approved,complete,40299,"possible_unnamed_addition,possible_unsourced_number"
+338531,UT,2026,HB58,Substitute #2,Substitute #1,approved,complete,101125,possible_unnamed_addition
+338532,UT,2026,HB183,Substitute #1,Introduced,approved,complete,198935,possible_unnamed_addition
+338665,UT,2026,HB508,Substitute #3,Substitute #2,approved,complete,26307,possible_unnamed_addition
+338744,UT,2026,HB176,Substitute #1,Introduced,approved,complete,26179,possible_unnamed_addition
+338785,UT,2026,HB375,Substitute #1,Introduced,approved,complete,50321,possible_unnamed_addition
+338797,UT,2026,SB54,Substitute #1,Introduced,approved,complete,74350,possible_unnamed_addition
+338870,UT,2026,SB278,Substitute #2,Substitute #1,approved,complete,43594,possible_unnamed_addition
+339196,UT,2026,SB153,Substitute #1,Introduced,approved,complete,251937,possible_unnamed_addition
+339212,UT,2026,SB153,Substitute #3,Substitute #2,approved,complete,181254,possible_unnamed_addition
+339262,UT,2026,HB366,Substitute #1,Introduced,approved,complete,99911,possible_unnamed_addition
+339267,UT,2026,SB284,Substitute #1,Introduced,approved,complete,129480,possible_unnamed_addition
+339339,UT,2026,HB70,Substitute #1,Introduced,approved,complete,32712,possible_unnamed_addition
+339368,UT,2026,SB284,Substitute #6,Substitute #5,approved,complete,27029,possible_unnamed_addition
+339392,UT,2026,SB284,Substitute #7,Substitute #6,approved,complete,41330,possible_unnamed_addition
+339418,UT,2026,HB514,Substitute #1,Introduced,approved,complete,41458,possible_unnamed_addition
+339509,UT,2026,HB210,Substitute #3,Substitute #2,approved,complete,27709,possible_unnamed_addition
+339512,UT,2026,SB58,Amended 1/22/2026 11:01:258,Substitute #5,approved,complete,27553,possible_unnamed_addition
+339630,UT,2026,HB386,Substitute #2,Substitute #1,approved,complete,31715,possible_unnamed_addition
+339698,UT,2026,HB8,Substitute #1,Introduced,approved,complete,235687,possible_unnamed_addition
+339710,UT,2026,HB38,Substitute #1,Introduced,approved,complete,111715,possible_unnamed_addition
+339713,UT,2026,HB59,Substitute #1,Introduced,approved,complete,70244,possible_unnamed_addition
+339715,UT,2026,HB59,Substitute #3,Substitute #2,approved,complete,30812,possible_unnamed_addition
+339716,UT,2026,HB38,Substitute #3,Substitute #2,approved,complete,42372,possible_unnamed_addition
+339720,UT,2026,HB218,Substitute #1,Introduced,approved,complete,30025,"possible_unnamed_addition,possible_unsourced_number"
+339725,UT,2026,SB81,Substitute #1,Introduced,approved,complete,31616,possible_unnamed_addition
+339770,UT,2026,HB87,Amended 2/19/2026 11:02:615,Substitute #2,approved,complete,28849,possible_unnamed_addition
+339782,UT,2026,SB87,Substitute #1,Introduced,approved,complete,36126,possible_unnamed_addition
+339785,UT,2026,SB189,Substitute #4,Substitute #3,approved,complete,48531,possible_unnamed_addition
+339787,UT,2026,SB87,Substitute #2,Substitute #1,approved,complete,165852,possible_unnamed_addition
+339796,UT,2026,HB492,Substitute #1,Introduced,approved,complete,64845,possible_unnamed_addition
+339800,UT,2026,HB492,Substitute #4,Substitute #3,approved,complete,106162,possible_unnamed_addition
+339801,UT,2026,HB481,Substitute #3,Substitute #2,approved,complete,110280,possible_unnamed_addition
+339814,UT,2026,HB481,Enrolled,Amended 2/25/2026 10:02:267,approved,complete,115538,"possible_unnamed_addition,possible_unsourced_number"
+339835,UT,2026,HB450,Substitute #2,Substitute #1,approved,complete,63398,possible_unnamed_addition
+339836,UT,2026,HB507,Substitute #1,Introduced,approved,complete,147846,possible_unnamed_addition
+339841,UT,2026,HB507,Substitute #3,Substitute #2,approved,complete,179624,possible_unnamed_addition
+339844,UT,2026,SB285,Substitute #1,Introduced,approved,complete,45387,possible_unnamed_addition
+339857,UT,2026,HB32,Substitute #1,Introduced,approved,complete,190232,possible_unnamed_addition
+339862,UT,2026,HB32,Substitute #2,Substitute #1,approved,complete,61443,possible_unnamed_addition
+339901,UT,2026,HB88,Substitute #7,Substitute #6,approved,complete,27261,possible_unnamed_addition
+339909,UT,2026,SB221,Substitute #2,Substitute #1,approved,complete,70670,possible_unnamed_addition
+339962,UT,2026,HB436,Substitute #1,Introduced,approved,complete,32228,possible_unnamed_addition
+340002,UT,2026,SB197,Substitute #1,Introduced,approved,complete,91743,possible_unnamed_addition
+340007,UT,2026,SB197,Amended 2/26/2026 19:02:436,Amended 2/20/2026 14:02:833,approved,complete,90386,possible_unnamed_addition
+340008,UT,2026,HB51,Substitute #1,Introduced,approved,complete,84045,possible_unnamed_addition
+340012,UT,2026,SB231,Substitute #1,Introduced,approved,complete,62211,possible_unnamed_addition
+340014,UT,2026,HB51,Substitute #3,Substitute #2,approved,complete,76266,possible_unnamed_addition
+340019,UT,2026,SB206,Substitute #2,Substitute #1,approved,complete,124124,possible_unnamed_addition
+340020,UT,2026,SB78,Substitute #1,Introduced,approved,complete,32452,possible_unnamed_addition
+340021,UT,2026,SB206,Substitute #3,Substitute #2,approved,complete,59963,possible_unnamed_addition
+340022,UT,2026,SB78,Substitute #2,Substitute #1,approved,complete,148093,possible_unnamed_addition
+340023,UT,2026,SB78,Substitute #3,Substitute #2,approved,complete,79186,possible_unnamed_addition
+340024,UT,2026,SB206,Substitute #4,Substitute #3,approved,complete,64364,possible_unnamed_addition
+340029,UT,2026,SB206,Enrolled,Amended 3/3/2026 10:03:297,approved,complete,68105,possible_unnamed_addition
+340031,UT,2026,SB97,Substitute #1,Introduced,approved,complete,35527,possible_unnamed_addition
+340045,UT,2026,HB125,Substitute #2,Substitute #1,approved,complete,90036,possible_unnamed_addition
+340052,UT,2026,HB125,Enrolled,Amended 2/19/2026 13:02:875,approved,complete,93351,possible_unnamed_addition
+340062,UT,2026,SB242,Substitute #1,Introduced,approved,complete,52516,possible_unnamed_addition
+340072,UT,2026,SB242,Substitute #3,Substitute #2,approved,complete,95723,possible_unnamed_addition
+340077,UT,2026,SB254,Substitute #3,Substitute #2,approved,complete,50617,possible_unnamed_addition
+340078,UT,2026,SB242,Amended 2/24/2026 10:02:565,Substitute #4,approved,complete,99304,"possible_unnamed_addition,possible_unsourced_number"
+340083,UT,2026,SB242,Amended 3/3/2026 19:03:474,Amended 2/26/2026 12:02:137,approved,complete,101932,possible_unnamed_addition
+340102,UT,2026,HB111,Substitute #2,Substitute #1,approved,complete,44160,possible_unnamed_addition
+340107,UT,2026,HB111,Enrolled,Amended 2/6/2026 16:02:469,approved,complete,44540,possible_unnamed_addition
+340120,UT,2026,SB122,Substitute #1,Introduced,approved,complete,73756,possible_unnamed_addition
+340122,UT,2026,SB122,Substitute #2,Substitute #1,approved,complete,88848,possible_unnamed_addition
+340136,UT,2026,HB310,Substitute #2,Substitute #1,approved,complete,28651,possible_unnamed_addition
+340174,UT,2026,HB407,Substitute #2,Substitute #1,approved,complete,50376,possible_unnamed_addition
+340202,UT,2026,SB135,Substitute #1,Introduced,approved,complete,25308,possible_unnamed_addition
+340235,UT,2026,HB276,Substitute #1,Introduced,approved,complete,45711,possible_unnamed_addition
+340265,UT,2026,HB110,Substitute #1,Introduced,approved,complete,40629,possible_unnamed_addition
+340275,UT,2026,SB194,Substitute #3,Substitute #2,approved,complete,42983,possible_unnamed_addition
+340276,UT,2026,SB194,Substitute #4,Substitute #3,approved,complete,68790,possible_unnamed_addition
+340278,UT,2026,SB194,Substitute #6,Substitute #5,approved,complete,203018,possible_unnamed_addition
+340279,UT,2026,SB194,Amended 2/17/2026 11:02:838,Substitute #6,approved,complete,281647,possible_unnamed_addition
+340280,UT,2026,SB194,Enrolled,Amended 2/17/2026 11:02:838,approved,complete,156654,possible_unnamed_addition
+340298,UT,2026,HB377,Substitute #1,Introduced,approved,complete,40143,possible_unnamed_addition
+340317,UT,2026,SB117,Substitute #1,Introduced,approved,complete,78105,possible_unnamed_addition
+340354,UT,2026,HB236,Substitute #1,Introduced,approved,complete,27021,possible_unnamed_addition
+340370,UT,2026,HB338,Substitute #1,Introduced,approved,complete,37718,possible_unnamed_addition
+340373,UT,2026,HB510,Substitute #1,Introduced,approved,complete,56961,possible_unnamed_addition
+340374,UT,2026,HB510,Substitute #2,Substitute #1,approved,complete,47090,possible_unnamed_addition
+340402,UT,2026,HB383,Substitute #1,Introduced,approved,complete,33782,possible_unnamed_addition
+340414,UT,2026,SB162,Substitute #1,Introduced,approved,complete,57324,possible_unnamed_addition
+340436,UT,2026,HB136,Substitute #4,Substitute #3,approved,complete,36585,"possible_unnamed_addition,possible_unsourced_number"
+340439,UT,2026,HB136,Amended 2/25/2026 10:02:367,Amended 1/26/2026 10:01:198,approved,complete,25152,possible_unnamed_addition
+340450,UT,2026,HB308,Substitute #1,Introduced,approved,complete,35283,possible_unnamed_addition
+340475,UT,2026,SB60,Substitute #1,Introduced,approved,complete,47284,possible_unnamed_addition
+340478,UT,2026,HB312,Substitute #2,Substitute #1,approved,complete,57775,"possible_unnamed_addition,possible_unsourced_number"
+340498,UT,2026,SB73,Substitute #1,Introduced,approved,complete,73338,possible_unnamed_addition
+340522,UT,2026,SB323,Substitute #1,Introduced,approved,complete,294833,possible_unnamed_addition
+340551,UT,2026,HB416,Substitute #5,Substitute #4,approved,complete,37654,possible_unnamed_addition
+340566,UT,2026,SB195,Substitute #2,Substitute #1,approved,complete,53783,possible_unnamed_addition
+340567,UT,2026,SB195,Amended 2/13/2026 11:02:455,Substitute #2,approved,complete,53957,possible_unnamed_addition
+340568,UT,2026,SB195,Enrolled,Amended 2/13/2026 11:02:455,approved,complete,54159,"possible_unnamed_addition,possible_unsourced_number"
+340581,UT,2026,HB429,Substitute #2,Substitute #1,approved,complete,41352,possible_unnamed_addition
+340583,UT,2026,HB361,Substitute #1,Introduced,approved,complete,296419,possible_unnamed_addition
+340589,UT,2026,SJR5,Substitute #2,Substitute #1,approved,complete,29555,possible_unnamed_addition
+340608,UT,2026,HB242,Substitute #2,Substitute #1,approved,complete,25545,possible_unnamed_addition
+340610,UT,2026,HB372,Substitute #1,Introduced,approved,complete,78064,possible_unnamed_addition
+340613,UT,2026,HB372,Substitute #4,Substitute #3,approved,complete,77227,possible_unnamed_addition
+340625,UT,2026,SB217,Substitute #1,Introduced,approved,complete,108328,possible_unnamed_addition
+340636,UT,2026,HB422,Substitute #1,Introduced,approved,complete,58435,possible_unnamed_addition
+340639,UT,2026,HB422,Amended 2/18/2026 11:02:717,Substitute #3,approved,complete,36733,possible_unnamed_addition
+340680,UT,2026,HB157,Substitute #2,Substitute #1,approved,complete,25384,possible_unnamed_addition
+340704,UT,2026,HB223,Substitute #3,Substitute #2,approved,complete,127855,possible_unnamed_addition
+340716,UT,2026,HB561,Substitute #1,Introduced,approved,complete,77478,possible_unnamed_addition
+340721,UT,2026,HB253,Substitute #2,Substitute #1,approved,complete,60885,possible_unnamed_addition
+340732,UT,2026,SB124,Substitute #1,Introduced,approved,complete,72413,possible_unnamed_addition
+340735,UT,2026,SB124,Amended 2/26/2026 19:02:747,Amended 2/2/2026 11:02:818,approved,complete,73821,possible_unnamed_addition
+340737,UT,2026,HB406,Substitute #1,Introduced,approved,complete,45178,possible_unnamed_addition
+340738,UT,2026,HB256,Substitute #1,Introduced,approved,complete,31918,possible_unnamed_addition
+340804,UT,2026,SB200,Substitute #1,Introduced,approved,complete,44336,possible_unnamed_addition
+340808,UT,2026,HB100,Substitute #1,Introduced,approved,complete,27111,possible_unnamed_addition

@@ -1,0 +1,9 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+465,MI,2025-2026,HB6127,House Concurred Bill,House Enrolled Bill,approved,complete,9954,
+698,MI,2025-2026,HB6126,House Concurred Bill,House Enrolled Bill,approved,complete,8148,
+1077,MI,2025-2026,HB6130,House Concurred Bill,House Enrolled Bill,approved,complete,5674,
+1088,MI,2025-2026,HB5109,House Concurred Bill,House Enrolled Bill,approved,complete,5054,quiet_but_words_differ
+1457,MI,2025-2026,HB5485,Substitute (H-4),House Introduced Bill,approved,complete,38029,possible_unnamed_addition
+1477,MI,2025-2026,HB4703,Substitute (H-2),Substitute (H-1) - 2,approved,complete,343,
+12179,MI,2025-2026,HB4678,As Passed by the House,Substitute (S-1) - 2,approved,complete,2309,
+213446,MI,2025-2026,HB4135,House Concurred Bill,House Enrolled Bill,approved,complete,18700,possible_contradiction

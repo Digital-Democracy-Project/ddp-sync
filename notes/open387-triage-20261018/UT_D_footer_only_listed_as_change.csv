@@ -1,0 +1,73 @@
+artifact_id,state,session,gov_id,new_version_note,summary_compares_from,review_status,status,diff_chars_today,flags
+335783,UT,2026,SB311,Enrolled,Introduced,approved,complete,234,possible_rewrap
+335820,UT,2026,HB309,Enrolled,Substitute #1,approved,complete,3448,"possible_rewrap,possible_unsourced_number"
+335995,UT,2026,SB290,Enrolled,Substitute #3,approved,complete,363,possible_rewrap
+336103,UT,2026,SB63,Enrolled,Introduced,approved,complete,277,possible_rewrap
+336137,UT,2026,HB178,Enrolled,Amended 2/13/2026 11:02:636,approved,complete,1449,possible_rewrap
+336263,UT,2026,HB296,Enrolled,Introduced,approved,complete,376,possible_rewrap
+336598,UT,2026,HB343,Enrolled,Introduced,approved,complete,399,possible_rewrap
+337137,UT,2026,SB267,Substitute #5,Substitute #4,approved,complete,326,possible_rewrap
+337401,UT,2026,HB103,Enrolled,Substitute #1,approved,complete,231,possible_rewrap
+337459,UT,2026,HB357,Enrolled,Amended 2/26/2026 12:02:214,approved,complete,1359,possible_rewrap
+337637,UT,2026,HB219,Enrolled,Substitute #1,approved,complete,314,possible_rewrap
+337772,UT,2026,HB536,Enrolled,Amended 3/3/2026 18:03:811,approved,complete,1673,possible_rewrap
+337795,UT,2026,SR1,Enrolled,Substitute #1,approved,complete,335,possible_rewrap
+337972,UT,2026,SB252,Enrolled,Substitute #1,approved,complete,446,possible_rewrap
+338050,UT,2026,HB314,Enrolled,Introduced,approved,complete,444,possible_rewrap
+338091,UT,2026,HB599,Enrolled,Substitute #3,approved,complete,249,possible_rewrap
+338293,UT,2026,HB251,Enrolled,Substitute #1,approved,complete,239,possible_rewrap
+338367,UT,2026,SB21,Substitute #4,Substitute #3,approved,complete,215,possible_rewrap
+338376,UT,2026,SB238,Enrolled,Introduced,approved,complete,373,possible_rewrap
+338512,UT,2026,SB232,Enrolled,Substitute #1,approved,complete,395,possible_rewrap
+338686,UT,2026,SCR9,Enrolled,Substitute #1,approved,complete,5521,possible_rewrap
+338759,UT,2026,SB55,Enrolled,Introduced,approved,complete,189,possible_rewrap
+338762,UT,2026,HB176,Enrolled,Substitute #3,approved,complete,1019,possible_rewrap
+339020,UT,2026,HB472,Enrolled,Substitute #1,approved,complete,294,possible_rewrap
+339052,UT,2026,SB161,Enrolled,Substitute #1,approved,complete,238,possible_rewrap
+339100,UT,2026,HB325,Enrolled,Substitute #3,approved,complete,385,possible_rewrap
+339186,UT,2026,SB74,Enrolled,Substitute #3,approved,complete,192,possible_rewrap
+339459,UT,2026,HCR11,Enrolled,Introduced,approved,complete,2364,possible_rewrap
+339562,UT,2026,HB307,Enrolled,Substitute #1,approved,complete,1947,possible_rewrap
+339623,UT,2026,SB236,Enrolled,Substitute #1,approved,complete,438,possible_rewrap
+339705,UT,2026,SB84,Enrolled,Amended 2/11/2026 12:02:860,approved,complete,540,possible_rewrap
+339733,UT,2026,HB137,Enrolled,Substitute #1,approved,complete,141,possible_rewrap
+339750,UT,2026,HB320,Enrolled,Amended 2/5/2026 10:02:948,approved,complete,375,possible_rewrap
+339757,UT,2026,SB139,Enrolled,Substitute #2,approved,complete,638,possible_rewrap
+339779,UT,2026,HB358,Enrolled,Substitute #1,approved,complete,353,possible_rewrap
+339780,UT,2026,SB307,Enrolled,Introduced,approved,complete,363,possible_rewrap
+339788,UT,2026,SB87,Enrolled,Substitute #2,approved,complete,338,possible_rewrap
+339813,UT,2026,HB207,Enrolled,Substitute #2,approved,complete,198,possible_rewrap
+339860,UT,2026,HB102,Enrolled,Substitute #2,approved,complete,211,possible_rewrap
+339872,UT,2026,SB237,Enrolled,Introduced,approved,complete,262,possible_rewrap
+339965,UT,2026,HB436,Enrolled,Substitute #1,approved,complete,233,possible_rewrap
+339975,UT,2026,HB7,Enrolled,Introduced,approved,complete,1808,possible_rewrap
+340017,UT,2026,HB51,Enrolled,Substitute #4,approved,complete,245,possible_rewrap
+340018,UT,2026,SB202,Enrolled,Introduced,approved,complete,258,possible_rewrap
+340055,UT,2026,SJR11,Enrolled,Substitute #1,approved,complete,2139,possible_rewrap
+340070,UT,2026,HB105,Enrolled,Substitute #1,approved,complete,268,possible_rewrap
+340087,UT,2026,HB299,Enrolled,Introduced,approved,complete,178,possible_rewrap
+340097,UT,2026,SB151,Enrolled,Substitute #5,approved,complete,142,possible_rewrap
+340106,UT,2026,SB77,Enrolled,Substitute #2,approved,complete,317,possible_rewrap
+340108,UT,2026,SB208,Enrolled,Introduced,approved,complete,185,possible_rewrap
+340118,UT,2026,HB108,Enrolled,Introduced,approved,complete,260,possible_rewrap
+340145,UT,2026,HB527,Enrolled,Substitute #4,approved,complete,189,possible_rewrap
+340168,UT,2026,HB496,Enrolled,Substitute #2,approved,complete,218,possible_rewrap
+340197,UT,2026,SB125,Enrolled,Substitute #1,approved,complete,408,possible_rewrap
+340210,UT,2026,HB333,Enrolled,Introduced,approved,complete,213,possible_rewrap
+340233,UT,2026,SJR13,Enrolled,Introduced,approved,complete,5024,possible_rewrap
+340241,UT,2026,HB537,Enrolled,Amended 2/20/2026 16:02:616,approved,complete,1057,possible_rewrap
+340251,UT,2026,SB128,Enrolled,Substitute #1,approved,complete,167,possible_rewrap
+340264,UT,2026,HB122,Enrolled,Amended 2/3/2026 10:02:62,approved,complete,2070,possible_rewrap
+340307,UT,2026,HB319,Enrolled,Amended 2/25/2026 09:02:409,approved,complete,735,possible_rewrap
+340363,UT,2026,SB123,Enrolled,Amended 3/5/2026 19:03:676,approved,complete,1678,possible_rewrap
+340411,UT,2026,HB94,Enrolled,Substitute #3,approved,complete,529,possible_rewrap
+340418,UT,2026,HB268,Enrolled,Introduced,approved,complete,1411,possible_rewrap
+340424,UT,2026,HB165,Enrolled,Substitute #4,approved,complete,414,possible_rewrap
+340444,UT,2026,HCR13,Enrolled,Introduced,approved,complete,2613,possible_rewrap
+340465,UT,2026,HCR8,Enrolled,Substitute #1,approved,complete,2881,possible_rewrap
+340470,UT,2026,SB313,Enrolled,Introduced,approved,complete,229,possible_rewrap
+340555,UT,2026,HB118,Enrolled,Substitute #2,approved,complete,331,possible_rewrap
+340582,UT,2026,HB429,Enrolled,Substitute #2,approved,complete,292,possible_rewrap
+340615,UT,2026,HB372,Enrolled,Substitute #5,approved,complete,573,possible_rewrap
+340631,UT,2026,HCR2,Enrolled,Substitute #2,approved,complete,1292,possible_rewrap
+340683,UT,2026,HB353,Enrolled,Introduced,approved,complete,389,possible_rewrap

@@ -1,0 +1,66 @@
+{
+ "AZ": {
+  "rows": 1972,
+  "rewrite_now": 1497,
+  "optional_low_harm": 10,
+  "hold_large_diff": 27,
+  "hide_decision_no_diff": 134,
+  "check_version": 0
+ },
+ "FL": {
+  "rows": 1229,
+  "rewrite_now": 11,
+  "optional_low_harm": 44,
+  "hold_large_diff": 82,
+  "hide_decision_no_diff": 11,
+  "check_version": 0
+ },
+ "MA": {
+  "rows": 290,
+  "rewrite_now": 0,
+  "optional_low_harm": 11,
+  "hold_large_diff": 8,
+  "hide_decision_no_diff": 0,
+  "check_version": 0
+ },
+ "MI": {
+  "rows": 1282,
+  "rewrite_now": 8,
+  "optional_low_harm": 23,
+  "hold_large_diff": 78,
+  "hide_decision_no_diff": 11,
+  "check_version": 13
+ },
+ "US": {
+  "rows": 3245,
+  "rewrite_now": 226,
+  "optional_low_harm": 0,
+  "hold_large_diff": 60,
+  "hide_decision_no_diff": 0,
+  "check_version": 3
+ },
+ "UT": {
+  "rows": 2701,
+  "rewrite_now": 11,
+  "optional_low_harm": 121,
+  "hold_large_diff": 153,
+  "hide_decision_no_diff": 670,
+  "check_version": 0
+ },
+ "VA": {
+  "rows": 213,
+  "rewrite_now": 0,
+  "optional_low_harm": 0,
+  "hold_large_diff": 7,
+  "hide_decision_no_diff": 0,
+  "check_version": 0
+ },
+ "WA": {
+  "rows": 1867,
+  "rewrite_now": 0,
+  "optional_low_harm": 1,
+  "hold_large_diff": 74,
+  "hide_decision_no_diff": 2,
+  "check_version": 0
+ }
+}
