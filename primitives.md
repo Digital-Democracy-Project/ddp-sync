@@ -382,6 +382,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions; a host only acts if it also has `KNOWLEDGE_BASE_INDEX_NAME` |
 | `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (the 05:00 archive start) |
 | `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
+| `openstates_scrape.secondary.jurisdictions` | `[va, mi, ma, ut, az, nc]` in the checked-in file | The Sunday secondary batch, and (SYNC-57) the states `POST /trigger/openstates-scrape/{state}` accepts on their own; `fl`/`wa`/`usa` are batch targets instead |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |
