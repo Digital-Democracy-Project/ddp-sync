@@ -472,6 +472,111 @@ async def generate_and_store_organization_content(
     return outcome
 
 
+async def resolve_and_describe_organizations(
+    results: list[dict],
+    *,
+    citations: dict[int, tuple[str, str]],
+    bill_openstates_id: str,
+    invocation_id: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> None:
+    """The steps after a position is written, shared by find_bill_positions research and the citation
+    verifier (verify_org_citations, SYNC-127), so a stub created from a cited position gets the same
+    treatment as one created by research.
+
+    `results` are verify_and_store_position return values; each is updated in place (a "resolution"
+    and/or "about_content" key, and organization_id / organization_needs_content when the position
+    moved). `citations` maps a written position id to its (citation_url, citation_excerpt), the
+    evidence the matcher is shown; a result whose position id is not in it is not resolved.
+
+    1. SYNC-97, the resolve step (`organization_resolution_mode`, off by default): for a newly created,
+       confirmed position, the broker shortlists existing organizations (only a stub is eligible),
+       LegBot chooses or answers null, and in `act` mode the broker may move the position. Before the
+       About step, because a position that moved to an existing organization needs no description
+       for the stub.
+    2. SYNC-107, the About step (`organization_content_enabled`, off by default): an organization that
+       a confirmed position resolved to and that still has no description gets its content once.
+
+    Never raises, and never undoes or holds back a written position.
+    """
+    settings = get_settings()
+    mode = settings.organization_resolution_mode
+    if mode != "off":
+        for result in results:
+            if (
+                result.get("outcome") != "written"
+                or result.get("result") != "created"
+                or result.get("verification_verdict") != "confirmed"
+                or result.get("position_id") not in citations
+            ):
+                continue
+            citation_url, citation_excerpt = citations[result["position_id"]]
+            try:
+                resolution = await resolve_organization_for_position(
+                    position_id=result["position_id"],
+                    org_name=result["org_name"],
+                    citation_url=citation_url,
+                    citation_excerpt=citation_excerpt,
+                    mode=mode,
+                    broker_api_base=broker_api_base,
+                    broker_api_token=broker_api_token,
+                )
+            except Exception as exc:  # the step must never block or fail position publication
+                logger.warning(
+                    "organization resolution raised -- stub left as is",
+                    position_id=result["position_id"], error=str(exc),
+                )
+                resolution = {
+                    "position_id": result["position_id"], "attempt_id": None, "outcome": "failed",
+                    "choice": None, "organization_id": None,
+                }
+            result["resolution"] = resolution
+            logger.info(
+                "organization_resolution_attempt",
+                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
+                org_name=result["org_name"], **resolution,
+            )
+            if resolution["outcome"] == "acted":
+                # The position now belongs to a reviewed organization: no About text for the stub.
+                result["organization_id"] = resolution["organization_id"]
+                result["organization_needs_content"] = False
+        if any("resolution" in r for r in results):
+            logger.info(
+                "organization_resolution_summary",
+                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
+                outcomes=dict(Counter(r["resolution"]["outcome"] for r in results if "resolution" in r)),
+            )
+
+    if settings.organization_content_enabled:
+        asked: set[int] = set()
+        for result in results:
+            organization_id = result.get("organization_id")
+            if (
+                result.get("verification_verdict") != "confirmed"
+                or not result.get("organization_needs_content")
+                or organization_id in asked
+            ):
+                continue
+            asked.add(organization_id)
+            result["about_content"] = await generate_and_store_organization_content(
+                organization_id=organization_id,
+                org_name=result["org_name"],
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        if asked:
+            # One line per call, so a LegBot or broker contract that fails every organization is
+            # visible instead of looking like a quiet success.
+            logger.info(
+                "organization_about_summary",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                asked=len(asked),
+                outcomes=dict(Counter(r["about_content"]["outcome"] for r in results if "about_content" in r)),
+            )
+
+
 async def generate_and_store_bill_organization_positions(
     *,
     bill_openstates_id: str,
@@ -674,85 +779,16 @@ async def generate_and_store_bill_organization_positions(
         if result.get("position_id") is not None:
             finding_by_position_id[result["position_id"]] = finding
 
-    # SYNC-97: the resolve step. Before the About step: a position that moves to an existing reviewed
-    # organization does not need a generated description for the stub.
-    mode = get_settings().organization_resolution_mode
-    if mode != "off":
-        for result in results:
-            if (
-                result.get("outcome") != "written"
-                or result.get("result") != "created"
-                or result.get("verification_verdict") != "confirmed"
-                or result.get("position_id") not in finding_by_position_id
-            ):
-                continue
-            finding = finding_by_position_id[result["position_id"]]
-            try:
-                resolution = await resolve_organization_for_position(
-                    position_id=result["position_id"],
-                    org_name=result["org_name"],
-                    citation_url=finding.get("citation_url", ""),
-                    citation_excerpt=finding.get("citation_excerpt", ""),
-                    mode=mode,
-                    broker_api_base=broker_api_base,
-                    broker_api_token=broker_api_token,
-                )
-            except Exception as exc:  # the step must never block or fail position publication
-                logger.warning(
-                    "organization resolution raised -- stub left as is",
-                    position_id=result["position_id"], error=str(exc),
-                )
-                resolution = {
-                    "position_id": result["position_id"], "attempt_id": None, "outcome": "failed",
-                    "choice": None, "organization_id": None,
-                }
-            result["resolution"] = resolution
-            logger.info(
-                "organization_resolution_attempt",
-                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
-                org_name=result["org_name"], **resolution,
-            )
-            if resolution["outcome"] == "acted":
-                # The position now belongs to a reviewed organization: no About text for the stub.
-                result["organization_id"] = resolution["organization_id"]
-                result["organization_needs_content"] = False
-        if any("resolution" in r for r in results):
-            logger.info(
-                "organization_resolution_summary",
-                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=mode,
-                outcomes=dict(Counter(r["resolution"]["outcome"] for r in results if "resolution" in r)),
-            )
-
-    # SYNC-107: an organization this run just confirmed a position for, and that still has no
-    # description (typically a stub the run created), gets its "About" content once. Only here, not in
-    # verify_and_store_position: verify_org_citations shares that function and never creates
-    # organizations. The first confirmed finding for the organization carries the outcome.
-    if get_settings().organization_content_enabled:
-        asked: set[int] = set()
-        for result in results:
-            organization_id = result.get("organization_id")
-            if (
-                result.get("verification_verdict") != "confirmed"
-                or not result.get("organization_needs_content")
-                or organization_id in asked
-            ):
-                continue
-            asked.add(organization_id)
-            result["about_content"] = await generate_and_store_organization_content(
-                organization_id=organization_id,
-                org_name=result["org_name"],
-                broker_api_base=broker_api_base,
-                broker_api_token=broker_api_token,
-            )
-        if asked:
-            # One line per bill, so a LegBot or broker contract that fails every organization is
-            # visible instead of looking like a quiet success.
-            logger.info(
-                "organization_about_summary",
-                bill_openstates_id=bill_openstates_id,
-                invocation_id=invocation_id,
-                asked=len(asked),
-                outcomes=dict(Counter(r["about_content"]["outcome"] for r in results if "about_content" in r)),
-            )
+    await resolve_and_describe_organizations(
+        results,
+        citations={
+            position_id: (finding.get("citation_url", ""), finding.get("citation_excerpt", ""))
+            for position_id, finding in finding_by_position_id.items()
+        },
+        bill_openstates_id=bill_openstates_id,
+        invocation_id=invocation_id,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
 
     return results
