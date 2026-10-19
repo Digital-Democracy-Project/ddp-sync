@@ -7,6 +7,7 @@ it reports back for a created / updated / unchanged row, the rate-limit path, an
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -420,3 +421,77 @@ async def test_a_second_background_run_waits_for_the_first(store):
 
     assert started == ["r1", "r2"]
     assert (store.runs["r1"]["status"], store.runs["r2"]["status"]) == ("finished", "finished")
+
+
+# ── SYNC-127: the matcher and About steps run after a citation's write, as in research ─────────────
+
+
+def _step_settings(mode="act", content=False):
+    return SimpleNamespace(organization_resolution_mode=mode, organization_content_enabled=content)
+
+
+async def _run_with_steps(*, mode="act", content=False, stored=None, resolve=None, about=None):
+    stored = stored or {**_stored(), "organization_id": 55, "organization_needs_content": True}
+    resolve = resolve or AsyncMock(return_value={
+        "position_id": 7, "attempt_id": 3, "outcome": "acted", "choice": 10, "organization_id": 10,
+    })
+    about = about or AsyncMock(return_value={"organization_id": 55, "outcome": "written", "written": ["description"]})
+    with patch(f"{_RESEARCH}.get_settings", return_value=_step_settings(mode, content)), \
+            patch(f"{_RESEARCH}.resolve_organization_for_position", new=resolve), \
+            patch(f"{_RESEARCH}.generate_and_store_organization_content", new=about):
+        summary, *_ = await _run([_item(url="https://cited.invalid")], write=AsyncMock(return_value=stored))
+    return summary, resolve, about
+
+
+@pytest.mark.asyncio
+async def test_a_new_confirmed_citation_runs_the_matcher_with_the_cited_page():
+    summary, resolve, _ = await _run_with_steps()
+
+    resolve.assert_awaited_once()
+    kwargs = resolve.await_args.kwargs
+    assert (kwargs["position_id"], kwargs["org_name"], kwargs["citation_url"], kwargs["citation_excerpt"],
+            kwargs["mode"]) == (7, "Sierra Club", "https://cited.invalid", "", "act")
+    assert summary["results"][0]["resolution"]["outcome"] == "acted"
+
+
+@pytest.mark.asyncio
+async def test_with_the_matcher_off_nothing_is_resolved_and_the_result_has_no_resolution():
+    summary, resolve, _ = await _run_with_steps(mode="off")
+
+    resolve.assert_not_awaited()
+    assert "resolution" not in summary["results"][0]
+
+
+@pytest.mark.asyncio
+async def test_an_updated_row_is_not_resolved_again():
+    _, resolve, _ = await _run_with_steps(stored={**_stored(result="updated"), "organization_id": 55})
+
+    resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_stub_the_matcher_left_alone_gets_its_about_content():
+    no_match = AsyncMock(return_value={
+        "position_id": 7, "attempt_id": 3, "outcome": "null_answer", "choice": None, "organization_id": None,
+    })
+    summary, _, about = await _run_with_steps(content=True, resolve=no_match)
+
+    about.assert_awaited_once()
+    assert about.await_args.kwargs["organization_id"] == 55
+    assert summary["results"][0]["about_content"]["outcome"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_a_position_moved_to_an_existing_organization_gets_no_about_content_for_the_stub():
+    _, _, about = await _run_with_steps(content=True)
+
+    about.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_matcher_that_raises_leaves_the_written_citation_recorded():
+    summary, _, _ = await _run_with_steps(resolve=AsyncMock(side_effect=RuntimeError("boom")))
+
+    assert summary["counts"] == {"written": 1}
+    assert summary["results"][0]["result"] == "created"
+    assert summary["results"][0]["resolution"]["outcome"] == "failed"

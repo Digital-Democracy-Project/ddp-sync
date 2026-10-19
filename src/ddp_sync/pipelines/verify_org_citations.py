@@ -32,7 +32,10 @@ from datetime import datetime, timezone
 
 import structlog
 
-from ddp_sync.pipelines.bill_organization_position_research import verify_and_store_position
+from ddp_sync.pipelines.bill_organization_position_research import (
+    resolve_and_describe_organizations,
+    verify_and_store_position,
+)
 from ddp_sync.services.local_openstates_client import get_current_version_identity
 from ddp_sync.services.redis_store import get_redis_store
 
@@ -77,6 +80,11 @@ async def verify_org_citations(
     earlier in this request; verified once). Two verdicts are reported, because they differ when an
     inconclusive re-check is refused permission to overwrite a settled row: `attempted_verdict` is
     what this check concluded, `verification_verdict` is the stored row's verdict as it now stands.
+
+    After each write, the same matcher and About steps research runs (SYNC-127,
+    resolve_and_describe_organizations), under the same two settings: a stub created from a citation
+    can be matched to an existing organization (in `act` mode the position moves to it) or get its
+    profile filled. A result then also carries "resolution" and/or "about_content".
     """
     run_id = run_id or f"org-citation-verify-{uuid.uuid4().hex[:12]}"
     invocation_id = str(uuid.uuid4())
@@ -124,6 +132,17 @@ async def verify_org_citations(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
         )
+        # SYNC-127: the same steps research runs after a write. A citation for an organization the
+        # broker does not know creates a stub; without this it stayed a stub, never matched.
+        if stored["position_id"] is not None:
+            await resolve_and_describe_organizations(
+                [stored],
+                citations={stored["position_id"]: (item["citation_url"], "")},
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
         await _record(
             _outcome(
                 item,
@@ -132,6 +151,8 @@ async def verify_org_citations(
                 result=stored["result"],
                 verification_verdict=stored["verification_verdict"],
                 attempted_verdict=stored["attempted_verdict"],
+                resolution=stored.get("resolution"),
+                about_content=stored.get("about_content"),
             )
         )
         logger.info("org_citation_verify_item", run_id=run_id, bill_openstates_id=bill_openstates_id,
@@ -151,8 +172,10 @@ def _outcome(
     result: str | None = None,
     verification_verdict: str | None = None,
     attempted_verdict: str | None = None,
+    resolution: dict | None = None,
+    about_content: dict | None = None,
 ) -> dict:
-    return {
+    out = {
         "bill_openstates_id": item["bill_openstates_id"],
         "org_name": item["org_name"],
         "position": item["position"],
@@ -163,6 +186,12 @@ def _outcome(
         "attempted_verdict": attempted_verdict,
         "position_id": position_id,
     }
+    # Present only when the step ran (SYNC-127): the matcher's outcome and the About step's outcome.
+    if resolution is not None:
+        out["resolution"] = resolution
+    if about_content is not None:
+        out["about_content"] = about_content
+    return out
 
 
 # One background run at a time per process: a second one waits its turn instead of starting beside it.
