@@ -192,6 +192,9 @@ class SyncSettings:
     session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
     grantbot_similarity_refresh_enabled: bool = True
+    # SYNC-127: default OFF like the people pull. Exactly one host reads #legislation each night (the
+    # Mac, where CAMS is); two would verify every citation twice.
+    slack_citations_enabled: bool = False
 
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
@@ -628,10 +631,11 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "grantbot_similarity_refresh_enabled": "GRANTBOT_SIMILARITY_REFRESH_ENABLED",
     "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",
     "fork_upstream_check_enabled": "FORK_UPSTREAM_CHECK_ENABLED",
+    "slack_citations_enabled": "SLACK_CITATIONS_ENABLED",
 }
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
-_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled"}
+_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "slack_citations_enabled"}
 
 
 def _parse_trigger_limit(raw: str | None) -> int | None:

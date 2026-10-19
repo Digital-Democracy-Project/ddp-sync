@@ -1260,3 +1260,41 @@ async def list_embedding_ledger(
         after = data.get("next_after")
         if not after:
             return ledger, True
+
+
+async def find_bill(jurisdiction_iso2: str, session: str, identifier: str) -> tuple[dict | None, bool]:
+    """SYNC-127: the bill a Slack citation thread links to on openstates.org, by (state, session, number),
+    from the local api-v3 (`GET /bills/{jurisdiction}/{session}/{bill_id}`).
+
+    Returns (bill, True) with bill = {"bill_openstates_id" (bare uuid), "jurisdiction" (upper ISO2),
+    "session_code", "gov_id"}; (None, True) when api-v3 answered that there is no such bill; (None, False)
+    when it could not answer (unconfigured, unreachable, an error status, a malformed body), so the caller
+    can try again later instead of recording the citation as unmatched. Never raises."""
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return None, False
+    url = f"{settings.local_openstates_api_base}/bills/{jurisdiction_iso2.lower()}/{session}/{identifier.replace(' ', '')}"
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, headers=_auth_headers(settings.local_openstates_api_key))
+    except httpx.RequestError as exc:
+        logger.warning("api-v3 unreachable for a bill lookup", jurisdiction=jurisdiction_iso2, error=str(exc))
+        return None, False
+    if resp.status_code == 404:
+        return None, True
+    if resp.status_code >= 400:
+        logger.warning("api-v3 rejected a bill lookup", jurisdiction=jurisdiction_iso2, status_code=resp.status_code)
+        return None, False
+    try:
+        data = resp.json()
+        bill_id = data["id"]
+        gov_id = data["identifier"]
+    except (ValueError, KeyError, TypeError):
+        logger.warning("api-v3 returned a malformed bill", jurisdiction=jurisdiction_iso2)
+        return None, False
+    return {
+        "bill_openstates_id": bill_id.removeprefix("ocd-bill/"),
+        "jurisdiction": jurisdiction_iso2.upper(),
+        "session_code": session,
+        "gov_id": gov_id,
+    }, True

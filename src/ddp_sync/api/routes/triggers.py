@@ -786,6 +786,31 @@ async def trigger_verify_org_citations(
     return result
 
 
+@router.post("/trigger/slack-citations", status_code=202)
+async def trigger_slack_citations(
+    background_tasks: BackgroundTasks,
+    token: str = Depends(api_key_auth),
+):
+    """Run the nightly Slack #legislation citation pull once, now (SYNC-127).
+
+    Uses sync_schedule.yaml's `slack_citations` block as it stands, including its `mode`
+    (report_only by default: logs what it would send, writes nothing). 202 at once; the summary is
+    logged as slack_citations_summary, and in write mode the verification progress is readable at
+    GET /trigger/verify-org-citations/{run_id} under the run id that summary names. Refused (409)
+    on a host whose SLACK_CITATIONS_ENABLED is off, so a manual call cannot make a second host read
+    Slack and verify the same citations again.
+    """
+    from ddp_sync.pipelines.slack_citations import run_slack_citations_job
+    from ddp_sync.scheduler import get_scheduler
+
+    if not get_settings().slack_citations_enabled:
+        raise HTTPException(status_code=409, detail="SLACK_CITATIONS_ENABLED is off on this host")
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("slack_citations", {}) if scheduler else {}
+    background_tasks.add_task(run_slack_citations_job, config, trigger="manual")
+    return {"status": "started", "mode": config.get("mode", "report_only")}
+
+
 @router.get("/trigger/verify-org-citations/{run_id}")
 async def get_verify_org_citations_run(run_id: str, token: str = Depends(api_key_auth)):
     """Progress of a background verify-org-citations run (SYNC-106): status (queued / running /

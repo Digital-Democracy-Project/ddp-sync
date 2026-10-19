@@ -157,6 +157,38 @@ class RedisStore:
             logger.error("Redis: failed to get verify run", run_id=run_id, error=str(e))
         return None
 
+    # -- Slack #legislation citations already handled (SYNC-127) --
+    #
+    # One set of Slack message timestamps (a message's id within its channel), no expiry: a late reply
+    # or an edit can arrive long after a "last seen" time, so the record is per message, not a watermark.
+
+    SLACK_CITATIONS_PROCESSED_KEY = "ddp:slack_citations:processed"
+
+    async def get_processed_slack_citations(self, message_ts: list[str]) -> set[str] | None:
+        """Of `message_ts`, the ones already handled. None (never an empty set) when Redis is down or the
+        read failed, so a caller cannot mistake an outage for "nothing handled yet" and resend everything."""
+        if not self._client:
+            return None
+        if not message_ts:
+            return set()
+        try:
+            flags = await self._client.smismember(self.SLACK_CITATIONS_PROCESSED_KEY, message_ts)
+        except Exception as e:
+            logger.error("Redis: failed to read processed Slack citations", error=str(e))
+            return None
+        return {ts for ts, flag in zip(message_ts, flags) if flag}
+
+    async def mark_slack_citations_processed(self, message_ts: list[str]) -> bool:
+        """Record `message_ts` as handled. Returns False when it could not be written."""
+        if not self._client or not message_ts:
+            return not message_ts
+        try:
+            await self._client.sadd(self.SLACK_CITATIONS_PROCESSED_KEY, *message_ts)
+        except Exception as e:
+            logger.error("Redis: failed to record processed Slack citations", error=str(e))
+            return False
+        return True
+
     # -- LegBot dispatch tracking (SYNC-61) --
     #
     # Sibling namespace to SYNC_TASK_PREFIX above, same shape of problem: an
