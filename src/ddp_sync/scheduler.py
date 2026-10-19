@@ -342,6 +342,8 @@ class UpdateScheduler:
         self._register_grantbot_scrape_job()
         # --- GrantBot twice-yearly grantee-similarity refresh (AGENTS-128) ---
         self._register_grantbot_similarity_refresh_job()
+        # --- Slack #legislation citation pull (SYNC-127) ---
+        self._register_slack_citations_job()
 
         self.scheduler.start()
         self._is_running = True
@@ -1427,6 +1429,37 @@ class UpdateScheduler:
             day_of_month=day_of_month,
             sync_time=sync_time_str,
         )
+
+    def _register_slack_citations_job(self) -> None:
+        """Register the nightly Slack #legislation citation pull (SYNC-127).
+
+        Two gates, both needed: the shared yaml `slack_citations.enabled` and this host's
+        SLACK_CITATIONS_ENABLED (default off), so exactly one host runs it.
+        """
+        from ddp_sync.pipelines.slack_citations import run_slack_citations_job
+
+        config = self._sync_config.get("slack_citations", {})
+        if not (self.settings.slack_citations_enabled and config.get("enabled", False)):
+            logger.info("slack_citations: disabled — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "09:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+
+        async def _slack_citations_wrapper():
+            return await run_slack_citations_job(config, trigger="scheduled")
+
+        self._add_job_replacing(
+            _slack_citations_wrapper,
+            trigger=CronTrigger(hour=hour, minute=minute, timezone=_UTC),
+            id="slack_citations",
+            name="Slack #legislation citation pull (nightly)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("slack_citations: registered", sync_time=sync_time_str, mode=config.get("mode", "report_only"))
 
     def stop(self) -> None:
         """Stop the scheduler."""

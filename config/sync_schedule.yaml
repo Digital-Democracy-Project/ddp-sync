@@ -1032,3 +1032,28 @@ grantbot_similarity_refresh:
   months: [3, 9]
   day_of_month: 15
   sync_time_utc: "07:00"
+
+# SYNC-127: nightly pull of organization-position citations from Slack #legislation (thread replies
+# included), verified and stored through the same path as POST /trigger/verify-org-citations, then
+# matched or described like any new position. Runs only on a host with SLACK_CITATIONS_ENABLED=true
+# in its own environment (default off; the Mac, where CAMS is), so one host reads Slack, not two.
+# Needs SLACK_BOT_TOKEN (Agent Smith, scope channels:history) on that host.
+#   mode: report_only (default) logs what it would send and writes nothing; write sends them.
+#   start_date: never reach back before this (the ~9,206 historical citations were sent by hand).
+#   lookback_days / thread_lookback_days: citations newer than lookback_days (handled ones are skipped;
+#     the window only has to outlast any backlog the cap leaves, oldest sent first), in threads started
+#     up to thread_lookback_days before that (730: a two-year session; a citation in a thread older
+#     than that is not seen). A citation is a late reply, so roots are listed from far back, but replies
+#     are only read for threads with a reply inside the window. An alert is posted when a citation the
+#     cap left behind is within 7 days of leaving the window.
+#   max_citations_per_run: each one is a metered verification call; the rest wait for the next run.
+slack_citations:
+  enabled: true
+  sync_time_utc: "09:00"
+  channel_id: "C04D5DWU5P1"       # #legislation
+  mode: report_only
+  start_date: "2026-10-19"
+  lookback_days: 30
+  thread_lookback_days: 730
+  max_citations_per_run: 200
+  source: "slack-legislation"

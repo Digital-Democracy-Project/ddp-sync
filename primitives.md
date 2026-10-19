@@ -172,6 +172,7 @@ Singleton: `get_redis_store() -> RedisStore`. All methods no-op gracefully when 
 - **`add_active_jurisdiction(code)` / `get_active_jurisdictions()`** — set at `ddp:active_jurisdictions`.
 - **`publish(channel, message) -> int`** — fire-and-forget pub/sub. Returns subscriber count.
 - **`add_sync_checkpoint(task_id, item_id)` / `get_sync_checkpoints(task_id)` / `copy_sync_checkpoints(from, to)`** — crash-resume support.
+- **`get_processed_slack_citations(ts_list) -> set | None` / `mark_slack_citations_processed(ts_list)`** — SYNC-127: the Slack #legislation messages whose citation is settled, one set at `ddp:slack_citations:processed`, no expiry. The read returns `None` (never an empty set) when Redis cannot answer, and the nightly pull then stops instead of resending everything.
 
 Redis key constants (import, don't hardcode):
 - `BILL_VERSION_PREFIX = "ddp:bill_version:"`
@@ -372,6 +373,7 @@ Use `settings.webflow_scheduler_api_key` for scheduled write operations (has bro
 | `POST /trigger/webflow/{job}` | Runs webflow batch job by name | CMS batch jobs |
 | `POST /trigger/verify-org-citations` | Calls `verify_org_citations(...)`, any number of items, one after another (SYNC-100). Synchronous by default; `background: true` (SYNC-106) answers 202 with a `run_id` and runs it in the background, one background run at a time (a second waits; a synchronous request is one citation and may overlap a background run, by design), recording progress in Redis (`ddp:verify_org_citations:run:*`, its own namespace, not the zombie-watchdog's) | Checks whether a cited page shows an organization holds a position on a bill and stores the answer, via `verify_and_store_position` (the same tail `find_bill_positions` research uses). The broker write is an upsert on (bill version, org, position, citation_url): a citation not on the bill is added, one that is has its verification updated, and an inconclusive answer never overwrites a settled row. For a manual batch, a visitor-flagged re-check, or a user-submitted citation. Costs one Claude call per item whether or not it was checked before |
 | `GET /trigger/verify-org-citations/{run_id}` | Reads the Redis run record | SYNC-106: `status` (queued / running / finished / failed), `total`, `processed` (items handled in the order sent, so an interrupted run resumes by resending from there), outcome `counts`, timestamps, `error`; 404 if unknown; kept 7 days. A `running` record whose `updated_at` stops moving died with the process; nothing restarts it |
+| `POST /trigger/slack-citations` | Runs `slack_citations.run_slack_citations_job(...)` once in the background (202) | SYNC-127: the nightly Slack #legislation pull, now, with the yaml `slack_citations` block as it stands (`mode: report_only` logs what it would send and writes nothing; `write` sends through `run_verify_org_citations_in_background`, so `GET /trigger/verify-org-citations/{run_id}` shows progress under the run id the `slack_citations_summary` log line names). 409 on a host whose `SLACK_CITATIONS_ENABLED` is off |
 
 ## sync_schedule.yaml config blocks
 
@@ -385,6 +387,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (the 05:00 archive start) |
 | `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
 | `openstates_scrape.secondary.jurisdictions` | `[va, mi, ma, ut, az, nc]` in the checked-in file | The Sunday secondary batch, and (SYNC-57) the states `POST /trigger/openstates-scrape/{state}` accepts on their own; `fl`/`wa`/`usa` are batch targets instead |
+| `slack_citations.*` | `enabled: true`, `mode: report_only`, `start_date`, `lookback_days: 30`, `thread_lookback_days: 730`, `max_citations_per_run: 200`, `sync_time_utc: "09:00"` | SYNC-127 nightly Slack pull; runs only where the host's `SLACK_CITATIONS_ENABLED=true` (default off) |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |
 | `bill_version_check.skip_webflow_update` | `false` | Suppress Flow 1 writes |
 | `rate_limit.requests_per_minute` | varies | Rate limiter config |

@@ -226,8 +226,11 @@ async def run_verify_org_citations_in_background(
     environment: str | None,
     broker_api_base: str | None,
     broker_api_token: str | None,
-) -> None:
+) -> dict | None:
     """Run verify_org_citations for a 202 caller, recording progress in Redis after every item.
+
+    Returns verify_org_citations' result (its per-item outcomes), or None when the run failed; the
+    nightly Slack pull (SYNC-127) uses it to know which messages it has finished with.
 
     The record says how many items have been handled in order (`processed`), so a run that was
     interrupted (ddp-sync restarted) can be resumed by resending the list from that index: the
@@ -247,12 +250,13 @@ async def run_verify_org_citations_in_background(
         await _save()
 
     await _save()
+    result = None
     async with _background_run_lock:
         record["status"] = "running"
         record["started_at"] = datetime.now(timezone.utc).isoformat()
         await _save()
         try:
-            await verify_org_citations(
+            result = await verify_org_citations(
                 items,
                 source=source,
                 run_id=run_id,
@@ -268,3 +272,4 @@ async def run_verify_org_citations_in_background(
             record["status"] = "finished"
         record["finished_at"] = datetime.now(timezone.utc).isoformat()
         await _save()
+    return result
