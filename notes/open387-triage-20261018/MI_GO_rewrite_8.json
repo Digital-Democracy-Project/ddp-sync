@@ -1,0 +1,48 @@
+{
+ "jurisdiction_iso2": "MI",
+ "session_code": "2025-2026",
+ "bill_candidates": [
+  {
+   "gov_id": "HB 4135",
+   "bill_openstates_id": "436d996a-8427-4f18-a27c-d26486a319bb"
+  },
+  {
+   "gov_id": "HB 4678",
+   "bill_openstates_id": "e1235476-34fe-4c7d-84b6-c83cecc2a044"
+  },
+  {
+   "gov_id": "HB 4703",
+   "bill_openstates_id": "6eefe7a5-2cdb-484c-a963-e6e272395c30"
+  },
+  {
+   "gov_id": "HB 5109",
+   "bill_openstates_id": "b934edba-18ac-435d-adff-3982140022dc"
+  },
+  {
+   "gov_id": "HB 5485",
+   "bill_openstates_id": "1755fe0a-ba2a-48de-8ed5-c07931e1e352"
+  },
+  {
+   "gov_id": "HB 6126",
+   "bill_openstates_id": "1dcee82c-9e1a-4f24-9415-f452d6d4ef9c"
+  },
+  {
+   "gov_id": "HB 6127",
+   "bill_openstates_id": "484f24a6-4343-4025-9cb3-0d2d6f951ba4"
+  },
+  {
+   "gov_id": "HB 6130",
+   "bill_openstates_id": "2e503df1-5f9a-4e17-8585-4211d4ad76fd"
+  }
+ ],
+ "ids_to_reject_then_rewrite": [
+  465,
+  698,
+  1077,
+  1088,
+  1457,
+  1477,
+  12179,
+  213446
+ ]
+}
