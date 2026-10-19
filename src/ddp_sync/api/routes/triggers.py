@@ -1081,8 +1081,15 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
 # Targets that map to a named job function.
 _OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people", "people-pull", "fork-check"}
 
-# Individual secondary-state codes accepted as single-jurisdiction triggers.
-_OPENSTATES_SINGLE_JURISDICTION = {"va", "mi", "ma", "ut", "az"}
+
+def _single_jurisdiction_targets(config: dict) -> set[str]:
+    """SYNC-57: the states that can be scraped on their own are the schedule's own
+    secondary list (sync_schedule.yaml openstates_scrape.secondary.jurisdictions), the
+    same list the Sunday batch runs. It used to be a hardcoded copy here, which missed NC
+    when NC joined the schedule. FL, WA and USA are batch targets above (several sessions
+    or both chambers), so a name that is already a batch target is not repeated here."""
+    names = (config.get("secondary") or {}).get("jurisdictions") or []
+    return {str(j).strip().lower() for j in names} - _OPENSTATES_JOB_TARGETS
 
 
 @router.post("/trigger/openstates-scrape/{target}")
@@ -1106,7 +1113,8 @@ async def trigger_openstates_scrape(
         people      — git pull people repo + os-people to-database for all states
         people-pull — git pull --ff-only of the people checkout only (SYNC-102)
         fork-check  — how far each DDP fork is behind its upstream (measure and alert only)
-        va|mi|ma|ut|az — single secondary-state scrape + import
+        <state>     — one state from openstates_scrape.secondary.jurisdictions in
+                      sync_schedule.yaml (va, mi, ma, ut, az, nc today), scraped alone
     """
     from ddp_sync.pipelines.openstates_scrape import (
         run_patch_refresh_job,
@@ -1138,11 +1146,12 @@ async def trigger_openstates_scrape(
         background_tasks.add_task(job_map[target], config)
         return {"status": "started", "target": target}
 
-    if target in _OPENSTATES_SINGLE_JURISDICTION:
+    single_targets = _single_jurisdiction_targets(config)
+    if target in single_targets:
         background_tasks.add_task(run_single_scrape_job, target, config)
         return {"status": "started", "target": target}
 
-    available = sorted(_OPENSTATES_JOB_TARGETS | _OPENSTATES_SINGLE_JURISDICTION)
+    available = sorted(_OPENSTATES_JOB_TARGETS | single_targets)
     raise HTTPException(
         status_code=404,
         detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
