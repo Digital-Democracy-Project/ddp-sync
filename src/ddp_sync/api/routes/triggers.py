@@ -786,6 +786,31 @@ async def trigger_verify_org_citations(
     return result
 
 
+@router.post("/trigger/docker-cleanup", status_code=202)
+async def trigger_docker_cleanup(
+    background_tasks: BackgroundTasks,
+    token: str = Depends(api_key_auth),
+):
+    """Run the nightly Docker cleanup once, now (SYNC-119): ddp-agents' docker-prune.sh, with the same
+    timeout and failure alert as the scheduled run. 202 at once; the outcome is logged as
+    docker_cleanup: done / failed, and the script's own log is ddp-agents logs/docker-prune.log.
+    Refused (409) on a host whose DOCKER_CLEANUP_ENABLED is off (a host without Docker)."""
+    from ddp_sync.pipelines.docker_cleanup import (
+        DEFAULT_TIMEOUT_SECONDS,
+        run_docker_cleanup_job,
+    )
+    from ddp_sync.scheduler import get_scheduler
+
+    settings = get_settings()
+    if not settings.docker_cleanup_enabled:
+        raise HTTPException(status_code=409, detail="DOCKER_CLEANUP_ENABLED is off on this host")
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("docker_cleanup", {}) if scheduler else {}
+    timeout_seconds = int(config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+    background_tasks.add_task(run_docker_cleanup_job, settings.docker_prune_script, timeout_seconds=timeout_seconds)
+    return {"status": "started", "script": settings.docker_prune_script}
+
+
 @router.post("/trigger/slack-citations", status_code=202)
 async def trigger_slack_citations(
     background_tasks: BackgroundTasks,

@@ -195,6 +195,8 @@ class SyncSettings:
     # SYNC-127: default OFF like the people pull. Exactly one host reads #legislation each night (the
     # Mac, where CAMS is); two would verify every citation twice.
     slack_citations_enabled: bool = False
+    # SYNC-119: default OFF. Only the Mac runs Docker (Colima); the EC2 hosts must never try the cleanup.
+    docker_cleanup_enabled: bool = False
 
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
@@ -209,6 +211,8 @@ class SyncSettings:
     # specific absolute path (ddp-agents' working directory); must be set
     # via CAMS_ARTIFACTS_DIR, not guessed.
     cams_artifacts_dir: str = ""
+    # SYNC-119: the ddp-agents Docker cleanup script the nightly job runs (machine-specific path).
+    docker_prune_script: str = "/Users/agentsmith/Developer/repos/ddp-agents/deployment/scripts/docker-prune.sh"
 
     # ddp-broker-py (BillArtifact write path — ddp-infra Phase 8). Local Mac
     # Studio dev stack by default (README's port 8080); production points at
@@ -632,10 +636,12 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",
     "fork_upstream_check_enabled": "FORK_UPSTREAM_CHECK_ENABLED",
     "slack_citations_enabled": "SLACK_CITATIONS_ENABLED",
+    "docker_cleanup_enabled": "DOCKER_CLEANUP_ENABLED",
 }
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
-_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "slack_citations_enabled"}
+_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "slack_citations_enabled",
+                           "docker_cleanup_enabled"}
 
 
 def _parse_trigger_limit(raw: str | None) -> int | None:
@@ -713,6 +719,9 @@ def _load_from_env() -> dict:
         "cams_base_url": os.getenv("CAMS_BASE_URL", "http://localhost:8000"),
         "cams_api_token": os.getenv("CAMS_API_TOKEN", ""),
         "cams_artifacts_dir": os.getenv("CAMS_ARTIFACTS_DIR", ""),
+        "docker_prune_script": os.getenv(
+            "DOCKER_PRUNE_SCRIPT", "/Users/agentsmith/Developer/repos/ddp-agents/deployment/scripts/docker-prune.sh"
+        ),
         "ddp_broker_api_base": os.getenv("DDP_BROKER_API_BASE", "http://localhost:8080"),
         "ddp_broker_api_token": os.getenv("DDP_BROKER_API_TOKEN", ""),
         "ondemand_broker_api_base_dev": os.getenv("ONDEMAND_BROKER_API_BASE_DEV", "http://localhost:8080"),

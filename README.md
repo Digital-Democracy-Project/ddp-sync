@@ -217,6 +217,8 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 | POST | `/trigger/knowledge-base-reconcile/{jurisdiction}` | SYNC-95: dry run of the reconcile pass (unrecorded bills and an estimated cost from a sample); 202, result in the log as `knowledge_base_reconcile_plan` |
 | POST | `/trigger/knowledge-base-entities/organizations` | SYNC-91: embed organizations into `ddp-knowledge-base` (`dry_run=true` default); 202, totals in the log. Any other entity, including `legislators`, is a 404 (SYNC-94) |
 
+`/trigger/docker-cleanup` — SYNC-119: run the nightly Docker cleanup (ddp-agents `deployment/scripts/docker-prune.sh`) once now (202), with the scheduled run's timeout and failure alert. Only on a host with `DOCKER_CLEANUP_ENABLED=true` (default off; 409 otherwise).
+
 `/trigger/slack-citations` — SYNC-127: run the nightly Slack #legislation citation pull once now (202). It follows the yaml `slack_citations.mode`: `report_only` (the default) only logs what it would send; `write` verifies and stores them through the same path as `/trigger/verify-org-citations`. Only on a host with `SLACK_CITATIONS_ENABLED=true` (default off; 409 otherwise), which needs `SLACK_BOT_TOKEN` with `channels:history`.
 
 `/trigger/openstates-scrape/{target}` — valid targets: `patches`, `fl`, `wa`, `usa`, `secondary`, `people`, `people-pull`, `fork-check`, and any one state listed in `openstates_scrape.secondary.jurisdictions` in `sync_schedule.yaml` (`va`, `mi`, `ma`, `ut`, `az`, `nc` today; SYNC-57: read from the config, so a state added there needs no code change). An unknown target returns 404 with the current list.

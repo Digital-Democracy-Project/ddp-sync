@@ -1057,3 +1057,15 @@ slack_citations:
   thread_lookback_days: 730
   max_citations_per_run: 200
   source: "slack-legislation"
+
+# SYNC-119 (AGENTS-138): nightly Docker cleanup, ddp-agents' deployment/scripts/docker-prune.sh (unused
+# images, old build cache, unused ANONYMOUS volumes older than 7 days, superseded scraper tags; never a
+# named volume or a container). Runs only where the host sets DOCKER_CLEANUP_ENABLED=true (default off;
+# the Mac, the one host with Docker). Script path: DOCKER_PRUNE_SCRIPT (per host). The script logs to
+# ddp-agents logs/docker-prune.log and alerts on failure itself; ddp-sync adds the timeout and a second
+# alert. Once this has run on schedule, drop docker-prune.sh from ddp-agents' weekly-housekeeping.sh STEPS
+# so only one pruner runs.
+docker_cleanup:
+  enabled: true
+  sync_time_utc: "06:30"           # ends by 07:00 at the latest (30-min timeout), well before ddp-agents' weekly launchd prune (Sundays 08:00 UTC) until it is retired
+  timeout_seconds: 1800

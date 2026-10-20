@@ -344,6 +344,8 @@ class UpdateScheduler:
         self._register_grantbot_similarity_refresh_job()
         # --- Slack #legislation citation pull (SYNC-127) ---
         self._register_slack_citations_job()
+        # --- Nightly Docker cleanup on the Mac (SYNC-119) ---
+        self._register_docker_cleanup_job()
 
         self.scheduler.start()
         self._is_running = True
@@ -1460,6 +1462,42 @@ class UpdateScheduler:
             misfire_grace_time=3600,
         )
         logger.info("slack_citations: registered", sync_time=sync_time_str, mode=config.get("mode", "report_only"))
+
+    def _register_docker_cleanup_job(self) -> None:
+        """Register the nightly Docker cleanup (SYNC-119): ddp-agents' docker-prune.sh.
+
+        Two gates, both needed: the shared yaml `docker_cleanup.enabled` and this host's
+        DOCKER_CLEANUP_ENABLED (default off), so only the Mac, the one host with Docker, runs it.
+        """
+        from ddp_sync.pipelines.docker_cleanup import (
+            DEFAULT_TIMEOUT_SECONDS,
+            run_docker_cleanup_job,
+        )
+
+        config = self._sync_config.get("docker_cleanup", {})
+        if not (self.settings.docker_cleanup_enabled and config.get("enabled", False)):
+            logger.info("docker_cleanup: disabled — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "06:30")
+        hour, minute = map(int, sync_time_str.split(":"))
+        timeout_seconds = int(config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        script_path = self.settings.docker_prune_script
+
+        async def _docker_cleanup_wrapper():
+            return await run_docker_cleanup_job(script_path, timeout_seconds=timeout_seconds)
+
+        self._add_job_replacing(
+            _docker_cleanup_wrapper,
+            trigger=CronTrigger(hour=hour, minute=minute, timezone=_UTC),
+            id="docker_cleanup",
+            name="Docker cleanup (nightly, Mac only)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("docker_cleanup: registered", sync_time=sync_time_str, script=script_path)
 
     def stop(self) -> None:
         """Stop the scheduler."""
