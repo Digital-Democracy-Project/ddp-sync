@@ -1051,7 +1051,7 @@ slack_citations:
   enabled: true
   sync_time_utc: "09:00"
   channel_id: "C04D5DWU5P1"       # #legislation
-  mode: report_only
+  mode: write                     # report-only checked 2026-10-19: 13 new citations, none already on the broker
   start_date: "2026-10-19"
   lookback_days: 30
   thread_lookback_days: 730
