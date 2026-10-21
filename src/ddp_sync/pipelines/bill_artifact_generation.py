@@ -57,6 +57,7 @@ fetch fallback at all -- see that function's own docstring).
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 from datetime import datetime, timezone
 
@@ -106,21 +107,19 @@ _TEXT_ANSWER_ARTIFACT_TYPES = {"bill_summary", "bill_vote_yes_frame", "bill_vote
 # ([{type, reason}, ...], config/legbot_questions.yaml) — flattened identically.
 _ORG_TYPES_ANSWER_ARTIFACT_TYPES = {"bill_supporting_orgs", "bill_opposing_orgs"}
 
-# bill_topics' 33-name taxonomy (ddp-infra's PLAN-legbot.md §27, approved
-# 2026-08-07; Priority Bill and Disney excluded) -- copied verbatim from
-# ddp-agents' config/legbot_questions.yaml bill_topics entry. Maintenance
-# rule: any future Webflow category change updates that YAML list and these
-# two constants together.
-_BILL_TOPICS_TAXONOMY = (
-    "Animals", "Arts", "Business", "Civil Rights", "Criminal Justice",
-    "Culture", "Drugs", "Economy", "Education", "Elections", "Employment",
-    "Energy", "Environment", "Government", "Guns", "Housing", "Immigration",
-    "International Relations", "LGBT", "Marriage", "Media", "Medical",
-    "Military and Veterans", "National Security", "Natural Disasters",
-    "Public Records", "Public Safety", "Social Welfare", "Sports",
-    "State Parks", "Taxes", "Technology", "Transportation",
+# bill_topics' taxonomy (SYNC-124): read from data/bill_topics_taxonomy.json, a verbatim copy of the file
+# ddp-broker-py generates from its Topic table (BROKER-143, `manage.py generate_bill_topics_taxonomy`;
+# format in that repo's docs/bill-topics-taxonomy.md). Never edit the copy by hand: when the broker's list
+# changes, copy the regenerated file here in the same window as ddp-agents' LegBot prompt (AGENTS-140),
+# which carries the same list. Read once at import, never fetched at run time; the names are used exactly
+# as given (display strings, not slugs). `_BILL_TOPICS_VERSION` is the file's content hash, so a mismatch
+# with LegBot's copy is easy to see.
+_BILL_TOPICS_FILE = json.loads(
+    importlib.resources.files("ddp_sync").joinpath("data", "bill_topics_taxonomy.json").read_text(encoding="utf-8")
 )
-_BILL_TOPICS_MAX = 4  # matches the YAML's max_topics
+_BILL_TOPICS_TAXONOMY = tuple(_BILL_TOPICS_FILE["topics"])
+_BILL_TOPICS_MAX = _BILL_TOPICS_FILE["max_topics"]
+_BILL_TOPICS_VERSION = _BILL_TOPICS_FILE["version"]
 
 _BILL_TOPICS_CANONICAL_BY_FOLD = {name.casefold(): name for name in _BILL_TOPICS_TAXONOMY}
 
