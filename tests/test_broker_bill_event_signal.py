@@ -129,6 +129,17 @@ async def test_off_by_default_and_unenrolled_jurisdictions_send_nothing(settings
     send.assert_not_awaited()
 
 
+def test_the_checked_in_schedule_ships_it_off_inside_the_block_run_scrape_receives():
+    # every _run_scrape caller passes the openstates_scrape block as `config`
+    import yaml
+
+    from ddp_sync.scheduler import DEFAULT_CONFIG_PATH
+
+    with open(DEFAULT_CONFIG_PATH) as f:
+        block = yaml.safe_load(f)["openstates_scrape"]["broker_bill_event_signal"]
+    assert block == {"enabled": False, "jurisdictions": []}
+
+
 @pytest.mark.asyncio
 async def test_usa_is_sent_as_the_brokers_us(settings, redis, send):
     await _maybe_signal_broker_bill_events("usa", CFG)
@@ -187,7 +198,7 @@ async def test_client_posts_the_jurisdiction_with_the_service_token(settings):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [400, 401, 503])
+@pytest.mark.parametrize("status", [301, 400, 401, 503])
 async def test_client_raises_with_the_status_on_a_rejection(settings, status):
     ctx, _ = _mock_post(httpx.Response(status, text="nope"))
     with ctx, pytest.raises(BrokerClientError, match=f"\\({status}\\)"):
