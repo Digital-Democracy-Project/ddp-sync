@@ -284,7 +284,7 @@ distinct difference, with the manifest file's mtime so a stale checkout is not m
 back to the manifest, then to the caller's last-resort constant (`None` means "neither could answer"). Never
 raises: a missing, invalid or incomplete manifest degrades to the yaml's answer with one log line.
 `log_config_disagreements(config, root)` compares every list at once; the scheduler calls it at start-up, and
-the OPEN-330 daily check reuses it. Features: `archive`, `embedding`, `search_refresh` (spelled `us`) and
+the OPEN-330 daily check reuses it. Features: `archive` (the manifest's `archive.scheduled`, the recurring list; `archive.enabled` is only the shell gate and the Stage 4 manual run, OPEN-418; a manifest from before that split reads as "cannot say"), `embedding`, `search_refresh` (spelled `us`) and
 `cloud_path`, `scrape_primary`, `scrape_secondary` (spelled `usa`), mirroring `check-jurisdiction-drift.py`'s
 `project()` in ddp-open-states. Wired so far: the embedding and search-refresh hook gates, the manual archive
 trigger and the knowledge-base 404 gates, the manual single-state scrape targets, and the two in-code
