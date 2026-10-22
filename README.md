@@ -31,7 +31,8 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
 - **Legislator bio sync** (weekly Sun 07:00 UTC, enabled 2026-05-01): unitedstates/congress-legislators + OpenStates → Webflow Legislators CMS (bio, contact, term, social, photo URL fields). Phase-3 photo upload pipeline populates the `legislator-image` (Image type) field with Webflow-hosted assets via the Webflow Assets v2 API. Per-state override registry handles jurisdiction-specific extraction (e.g., FL `official-website` from `links[]` "member detail page").
 - **Organization sync** (monthly 1st 08:00 UTC): Webflow → Pinecone
 - **Voatz → Brevo user sync** (every 30 min): Voatz → Brevo contact lists
-- **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): Full re-import
+- **Voatz → Brevo full-attribute sync** (monthly 1st 02:00 UTC): re-imports attributes for contacts already in each list
+- **Opt-outs are never re-added** (SYNC-122): both jobs skip anyone on DDP's suppression list (ddp-broker-py `GET /api/email/suppressions/`, BROKER-305, service token) or blocklisted in Brevo; the 30-minute job also looks up each would-be new contact in Brevo and skips anyone who unsubscribed from that list. If the suppression list or a Brevo lookup cannot be read, those people are not added that run (they are retried on the next). The monthly job never adds anyone. Needs the broker with BROKER-305 deployed first, or nobody is added.
 - **Webflow CMS batch jobs** (weekly Mon 03:00 UTC): Fill fields, sync refs, detect bill duplicates
 - **API health check** (nightly 09:00 UTC): POSTs to `/get_events` for every configured Voatz org, asserts non-empty JSON results, and fires a Zapier alert on any failure. Manual run: `.venv/bin/python scripts/check_api_health.py [--dry-run]`
 

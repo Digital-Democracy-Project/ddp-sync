@@ -248,6 +248,58 @@ def fetch_brevo_contacts(api_key: str, list_id: int) -> list[dict] | None:
     return contacts
 
 
+def fetch_ddp_suppressed_emails() -> set[str] | None:
+    """SYNC-122: the addresses DDP must not email (ddp-broker-py BROKER-305, `GET /api/email/suppressions/`).
+
+    BROKER-235 made DDP's database the source of truth: a hard bounce, a spam complaint, "stop all
+    email" or a staff entry. Returns None when the list cannot be read (unset base/token, broker down,
+    bad answer), and the callers then add nobody: failing closed only delays a new sign-up by one run.
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
+        logger.error("DDP suppression list unreadable: DDP_BROKER_API_BASE/TOKEN not set")
+        return None
+    try:
+        response = requests.get(
+            f"{settings.ddp_broker_api_base}/api/email/suppressions/",
+            headers={"Authorization": f"Bearer {settings.ddp_broker_api_token}"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.error(f"DDP suppression list unreadable: {response.status_code}")
+            return None
+        return {str(e).strip().lower() for e in response.json()["emails"]}
+    except Exception as e:
+        logger.error(f"DDP suppression list unreadable: {e}")
+        return None
+
+
+def brevo_contact_opted_out(api_key: str, email: str, list_id: int) -> bool | None:
+    """SYNC-122: has this person opted out in Brevo? True when the contact is blocklisted for email
+    campaigns (a newsletter unsubscribe or a block) or has unsubscribed from this list (it then appears
+    in `listUnsubscribed` and is no longer in the list, which the 30-minute diff would otherwise read as
+    a new sign-up). False for an unknown address. None when Brevo cannot answer: skip for this run.
+    """
+    try:
+        response = requests.get(
+            f"https://api.brevo.com/v3/contacts/{email}",
+            headers={"Accept": "application/json", "api-key": api_key},
+            params={"identifierType": "email_id"},
+            timeout=30,
+        )
+        time.sleep(0.1)
+    except Exception as e:
+        logger.error(f"Brevo contact lookup failed for {email}: {e}")
+        return None
+    if response.status_code == 404:
+        return False
+    if response.status_code != 200:
+        logger.error(f"Brevo contact lookup unexpected status for {email}: {response.status_code}")
+        return None
+    contact = response.json()
+    return bool(contact.get("emailBlacklisted")) or list_id in (contact.get("listUnsubscribed") or [])
+
+
 def flatten_voatz_user(user: dict) -> dict:
     """Flatten Voatz user structure for comparison."""
     flattened = {
@@ -619,11 +671,14 @@ def resolve_phone_ownership(api_key: str, phone: str, new_email: str,
     return False
 
 
-def sync_org(org_config: dict, claimed_phones: dict | None = None) -> dict | None:
+def sync_org(org_config: dict, claimed_phones: dict | None = None,
+             suppressed_emails: set[str] | None = None) -> dict | None:
     """
     Sync users for a single organization.
 
-    - Adds new users to Brevo
+    - Adds new users to Brevo, except anyone who opted out (SYNC-122): an address on DDP's
+      suppression list, or one Brevo shows as blocklisted or unsubscribed from this list.
+      `suppressed_emails` None means the list could not be read, and then nobody is added.
     - Removes departed users from Brevo
     - Returns summary of changes
     """
@@ -724,6 +779,18 @@ def sync_org(org_config: dict, claimed_phones: dict | None = None) -> dict | Non
     # Log the differences
     logger.info(f"  Diff: {len(added_emails)} emails in Voatz but not Brevo, {len(removed_emails)} emails in Brevo but not Voatz")
 
+    # SYNC-122: never add someone who opted out. Anyone Brevo cannot answer for is left for the next run.
+    opted_out_count = 0
+    if suppressed_emails is None:
+        logger.error(f"Org {org_name}: adding nobody this run, the DDP suppression list could not be read")
+        added_emails = set()
+    for email in sorted(added_emails):
+        if email in suppressed_emails or brevo_contact_opted_out(brevo_api_key, email, brevo_list_id) is not False:
+            added_emails.discard(email)
+            opted_out_count += 1
+    if opted_out_count:
+        logger.info(f"  Not added (opted out, or Brevo could not say): {opted_out_count}")
+
     users_to_add = [voatz_details_by_email[e] for e in added_emails]
     emails_to_remove = list(removed_emails)
 
@@ -761,13 +828,18 @@ def sync_org(org_config: dict, claimed_phones: dict | None = None) -> dict | Non
     return None
 
 
-def full_sync_org(org_config: dict, claimed_phones: dict | None = None) -> dict | None:
+def full_sync_org(org_config: dict, claimed_phones: dict | None = None,
+                  suppressed_emails: set[str] | None = None) -> dict | None:
     """
     Full-attribute sync for a single organization.
 
-    Re-imports all Voatz users to Brevo, updating any changed attributes.
-    Unlike sync_org(), this does not diff -- it pushes all users through
+    Re-imports Voatz users to Brevo, updating any changed attributes, through
     add_contacts_to_brevo() which uses updateExistingContacts: True.
+
+    SYNC-122: only users who are already in the Brevo list and have not opted out
+    (blocklisted for email, or on DDP's suppression list) are re-imported, so this
+    job can never add anyone; adding is sync_org()'s job, which checks opt-outs.
+    It skips the org when the list or the suppression list cannot be read.
     """
     org_name = org_config.get("name", "Unknown")
     org_id = org_config["voatz_org_id"]
@@ -819,18 +891,35 @@ def full_sync_org(org_config: dict, claimed_phones: dict | None = None) -> dict 
         logger.info(f"No users to sync for {org_name}")
         return None
 
-    # Fetch Brevo contacts to build phone index (avoids per-user API lookups)
+    if suppressed_emails is None:
+        logger.error(f"Skipping full sync for org {org_name}: the DDP suppression list could not be read")
+        return None
+
+    # Fetch Brevo contacts: who is in the list (SYNC-122) and the phone index (avoids per-user API lookups)
     brevo_phones = {}
     brevo_contacts = fetch_brevo_contacts(brevo_api_key, brevo_list_id)
-    if brevo_contacts is not None:
-        for contact in brevo_contacts:
-            email = contact.get("email")
-            whatsapp = contact.get("attributes", {}).get("WHATSAPP")
-            if whatsapp:
-                brevo_phones[str(whatsapp)] = email.lower() if email else None
-        logger.info(f"  Built phone index from {len(brevo_contacts)} Brevo contacts ({len(brevo_phones)} phones)")
-    else:
-        logger.warning(f"  Brevo fetch failed for {org_name} — phone conflicts will use live lookups")
+    if brevo_contacts is None:
+        logger.error(f"Skipping full sync for org {org_name}: Brevo fetch failed (cannot tell who is in the list)")
+        return None
+    in_list = set()
+    for contact in brevo_contacts:
+        email = contact.get("email")
+        whatsapp = contact.get("attributes", {}).get("WHATSAPP")
+        if whatsapp:
+            brevo_phones[str(whatsapp)] = email.lower() if email else None
+        if email and not contact.get("emailBlacklisted"):
+            in_list.add(email.lower())
+    logger.info(f"  Built phone index from {len(brevo_contacts)} Brevo contacts ({len(brevo_phones)} phones)")
+
+    eligible = []
+    for user in users_to_sync:
+        email = (clean_email(user.get("emailAddress")) or "").lower()
+        if email in in_list and email not in suppressed_emails:
+            eligible.append(user)
+    logger.info(f"  Re-importing {len(eligible)} of {len(users_to_sync)} (the rest are not in the list or opted out)")
+    users_to_sync = eligible
+    if not users_to_sync:
+        return None
 
     # Push all users to Brevo (updates existing contacts matched by email)
     added_success, added_failed, overseas_count = add_contacts_to_brevo(
@@ -899,10 +988,11 @@ def run_sync_job():
         all_summaries = []
         # Track phone ownership across orgs to avoid Brevo unique-key conflicts
         claimed_phones = {}
+        suppressed_emails = fetch_ddp_suppressed_emails()  # SYNC-122
 
         for org_config in orgs:
             try:
-                summary = sync_org(org_config, claimed_phones)
+                summary = sync_org(org_config, claimed_phones, suppressed_emails)
                 if summary:
                     all_summaries.append(summary)
             except Exception as e:
@@ -934,10 +1024,11 @@ def run_full_sync_job():
 
         all_summaries = []
         claimed_phones = {}
+        suppressed_emails = fetch_ddp_suppressed_emails()  # SYNC-122
 
         for org_config in orgs:
             try:
-                summary = full_sync_org(org_config, claimed_phones)
+                summary = full_sync_org(org_config, claimed_phones, suppressed_emails)
                 if summary:
                     all_summaries.append(summary)
             except Exception as e:
