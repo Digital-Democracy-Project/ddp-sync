@@ -218,6 +218,16 @@ openstates_scrape:
   enabled: true
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
 
+  # SYNC-128: after a successful scrape, POST the jurisdiction to ddp-broker-py's
+  # /api/openstates-bill-events/check/ (BROKER-300) so it checks for new bill events now rather
+  # than on its own schedule. Read by _maybe_signal_broker_bill_events in openstates_scrape.py.
+  # Codes are the broker's ("us", not "usa"). Off until the broker release with BROKER-300 is
+  # deployed AND the scraping host has a real DDP_BROKER_API_TOKEN (the EC2 broker host's is the
+  # placeholder "public-endpoint-no-auth", which the broker answers with 401). Pilot one state first.
+  broker_bill_event_signal:
+    enabled: false
+    jurisdictions: []
+
   # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
   # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
   # loses everything it had collected. That is not theoretical: FL 213 + MA 473 bills went that

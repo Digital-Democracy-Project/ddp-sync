@@ -264,6 +264,11 @@ Pub/sub channels (hardcoded strings in callers):
 - **`OpenStatesPerson`** — bio data shape
 - **`OpenStatesError`** / **`OpenStatesRateLimitError`** — exception hierarchy
 
+## Broker bill-event signal (`pipelines/openstates_scrape.py`, SYNC-128)
+
+- **`_maybe_signal_broker_bill_events(jurisdiction, config)`** — called from `_run_scrape` on success, before the OPEN-291 archive hook. Gated by `openstates_scrape.broker_bill_event_signal` (`enabled`, `jurisdictions`; default off), maps `usa` to `us` with `openstates_archive._archive_jurisdiction_code`, debounces 15 minutes per jurisdiction (`ddp:broker_bill_event_signal:<code>`, SET NX EX, fails open). Never raises, never retries.
+- **`broker_client.request_bill_event_check(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/openstates-bill-events/check/` `{"jurisdiction": ...}` with the service token (BROKER-300; 202 queued). Raises `BrokerClientError` on an unset base/token, unreachable broker, or any 4xx/5xx (400 unknown jurisdiction, 401 token, 503 queue down).
+
 ## People checkout pull (`pipelines/openstates_scrape.py`)
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.

@@ -983,6 +983,61 @@ def _run_with_group_kill(
             watchdog.join(timeout=_STALL_POLL_SECONDS + 5)
 
 
+# SYNC-128: how long one jurisdiction's bill-event signal to the broker covers. FL/USA call
+# _run_scrape() once per session, back to back; this keeps that to one signal per run. A later
+# scrape of the same jurisdiction (new data) signals again once the window has passed.
+_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_PREFIX = "ddp:broker_bill_event_signal:"
+_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_TTL_SECONDS = 900
+
+
+async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | None) -> None:
+    """SYNC-128: after a successful scrape, ask ddp-broker-py (BROKER-300) to run its bill-event
+    check for this jurisdiction now instead of waiting for its own schedule.
+
+    Enrollment is `openstates_scrape.broker_bill_event_signal` in sync_schedule.yaml (default off).
+    Best effort: never raises, never retries; a failure is a WARNING and the broker's own schedule
+    still picks the changes up later. The debounce fails open (a duplicate signal is harmless).
+    """
+    try:
+        block = (config or {}).get("broker_bill_event_signal") or {}
+        if not block.get("enabled", False):
+            return
+        from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
+
+        code = _archive_jurisdiction_code(jurisdiction).lower()
+        if code not in {str(j).lower() for j in block.get("jurisdictions", [])}:
+            return
+
+        from ddp_sync.config import get_settings
+
+        settings = get_settings()
+        if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
+            logger.warning("broker_bill_event_signal_not_configured", jurisdiction=code)
+            return
+
+        try:
+            from ddp_sync.services.redis_store import get_redis_store
+
+            redis_client = get_redis_store()._client
+            if redis_client and not await redis_client.set(
+                f"{_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_PREFIX}{code}",
+                "1",
+                nx=True,
+                ex=_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_TTL_SECONDS,
+            ):
+                logger.info("broker_bill_event_signal_debounced", jurisdiction=code)
+                return
+        except Exception as e:  # noqa: BLE001 -- fail open: a duplicate signal is harmless
+            logger.warning("broker_bill_event_signal_debounce_failed_proceeding", jurisdiction=code, error=str(e))
+
+        from ddp_sync.services.broker_client import request_bill_event_check
+
+        await request_bill_event_check(code)
+        logger.info("broker_bill_event_signal_sent", jurisdiction=code)
+    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+        logger.warning("broker_bill_event_signal_failed", jurisdiction=jurisdiction, error=str(e))
+
+
 async def _run_scrape(
     jurisdiction: str,
     session_arg: str | None,
@@ -1015,12 +1070,17 @@ async def _run_scrape(
     mechanism (config-driven, not per-jurisdiction code) and the debounce that
     keeps FL/USA's multi-session loop from firing this once per session.
 
+    SYNC-128: before that, `_maybe_signal_broker_bill_events` tells ddp-broker-py to run
+    its bill-event check for the jurisdiction (opt-in, never raises).
+
     Wrapped in its own catch-all, mirroring `_run_archive_with_hook`'s own fix
     for the same pm-review finding: nothing after a successful scrape may
     change that scrape's own already-successful result.
     """
     result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
     if result.get("success"):
+        # SYNC-128: first, because the archive hook below can run for hours.
+        await _maybe_signal_broker_bill_events(jurisdiction, config)
         try:
             from ddp_sync.pipelines.openstates_archive import maybe_trigger_archive_after_scrape
 
