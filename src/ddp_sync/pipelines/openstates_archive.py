@@ -35,7 +35,9 @@ import requests
 import structlog
 
 from ddp_sync.config import SyncSettings, get_settings
+from ddp_sync.pipelines.openstates_scrape import _get_root as _scrape_root
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
+from ddp_sync.services.jurisdiction_enrollment import enrolled
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
 from ddp_sync.slack_alerts import post_alert
@@ -49,7 +51,7 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # trigger endpoint, run_archive_jobs' own default) share one definition instead of each
 # hardcoding their own copy -- triggers.py's copy silently went stale when ma/al/us were
 # added here 2026-08-10, exactly the class of bug a single shared constant prevents.
-DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us"]
+DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us", "nc"]  # OPEN-328: nc was missing; only a last resort now (jurisdictions.yaml answers first)
 
 # OPEN-291: the scrape side's federal job is "usa" (openstates_scrape.primary.usa in
 # sync_schedule.yaml); the archive side's is "us" (matching OpenStates' own jurisdiction
@@ -783,7 +785,8 @@ def _knowledge_base_embedding_eligible(jurisdiction: str, config: dict | None) -
     block = (config or {}).get("knowledge_base_embedding") or {}
     if not block.get("enabled", False):
         return False
-    return jurisdiction.lower() in {str(j).lower() for j in block.get("jurisdictions", [])}
+    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
+    return jurisdiction.lower() in enrolled("embedding", block.get("jurisdictions", []), _scrape_root(config))
 
 
 def _reconcile_max_bills(config: dict | None) -> int:
@@ -903,7 +906,7 @@ def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> boo
     block = (config or {}).get("bill_search_refresh") or {}
     if not block.get("enabled", False):
         return False
-    return jurisdiction.lower() in {str(j).lower() for j in block.get("jurisdictions", [])}
+    return jurisdiction.lower() in enrolled("search_refresh", block.get("jurisdictions", []), _scrape_root(config))
 
 
 async def _maybe_refresh_bill_search(jurisdiction: str, config: dict | None) -> None:
@@ -1126,8 +1129,10 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     entire batch, not per-jurisdiction, since a mixed batch would need its own reasoning
     about which jurisdictions are safe to run where, and nothing here needs that yet.
     """
-    jurisdictions: list[str] = (config or {}).get(
-        "jurisdictions", DEFAULT_ARCHIVE_JURISDICTIONS
+    # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant.
+    jurisdictions: list[str] = (
+        enrolled("archive", (config or {}).get("jurisdictions"), _scrape_root(config))
+        or DEFAULT_ARCHIVE_JURISDICTIONS
     )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()

@@ -30,6 +30,7 @@ import structlog
 
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
 from ddp_sync.services import scrapebot_client
+from ddp_sync.services.jurisdiction_enrollment import enrolled
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
 from ddp_sync.slack_alerts import post_alert
 
@@ -1754,9 +1755,11 @@ async def run_secondary_scrapes_job(
     """
     openstates_root = _get_root(config)
     if jurisdictions is None:
+        # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant
+        # (which had drifted: no nc).
         jurisdictions = (
-            (config or {}).get("secondary", {})
-            .get("jurisdictions", ["va", "mi", "ma", "ut", "az"])
+            enrolled("scrape_secondary", ((config or {}).get("secondary") or {}).get("jurisdictions"), openstates_root)
+            or ["va", "mi", "ma", "ut", "az", "nc"]
         )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()
