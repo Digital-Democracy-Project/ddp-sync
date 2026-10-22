@@ -604,6 +604,36 @@ async def write_organization_content(
     return result
 
 
+async def request_bill_event_check(jurisdiction: str) -> None:
+    """Ask ddp-broker-py to run its bill-event check for one jurisdiction now (SYNC-128 / BROKER-300).
+
+    The broker only queues the check (202) and does the work itself; this returns as soon as it is
+    queued. Used by the post-scrape signal in `openstates_scrape._maybe_signal_broker_bill_events`.
+
+    Raises:
+        BrokerClientError: DDP_BROKER_API_BASE/TOKEN unset, the broker unreachable, or any non-2xx
+            (400 = a jurisdiction the broker does not check, 401 = bad token, 503 = its queue is down).
+    """
+    settings = get_settings()
+    if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
+        raise BrokerClientError("DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN not configured")
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{settings.ddp_broker_api_base}/api/openstates-bill-events/check/",
+                headers={"Authorization": f"Bearer {settings.ddp_broker_api_token}"},
+                json={"jurisdiction": jurisdiction},
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the bill-event check ({resp.status_code}): {resp.text[:200]}"
+        )
+
+
 async def _post_organization_resolution(
     path: str,
     payload: dict,
