@@ -70,11 +70,21 @@ def _settings(routing=(), legbot=()):
 
 def test_everything_agreeing_has_no_findings(root):
     f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US", "FL", "NC"], ["fl", "us", "nc"]), root)
-    assert f == {"drift": [], "unverifiable": []}
+    assert f == {"drift": [], "unverifiable": [], "skipped": []}
 
 
-def test_an_env_list_the_host_does_not_set_is_not_drift(root):
-    assert jdc.collect_findings(AGREEING_CONFIG, _settings(), root) == {"drift": [], "unverifiable": []}
+def test_an_env_list_the_host_does_not_set_is_not_drift_but_is_named_as_skipped(root):
+    f = jdc.collect_findings(AGREEING_CONFIG, _settings(), root)
+    assert f["drift"] == [] and f["unverifiable"] == []
+    assert f["skipped"] == ["DDP_OPENSTATES_JURISDICTIONS", "LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST"]
+
+
+def test_skipped_env_lists_do_not_change_the_alert_signature_or_cause_an_alert(root):
+    result, post, _ = _run(root, AGREEING_CONFIG, _settings())
+    assert not post.called and result["findings"]["skipped"]
+    a = jdc._signature({"drift": [], "unverifiable": [], "skipped": []})
+    b = jdc._signature({"drift": [], "unverifiable": [], "skipped": ["X"]})
+    assert a == b
 
 
 def test_an_env_list_that_differs_is_drift_with_both_sides(root):
@@ -181,10 +191,19 @@ def test_recovery_clears_the_signature(root):
     assert result["status"] == "ok" and result["signature"] == "" and not post.called
 
 
-def test_the_job_never_raises(root):
-    with patch("ddp_sync.scheduler.get_scheduler", side_effect=RuntimeError("boom")):
+def test_the_job_never_raises_and_a_broken_check_alerts(root):
+    with patch("ddp_sync.scheduler.get_scheduler", side_effect=RuntimeError("boom")), patch.object(jdc, "post_alert") as post:
         result = asyncio.run(jdc.run_jurisdiction_drift_check({}))
     assert result["status"] == "error"
+    post.assert_called_once()
+    assert "could not run" in post.call_args.args[0] and "boom" in post.call_args.args[0]
+
+
+def test_a_failing_failure_alert_still_does_not_escape(root):
+    with patch("ddp_sync.scheduler.get_scheduler", side_effect=RuntimeError("boom")), patch.object(
+        jdc, "post_alert", side_effect=OSError("slack down")
+    ):
+        assert asyncio.run(jdc.run_jurisdiction_drift_check({}))["status"] == "error"
 
 
 # --- wiring ---------------------------------------------------------------------------------------------

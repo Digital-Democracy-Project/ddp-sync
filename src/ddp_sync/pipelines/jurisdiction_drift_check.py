@@ -45,13 +45,18 @@ _CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "sc
 
 
 def collect_findings(sync_config: dict, settings: Any, root: str) -> dict[str, Any]:
-    """Everything wrong right now, as plain data: {"drift": [...], "unverifiable": [...]}."""
+    """Everything wrong right now, as plain data: {"drift": [...], "unverifiable": [...], "skipped": [...]}.
+    `skipped` names the env lists this host does not set (unset and an empty value are the same thing to the
+    settings layer, so a list accidentally cleared reads as "not set"). It is reported in the status and the log
+    so the gap is visible, but it is not a finding and does not alert."""
     drift = [dict(d, source="sync_schedule.yaml") for d in je.config_disagreements(sync_config, root)]
     unverifiable = [f for f in _CHECKED_FEATURES if je.manifest_codes(f, root) is None]
+    skipped = []
     for name, (feature, attr) in _ENV_LISTS.items():
         have = {str(c).strip().lower() for c in (getattr(settings, attr, None) or []) if str(c).strip()}
         if not have:
-            continue  # this host does not set it: nothing to compare
+            skipped.append(name)  # this host does not set it: nothing to compare
+            continue
         want = je.manifest_codes(feature, root)
         if want is None:
             unverifiable.append(feature)
@@ -59,11 +64,13 @@ def collect_findings(sync_config: dict, settings: Any, root: str) -> dict[str, A
         if have != set(want):
             drift.append({"feature": feature, "source": f"env {name}", "only_in_yaml": sorted(have - set(want)),
                           "only_in_manifest": sorted(set(want) - have)})
-    return {"drift": drift, "unverifiable": sorted(set(unverifiable))}
+    return {"drift": drift, "unverifiable": sorted(set(unverifiable)), "skipped": skipped}
 
 
 def _signature(findings: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(findings, sort_keys=True).encode()).hexdigest()[:16]
+    # `skipped` describes this host's setup, not a problem: it must not change the signature (re-alert)
+    problems = {k: findings[k] for k in ("drift", "unverifiable")}
+    return hashlib.sha256(json.dumps(problems, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _alert_text(findings: dict[str, Any], root: str) -> str:
@@ -120,8 +127,14 @@ async def run_jurisdiction_drift_check(config: dict | None = None) -> dict[str, 
         }
         await _write_flow_status(FLOW_KEY, result)
         (logger.warning if problem else logger.info)("jurisdiction_drift_check: done", status=result["status"],
-                                                      drift=len(findings["drift"]), unverifiable=findings["unverifiable"], alerted=alerted)
+                                                      drift=len(findings["drift"]), unverifiable=findings["unverifiable"],
+                                                      env_lists_not_set_on_this_host=findings["skipped"], alerted=alerted)
         return result
     except Exception as exc:  # noqa: BLE001
         logger.error("jurisdiction_drift_check: failed", error=str(exc))
+        # A monitor that cannot run is an alert condition too. Not de-duplicated: a check that breaks should nag.
+        try:
+            post_alert(f":warning: jurisdiction drift check could not run on this host: {exc}", source="jurisdiction_drift_check")
+        except Exception:  # noqa: BLE001 - never let the alert path escape into the scheduler
+            logger.error("jurisdiction_drift_check: failure alert also failed")
         return {"flow": FLOW_KEY, "status": "error", "error": str(exc)}
