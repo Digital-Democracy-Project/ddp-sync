@@ -332,6 +332,7 @@ class UpdateScheduler:
         # --- Fork upstream check (independent of whether this host runs scrapes) ---
         self._register_people_pull_job()
         self._register_fork_upstream_check_job()
+        self._register_jurisdiction_drift_check_job()
 
         # --- OpenStates bill-document archive (independent of scrape schedule) ---
         self._register_openstates_archive_jobs()
@@ -908,6 +909,34 @@ class UpdateScheduler:
                 misfire_grace_time=3600,
             )
             logger.info("fork_upstream_check: registered", sync_time=fork_time)
+
+    def _register_jurisdiction_drift_check_job(self) -> None:
+        """OPEN-330: daily check that this host's jurisdiction lists agree with jurisdictions.yaml. Registered
+        outside _register_openstates_scrape_jobs for the same reason as the fork check: that method returns early
+        on a host whose scrapes are off, and this must still be switchable there. Default-off per-host env flag
+        ANDed with the shared yaml gate."""
+        from ddp_sync.pipelines.jurisdiction_drift_check import run_jurisdiction_drift_check
+
+        config = self._sync_config.get("openstates_scrape", {})
+        drift_cfg = config.get("jurisdiction_drift_check", {})
+        if self.settings.jurisdiction_drift_check_enabled and drift_cfg.get("enabled", True):
+            drift_time = drift_cfg.get("sync_time_utc", "06:20")
+            driftth, driftm = map(int, drift_time.split(":"))
+
+            async def _jurisdiction_drift_check_wrapper():
+                return await run_jurisdiction_drift_check(config)
+
+            self._add_job_replacing(
+                _jurisdiction_drift_check_wrapper,
+                trigger=CronTrigger(hour=driftth, minute=driftm, timezone=_UTC),
+                id="jurisdiction_drift_check",
+                name="OpenStates: jurisdiction list drift check",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("jurisdiction_drift_check: registered", sync_time=drift_time)
 
     def _add_job_replacing(self, func, **kwargs) -> None:
         """add_job that is idempotent whether or not the scheduler has started.

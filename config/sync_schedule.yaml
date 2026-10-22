@@ -720,6 +720,17 @@ openstates_scrape:
     alert_tiers_days: [3, 7, 14]
     repeat_days: 7
 
+  # OPEN-330 (OPEN-318 slice 5): daily check that THIS host's jurisdiction lists (the live copy of this file, and its
+  # own DDP_OPENSTATES_JURISDICTIONS / LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST when set) agree with ddp-open-states'
+  # jurisdictions.yaml, and that the manifest on this host can be read and is current enough to check. Alerts through
+  # post_alert when the findings change, then every repeat_days. Default off per host: a host sets
+  # JURISDICTION_DRIFT_CHECK_ENABLED=true (Mac Studio and the EC2 broker host both should). Manual run:
+  # POST /trigger/openstates-scrape/drift-check
+  jurisdiction_drift_check:
+    enabled: true
+    sync_time_utc: "06:20"
+    repeat_days: 7
+
   # OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory store on
   # an independent schedule (PLAN-scraper-execution-migration.md §6, "publish, do not call
   # in"). Runs regardless of whether a Michigan scrape is happening right now -- no inbound

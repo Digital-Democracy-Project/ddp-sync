@@ -189,6 +189,9 @@ class SyncSettings:
     # Daily fork-vs-upstream gap check (fork_upstream_check.py). Default OFF like the people pull:
     # only the Mac Studio instance opts in, so the EC2 instances never run it.
     fork_upstream_check_enabled: bool = False
+    # Daily check that this host's jurisdiction lists agree with jurisdictions.yaml (OPEN-330). Default OFF: a host
+    # opts in with JURISDICTION_DRIFT_CHECK_ENABLED=true.
+    jurisdiction_drift_check_enabled: bool = False
     session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
     grantbot_similarity_refresh_enabled: bool = True
@@ -635,12 +638,14 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "grantbot_similarity_refresh_enabled": "GRANTBOT_SIMILARITY_REFRESH_ENABLED",
     "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",
     "fork_upstream_check_enabled": "FORK_UPSTREAM_CHECK_ENABLED",
+    "jurisdiction_drift_check_enabled": "JURISDICTION_DRIFT_CHECK_ENABLED",
     "slack_citations_enabled": "SLACK_CITATIONS_ENABLED",
     "docker_cleanup_enabled": "DOCKER_CLEANUP_ENABLED",
 }
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
-_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "slack_citations_enabled",
+_TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "jurisdiction_drift_check_enabled",
+                           "slack_citations_enabled",
                            "docker_cleanup_enabled"}
 
 

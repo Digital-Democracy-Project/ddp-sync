@@ -301,6 +301,20 @@ ddp-open-states checkout is current on `main` (pull it first on the EC2 broker h
 automatically); (3) the deployed `sync_schedule.yaml` on that host has all six lists; (4) rollback is removing
 the env var and restarting. Do the Mac first, the EC2 broker host second.
 
+## Jurisdiction drift check (`pipelines/jurisdiction_drift_check.py`, OPEN-330)
+
+A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
+`post_alert` (source `jurisdiction_drift_check`). It checks the live `sync_schedule.yaml` dict (hand-edited per host),
+the host's own `DDP_OPENSTATES_JURISDICTIONS` and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` (only when the host sets
+them: unset is not drift), and whether the manifest can answer at all: a missing, unreadable, or out-of-date checkout is
+reported as "cannot verify" (the EC2 bind mount is never auto-pulled), because a monitor that cannot see must alert.
+The alert repeats only when the findings change or after `jurisdiction_drift_check.repeat_days` (7). Default off per host
+(`JURISDICTION_DRIFT_CHECK_ENABLED=true`), registered outside `_register_openstates_scrape_jobs` like the fork check.
+Manual run: `POST /trigger/openstates-scrape/drift-check`. It reuses `jurisdiction_enrollment.config_disagreements`
+(OPEN-328), so its logs are the weekly-review evidence for the dual-read. It cannot read the broker's env (another
+host); that value is checked with `check-jurisdiction-drift.py --live` in ddp-open-states. `.github/workflows/
+jurisdiction-drift.yml` runs the ddp-open-states drift script on ddp-sync PRs, advisory only (see that file).
+
 ## Fork upstream check (`pipelines/fork_upstream_check.py`)
 
 - **`run_fork_upstream_check_job(config)`** — Daily (01:30 UTC, `openstates_scrape.fork_upstream_check` in `sync_schedule.yaml`). For each DDP fork (people, openstates-core, openstates-scrapers, api-v3) fetches the fork's `main` and its upstream's `main` over public https into a job-owned bare cache (`<OPENSTATES_ROOT>/logs/fork-upstream-cache/`, no credentials, never the live working trees) and counts upstream commits the fork lacks. Writes `<OPENSTATES_ROOT>/logs/fork-upstream-status.json` (per repo: `behind_count`, `oldest_age_days`, `titles`, `areas_changed`, `sensitive_paths_changed` for workflows/migrations/dependency files) for a reviewer to read, and flow status `fork_upstream_check` (shown by `/health`). Alerts through `post_alert` when the oldest missing commit is 3+ days old (tiers 3/7/14 days, then weekly) or a fetch fails (nights 1, 3, then weekly); the previous status file is the de-dup memory. Never merges, opens PRs or pushes. Registered only when `FORK_UPSTREAM_CHECK_ENABLED=true` on the host (default off; Mac Studio only). It has its own registration step (`_register_fork_upstream_check_job`) and does **not** depend on `OPENSTATES_SCRAPE_ENABLED`: the Mac has scraping off, and until PR #213 the check was tucked inside the scrape registration and silently never started. Do not move it back. Manual: `POST /trigger/openstates-scrape/fork-check`. This is the stalled-sync check SYNC-104 asked for. Alerts use `SLACK_BOT_TOKEN`, which the service gets from `ddp-agents/.env` through `scripts/start-ddp-sync.sh`; ddp-sync's own `.env` does not hold it, so a hand-run test must load it the same way. Delivery verified 2026-10-13 (a labelled test reached #automation-errors as CodeBot).

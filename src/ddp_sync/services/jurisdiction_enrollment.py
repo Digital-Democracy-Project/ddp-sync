@@ -40,6 +40,9 @@ _FEATURES = {
     "embedding": (lambda e: e["enrollment"]["embedding"], False),
     "search_refresh": (lambda e: e["enrollment"]["search_refresh"], False),
     "cloud_path": (lambda e: e["enrollment"]["cloud_path"], True),
+    # OPEN-330: the two env-var lists, spelled "us" like the env values themselves.
+    "replica_routing": (lambda e: e["enrollment"]["replica_routing"], False),
+    "legbot_replica": (lambda e: e["enrollment"]["legbot_replica"], False),
     # A paused jurisdiction is on no scrape schedule whatever its (required) tier says.
     "scrape_primary": (lambda e: e["tier"] == "primary" and e["status"] != "paused", True),
     "scrape_secondary": (lambda e: e["tier"] == "secondary" and e["status"] != "paused", True),
