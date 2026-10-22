@@ -117,7 +117,10 @@ def enrolled(feature: str, yaml_codes, root: str) -> list[str] | None:
     such key). Shadow mode (default) returns the yaml's list and logs a disagreement with the manifest once
     per distinct difference; authoritative mode returns the manifest's. A yaml with no list falls back to the
     manifest in either mode (there is no yaml answer to protect); None is returned only when neither can answer,
-    so the caller can fall back to its own last-resort default."""
+    so the caller can fall back to its own last-resort default. An EMPTY list is an answer, never "absent":
+    callers must test the result with `is None`, not truthiness. Pass `None` for yaml_codes only where the
+    caller has such a fallback; where it does not (the hook gates), pass the yaml's list as it is, `[]` if the
+    key is missing, so shadow mode keeps exactly the answer the code gave before OPEN-328."""
     manifest = manifest_codes(feature, root)
     if yaml_codes is None:
         return manifest

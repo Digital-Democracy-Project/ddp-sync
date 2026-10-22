@@ -277,3 +277,59 @@ def test_the_shipped_sync_schedule_agrees_with_the_real_manifest_when_a_checkout
         pytest.skip("set OPENSTATES_ROOT to a ddp-open-states checkout to run this")
     config = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "..", "config", "sync_schedule.yaml")))
     assert je.config_disagreements(config, root) == []
+
+
+# --- an explicitly empty list is an answer, not "absent" (pm-review round 1) -------------------------------
+
+def test_an_empty_yaml_list_stays_empty_in_shadow_mode(root):
+    assert je.enrolled("archive", [], root) == []
+
+
+def test_an_empty_manifest_result_stays_empty_in_authoritative_mode(tmp_path, monkeypatch):
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump({"fl": _entry(archive=False)}))
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    assert je.enrolled("archive", ["fl"], str(tmp_path)) == []
+
+
+def test_the_manual_archive_trigger_does_not_fall_back_to_the_default_when_the_list_is_empty(root):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from ddp_sync.api.auth import api_key_auth
+    from ddp_sync.api.routes.triggers import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[api_key_auth] = lambda: "t"
+    scheduler = MagicMock()
+    scheduler._sync_config = {"openstates_archive": {"openstates_root": root, "jurisdictions": []}}
+    with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), patch(
+        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
+    ) as run:
+        resp = TestClient(app).post("/trigger/openstates-archive/fl")
+    assert resp.status_code == 404  # nothing enrolled; the default list (which contains fl) must not be used
+    run.assert_not_awaited()
+
+
+def test_run_archive_jobs_with_an_empty_list_archives_nothing_rather_than_the_default(root):
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    with patch.object(openstates_archive, "_write_flow_status", new=AsyncMock()), patch.object(
+        openstates_archive, "_run_archive_with_hook", new=AsyncMock(return_value={"success": True})
+    ) as run:
+        asyncio.run(openstates_archive.run_archive_jobs({"openstates_root": root, "jurisdictions": []}))
+    run.assert_not_awaited()
+
+
+def test_run_secondary_scrapes_with_an_empty_list_scrapes_nothing_rather_than_the_default(root):
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    with patch.object(openstates_scrape, "_write_flow_status", new=AsyncMock()), patch.object(
+        openstates_scrape, "_run_scrape", new=AsyncMock()
+    ) as run:
+        asyncio.run(openstates_scrape.run_secondary_scrapes_job({"openstates_root": root, "secondary": {"jurisdictions": []}}))
+    run.assert_not_awaited()

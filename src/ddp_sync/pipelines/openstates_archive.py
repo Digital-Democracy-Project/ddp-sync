@@ -1129,11 +1129,10 @@ async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
     entire batch, not per-jurisdiction, since a mixed batch would need its own reasoning
     about which jurisdictions are safe to run where, and nothing here needs that yet.
     """
-    # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant.
-    jurisdictions: list[str] = (
-        enrolled("archive", (config or {}).get("jurisdictions"), _scrape_root(config))
-        or DEFAULT_ARCHIVE_JURISDICTIONS
-    )
+    # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant. An
+    # explicitly EMPTY list is a real answer (nothing enrolled), not "absent", so test for None, not falsiness.
+    listed = enrolled("archive", (config or {}).get("jurisdictions"), _scrape_root(config))
+    jurisdictions: list[str] = DEFAULT_ARCHIVE_JURISDICTIONS if listed is None else listed
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()
 

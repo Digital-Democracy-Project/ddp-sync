@@ -1757,10 +1757,9 @@ async def run_secondary_scrapes_job(
     if jurisdictions is None:
         # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant
         # (which had drifted: no nc).
-        jurisdictions = (
-            enrolled("scrape_secondary", ((config or {}).get("secondary") or {}).get("jurisdictions"), openstates_root)
-            or ["va", "mi", "ma", "ut", "az", "nc"]
-        )
+        # An explicitly empty list is a real answer, so this tests for None, not falsiness.
+        listed = enrolled("scrape_secondary", ((config or {}).get("secondary") or {}).get("jurisdictions"), openstates_root)
+        jurisdictions = ["va", "mi", "ma", "ut", "az", "nc"] if listed is None else listed
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()
 

@@ -1247,9 +1247,8 @@ async def trigger_openstates_archive(
     from ddp_sync.pipelines.openstates_scrape import _get_root
     from ddp_sync.services.jurisdiction_enrollment import enrolled
 
-    jurisdictions = set(
-        enrolled("archive", config.get("jurisdictions"), _get_root(config)) or DEFAULT_ARCHIVE_JURISDICTIONS
-    )
+    listed = enrolled("archive", config.get("jurisdictions"), _get_root(config))
+    jurisdictions = set(DEFAULT_ARCHIVE_JURISDICTIONS if listed is None else listed)
 
     if target == "all":
         background_tasks.add_task(run_archive_jobs, config)
