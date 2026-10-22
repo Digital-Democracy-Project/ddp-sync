@@ -11,6 +11,7 @@ import structlog
 from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata, MetadataExtractor
 from ddp_sync.ingestion.pipeline import DocumentSource
+from ddp_sync.services.jurisdiction_names import source_name
 
 logger = structlog.get_logger()
 
@@ -109,20 +110,6 @@ class OpenStatesSource:
     """
 
     # Mapping of jurisdiction codes to human-readable source names
-    JURISDICTION_SOURCE_NAMES = {
-        "us": "US Congress",
-        "fl": "Florida Legislature",
-        "wa": "Washington Legislature",
-        "va": "Virginia Legislature",
-        "mi": "Michigan Legislature",
-        "ma": "Massachusetts Legislature",
-        "ut": "Utah Legislature",
-        "az": "Arizona Legislature",
-        "al": "Alabama Legislature",
-        "ca": "California Legislature",
-        "ny": "New York Legislature",
-        "tx": "Texas Legislature",
-    }
 
     def __init__(
         self,
@@ -152,11 +139,7 @@ class OpenStatesSource:
         Returns:
             Human-readable source name (e.g., 'Florida Legislature', 'US Congress')
         """
-        jurisdiction_lower = jurisdiction.lower() if jurisdiction else ""
-        return self.JURISDICTION_SOURCE_NAMES.get(
-            jurisdiction_lower,
-            f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature"
-        )
+        return source_name(jurisdiction)
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
         """
