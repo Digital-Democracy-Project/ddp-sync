@@ -1,0 +1,43 @@
+name: Jurisdiction lists vs the manifest
+
+# OPEN-330. ddp-open-states' check-jurisdiction-drift.py compares ddp-sync's jurisdiction lists (this repo's
+# config/sync_schedule.yaml and the two timeout tables) with ddp-open-states' jurisdictions.yaml. It already runs
+# on ddp-open-states PRs; this runs it on ddp-sync PRs too, so a list change made here is seen before it merges.
+#
+# ADVISORY on purpose (continue-on-error): this compares the PR with ddp-open-states' `main`, and ddp-open-states'
+# own CI compares the manifest with THIS repo's `main`. Enrolling a state edits both repos, so making both gates
+# blocking would be a deadlock (each PR red until the other merges). The order is: merge the ddp-sync change
+# first (RUNBOOK.md in ddp-open-states), then the manifest. The daily in-process check on each host
+# (jurisdiction_drift_check, JURISDICTION_DRIFT_CHECK_ENABLED) is what catches drift that gets through.
+#
+# ddp-sync has no other CI; this job only needs PyYAML (no ddp-sync dependencies are installed).
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/jurisdiction-drift.yml"
+      - "config/sync_schedule.yaml"
+      - "src/ddp_sync/pipelines/openstates_scrape.py"
+      - "src/ddp_sync/pipelines/openstates_archive.py"
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ddp-sync
+      - uses: actions/checkout@v4
+        with:
+          repository: Digital-Democracy-Project/ddp-open-states
+          path: ddp-open-states
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Compare this PR's lists with the manifest on ddp-open-states main
+        working-directory: ddp-open-states
+        run: |
+          echo "manifest at ddp-open-states $(git rev-parse HEAD)"
+          python3 check-jurisdiction-drift.py --ddp-sync-root ../ddp-sync --require-ddp-sync
