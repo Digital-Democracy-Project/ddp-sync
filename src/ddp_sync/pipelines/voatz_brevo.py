@@ -278,7 +278,8 @@ def brevo_contact_opted_out(api_key: str, email: str, list_id: int) -> bool | No
     """SYNC-122: has this person opted out in Brevo? True when the contact is blocklisted for email
     campaigns (a newsletter unsubscribe or a block) or has unsubscribed from this list (it then appears
     in `listUnsubscribed` and is no longer in the list, which the 30-minute diff would otherwise read as
-    a new sign-up). False for an unknown address. None when Brevo cannot answer: skip for this run.
+    a new sign-up), or from the overseas list the import also adds to. False for an unknown address.
+    None when Brevo cannot answer: skip for this run.
     """
     try:
         response = requests.get(
@@ -296,8 +297,13 @@ def brevo_contact_opted_out(api_key: str, email: str, list_id: int) -> bool | No
     if response.status_code != 200:
         logger.error(f"Brevo contact lookup unexpected status for {email}: {response.status_code}")
         return None
-    contact = response.json()
-    return bool(contact.get("emailBlacklisted")) or list_id in (contact.get("listUnsubscribed") or [])
+    return _opted_out(response.json(), list_id)
+
+
+def _opted_out(contact: dict, list_id: int) -> bool:
+    """A Brevo contact that is blocklisted for email, or left this list or the overseas list (SYNC-122)."""
+    left = set(contact.get("listUnsubscribed") or [])
+    return bool(contact.get("emailBlacklisted")) or bool(left & {list_id, OVERSEAS_LIST_ID})
 
 
 def flatten_voatz_user(user: dict) -> dict:
@@ -837,7 +843,7 @@ def full_sync_org(org_config: dict, claimed_phones: dict | None = None,
     add_contacts_to_brevo() which uses updateExistingContacts: True.
 
     SYNC-122: only users who are already in the Brevo list and have not opted out
-    (blocklisted for email, or on DDP's suppression list) are re-imported, so this
+    (blocklisted for email, left the overseas list, or on DDP's suppression list) are re-imported, so this
     job can never add anyone; adding is sync_org()'s job, which checks opt-outs.
     It skips the org when the list or the suppression list cannot be read.
     """
@@ -907,7 +913,7 @@ def full_sync_org(org_config: dict, claimed_phones: dict | None = None,
         whatsapp = contact.get("attributes", {}).get("WHATSAPP")
         if whatsapp:
             brevo_phones[str(whatsapp)] = email.lower() if email else None
-        if email and not contact.get("emailBlacklisted"):
+        if email and not _opted_out(contact, brevo_list_id):
             in_list.add(email.lower())
     logger.info(f"  Built phone index from {len(brevo_contacts)} Brevo contacts ({len(brevo_phones)} phones)")
 

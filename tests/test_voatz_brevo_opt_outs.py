@@ -39,7 +39,10 @@ def voatz():
 
 
 BREVO_LIST = [{"email": "member@example.org", "attributes": {}, "emailBlacklisted": False},
-              {"email": "blocked@example.org", "attributes": {}, "emailBlacklisted": True}]
+              {"email": "blocked@example.org", "attributes": {}, "emailBlacklisted": True},
+              # still in this list, but left the overseas list the import would also put them in
+              {"email": "new@example.org", "attributes": {}, "emailBlacklisted": False,
+               "listUnsubscribed": [voatz_brevo.OVERSEAS_LIST_ID]}]
 
 # What GET /v3/contacts/{email} answers for addresses that are not in the list
 BREVO_CONTACTS = {
@@ -124,6 +127,7 @@ def test_full_sync_skips_the_org_when_either_list_cannot_be_read(voatz, brevo_li
     (_response(200, {"emailBlacklisted": False, "listUnsubscribed": [99]}), False),
     (_response(200, {"emailBlacklisted": True}), True),
     (_response(200, {"emailBlacklisted": False, "listUnsubscribed": [LIST_ID]}), True),
+    (_response(200, {"emailBlacklisted": False, "listUnsubscribed": [voatz_brevo.OVERSEAS_LIST_ID]}), True),
     (_response(429), None),
 ])
 def test_brevo_contact_opted_out(response, expected):
