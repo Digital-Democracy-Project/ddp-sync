@@ -10,6 +10,7 @@ import re
 import requests
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 from email_validator import validate_email, EmailNotValidError
 
@@ -283,7 +284,7 @@ def brevo_contact_opted_out(api_key: str, email: str, list_id: int) -> bool | No
     """
     try:
         response = requests.get(
-            f"https://api.brevo.com/v3/contacts/{email}",
+            f"https://api.brevo.com/v3/contacts/{quote(email, safe='@')}",
             headers={"Accept": "application/json", "api-key": api_key},
             params={"identifierType": "email_id"},
             timeout=30,
@@ -301,9 +302,11 @@ def brevo_contact_opted_out(api_key: str, email: str, list_id: int) -> bool | No
 
 
 def _opted_out(contact: dict, list_id: int) -> bool:
-    """A Brevo contact that is blocklisted for email, or left this list or the overseas list (SYNC-122)."""
+    """A Brevo contact that is blocklisted for email, or left this list or the overseas list (SYNC-122).
+    Brevo always sends `emailBlacklisted`; a record without it counts as opted out (fail closed).
+    `listUnsubscribed` is optional in Brevo's schema: absent means none."""
     left = set(contact.get("listUnsubscribed") or [])
-    return bool(contact.get("emailBlacklisted")) or bool(left & {list_id, OVERSEAS_LIST_ID})
+    return bool(contact.get("emailBlacklisted", True)) or bool(left & {list_id, OVERSEAS_LIST_ID})
 
 
 def flatten_voatz_user(user: dict) -> dict:

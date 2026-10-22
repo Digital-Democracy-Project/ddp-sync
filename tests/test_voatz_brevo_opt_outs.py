@@ -128,6 +128,7 @@ def test_full_sync_skips_the_org_when_either_list_cannot_be_read(voatz, brevo_li
     (_response(200, {"emailBlacklisted": True}), True),
     (_response(200, {"emailBlacklisted": False, "listUnsubscribed": [LIST_ID]}), True),
     (_response(200, {"emailBlacklisted": False, "listUnsubscribed": [voatz_brevo.OVERSEAS_LIST_ID]}), True),
+    (_response(200, {"listUnsubscribed": []}), True),  # no emailBlacklisted at all: fail closed
     (_response(429), None),
 ])
 def test_brevo_contact_opted_out(response, expected):
@@ -156,3 +157,23 @@ def test_suppression_list_unreadable_is_none(settings, response):
     with patch.object(voatz_brevo, "get_settings", return_value=settings), \
             patch.object(voatz_brevo.requests, "get", return_value=response):
         assert voatz_brevo.fetch_ddp_suppressed_emails() is None
+
+
+def test_suppression_matches_regardless_of_case_or_spaces():
+    users = [_voatz_user(" New@Example.ORG ", 1)]
+    with patch.object(voatz_brevo, "get_voatz_tokens", return_value=("ws", "csrf")), \
+            patch.object(voatz_brevo, "fetch_voatz_users", return_value=users), \
+            patch.object(voatz_brevo, "fetch_brevo_contacts", return_value=[BREVO_LIST[0]]), \
+            patch.object(voatz_brevo.requests, "get", return_value=_response(404)), \
+            patch.object(voatz_brevo.time, "sleep"), \
+            patch.object(voatz_brevo, "add_contacts_to_brevo") as add, \
+            patch.object(voatz_brevo, "remove_contacts_from_brevo", return_value=(0, 0)):
+        voatz_brevo.sync_org(ORG, {}, {"new@example.org"})
+    add.assert_not_called()
+
+
+def test_the_lookup_url_encodes_the_address():
+    with patch.object(voatz_brevo.requests, "get", return_value=_response(404)) as get, \
+            patch.object(voatz_brevo.time, "sleep"):
+        voatz_brevo.brevo_contact_opted_out("key", "a/b+c@example.org", LIST_ID)
+    assert get.call_args.args[0] == "https://api.brevo.com/v3/contacts/a%2Fb%2Bc@example.org"
