@@ -1138,8 +1138,12 @@ def _single_jurisdiction_targets(config: dict) -> set[str]:
     same list the Sunday batch runs. It used to be a hardcoded copy here, which missed NC
     when NC joined the schedule. FL, WA and USA are batch targets above (several sessions
     or both chambers), so a name that is already a batch target is not repeated here."""
-    names = (config.get("secondary") or {}).get("jurisdictions") or []
-    return {str(j).strip().lower() for j in names} - _OPENSTATES_JOB_TARGETS
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import enrolled
+
+    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
+    names = enrolled("scrape_secondary", (config.get("secondary") or {}).get("jurisdictions") or [], _get_root(config))
+    return {str(j).strip().lower() for j in names or []} - _OPENSTATES_JOB_TARGETS
 
 
 @router.post("/trigger/openstates-scrape/{target}")
@@ -1239,7 +1243,12 @@ async def trigger_openstates_archive(
     # list silently went stale when ma/al/us were added to config 2026-08-10 (this endpoint
     # kept 404ing on them while the scheduler and run_archive_jobs' own default both knew
     # about the new jurisdictions already).
-    jurisdictions = set(config.get("jurisdictions", DEFAULT_ARCHIVE_JURISDICTIONS))
+    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import enrolled
+
+    listed = enrolled("archive", config.get("jurisdictions"), _get_root(config))
+    jurisdictions = set(DEFAULT_ARCHIVE_JURISDICTIONS if listed is None else listed)
 
     if target == "all":
         background_tasks.add_task(run_archive_jobs, config)
@@ -1367,7 +1376,11 @@ async def trigger_knowledge_base_backfill(
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
     block = (config.get("knowledge_base_embedding") or {})
-    enrolled = {str(j).lower() for j in block.get("jurisdictions", [])}
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import enrolled as _enrolled
+
+    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
+    enrolled = {str(j).lower() for j in _enrolled("embedding", block.get("jurisdictions", []), _get_root(config))}
     if jurisdiction.lower() not in enrolled:
         raise HTTPException(
             status_code=404,
@@ -1491,7 +1504,14 @@ async def trigger_knowledge_base_reconcile_plan(
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
-    enrolled = {str(j).lower() for j in (config.get("knowledge_base_embedding") or {}).get("jurisdictions", [])}
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import enrolled as _enrolled
+
+    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
+    enrolled = {
+        str(j).lower()
+        for j in _enrolled("embedding", (config.get("knowledge_base_embedding") or {}).get("jurisdictions", []), _get_root(config))
+    }
     if jurisdiction.lower() not in enrolled:
         raise HTTPException(
             status_code=404,

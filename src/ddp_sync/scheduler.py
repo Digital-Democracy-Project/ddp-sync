@@ -91,6 +91,15 @@ class UpdateScheduler:
             logger.error(f"Failed to load sync config: {e}")
             return {}
 
+    def _log_manifest_disagreements(self) -> None:
+        """OPEN-328: dual-read. Compare every jurisdiction list in sync_schedule.yaml with ddp-open-states'
+        jurisdictions.yaml and log each difference (jurisdiction_manifest_disagrees). Never raises, never
+        changes what the scheduler does: the yaml stays authoritative until a host opts in."""
+        from ddp_sync.pipelines.openstates_scrape import _get_root
+        from ddp_sync.services.jurisdiction_enrollment import log_config_disagreements
+
+        log_config_disagreements(self._sync_config, _get_root(self._sync_config.get("openstates_scrape")))
+
     def _warn_if_alerting_unconfigured(self) -> None:
         """OPEN-286: when neither alert channel is configured, _alert_scrape_failure's
         own fallback is just a `warning` buried deep inside a scrape/load failure path
@@ -130,6 +139,7 @@ class UpdateScheduler:
             return
 
         self._warn_if_alerting_unconfigured()
+        self._log_manifest_disagreements()
 
         # Parse sync time — prefer new bill_sync block, fall back to top-level
         bill_sync_config = self._sync_config.get("bill_sync", {})

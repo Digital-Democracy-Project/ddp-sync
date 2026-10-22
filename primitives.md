@@ -273,6 +273,34 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
+## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
+
+ddp-open-states' `jurisdictions.yaml` says which jurisdictions are enrolled in which feature; ddp-sync's own
+lists in `sync_schedule.yaml` are still the authority. `enrolled(feature, yaml_codes, root)` is the one call a
+consumer makes (`root` = `openstates_scrape._get_root(config)`, which honours `OPENSTATES_ROOT`): in **shadow
+mode (default)** it returns the yaml's list and logs a `jurisdiction_manifest_disagrees` WARNING (once per
+distinct difference, with the manifest file's mtime so a stale checkout is not mistaken for drift); with
+`JURISDICTION_MANIFEST_MODE=authoritative` in a host's env it returns the manifest's. A yaml with no list falls
+back to the manifest, then to the caller's last-resort constant (`None` means "neither could answer"). Never
+raises: a missing, invalid or incomplete manifest degrades to the yaml's answer with one log line.
+`log_config_disagreements(config, root)` compares every list at once; the scheduler calls it at start-up, and
+the OPEN-330 daily check reuses it. Features: `archive`, `embedding`, `search_refresh` (spelled `us`) and
+`cloud_path`, `scrape_primary`, `scrape_secondary` (spelled `usa`), mirroring `check-jurisdiction-drift.py`'s
+`project()` in ddp-open-states. Wired so far: the embedding and search-refresh hook gates, the manual archive
+trigger and the knowledge-base 404 gates, the manual single-state scrape targets, and the two in-code
+fallbacks. **Not wired (still yaml only, deliberately):** scheduler registration of the scrape/archive jobs,
+`_cloud_path_owns`, `_memory_backend_enabled`, `maybe_trigger_archive_after_scrape`, and the per-feature
+opt-in lists (`sweep_import`, `scrape_retry`, `full_walk`, `scrapebot_fallback`), because a wrong answer there
+changes what production scrapes. The manifest is read from the ddp-open-states checkout on each host (a bind
+mount on the EC2 broker host that nothing here pulls).
+
+**Cutover checklist (per host, before setting `JURISDICTION_MANIFEST_MODE=authoritative`):** (1) the host has
+logged `jurisdiction_manifest_agrees` at start-up and from the OPEN-330 daily check for a full weekly cycle,
+with no unexplained `jurisdiction_manifest_disagrees`; (2) `git -C <openstates_root> log -1` shows the host's
+ddp-open-states checkout is current on `main` (pull it first on the EC2 broker host: nothing does it
+automatically); (3) the deployed `sync_schedule.yaml` on that host has all six lists; (4) rollback is removing
+the env var and restarting. Do the Mac first, the EC2 broker host second.
+
 ## Fork upstream check (`pipelines/fork_upstream_check.py`)
 
 - **`run_fork_upstream_check_job(config)`** — Daily (01:30 UTC, `openstates_scrape.fork_upstream_check` in `sync_schedule.yaml`). For each DDP fork (people, openstates-core, openstates-scrapers, api-v3) fetches the fork's `main` and its upstream's `main` over public https into a job-owned bare cache (`<OPENSTATES_ROOT>/logs/fork-upstream-cache/`, no credentials, never the live working trees) and counts upstream commits the fork lacks. Writes `<OPENSTATES_ROOT>/logs/fork-upstream-status.json` (per repo: `behind_count`, `oldest_age_days`, `titles`, `areas_changed`, `sensitive_paths_changed` for workflows/migrations/dependency files) for a reviewer to read, and flow status `fork_upstream_check` (shown by `/health`). Alerts through `post_alert` when the oldest missing commit is 3+ days old (tiers 3/7/14 days, then weekly) or a fetch fails (nights 1, 3, then weekly); the previous status file is the de-dup memory. Never merges, opens PRs or pushes. Registered only when `FORK_UPSTREAM_CHECK_ENABLED=true` on the host (default off; Mac Studio only). It has its own registration step (`_register_fork_upstream_check_job`) and does **not** depend on `OPENSTATES_SCRAPE_ENABLED`: the Mac has scraping off, and until PR #213 the check was tucked inside the scrape registration and silently never started. Do not move it back. Manual: `POST /trigger/openstates-scrape/fork-check`. This is the stalled-sync check SYNC-104 asked for. Alerts use `SLACK_BOT_TOKEN`, which the service gets from `ddp-agents/.env` through `scripts/start-ddp-sync.sh`; ddp-sync's own `.env` does not hold it, so a hand-run test must load it the same way. Delivery verified 2026-10-13 (a labelled test reached #automation-errors as CodeBot).
