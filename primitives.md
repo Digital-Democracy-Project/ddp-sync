@@ -269,6 +269,12 @@ Pub/sub channels (hardcoded strings in callers):
 - **`_maybe_signal_broker_bill_events(jurisdiction, config)`** — called from `_run_scrape` on success, before the OPEN-291 archive hook. Gated by `openstates_scrape.broker_bill_event_signal` (`enabled`, `jurisdictions`; default off), maps `usa` to `us` with `openstates_archive._archive_jurisdiction_code`, debounces 15 minutes per jurisdiction (`ddp:broker_bill_event_signal:<code>`, SET NX EX, fails open). Never raises, never retries.
 - **`broker_client.request_bill_event_check(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/openstates-bill-events/check/` `{"jurisdiction": ...}` with the service token (BROKER-300; 202 queued). Raises `BrokerClientError` on an unset base/token, unreachable broker, or any 4xx/5xx (400 unknown jurisdiction, 401 token, 503 queue down).
 
+## Voatz → Brevo opt-outs (`pipelines/voatz_brevo.py`, SYNC-122)
+
+- **`fetch_ddp_suppressed_emails()`** — DDP's suppression list from ddp-broker-py (`GET /api/email/suppressions/`, BROKER-305), lower-cased; `None` when unreadable (callers then add nobody).
+- **`brevo_contact_opted_out(api_key, email, list_id)`** — `GET /v3/contacts/{email}`: True if `emailBlacklisted` or the list is in `listUnsubscribed`, False for an unknown address, `None` when Brevo cannot answer (skip for this run).
+- `sync_org(..., suppressed_emails)` checks both before adding; `full_sync_org(..., suppressed_emails)` re-imports only current, non-blocklisted list members not on the suppression list.
+
 ## People checkout pull (`pipelines/openstates_scrape.py`)
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
