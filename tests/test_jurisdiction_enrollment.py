@@ -22,7 +22,7 @@ def _entry(tier="secondary", status="live", archive=True, embedding=False, searc
     return {
         "tier": tier,
         "status": status,
-        "archive": {"enabled": archive},
+        "archive": {"enabled": archive, "scheduled": archive},
         "enrollment": {"embedding": embedding, "search_refresh": search_refresh, "cloud_path": cloud_path},
     }
 
@@ -333,3 +333,33 @@ def test_run_secondary_scrapes_with_an_empty_list_scrapes_nothing_rather_than_th
     ) as run:
         asyncio.run(openstates_scrape.run_secondary_scrapes_job({"openstates_root": root, "secondary": {"jurisdictions": []}}))
     run.assert_not_awaited()
+
+
+# --- OPEN-418: the recurring archive list is the manifest's archive.scheduled -------------------------------
+
+def test_the_archive_feature_reads_scheduled_not_enabled(tmp_path):
+    """A state mid-pilot is `enabled` (may be archived by hand) but not `scheduled` (not on the recurring list)."""
+    manifest = {
+        "fl": _entry("primary"),
+        "nc": dict(_entry("secondary", status="validating"), archive={"enabled": True, "scheduled": False}),
+    }
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    assert je.manifest_codes("archive", str(tmp_path)) == ["fl"]
+
+
+def test_a_manifest_from_before_the_flag_split_cannot_say_what_is_scheduled(tmp_path):
+    old = {"fl": dict(_entry("primary"), archive={"enabled": True})}  # no `scheduled`
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(old))
+    with capture_logs() as logs:
+        assert je.manifest_codes("archive", str(tmp_path)) is None
+    assert any(e["event"] == "jurisdiction_manifest_unusable" for e in logs)
+    assert je.enrolled("archive", ["fl"], str(tmp_path)) == ["fl"]  # the yaml's answer stands, in shadow mode
+
+
+def test_a_stage_4_state_on_the_ddp_sync_archive_list_is_a_config_disagreement(tmp_path):
+    manifest = {"fl": _entry("primary"), "nc": dict(_entry("secondary", status="validating"), archive={"enabled": True, "scheduled": False})}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    config = {"openstates_archive": {"jurisdictions": ["fl", "nc"]}}
+    assert je.config_disagreements(config, str(tmp_path)) == [
+        {"feature": "archive", "only_in_yaml": ["nc"], "only_in_manifest": []}
+    ]

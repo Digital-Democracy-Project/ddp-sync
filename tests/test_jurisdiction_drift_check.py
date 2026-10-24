@@ -21,7 +21,7 @@ from ddp_sync.services import jurisdiction_enrollment as je
 def _entry(tier="secondary", status="live", archive=True, embedding=False, search_refresh=False, cloud_path=False,
            replica_routing=True, legbot_replica=True):
     return {
-        "tier": tier, "status": status, "archive": {"enabled": archive},
+        "tier": tier, "status": status, "archive": {"enabled": archive, "scheduled": archive},
         "enrollment": {"embedding": embedding, "search_refresh": search_refresh, "cloud_path": cloud_path,
                        "replica_routing": replica_routing, "legbot_replica": legbot_replica},
     }

@@ -36,7 +36,9 @@ MANIFEST_FILENAME = "jurisdictions.yaml"
 # feature -> (does this manifest entry belong?, does ddp-sync spell the federal jurisdiction "usa" here?)
 # The scrape tables and the cloud path say "usa"; archive, embedding and search refresh say "us".
 _FEATURES = {
-    "archive": (lambda e: e["archive"]["enabled"], False),
+    # OPEN-418: the RECURRING archive list is the manifest's archive.scheduled, not archive.enabled (which only means
+    # "may be archived", the Stage 4 manual run). A pre-OPEN-418 manifest has no `scheduled`, which reads as "cannot say".
+    "archive": (lambda e: e["archive"]["scheduled"], False),
     "embedding": (lambda e: e["enrollment"]["embedding"], False),
     "search_refresh": (lambda e: e["enrollment"]["search_refresh"], False),
     "cloud_path": (lambda e: e["enrollment"]["cloud_path"], True),
