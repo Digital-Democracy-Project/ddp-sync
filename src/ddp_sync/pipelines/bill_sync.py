@@ -14,6 +14,7 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata
 from ddp_sync.ingestion.pipeline import DocumentSource, IngestionPipeline
 from ddp_sync.ingestion.sources.openstates import JurisdictionInfo, OpenStatesSource
+from ddp_sync.services.jurisdiction_names import source_name
 from ddp_sync.services.legislative_calendar import StateLegislativeCalendar
 from ddp_sync.services.rate_limiter import RateLimitConfig, RateLimiter
 
@@ -81,21 +82,6 @@ class BillSyncService:
     }
 
     # Mapping of jurisdiction codes to human-readable source names
-    JURISDICTION_SOURCE_NAMES = {
-        "us": "US Congress",
-        "fl": "Florida Legislature",
-        "wa": "Washington Legislature",
-        "va": "Virginia Legislature",
-        "mi": "Michigan Legislature",
-        "ma": "Massachusetts Legislature",
-        "ut": "Utah Legislature",
-        "az": "Arizona Legislature",
-        "al": "Alabama Legislature",
-        "ca": "California Legislature",
-        "ny": "New York Legislature",
-        "tx": "Texas Legislature",
-        # Add more as needed
-    }
 
     def __init__(self, settings: Settings | None = None, config_path: Path | None = None):
         """
@@ -139,11 +125,7 @@ class BillSyncService:
         Returns:
             Human-readable source name (e.g., 'Florida Legislature', 'US Congress')
         """
-        jurisdiction_lower = jurisdiction.lower() if jurisdiction else ""
-        return self.JURISDICTION_SOURCE_NAMES.get(
-            jurisdiction_lower,
-            f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature"
-        )
+        return source_name(jurisdiction)
 
     def resolve_jurisdiction_code(self, jurisdiction_id: str, openstates_url: str = "") -> str:
         """Resolve Webflow jurisdiction reference ID to state code.

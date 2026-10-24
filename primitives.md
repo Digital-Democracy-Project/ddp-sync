@@ -279,6 +279,15 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
+## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
+
+`source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida
+Legislature", "US Congress"), used by `bill_sync`, `legislator_sync` and the OpenStates source (each keeps a thin
+`_get_source_name` that delegates). It was three identical copies, none with `nc`. The manifest cannot supply the strings
+(its `name` is "North Carolina"), so this stays its own table; `tests/test_jurisdiction_names.py` pins the existing names
+and, when `OPENSTATES_ROOT` points at a ddp-open-states checkout (set at import, other tests clear it), fails if a manifest
+jurisdiction has no entry. **Adding a state: add its line here.** An unknown code still falls back to "<CODE> Legislature".
+
 ## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
 
 ddp-open-states' `jurisdictions.yaml` says which jurisdictions are enrolled in which feature; ddp-sync's own
