@@ -406,7 +406,9 @@ that correcting it clears the signature. Mac first.
   test does not see them.
 - Needs the `chat:write.customize` scope on the Slack app; without it Slack ignores the two fields and the post still
   succeeds under the default name. On the Mac, `scripts/start-ddp-sync.sh` copies the two `CODEBOT_*` variables from
-  `ddp-agents/.env` (the icon is configured only there; PR #195); EC2 does not run that script and gets them only from its compose environment (per PR #195; not checked on the host).
+  `ddp-agents/.env` (PR #195). EC2 does not run that script: `infrastructure/render-env.sh` writes them from the
+  `ddp-sync/credentials` secret's `codebot_slack_username` / `codebot_slack_icon_emoji` keys (SYNC-131), so the icon
+  on EC2 is only as good as that secret.
 - Mirrors in other repos: `ddp-open-states/lib/slack-alert.sh::post_slack_alert` (shell scripts) and the persona
   registry in ddp-agents (`cams/slack_identity.py`). Change a default name/icon/variable in one, change all three.
 - **Merged 2026-10-06:** PRs #194 (identity), #195 (start script) and #196 (this single function). Not yet verified against live Slack.

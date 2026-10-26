@@ -80,6 +80,11 @@ KEY_MAP = {
     # has chat:write scope, confirmed live against #automation-errors) rather than minting a
     # new one -- _alert_scrape_failure() already reads SLACK_BOT_TOKEN, it was just never set.
     "slack_bot_token": "SLACK_BOT_TOKEN",
+    # SYNC-131: the CodeBot persona for those alerts (slack_identity.codebot_identity()). On the Mac,
+    # scripts/start-ddp-sync.sh copies these from ddp-agents/.env; EC2 has no such file, so without
+    # them its alerts post as CodeBot with the default :robot_face: icon instead of :codebot:.
+    "codebot_slack_username": "CODEBOT_SLACK_USERNAME",
+    "codebot_slack_icon_emoji": "CODEBOT_SLACK_ICON_EMOJI",
     # SYNC-59: this EC2 process's Bearer token for calling the Mac Studio's own ddp-sync
     # (/trigger/scraper-session-legbot), to trigger LegBot after a cloud-owned scrape's
     # RDS-load finishes. Must match the Mac's own DDP_SYNC_API_KEY exactly -- a fresh one was
