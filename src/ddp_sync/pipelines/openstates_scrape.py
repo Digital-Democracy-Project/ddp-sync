@@ -1610,13 +1610,14 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
 async def run_fl_scrapes_job(config: dict | None = None) -> dict[str, Any]:
     """Run all FL sessions sequentially (they share _data/fl/).
 
-    Sessions run in order: 2026 → 2026D → 2026E → 2026F. A failed session
-    is logged but does not abort the remaining sessions.
+    Sessions run in the order listed in `primary.fl.sessions` in sync_schedule.yaml
+    (2026 → 2026D → 2026E → 2026F → 2027). A failed session is logged but does not
+    abort the remaining sessions.
     """
     openstates_root = _get_root(config)
     sessions = (
         (config or {}).get("primary", {}).get("fl", {})
-        .get("sessions", ["2026", "2026D", "2026E", "2026F"])
+        .get("sessions", ["2026", "2026D", "2026E", "2026F", "2027"])
     )
     start_time = datetime.now(timezone.utc)
     t = time.monotonic()

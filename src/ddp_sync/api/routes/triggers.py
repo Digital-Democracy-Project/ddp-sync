@@ -1160,7 +1160,7 @@ async def trigger_openstates_scrape(
 
     Targets:
         patches     — run apply-local-patches.sh (idempotent, ~30s)
-        fl          — all FL sessions sequentially (2026, 2026D, 2026E, 2026F)
+        fl          — all FL sessions sequentially (primary.fl.sessions in sync_schedule.yaml)
         wa          — WA scrape + import
         usa         — USA lower then upper sequentially
         secondary   — VA, MI, MA, UT, AZ concurrently
