@@ -270,7 +270,7 @@ def test_unexpected_error_from_pipeline_returns_500():
 
 def test_no_x_ddp_environment_header_preserves_default_broker_target():
     """No X-DDP-Environment header (the default for every existing caller --
-    the scheduled session_pipeline_batch job, direct operator calls) must
+    direct operator calls) must
     keep this endpoint's original behavior: (None, None), letting
     run_legbot_pipeline fall through to whatever DDP_BROKER_API_BASE is
     globally configured -- covered directly by the exact-args assertions

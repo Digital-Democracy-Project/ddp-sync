@@ -37,7 +37,6 @@ def _settings(**overrides) -> MagicMock:
     settings.openstates_archive_enabled = True
     settings.openstates_patch_refresh_enabled = True
     settings.mi_cookie_publish_enabled = True
-    settings.session_pipeline_batch_enabled = True
     for key, value in overrides.items():
         setattr(settings, key, value)
     return settings
@@ -175,43 +174,19 @@ async def test_mi_cookie_publish_enabled_true_still_requires_yaml_enabled_true()
 
 
 @pytest.mark.asyncio
-async def test_session_pipeline_batch_enabled_false_overrides_yaml_enabled_true():
-    """Independent review, round 1: this job was originally missed entirely -- it has no
-    cross-host overlap lock of its own (run_scheduled_session_pipeline() calls
-    run_legbot_pipeline() directly, not through SYNC-48's overlap-safe wrapper), so this
-    env flag is the only lever available to stop it firing on two colocated hosts at once."""
+async def test_a_leftover_session_pipeline_batch_block_registers_nothing():
+    """SYNC-135: the weekly session_pipeline_batch job is removed. A host whose YAML still has
+    an enabled block for it must not register a job."""
     sched = _scheduler_with_yaml(
         """
         bill_sync:
           sync_time_utc: "04:00"
         session_pipeline_batch:
           enabled: true
-          jurisdiction_iso2: "us-fl"
-          session_code: "2026"
+          jurisdiction_iso2: "FL"
+          session_code: "2026F"
           artifact_types: ["bill_summary"]
           limit: 10
-        """,
-        session_pipeline_batch_enabled=False,
-    )
-    sched.start()
-    try:
-        ids = {j.id for j in sched.scheduler.get_jobs()}
-        assert "session_pipeline_batch" not in ids
-    finally:
-        sched.stop()
-
-
-@pytest.mark.asyncio
-async def test_session_pipeline_batch_enabled_true_still_requires_yaml_enabled_true():
-    """The reverse direction of the AND: the env flag defaulting True must not make
-    session_pipeline_batch run when the shared YAML itself has it disabled (the documented
-    default -- ddp-infra's Phase 8 concurrency cap/prioritization isn't live yet)."""
-    sched = _scheduler_with_yaml(
-        """
-        bill_sync:
-          sync_time_utc: "04:00"
-        session_pipeline_batch:
-          enabled: false
         """
     )
     sched.start()

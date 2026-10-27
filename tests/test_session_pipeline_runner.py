@@ -15,7 +15,6 @@ from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines import session_pipeline_runner
 from ddp_sync.pipelines.session_pipeline_runner import (
     ALL_ARTIFACT_TYPES,
-    run_scheduled_session_pipeline,
     run_legbot_pipeline,
     run_single_bill_full,
 )
@@ -1867,103 +1866,6 @@ async def test_concept_statements_broker_override_threads_through():
     assert mock_dispatch.await_args.kwargs["broker_api_token"] == "dev-token"
 
 
-# --- run_scheduled_session_pipeline (SYNC-9 scheduler wrapper) -------------
-
-_VALID_BATCH_CONFIG = {
-    "jurisdiction_iso2": "FL",
-    "session_code": "2026F",
-    "artifact_types": ["bill_summary", "bill_pros_cons"],
-    "limit": 10,
-}
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_maps_full_config_to_run_legbot_pipeline():
-    config = dict(_VALID_BATCH_CONFIG, include_org_research=True, dry_run=True)
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(return_value={"bills_considered": 2}),
-    ) as mock_run:
-        result = await run_scheduled_session_pipeline(config)
-
-    mock_run.assert_awaited_once_with(
-        "FL", "2026F", ["bill_summary", "bill_pros_cons"], True, 10,
-        include_concept_statements=False, retry_failed=False, dry_run=True,
-    )
-    assert result == {"bills_considered": 2}
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_defaults_org_research_and_dry_run_when_absent():
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(return_value={}),
-    ) as mock_run:
-        await run_scheduled_session_pipeline(_VALID_BATCH_CONFIG)
-
-    mock_run.assert_awaited_once_with(
-        "FL", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=False, retry_failed=False, dry_run=False,
-    )
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_maps_include_concept_statements_when_present():
-    config = dict(_VALID_BATCH_CONFIG, include_concept_statements=True)
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(return_value={}),
-    ) as mock_run:
-        await run_scheduled_session_pipeline(config)
-
-    mock_run.assert_awaited_once_with(
-        "FL", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=True, retry_failed=False, dry_run=False,
-    )
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_missing_required_key_returns_invalid_config():
-    config = {k: v for k, v in _VALID_BATCH_CONFIG.items() if k != "artifact_types"}
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(),
-    ) as mock_run:
-        result = await run_scheduled_session_pipeline(config)
-
-    mock_run.assert_not_awaited()
-    assert result["success"] is False
-    assert result["error"] == "invalid_config"
-    assert "artifact_types" in result["missing_keys"]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_zero_limit_treated_as_missing():
-    config = dict(_VALID_BATCH_CONFIG, limit=0)
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(),
-    ) as mock_run:
-        result = await run_scheduled_session_pipeline(config)
-
-    mock_run.assert_not_awaited()
-    assert result["error"] == "invalid_config"
-    assert "limit" in result["missing_keys"]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_value_error_from_pipeline_is_caught():
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(side_effect=ValueError("Unrecognized artifact_types: ['bogus']")),
-    ):
-        result = await run_scheduled_session_pipeline(_VALID_BATCH_CONFIG)
-
-    assert result["success"] is False
-    assert result["error"] == "invalid_config"
-    assert "Unrecognized artifact_types" in result["detail"]
-
-
 # --- run_single_bill_full (SYNC-15) ----------------------------------------
 #
 # The single-bill counterpart to run_legbot_pipeline -- one caller-specified
@@ -3134,33 +3036,6 @@ async def test_retry_failed_does_not_reach_pending_or_processing():
         "bill_pros_cons", "bill_summary",
     ]
     assert bill_result["artifacts_generated"] == []
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_defaults_retry_failed_to_false_when_absent():
-    """A cron job must keep doing exactly what it did yesterday when a new
-    option appears. Re-dispatching every previously-failed artifact on a
-    schedule is not something a YAML block should start doing by omission."""
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(return_value={"ok": True}),
-    ) as mock_run:
-        await run_scheduled_session_pipeline(dict(_VALID_BATCH_CONFIG))
-
-    assert mock_run.await_args.kwargs["retry_failed"] is False
-
-
-@pytest.mark.asyncio
-async def test_scheduled_wrapper_passes_retry_failed_when_set():
-    with patch(
-        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
-        new=AsyncMock(return_value={"ok": True}),
-    ) as mock_run:
-        await run_scheduled_session_pipeline(
-            dict(_VALID_BATCH_CONFIG, retry_failed=True)
-        )
-
-    assert mock_run.await_args.kwargs["retry_failed"] is True
 
 
 # --- SYNC-45: bill_changelog coverage is per-transition, not per-bill --------

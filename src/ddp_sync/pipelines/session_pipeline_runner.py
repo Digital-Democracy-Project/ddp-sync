@@ -33,18 +33,9 @@ RDS for the ONE bill about to dispatch, gated behind
 `replica_freshness_check_enabled` (default off until that infrastructure
 exists).
 
-Two real callers now (SYNC-9): the on-demand API route
-(``POST /trigger/bill-artifact-generation``, api/routes/triggers.py) and
-``run_scheduled_session_pipeline`` below, registered as the
-``session_pipeline_batch`` APScheduler job (scheduler.py) -- shipped
-``enabled: false`` in sync_schedule.yaml pending ddp-infra's own Phase 8
-(prioritization vs. interactive Agent Smith traffic specifically -- this
-change fixes "bills stack up one at a time no matter what capacity exists,"
-not "this batch job might still contend with interactive traffic under real
-load," which is a separate, still-open concern). Phase 6 (``BillArtifact``
-dedup key) is separately confirmed live since 2026-07-26, so this pipeline's
-actual writes are safe; what's gated is unattended *broad* production batch
-volume specifically, not this module's existence as a real caller.
+Called through scraper_triggered_legbot.py (the archive-completion hook and
+``POST /trigger/bill-artifact-generation``, api/routes/triggers.py). The weekly ``session_pipeline_batch`` scheduled job that used to call it
+directly was removed (SYNC-135).
 
 SYNC-31: ``include_concept_statements`` folds ``ConceptStatementSet``
 generation (previously the standalone, since-retired ``concept_statement_
@@ -127,8 +118,8 @@ def get_session_pipeline_semaphore() -> asyncio.Semaphore:
     ONE call to session_pipeline_concurrency bills in flight, a clean 1:1
     match with CAMS's configured MLX worker count (2) when only one
     jurisdiction's run was active. But run_legbot_pipeline has two real
-    callers that run independently of each other and can overlap freely --
-    run_scheduled_session_pipeline's cron-driven batch jobs, and
+    callers that ran independently of each other and could overlap freely --
+    run_scheduled_session_pipeline's cron-driven batch job (removed, SYNC-135), and
     scraper_triggered_legbot.py's archive-completion hook (SYNC-65) -- so
     two jurisdictions' batch runs overlapping meant two separate
     semaphores, each independently admitting 2 bills, for a real total of 4
@@ -184,8 +175,6 @@ def get_session_pipeline_semaphore() -> asyncio.Semaphore:
 # (config.legbot_scrape_completion_trigger_artifact_types, SYNC-50) names all
 # of them, bill_topics included; it applies only where that trigger is enabled,
 # and a host's LEGBOT_SCRAPE_COMPLETION_TRIGGER_ARTIFACT_TYPES replaces it.
-# config/sync_schedule.yaml's session_pipeline_batch hand-picks a small subset
-# without bill_topics (SYNC-123).
 ALL_ARTIFACT_TYPES = frozenset({
     "bill_summary",
     "bill_pros_cons",
@@ -1478,61 +1467,5 @@ async def run_single_bill_full(
     result["run_id"] = run_id
     logger.info("single_bill_full_run_end", run_id=run_id, **{k: v for k, v in result.items() if k != "run_id"})
     return result
-
-
-# Required session_pipeline_batch YAML keys -- deliberately no defaults
-# invented here either, same "every cost-relevant param is a conscious
-# choice" discipline as run_legbot_pipeline's own signature above. A
-# scheduled run missing any of these fails loudly (logged + returned as a
-# failure dict), rather than silently falling back to "every bill, every
-# artifact type."
-_REQUIRED_BATCH_CONFIG_KEYS = ("jurisdiction_iso2", "session_code", "artifact_types", "limit")
-
-
-async def run_scheduled_session_pipeline(config: dict) -> dict:
-    """Scheduler-driven wrapper around run_legbot_pipeline -- the
-    ``session_pipeline_batch`` YAML block's own scheduled batch job (SYNC-9).
-
-    Args:
-        config: this job's own ``session_pipeline_batch`` block
-            (sync_schedule.yaml). Required keys: jurisdiction_iso2,
-            session_code, artifact_types, limit. Optional:
-            include_org_research (default False), include_concept_statements
-            (default False, SYNC-31), retry_failed (default False, SYNC-42),
-            dry_run (default False).
-
-            retry_failed defaults here even though the trigger endpoints
-            require it explicitly: a cron job must keep doing exactly what it
-            did yesterday when a new option appears, and re-dispatching every
-            previously-failed artifact on a schedule is not something a YAML
-            block should start doing by omission.
-
-    Returns:
-        run_legbot_pipeline's own result dict on success. On a missing
-        required key or a value run_legbot_pipeline itself rejects (e.g.
-        an unrecognized artifact_type), returns
-        ``{"success": False, "error": "invalid_config", ...}`` instead --
-        never raises, so a misconfigured YAML block can't crash the
-        scheduler process or take down other scheduled jobs with it.
-    """
-    missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]
-    if missing:
-        logger.error("session_pipeline_batch_invalid_config", missing_keys=missing)
-        return {"success": False, "error": "invalid_config", "missing_keys": missing}
-
-    try:
-        return await run_legbot_pipeline(
-            config["jurisdiction_iso2"],
-            config["session_code"],
-            config["artifact_types"],
-            config.get("include_org_research", False),
-            config["limit"],
-            include_concept_statements=config.get("include_concept_statements", False),
-            retry_failed=config.get("retry_failed", False),
-            dry_run=config.get("dry_run", False),
-        )
-    except ValueError as exc:
-        logger.error("session_pipeline_batch_invalid_config", error=str(exc))
-        return {"success": False, "error": "invalid_config", "detail": str(exc)}
 
 

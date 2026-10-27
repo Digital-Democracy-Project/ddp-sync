@@ -36,7 +36,6 @@ def _settings(environment: str) -> MagicMock:
     settings.openstates_scrape_enabled = False
     settings.openstates_archive_enabled = False
     settings.mi_cookie_publish_enabled = False
-    settings.session_pipeline_batch_enabled = False
     return settings
 
 
