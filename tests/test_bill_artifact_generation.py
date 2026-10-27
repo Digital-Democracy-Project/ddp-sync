@@ -83,6 +83,30 @@ def archived_text_by_default():
         yield mock_lookup
 
 
+# SYNC-134: the list the broker would serve (the 33 names in production as of 2026-10-27). bill_topics reads it
+# live; here every test gets it without a broker. test_bill_topics_live_list.py covers the fetch itself.
+BROKER_TOPICS = {
+    "version": "55990750e0b0",
+    "max_topics": 4,
+    "topics": [
+        "Animals", "Arts", "Business", "Civil Rights", "Criminal Justice", "Culture", "Drugs", "Economy",
+        "Education", "Elections", "Employment", "Energy", "Environment", "Government", "Guns", "Housing",
+        "Immigration", "International Relations", "LGBT", "Marriage", "Media", "Medical", "Military and Veterans",
+        "National Security", "Natural Disasters", "Public Records", "Public Safety", "Social Welfare", "Sports",
+        "State Parks", "Taxes", "Technology", "Transportation",
+    ],
+}
+
+
+@pytest.fixture(autouse=True)
+def broker_topic_list():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_topics_taxonomy",
+        new=AsyncMock(return_value=BROKER_TOPICS),
+    ) as mock_fetch, patch.dict("ddp_sync.pipelines.bill_artifact_generation._bill_topics_cache", clear=True):
+        yield mock_fetch
+
+
 @pytest.mark.asyncio
 async def test_rejects_unsupported_artifact_type():
     with pytest.raises(ValueError, match="Unsupported artifact_type"):
@@ -368,7 +392,7 @@ async def test_local_status_overrides_a_conflicting_broker_response_status():
 
 # ---------------------------------------------------------------------------
 # bill_topics (ddp-infra's PLAN-legbot.md §27) -- deterministic filter/flatten
-# of LegBot's primary_topic/topics answer shape against the 33-name taxonomy.
+# of LegBot's primary_topic/topics answer shape against the broker's topic list (SYNC-134).
 # ---------------------------------------------------------------------------
 
 def _bill_topics_dispatch_result(*, primary_topic, topics):

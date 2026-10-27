@@ -635,6 +635,55 @@ async def request_bill_event_check(jurisdiction: str) -> None:
         )
 
 
+async def get_bill_topics_taxonomy(
+    *,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """The live bill-topics list: `{"version", "max_topics", "topics"}` (SYNC-134 / BROKER-314).
+
+    `GET /api/bill-topics/taxonomy/` with the service token; the broker builds it from its Topic table on
+    every call. The base/token overrides work as in write_bill_artifact, so a run against the dev broker
+    checks answers against the dev broker's list. The caller caches it (bill_artifact_generation).
+
+    Raises:
+        BrokerClientError: base unset, the broker unreachable, any answer but 200 (404 = a broker without
+            BROKER-314, 401 = bad token), or a body that is not a usable list. There is no fallback list.
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError("DDP_BROKER_API_BASE is not configured — cannot read the bill-topics list.")
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.get(
+                f"{resolved_api_base}/api/bill-topics/taxonomy/",
+                headers={"Authorization": f"Bearer {resolved_api_token}"},
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise BrokerClientError(
+            f"ddp-broker-py did not return the bill-topics list ({resp.status_code}): {resp.text[:200]}"
+        )
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise BrokerClientError("ddp-broker-py returned a bill-topics list that is not JSON") from exc
+    if not (
+        isinstance(data, dict)
+        and isinstance(data.get("version"), str) and data["version"]
+        and type(data.get("max_topics")) is int and data["max_topics"] >= 1
+        and isinstance(data.get("topics"), list) and data["topics"]
+        and all(isinstance(name, str) and name.strip() for name in data["topics"])
+    ):
+        raise BrokerClientError(f"ddp-broker-py returned an unusable bill-topics list: {str(data)[:200]}")
+    return {"version": data["version"], "max_topics": data["max_topics"], "topics": list(data["topics"])}
+
+
 async def _post_organization_resolution(
     path: str,
     payload: dict,

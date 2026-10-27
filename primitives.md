@@ -139,9 +139,27 @@ The daily bill sync entry point. **Do not reinvent these methods.**
 
 - **`LegislatorSyncService`** — legislator sponsored-bills + voting-record sync (`legislator-bills`/`legislator-votes` documents). Key methods: `fetch_sponsored_bills(person_id, jurisdiction, ...)`, `fetch_legislator_votes(person_id, jurisdiction, session, ...)`, `sync_legislator(legislator, ...)`, `sync_all_legislators(legislators, ...)`. `_get_sponsor_name(person_id, jurisdiction=None)` (SYNC-78) routes to the local OpenStates replica the same way as the other two methods when `jurisdiction` is passed and covered — `fetch_sponsored_bills` passes its own `jurisdiction` through at the call site; omitted (`None`), it falls back to the public API, same as before SYNC-78. `_ocd_person_id(person_id)` (SYNC-77, module-level function) normalizes the CMS's bare-UUID `openstates_id` to OpenStates' `ocd-person/{uuid}` form — applied at all three OpenStates-facing call sites (`_get_sponsor_name`, `fetch_sponsored_bills`, `fetch_legislator_votes`); document IDs/`legislator_id` metadata elsewhere stay on the bare UUID by convention, this only normalizes the request/comparison boundary. `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` routes to the local OpenStates replica when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8).
 
-## Bill-topics taxonomy (`data/bill_topics_taxonomy.json`, SYNC-124)
+## Bill-topics list (live from the broker, SYNC-134)
 
-`bill_topics` answers are validated against `src/ddp_sync/data/bill_topics_taxonomy.json` (`version`, `max_topics`, `topics`), a verbatim copy of the file ddp-broker-py generates from its `Topic` table (BROKER-143, `manage.py generate_bill_topics_taxonomy`; format in that repo's `docs/bill-topics-taxonomy.md`). `bill_artifact_generation.py` reads it once at import into `_BILL_TOPICS_TAXONOMY`, `_BILL_TOPICS_MAX` and `_BILL_TOPICS_VERSION`; `_filter_bill_topics` is unchanged. **Never edit the copy by hand and never fetch the list at run time:** when the broker's list changes, copy the regenerated file here in the same window as ddp-agents' LegBot prompt (AGENTS-140). `tests/test_bill_topics_taxonomy.py` fails if the copy was edited (its `version` must be the broker's hash of its content). Shipped as package data (`pyproject.toml`), so the non-editable EC2 image includes it.
+`bill_topics` answers are checked against the broker's live list: `broker_client.get_bill_topics_taxonomy()` reads
+ddp-broker-py's `GET /api/bill-topics/taxonomy/` (BROKER-314, service token; `{version, max_topics, topics}` built from
+its `Topic` table on every call, the cap from its `BILL_TOPICS_MAX`). `bill_artifact_generation._bill_topics_taxonomy`
+keeps it per broker base for `_BILL_TOPICS_CACHE_SECONDS` (300), so a topic staff add in the broker admin is accepted
+within five minutes with no release (Ramon, 2026-10-26: the Topic table is the one list). The dev-broker header
+(`X-DDP-Environment: dev`) therefore checks against the dev broker's list. Rules:
+- **No fallback list.** A failed refresh uses the last list that broker gave (`bill_topics_list_refresh_failed_using_cached`);
+  with none, `BrokerClientError` is raised **before** the LegBot call, so nothing is dispatched or written and the
+  session pipeline counts the artifact failed and retries the bill next run. Do not add a built-in or file copy back.
+- **The version is recorded on every bill_topics row** as `generation_config = {"bill_topics_list_version": ...}`.
+  That field is not part of the broker's row identity; do not move it into `model_version`/`prompt_version`/`prompt_hash`
+  (see CLAUDE.md, "Writing BillArtifacts").
+- `_filter_bill_topics(answer, bill_openstates_id=, taxonomy=)` takes the list as an argument; names are display
+  strings matched trimmed and case-insensitively.
+- **Deploy the broker first.** A broker without BROKER-314 answers 404, and every bill_topics generation then fails
+  clearly (no rows written) until it is deployed.
+- **LegBot still carries its own list** in its prompt until AGENTS-181 decides how the list reaches it (recommended:
+  ddp-sync sends it with each request). Until then a topic added in the admin is accepted here but LegBot does not
+  propose it, and a topic switched off is dropped here (`bill_topics_dropped_non_member`) even if LegBot proposes it.
 
 ## Organization position research (`pipelines/bill_organization_position_research.py`)
 

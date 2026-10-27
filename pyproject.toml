@@ -58,7 +58,3 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-# SYNC-124: the bill-topics taxonomy file (a copy of ddp-broker-py's generated file), read at import.
-ddp_sync = ["data/*.json"]
