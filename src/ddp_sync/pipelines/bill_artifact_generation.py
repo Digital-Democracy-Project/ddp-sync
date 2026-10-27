@@ -57,8 +57,8 @@ fetch fallback at all -- see that function's own docstring).
 
 from __future__ import annotations
 
-import importlib.resources
 import json
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -69,6 +69,7 @@ from ddp_sync.services.broker_client import (
     BrokerClientError,
     artifact_counts_as_present,
     get_bill_artifact_coverage_all_versions,
+    get_bill_topics_taxonomy,
     write_bill_artifact,
 )
 from ddp_sync.services.legbot_client import (
@@ -107,21 +108,37 @@ _TEXT_ANSWER_ARTIFACT_TYPES = {"bill_summary", "bill_vote_yes_frame", "bill_vote
 # ([{type, reason}, ...], config/legbot_questions.yaml) — flattened identically.
 _ORG_TYPES_ANSWER_ARTIFACT_TYPES = {"bill_supporting_orgs", "bill_opposing_orgs"}
 
-# bill_topics' taxonomy (SYNC-124): read from data/bill_topics_taxonomy.json, a verbatim copy of the file
-# ddp-broker-py generates from its Topic table (BROKER-143, `manage.py generate_bill_topics_taxonomy`;
-# format in that repo's docs/bill-topics-taxonomy.md). Never edit the copy by hand: when the broker's list
-# changes, copy the regenerated file here in the same window as ddp-agents' LegBot prompt (AGENTS-140),
-# which carries the same list. Read once at import, never fetched at run time; the names are used exactly
-# as given (display strings, not slugs). `_BILL_TOPICS_VERSION` is the file's content hash, so a mismatch
-# with LegBot's copy is easy to see.
-_BILL_TOPICS_FILE = json.loads(
-    importlib.resources.files("ddp_sync").joinpath("data", "bill_topics_taxonomy.json").read_text(encoding="utf-8")
-)
-_BILL_TOPICS_TAXONOMY = tuple(_BILL_TOPICS_FILE["topics"])
-_BILL_TOPICS_MAX = _BILL_TOPICS_FILE["max_topics"]
-_BILL_TOPICS_VERSION = _BILL_TOPICS_FILE["version"]
+# bill_topics' list (SYNC-134): read live from ddp-broker-py's Topic table (`GET /api/bill-topics/taxonomy/`,
+# BROKER-314), so a topic staff add in the broker admin is accepted on the next run with no release. Kept per
+# broker base for _BILL_TOPICS_CACHE_SECONDS; when a refresh fails, the last list that broker gave is used. With
+# no list at all, bill_topics is not generated (BrokerClientError): there is no built-in fallback list. The names
+# are display strings, matched trimmed and case-insensitively; `version` is recorded on each row written.
+_BILL_TOPICS_CACHE_SECONDS = 300
+_bill_topics_cache: dict[str, tuple[float, dict]] = {}
 
-_BILL_TOPICS_CANONICAL_BY_FOLD = {name.casefold(): name for name in _BILL_TOPICS_TAXONOMY}
+
+async def _bill_topics_taxonomy(broker_api_base: str | None, broker_api_token: str | None) -> dict:
+    """The bill-topics list for this broker: cached, refreshed after _BILL_TOPICS_CACHE_SECONDS.
+
+    Raises:
+        BrokerClientError: the broker could not give a list and none was cached for it.
+    """
+    key = broker_api_base if broker_api_base is not None else get_settings().ddp_broker_api_base
+    cached = _bill_topics_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _BILL_TOPICS_CACHE_SECONDS:
+        return cached[1]
+    try:
+        taxonomy = await get_bill_topics_taxonomy(broker_api_base=broker_api_base, broker_api_token=broker_api_token)
+    except BrokerClientError as exc:
+        if cached is None:
+            raise BrokerClientError(f"no bill-topics list, bill_topics not generated: {exc}") from exc
+        logger.warning("bill_topics_list_refresh_failed_using_cached", version=cached[1]["version"], error=str(exc))
+        return cached[1]
+    if cached is None or cached[1]["version"] != taxonomy["version"]:
+        logger.info("bill_topics_list_loaded", version=taxonomy["version"], topics=len(taxonomy["topics"]),
+                    max_topics=taxonomy["max_topics"])
+    _bill_topics_cache[key] = (time.monotonic(), taxonomy)
+    return taxonomy
 
 
 class ArchivedVersionMismatchError(Exception):
@@ -197,14 +214,14 @@ def _bill_changelog_has_structural_content(answer: dict) -> bool:
     return any(answer.get(field) for field in _CHANGELOG_STRUCTURAL_FIELDS)
 
 
-def _canonicalize_bill_topic(raw_topic: str) -> str | None:
+def _canonicalize_bill_topic(raw_topic: str, canonical_by_fold: dict[str, str]) -> str | None:
     """Match a raw topic string (trimmed, case-insensitive) to its canonical
-    _BILL_TOPICS_TAXONOMY name, or None if it isn't a member.
+    name in the list, or None if it isn't a member.
     """
-    return _BILL_TOPICS_CANONICAL_BY_FOLD.get(raw_topic.strip().casefold())
+    return canonical_by_fold.get(raw_topic.strip().casefold())
 
 
-def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, list[str]] | None:
+def _filter_bill_topics(answer: dict, *, bill_openstates_id: str, taxonomy: dict) -> tuple[str, list[str]] | None:
     """Deterministic filter/flatten for bill_topics' answer shape (ddp-infra's
     PLAN-legbot.md §27), in the plan's specified order:
 
@@ -212,7 +229,7 @@ def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, 
        duplicates and non-members (each drop logged).
     2. if primary_topic is a valid member absent from the surviving topics,
        prepend it (logged).
-    3. cap at _BILL_TOPICS_MAX, keeping the primary when one was established
+    3. cap at the list's max_topics, keeping the primary when one was established
        in step 2.
     4. if primary_topic itself was dropped as a non-member, promote the
        first surviving topic to primary (logged).
@@ -222,10 +239,12 @@ def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, 
         zero topics survive (the caller records a failed artifact row for
         that case rather than writing empty/misleading content).
     """
+    canonical_by_fold = {name.strip().casefold(): name for name in taxonomy["topics"]}
+    max_topics = taxonomy["max_topics"]
     topics: list[str] = []
     seen: set[str] = set()
     for raw_topic in answer.get("topics") or []:
-        canonical = _canonicalize_bill_topic(raw_topic)
+        canonical = _canonicalize_bill_topic(raw_topic, canonical_by_fold)
         if canonical is None:
             logger.info(
                 "bill_topics_dropped_non_member",
@@ -242,7 +261,7 @@ def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, 
         topics.append(canonical)
 
     raw_primary = answer.get("primary_topic")
-    primary = _canonicalize_bill_topic(raw_primary) if raw_primary else None
+    primary = _canonicalize_bill_topic(raw_primary, canonical_by_fold) if raw_primary else None
 
     if primary is not None and primary not in topics:
         topics.insert(0, primary)
@@ -251,11 +270,11 @@ def _filter_bill_topics(answer: dict, *, bill_openstates_id: str) -> tuple[str, 
             bill_openstates_id=bill_openstates_id, primary_topic=primary,
         )
 
-    if len(topics) > _BILL_TOPICS_MAX:
+    if len(topics) > max_topics:
         if primary is not None:
-            topics = [primary] + [t for t in topics if t != primary][: _BILL_TOPICS_MAX - 1]
+            topics = [primary] + [t for t in topics if t != primary][: max_topics - 1]
         else:
-            topics = topics[:_BILL_TOPICS_MAX]
+            topics = topics[:max_topics]
         logger.info(
             "bill_topics_truncated",
             bill_openstates_id=bill_openstates_id, kept_topics=topics,
@@ -436,9 +455,20 @@ async def generate_and_store_bill_artifact(
         )
         return {"status": "not_applicable"}
 
-    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
+    # SYNC-134: the list comes first, so a broker that cannot give one costs no LegBot call and writes no row.
+    taxonomy = None
+    generation_config = None
+    if artifact_type == "bill_topics":
+        taxonomy = await _bill_topics_taxonomy(broker_api_base, broker_api_token)
+        generation_config = {"bill_topics_list_version": taxonomy["version"]}
+
+    # The answer is checked against the same list LegBot was given (AGENTS-181 takes it from the request).
+    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type, topic_list=taxonomy)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
+    if taxonomy is not None and answer.get("topics_version") not in (None, taxonomy["version"]):
+        logger.warning("bill_topics_list_version_mismatch", bill_openstates_id=bill_openstates_id,
+                       sent=taxonomy["version"], answered=answer.get("topics_version"))
 
     if answer.get("insufficient_information"):
         logger.info(
@@ -458,6 +488,7 @@ async def generate_and_store_bill_artifact(
             failure_stage="generation",
             failure_reason="insufficient_information",
             model_name=model_name,
+            generation_config=generation_config,
             artifact_id=target_artifact_id,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
@@ -465,7 +496,7 @@ async def generate_and_store_bill_artifact(
         return {**broker_result, "status": "failed"}
 
     if artifact_type == "bill_topics":
-        filtered = _filter_bill_topics(answer, bill_openstates_id=bill_openstates_id)
+        filtered = _filter_bill_topics(answer, bill_openstates_id=bill_openstates_id, taxonomy=taxonomy)
         if filtered is None:
             logger.info(
                 "bill_topics had zero valid topics -- recording a failed artifact",
@@ -483,6 +514,7 @@ async def generate_and_store_bill_artifact(
                 failure_stage="generation",
                 failure_reason="no_valid_topics",
                 model_name=model_name,
+                generation_config=generation_config,
                 artifact_id=target_artifact_id,
                 broker_api_base=broker_api_base,
                 broker_api_token=broker_api_token,
@@ -503,6 +535,7 @@ async def generate_and_store_bill_artifact(
         content=content,
         status="complete",
         model_name=model_name,
+        generation_config=generation_config,
         # SYNC-43: AGENTS-80's source_support, recorded rather than dropped.
         # Only "inferred" marks anything -- see _validation_notes_for.
         source_support=answer.get("source_support"),

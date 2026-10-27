@@ -158,6 +158,7 @@ async def dispatch_bill_question(
     question_type: str,
     *,
     timeout_seconds: float | None = None,
+    topic_list: dict | None = None,
 ) -> dict:
     """Dispatch an analyze_bill task to LegBot and return its structured answer.
 
@@ -168,6 +169,9 @@ async def dispatch_bill_question(
         timeout_seconds: how long to poll before giving up. None (the
             default) resolves to settings.legbot_dispatch_timeout_seconds
             at call time.
+        topic_list: bill_topics only (SYNC-134 / AGENTS-181): the broker's live list as
+            get_bill_topics_taxonomy returns it. Sent as topics, max_topics and
+            topics_version; LegBot fails a bill_topics request without them.
 
     Returns:
         See _dispatch_and_await.
@@ -178,12 +182,17 @@ async def dispatch_bill_question(
             DELETE of the CAMS task before raising (SYNC-20) -- see
             _dispatch_and_await's own docstring.
     """
+    payload = {
+        "bill_source": bill_source,
+        "question_type": question_type,
+        "caller": "ddp_sync",
+    }
+    if topic_list is not None:
+        payload["topics"] = list(topic_list["topics"])
+        payload["max_topics"] = topic_list["max_topics"]
+        payload["topics_version"] = topic_list["version"]
     return await _dispatch_and_await(
-        {
-            "bill_source": bill_source,
-            "question_type": question_type,
-            "caller": "ddp_sync",
-        },
+        payload,
         question_type=question_type,
         timeout_seconds=timeout_seconds,
     )
