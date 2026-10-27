@@ -319,7 +319,7 @@ distinct difference, with the manifest file's mtime so a stale checkout is not m
 back to the manifest, then to the caller's last-resort constant (`None` means "neither could answer"). Never
 raises: a missing, invalid or incomplete manifest degrades to the yaml's answer with one log line.
 `log_config_disagreements(config, root)` compares every list at once; the scheduler calls it at start-up, and
-the OPEN-330 daily check reuses it. Features: `archive` (the manifest's `archive.scheduled`, the recurring list; `archive.enabled` is only the shell gate and the Stage 4 manual run, OPEN-418; a manifest from before that split reads as "cannot say"), `embedding`, `search_refresh` (spelled `us`) and
+the OPEN-330 daily check reuses it. Features: `archive` (the manifest's `archive.scheduled`, the recurring list; `archive.enabled` is only the shell gate and the Stage 4 manual run, OPEN-418; a manifest from before that split reads as "cannot say" and logs `jurisdiction_manifest_unusable error="missing field 'scheduled'"` at start-up. On 2026-10-27 both the Mac and the EC2-broker host logged it because their ddp-open-states checkouts did not contain OPEN-418's commit `1c69cb57d5` (no `scheduled:` lines; main has 10); check that first, then the manifest itself), `embedding`, `search_refresh` (spelled `us`) and
 `cloud_path`, `scrape_primary`, `scrape_secondary` (spelled `usa`), mirroring `check-jurisdiction-drift.py`'s
 `project()` in ddp-open-states. Wired so far: the embedding and search-refresh hook gates, the manual archive
 trigger and the knowledge-base 404 gates, the manual single-state scrape targets, and the two in-code
@@ -431,7 +431,8 @@ that correcting it clears the signature. Mac first.
   on EC2 is only as good as that secret.
 - Mirrors in other repos: `ddp-open-states/lib/slack-alert.sh::post_slack_alert` (shell scripts) and the persona
   registry in ddp-agents (`cams/slack_identity.py`). Change a default name/icon/variable in one, change all three.
-- **Merged 2026-10-06:** PRs #194 (identity), #195 (start script) and #196 (this single function). Not yet verified against live Slack.
+- **Merged 2026-10-06:** PRs #194 (identity), #195 (start script) and #196 (this single function). EC2 checked 2026-10-27 (SYNC-131): with the secret key set, a test alert posted under the name CodeBot
+  in #automation-errors (read through the Slack API, which returns the name but no icon, so the picture was not checked there).
 
 ## Scheduler (`scheduler.py`)
 
