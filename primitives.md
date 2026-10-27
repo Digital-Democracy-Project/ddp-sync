@@ -143,7 +143,7 @@ The daily bill sync entry point. **Do not reinvent these methods.**
 
 `bill_topics` answers are checked against the broker's live list: `broker_client.get_bill_topics_taxonomy()` reads
 ddp-broker-py's `GET /api/bill-topics/taxonomy/` (BROKER-314, service token; `{version, max_topics, topics}` built from
-its `Topic` table on every call, the cap from its `BILL_TOPICS_MAX`). `bill_artifact_generation._bill_topics_taxonomy`
+its `Topic` table on every call, the cap from its "Bill topic settings" row, which staff edit in the broker admin, BROKER-315). `bill_artifact_generation._bill_topics_taxonomy`
 keeps it per broker base for `_BILL_TOPICS_CACHE_SECONDS` (300), so a topic staff add in the broker admin is accepted
 within five minutes with no release (Ramon, 2026-10-26: the Topic table is the one list). The dev-broker header
 (`X-DDP-Environment: dev`) therefore checks against the dev broker's list. Rules:
