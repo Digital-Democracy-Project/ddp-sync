@@ -157,9 +157,11 @@ within five minutes with no release (Ramon, 2026-10-26: the Topic table is the o
   strings matched trimmed and case-insensitively.
 - **Deploy the broker first.** A broker without BROKER-314 answers 404, and every bill_topics generation then fails
   clearly (no rows written) until it is deployed.
-- **LegBot still carries its own list** in its prompt until AGENTS-181 decides how the list reaches it (recommended:
-  ddp-sync sends it with each request). Until then a topic added in the admin is accepted here but LegBot does not
-  propose it, and a topic switched off is dropped here (`bill_topics_dropped_non_member`) even if LegBot proposes it.
+- **The same list goes to LegBot.** For bill_topics, `dispatch_bill_question(..., topic_list=taxonomy)` adds `topics`,
+  `max_topics` and `topics_version` to the payload; LegBot (AGENTS-181, ddp-agents #389) builds its prompt from them and
+  fails a bill_topics request without them, so the answer is checked against exactly the list it was asked from. Other
+  question types send no list. An answer echoing a different `topics_version` logs `bill_topics_list_version_mismatch`.
+  **Deploy order:** broker (BROKER-314), then ddp-sync, then LegBot. An older LegBot ignores the extra keys.
 
 ## Organization position research (`pipelines/bill_organization_position_research.py`)
 

@@ -267,7 +267,7 @@ async def test_vote_frame_happy_path_writes_broker(artifact_type, question_type)
         )
 
     assert result == {"id": 4, "created": True, "status": "complete"}
-    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type, topic_list=None)
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "Vote yes if you want..."
     assert write_kwargs["status"] == "complete"
@@ -298,7 +298,7 @@ async def test_org_types_happy_path_writes_broker(artifact_type, question_type):
         )
 
     assert result == {"id": 5, "created": True, "status": "complete"}
-    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type)
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, question_type, topic_list=None)
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
         "org_types": [{"type": "environmental advocacy groups", "reason": "Title II's emissions provisions"}]
@@ -329,7 +329,7 @@ async def test_impact_analysis_happy_path_writes_broker():
         )
 
     assert result == {"id": 6, "created": True, "status": "complete"}
-    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "impact_analysis")
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "impact_analysis", topic_list=None)
     write_kwargs = mock_write.await_args.kwargs
     assert json.loads(write_kwargs["content"]) == {
         "affected_parties": [{"party": "small businesses", "effect": "new licensing fee"}],
@@ -423,7 +423,7 @@ async def test_bill_topics_happy_path_writes_broker():
         )
 
     assert result == {"id": 8, "created": True, "status": "complete"}
-    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "bill_topics")
+    mock_dispatch.assert_awaited_once_with(_ARCHIVED_TEXT, "bill_topics", topic_list=BROKER_TOPICS)
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["content"] == "**Primary:** Criminal Justice\n\n- Criminal Justice\n- Drugs"
     assert write_kwargs["status"] == "complete"
@@ -565,7 +565,7 @@ async def test_archived_text_found_is_used_for_dispatch(archived_text_by_default
 
     assert result == {"id": 7, "created": True, "status": "complete"}
     archived_text_by_default.assert_awaited_once_with(_COMMON_KWARGS["bill_openstates_id"])
-    mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "summary_500char")
+    mock_dispatch.assert_awaited_once_with("ARCHIVED FULL BILL TEXT", "summary_500char", topic_list=None)
 
 
 @pytest.mark.asyncio

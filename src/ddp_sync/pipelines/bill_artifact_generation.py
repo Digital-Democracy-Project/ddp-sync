@@ -462,9 +462,13 @@ async def generate_and_store_bill_artifact(
         taxonomy = await _bill_topics_taxonomy(broker_api_base, broker_api_token)
         generation_config = {"bill_topics_list_version": taxonomy["version"]}
 
-    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type)
+    # The answer is checked against the same list LegBot was given (AGENTS-181 takes it from the request).
+    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type, topic_list=taxonomy)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
+    if taxonomy is not None and answer.get("topics_version") not in (None, taxonomy["version"]):
+        logger.warning("bill_topics_list_version_mismatch", bill_openstates_id=bill_openstates_id,
+                       sent=taxonomy["version"], answered=answer.get("topics_version"))
 
     if answer.get("insufficient_information"):
         logger.info(

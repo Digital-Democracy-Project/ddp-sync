@@ -135,6 +135,56 @@ async def test_other_artifact_types_do_not_read_the_list():
     assert write.await_args.kwargs["generation_config"] is None
 
 
+# ── sending the list to LegBot (AGENTS-181 takes it from the request) ──────────────
+
+
+async def _sent_payloads(fetch, artifact_type="bill_topics", runs=1, echo_version=None, answer=None):
+    """Run generation with the real dispatch_bill_question and return the payloads it handed to CAMS."""
+    answer = answer or _answer("Drugs")
+    if echo_version is not None:
+        answer["answer"]["topics_version"] = echo_version
+    send = AsyncMock(return_value=answer)
+    with patch.object(gen, "get_bill_topics_taxonomy", new=fetch), \
+            patch("ddp_sync.services.legbot_client._dispatch_and_await", new=send), \
+            patch.object(gen, "write_bill_artifact", new=AsyncMock(return_value={"id": 1})):
+        for _ in range(runs):
+            await gen.generate_and_store_bill_artifact(**KWARGS, artifact_type=artifact_type)
+    return [c.args[0] for c in send.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_the_list_checked_against_is_the_list_sent_to_legbot():
+    [payload] = await _sent_payloads(AsyncMock(return_value=LIST_V1))
+    assert payload["question_type"] == "bill_topics"
+    assert payload["topics"] == ["Drugs", "Education", "Guns"]
+    assert payload["max_topics"] == 4
+    assert payload["topics_version"] == "aaaaaaaaaaaa"
+
+
+@pytest.mark.asyncio
+async def test_a_changed_list_changes_what_legbot_is_sent(monkeypatch):
+    monkeypatch.setattr(gen, "_BILL_TOPICS_CACHE_SECONDS", 0)
+    first, second = await _sent_payloads(AsyncMock(side_effect=[LIST_V1, LIST_V2]), runs=2)
+    assert "Zoning" not in first["topics"]
+    assert second["topics"][-1] == "Zoning"
+    assert second["topics_version"] == "bbbbbbbbbbbb"
+
+
+@pytest.mark.asyncio
+async def test_other_question_types_are_sent_no_list():
+    [payload] = await _sent_payloads(AsyncMock(), artifact_type="bill_summary",
+                                     answer={"answer": {"text": "A summary.", "insufficient_information": False}})
+    assert not {"topics", "max_topics", "topics_version"} & payload.keys()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_for_another_list_version_is_logged():
+    with patch.object(gen.logger, "warning") as warn:
+        await _sent_payloads(AsyncMock(return_value=LIST_V1), echo_version="zzzzzzzzzzzz")
+    warn.assert_called_once()
+    assert warn.call_args.args[0] == "bill_topics_list_version_mismatch"
+
+
 # ── the fetch ─────────────────────────────────────────────────────────────────────
 
 
