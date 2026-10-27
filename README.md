@@ -10,7 +10,7 @@ DDP-Sync handles all scheduled and on-demand data sync operations:
 
 - **OpenStates scrape jobs** (managed via `openstates_scrape` block in `sync_schedule.yaml`):
   - **Patch refresh** (daily 01:00 UTC): runs `apply-local-patches.sh` on the Mac Studio before any scrapes start (Mac-only: a host with no live editable checkouts, e.g. the EC2-broker, sets `OPENSTATES_PATCH_REFRESH_ENABLED=false` -- OPEN-320)
-  - **FL scrape** (daily 02:00 UTC): all four FL sessions sequentially (2026 → 2026D → 2026E → 2026F share `_data/fl/`); starts first as it takes 12+ hours
+  - **FL scrape** (02:00 UTC): one run that scrapes every FL session the scrapers image marks `active` (no session list here, SYNC-130); starts first as it takes 12+ hours
   - **WA scrape** (daily 02:30 UTC): staggered 30 min after FL; finishes ~07:30 UTC
   - **USA scrape** (daily 03:00 UTC): House then Senate sequentially (share `_data/usa/`); finishes ~09:00 UTC
   - **Secondary states** (Sunday 02:00 UTC): VA, MI, MA, UT, AZ fanned out concurrently via `asyncio.gather` — independent `_data/` dirs, no conflicts; run alongside FL start

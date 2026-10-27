@@ -641,11 +641,9 @@ openstates_scrape:
       # own; this value is only what FL falls back to if that history is missing or Redis
       # is down.
       sync_day: sunday
-      sessions:
-        - "2026"
-        - "2026D"
-        - "2026E"
-        - "2026F"
+      # No session list (SYNC-130): like every other state, one run scrapes each session the
+      # scrapers image marks "active": True in scrapers/fl/__init__.py, so a new session is picked
+      # up when the image that activates it is deployed, with no edit here.
 
     wa:
       enabled: true

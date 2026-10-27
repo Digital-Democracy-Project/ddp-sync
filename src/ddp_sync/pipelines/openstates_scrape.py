@@ -1608,58 +1608,25 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
 
 
 async def run_fl_scrapes_job(config: dict | None = None) -> dict[str, Any]:
-    """Run all FL sessions sequentially (they share _data/fl/).
+    """Run the FL scrape: one run, no session argument, like WA and the secondary batch.
 
-    Sessions run in order: 2026 → 2026D → 2026E → 2026F. A failed session
-    is logged but does not abort the remaining sessions.
+    SYNC-130: the scraper then scrapes every session marked "active" in the scrapers image's
+    scrapers/fl/__init__.py, so a new session needs no edit here. This used to loop over a
+    hand-kept `primary.fl.sessions` list, which left 2027 unscraped.
     """
     openstates_root = _get_root(config)
-    sessions = (
-        (config or {}).get("primary", {}).get("fl", {})
-        .get("sessions", ["2026", "2026D", "2026E", "2026F"])
-    )
     start_time = datetime.now(timezone.utc)
-    t = time.monotonic()
 
-    logger.info("openstates_fl_scrapes: starting", sessions=sessions)
-
-    results = []
-    for session in sessions:
-        result = await _run_scrape(
-            "fl", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["fl"], config
-        )
-        results.append(result)
-
-    duration = round(time.monotonic() - t, 1)
-    failed = [r for r in results if not r["success"]]
-
-    log_fn = logger.error if failed else logger.info
-    log_fn(
-        "openstates_fl_scrapes: completed",
-        sessions=sessions,
-        total=len(results),
-        failed=len(failed),
-        duration_seconds=duration,
-    )
+    result = await _run_scrape("fl", None, openstates_root, SCRAPE_TIMEOUT_S["fl"], config)
 
     await _write_flow_status("openstates_fl_scrapes", {
         "flow": "openstates_fl_scrapes",
         "started_at": start_time.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if not failed else "completed_with_errors",
-        "sessions": sessions,
-        "total": len(results),
-        "failed": len(failed),
-        "results": results,
-        "duration_seconds": duration,
+        "status": "completed" if result["success"] else "failed",
+        **result,
     })
-    return {
-        "success": not failed,
-        "sessions": sessions,
-        "results": results,
-        "failed": len(failed),
-        "duration_seconds": duration,
-    }
+    return result
 
 
 async def run_wa_scrape_job(config: dict | None = None) -> dict[str, Any]:
