@@ -943,82 +943,10 @@ votebot_eval:
     enabled: true                    # set false to suppress Zapier alerts
     alert_on_success: true           # send the green-path summary too, not just failures
 
-# Concept-Statement Dispatch's own standalone scheduled batch job (ddp-infra
-# PLAN-bill-concept-polling.md §0.4) retired SYNC-32 -- ConceptStatementSet
-# generation now runs through session_pipeline_batch below, via its
-# include_concept_statements option (SYNC-31). That standalone job's own
-# dedup pre-check hit a real DDP_BROKER_API_BASE misconfiguration in
-# production on 2026-08-16 and silently failed 25/25 dispatches with no
-# alerting anywhere -- session_pipeline_runner.py's broker-base-URL handling
-# is more battle-tested, and consolidating removes that whole independent
-# failure surface, not just this one instance of it.
-
-# Session-Targeted BillArtifact Batch (SYNC-9)
-# =============================================
-# Scheduled batch job for run_legbot_pipeline (pipelines/session_pipeline_runner.py,
-# ddp-infra PLAN-bill-document-provenance.md "Step 1, scoped version") -- fills in
-# whichever of the 8 BillArtifact types (bill_summary, bill_pros_cons, etc.) are
-# missing for every bill in one jurisdiction/session, plus optional Organization
-# Position Research and ConceptStatementSet generation (SYNC-31 -- folded in
-# from the retired standalone concept_statement_dispatch job, SYNC-32; see
-# this file's own git history for that job's former config block). The
-# on-demand route POST /trigger/bill-artifact-generation (api/routes/triggers.py)
-# is this pipeline's other real caller and works regardless of this block's
-# `enabled` value.
-#
-# Disabled by default, deliberately -- verified 2026-08-14 directly against
-# ddp-infra's PLAN-legbot.md and PLAN-bill-document-provenance.md:
-#   - Phase 6 (BillArtifact dedup key): LIVE. Merged to ddp-broker-py `main`
-#     2026-07-26, production RDS confirmed up to date the same day. Writes
-#     from this job are safe.
-#   - Phase 8 (concurrency cap, prioritization vs. interactive Agent Smith
-#     traffic): NOT BUILT. The plan doc's own corrected note (2026-07-22) is
-#     explicit -- there is no max_concurrent_requests cap anywhere in this
-#     pipeline today, just a plain sequential loop (effective concurrency of
-#     1). Nothing since the plan's last update (2026-08-10) indicates this
-#     shipped.
-# Flip `enabled: true` only after ddp-infra's Phase 8 concurrency work is
-# confirmed live -- until then, use the on-demand trigger route for any real
-# batch, which caps `limit` to 25 for the same reason.
-#
-# jurisdiction_iso2/session_code are a single, specific state/session (not
-# "current session" auto-detection, not "all jurisdictions") and
-# artifact_types is a small subset, not all 8 -- a deliberately narrow first
-# scope per the plan's own "start with a small reviewed batch" rollout note,
-# same spirit as the retired concept_statement_dispatch job's own
-# max_bills_per_run cap.
-#
-# include_concept_statements: false, same as include_org_research -- per
-# Ramon's 2026-08-21 direction (SYNC-31/SYNC-32), no scheduled cadence exists
-# yet for ANY LegBot artifact type, concept statements included. Leave this
-# false here; exercise concept-statement generation via the on-demand route
-# only until a real cadence decision is made.
-#
-# include_org_research is additionally the ONLY setting in this block that
-# costs money, and the only reason to think twice before raising `limit`.
-# Every artifact_type runs on the local MLX model at $0; org research is a
-# metered cloud API call with server-side web search, measured 2026-08-28 at
-# $7.26 for 17 bills (~$0.43 each) on FL 2026E. It scales per bill, so
-# turning this true on a scheduled weekly job over a full session is a
-# recurring five-to-high-two-figure bill per run, not a one-off. If a cadence
-# decision ever turns it on, decide `limit` and this flag together.
-# Enabled for testing the pipeline via ddp-sync's own scheduled dispatch (as opposed to
-# the scraper-completion trigger, SYNC-48/50, which stays off separately). This is a
-# shared, checked-in flag -- every ddp-sync host picks it up on next pull/restart unless
-# it has its own SESSION_PIPELINE_BATCH_ENABLED=false in .env (SYNC-51).
-session_pipeline_batch:
-  enabled: true
-  frequency: weekly
-  sync_day: sunday
-  sync_time_utc: "13:00"       # after votebot_eval (12:00)
-  jurisdiction_iso2: "FL"
-  session_code: "2026F"
-  artifact_types:
-    - bill_summary
-    - bill_pros_cons
-  include_org_research: false
-  include_concept_statements: false
-  limit: 10
+# Two scheduled LegBot batch jobs are retired; see this file's git history for their blocks:
+# concept_statement_dispatch (SYNC-32) and session_pipeline_batch (SYNC-135, a weekly run of at
+# most 10 bills pinned to one hand-picked session). New bills get LegBot after archiving
+# (openstates_archive's hook); for a hand-picked batch use POST /trigger/bill-artifact-generation.
 
 # SYNC-36/AGENTS-54: GrantBot's Notion funder-scrape + Kindora enrichment + shortlist job.
 # Used to self-schedule weekly entirely inside CAMS's own internal cron -- moved here to match

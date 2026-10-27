@@ -340,14 +340,8 @@ class UpdateScheduler:
         # --- Michigan WAF cookie publish (OPEN-188, independent of scrape schedule) ---
         self._register_mi_cookie_publish_job()
 
-        # Concept-statement dispatch's own standalone scheduled batch job
-        # (ddp-infra PLAN-bill-concept-polling.md §0.4) retired here (SYNC-32)
-        # -- ConceptStatementSet generation now runs through this same
-        # session-targeted batch job below, via its include_concept_statements
-        # option (SYNC-31).
-
-        # --- Session-targeted BillArtifact batch job (SYNC-9) ---
-        self._register_session_pipeline_batch_job()
+        # Two scheduled LegBot batch jobs are retired: concept-statement dispatch (SYNC-32) and the
+        # session-targeted BillArtifact batch (SYNC-135). New bills get LegBot after archiving.
 
         # --- GrantBot funder scrape + Kindora enrichment (SYNC-36/AGENTS-54) ---
         self._register_grantbot_scrape_job()
@@ -1295,94 +1289,6 @@ class UpdateScheduler:
         )
         logger.info("mi_cookie_publish: registered", **schedule)
 
-    def _register_session_pipeline_batch_job(self) -> None:
-        """Register the session-targeted BillArtifact batch job (SYNC-9).
-
-        Reads YAML block ``session_pipeline_batch``, mirroring
-        ``concept_statement_dispatch``'s own ``enabled``/``frequency``/
-        ``sync_day``/``sync_time_utc`` shape. Shipped ``enabled: false`` in
-        sync_schedule.yaml -- see that block's own comment for why
-        (ddp-infra's Phase 8 concurrency cap/prioritization isn't live yet,
-        verified 2026-08-14 directly against PLAN-legbot.md and
-        PLAN-bill-document-provenance.md).
-
-        Unlike ``concept_statement_dispatch``'s all-optional block, this
-        job has genuinely required fields with no sensible default
-        (jurisdiction_iso2, session_code, artifact_types, limit) --
-        validated here, before registration, same gate style
-        ``votebot_eval`` uses for its own required config. An ``enabled:
-        true`` block missing one of these skips registration (logged as an
-        error) rather than registering a job that would fail every time it
-        fires.
-        """
-        from ddp_sync.pipelines.session_pipeline_runner import (
-            _REQUIRED_BATCH_CONFIG_KEYS,
-            run_scheduled_session_pipeline,
-        )
-
-        config = self._sync_config.get("session_pipeline_batch", {})
-
-        # SYNC-51 (independent review, round 1): this job has no cross-host overlap lock of
-        # its own -- run_scheduled_session_pipeline() calls run_legbot_pipeline() directly,
-        # not through SYNC-48's overlap-safe trigger_scraper_session_pipeline() wrapper -- so
-        # a per-host env opt-out is the only lever available to stop it firing on two colocated
-        # hosts at once. Env flag ANDs with the existing (shared, checked-in) YAML gate, same
-        # pattern as openstates_scrape_enabled/openstates_archive_enabled/mi_cookie_publish_enabled.
-        if not (self.settings.session_pipeline_batch_enabled and config.get("enabled", False)):
-            logger.info("session_pipeline_batch: disabled — skipping")
-            return
-
-        missing = [key for key in _REQUIRED_BATCH_CONFIG_KEYS if not config.get(key)]
-        if missing:
-            logger.error(
-                "session_pipeline_batch: missing required config keys — skipping registration",
-                missing_keys=missing,
-            )
-            return
-
-        sync_time_str = config.get("sync_time_utc", "13:00")
-        hour, minute = map(int, sync_time_str.split(":"))
-        frequency = config.get("frequency", "weekly")
-
-        async def _session_pipeline_batch_wrapper():
-            return await run_scheduled_session_pipeline(config)
-
-        if frequency == "daily":
-            trigger = CronTrigger(hour=hour, minute=minute, timezone=_UTC)
-            cadence_str = f"daily at {sync_time_str} UTC"
-        else:
-            day_map = {
-                "monday": "mon", "tuesday": "tue", "wednesday": "wed",
-                "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
-            }
-            sync_day = config.get("sync_day", "sunday").lower()
-            trigger = CronTrigger(
-                day_of_week=day_map.get(sync_day, "sun"),
-                hour=hour,
-                minute=minute,
-                timezone=_UTC,
-            )
-            cadence_str = f"weekly {sync_day} {sync_time_str} UTC"
-
-        self.scheduler.add_job(
-            _session_pipeline_batch_wrapper,
-            trigger=trigger,
-            id="session_pipeline_batch",
-            name="Session-targeted BillArtifact batch (SYNC-9)",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=3600,
-        )
-        logger.info(
-            "session_pipeline_batch: registered",
-            cadence=cadence_str,
-            jurisdiction_iso2=config.get("jurisdiction_iso2"),
-            session_code=config.get("session_code"),
-            artifact_types=config.get("artifact_types"),
-            limit=config.get("limit"),
-        )
-
     def _register_grantbot_similarity_refresh_job(self) -> None:
         """Register GrantBot's twice-yearly grantee-similarity refresh trigger (AGENTS-128).
 
@@ -1430,8 +1336,8 @@ class UpdateScheduler:
 
         AGENTS-54 removes CAMS's own internal cron for this job; this is its
         replacement, following the same YAML enabled/frequency/sync_time_utc
-        shape session_pipeline_batch and votebot_eval use for their own
-        required config. Unlike those two, every field here has a sensible
+        shape votebot_eval uses for its own
+        required config. Unlike that one, every field here has a sensible
         default -- this job takes no per-run parameters at all -- so there's
         no required-key validation before registering, just the enabled gate.
 

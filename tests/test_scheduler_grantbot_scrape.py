@@ -1,6 +1,6 @@
 """Scheduler wiring tests for GrantBot's monthly funder-scrape trigger
-(SYNC-36/AGENTS-54). Mirrors test_scheduler_session_pipeline_batch.py's
-pattern (temp YAML config file + UpdateScheduler); unlike that job, this one
+(SYNC-36/AGENTS-54). Same pattern as the other scheduler tests (temp YAML
+config file + UpdateScheduler); this job
 has no required keys with no sensible default, so there's no
 missing-required-key case here.
 """
@@ -91,8 +91,7 @@ async def test_enabled_monthly_registers_cron_job():
 @pytest.mark.asyncio
 async def test_enabled_with_only_defaults_still_registers():
     """Every field has a sensible default -- an `enabled: true` block with
-    nothing else must still register (no required-key validation gate,
-    unlike session_pipeline_batch)."""
+    nothing else must still register (no required-key validation gate)."""
     sched = _scheduler_with_yaml(
         """
         grantbot_scrape:

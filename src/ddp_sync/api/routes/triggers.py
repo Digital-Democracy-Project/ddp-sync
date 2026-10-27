@@ -223,7 +223,7 @@ def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, s
     endpoints), which requires the header and is meant only for calls
     forwarded through ddp-api's own trusted proxy. This endpoint predates
     that header entirely and has real existing callers (the
-    session_pipeline_batch scheduled job, direct operator calls) that never
+    archive-completion hook, direct operator calls) that never
     set it -- a missing/omitted header must keep this endpoint's original
     behavior (None, None), letting run_legbot_pipeline fall through to
     whatever DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN are globally

@@ -192,7 +192,6 @@ class SyncSettings:
     # Daily check that this host's jurisdiction lists agree with jurisdictions.yaml (OPEN-330). Default OFF: a host
     # opts in with JURISDICTION_DRIFT_CHECK_ENABLED=true.
     jurisdiction_drift_check_enabled: bool = False
-    session_pipeline_batch_enabled: bool = True
     grantbot_scrape_enabled: bool = True
     grantbot_similarity_refresh_enabled: bool = True
     # SYNC-127: default OFF like the people pull. Exactly one host reads #legislation each night (the
@@ -545,11 +544,9 @@ class SyncSettings:
     legbot_scrape_completion_trigger_lock_renewal_seconds: int = 120
 
     # SYNC-50: what a real scraper-completion trigger dispatches once it has
-    # resolved which session(s) a scrape run touched. Deliberately its own
-    # setting, not a reuse of config/sync_schedule.yaml's session_pipeline_batch
-    # job config -- that job hand-picks one fixed (jurisdiction, session) pair on
-    # a schedule; this fires for whichever jurisdiction/session a real scrape
-    # just resolved, so its defaults have to be jurisdiction-agnostic. Defaults
+    # resolved which session(s) a scrape run touched. It fires for whichever
+    # jurisdiction/session a real scrape just resolved, so its defaults have to
+    # be jurisdiction-agnostic. Defaults
     # to every recognized artifact type (session_pipeline_runner.ALL_ARTIFACT_TYPES)
     # -- a real 24/7 pipeline has no principled reason to leave one out by default.
     legbot_scrape_completion_trigger_artifact_types: list = field(default_factory=list)
@@ -563,9 +560,8 @@ class SyncSettings:
     # run is then as long as that many bills (about 170 an hour per run at the measured pace).
     legbot_scrape_completion_trigger_limit: int | None = None
 
-    # SYNC-50: concept_statements is already part of the standard automated flow
-    # elsewhere (session_pipeline_batch's own include_concept_statements) --
-    # true by default here for the same reason. include_org_research has no
+    # SYNC-50: concept_statements is part of the standard automated flow, so it is
+    # true by default here. include_org_research has no
     # equivalent setting: ddp-infra PLAN-legbot.md §32 Gate 1 item 4 (2026-09-01)
     # decided that explicitly out of scope for automated dispatch, not a knob to
     # reintroduce here -- see _maybe_trigger_legbot_for_scrape's own call site.
@@ -633,7 +629,6 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "openstates_archive_enabled": "OPENSTATES_ARCHIVE_ENABLED",
     "openstates_patch_refresh_enabled": "OPENSTATES_PATCH_REFRESH_ENABLED",
     "mi_cookie_publish_enabled": "MI_COOKIE_PUBLISH_ENABLED",
-    "session_pipeline_batch_enabled": "SESSION_PIPELINE_BATCH_ENABLED",
     "grantbot_scrape_enabled": "GRANTBOT_SCRAPE_ENABLED",
     "grantbot_similarity_refresh_enabled": "GRANTBOT_SIMILARITY_REFRESH_ENABLED",
     "openstates_people_pull_enabled": "OPENSTATES_PEOPLE_PULL_ENABLED",

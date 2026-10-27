@@ -63,7 +63,6 @@ services:
       - WEBFLOW_BATCH_ENABLED=false
       - VOTEBOT_EVAL_ENABLED=false
       - API_HEALTH_CHECK_ENABLED=false
-      - SESSION_PIPELINE_BATCH_ENABLED=false
       # OPENSTATES_SCRAPE_ENABLED=true (OPEN-253, 2026-09-03): flipped from the canary-era
       # false above once Ramon moved live scheduled scraping from the Mac host to this one
       # (Mac's own scrape runs stopped the same night). Registers the SIX recurring scheduled
