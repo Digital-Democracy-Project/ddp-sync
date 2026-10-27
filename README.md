@@ -263,8 +263,9 @@ re-test were precisely the ones marked `failed`.
 
 `retry_failed` has **no default on either endpoint** — omitting it is a 422 — for the same reason every
 other cost-relevant field here is required: a retry spends real inference and rewrites real rows. The one
-place it does default is `run_scheduled_session_pipeline`, to `False`, because a cron job must keep doing
-exactly what it did yesterday when a new option appears. Pair it with `dry_run=true` first; the preview
+place it does default is the automatic run after an archive (`trigger_scraper_session_pipeline`, called from
+`openstates_archive.py`), to `False`, because an automatic run must keep doing exactly what it did yesterday
+when a new option appears. Pair it with `dry_run=true` first; the preview
 honours the flag by construction, since it reports whatever reaches `needs_dispatch`.
 
 **`complete` is never dispatched at any value of this flag**, and the skip for it is deliberately kept a
