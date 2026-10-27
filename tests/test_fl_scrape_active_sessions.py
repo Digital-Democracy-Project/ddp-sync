@@ -32,3 +32,13 @@ async def test_the_fl_job_runs_once_without_a_session(config):
     assert [c.args[:2] for c in run.await_args_list] == [("fl", None)]
     assert result["success"] is True
     assert status.await_args.args[1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fl_run_is_recorded_as_failed(config):
+    status = AsyncMock()
+    with patch.object(openstates_scrape, "_run_scrape", new=AsyncMock(return_value={"success": False})), \
+            patch.object(openstates_scrape, "_write_flow_status", new=status):
+        result = await openstates_scrape.run_fl_scrapes_job(config)
+    assert result["success"] is False
+    assert status.await_args.args[1]["status"] == "failed"
