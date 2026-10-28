@@ -344,7 +344,7 @@ the host's own `DDP_OPENSTATES_JURISDICTIONS` and `LEGBOT_RDS_REPLICA_JURISDICTI
 them: unset is not drift), and whether the manifest can answer at all: a missing, unreadable, or out-of-date checkout is
 reported as "cannot verify" (the EC2 bind mount is never auto-pulled), because a monitor that cannot see must alert.
 The alert repeats only when the findings change or after `jurisdiction_drift_check.repeat_days` (7). Default off per host
-(`JURISDICTION_DRIFT_CHECK_ENABLED=true`), registered outside `_register_openstates_scrape_jobs` like the fork check.
+(`JURISDICTION_DRIFT_CHECK_ENABLED=true`), registered outside `_register_openstates_scrape_jobs` like the fork check. On the Mac it is set in `.env`; on the EC2 host it is set in `infrastructure/docker-compose.prod.yml` (per host, never in the shared `ddp-sync/credentials` secret).
 Manual run: `POST /trigger/openstates-scrape/drift-check`. It reuses `jurisdiction_enrollment.config_disagreements`
 (OPEN-328), so its logs are the weekly-review evidence for the dual-read. It cannot read the broker's env (another
 host); that value is checked with `check-jurisdiction-drift.py --live` in ddp-open-states. `.github/workflows/

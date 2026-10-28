@@ -74,6 +74,10 @@ services:
       - OPENSTATES_SCRAPE_ENABLED=true
       # SYNC-102 (PR #206): nightly pull of the people checkout at 03:00 UTC (default off; per-instance)
       - OPENSTATES_PEOPLE_PULL_ENABLED=true
+      # OPEN-330 (OPEN-318 slice 5): daily check (06:20 UTC) that this host's jurisdiction lists agree with
+      # ddp-open-states' jurisdictions.yaml and that the manifest here can be read and is current. Per host and
+      # default off, so it is set here and NOT in the shared `ddp-sync/credentials` secret. Alerts only; changes nothing.
+      - JURISDICTION_DRIFT_CHECK_ENABLED=true
       # OPENSTATES_ARCHIVE_ENABLED/MI_COOKIE_PUBLISH_ENABLED: the handoff note left these as
       # "your call" (OpenStates-domain, not Voatz/Webflow/LegBot, so plausible either way) --
       # defaulted to false here too, since this host's mandate is specifically the OPEN-193
