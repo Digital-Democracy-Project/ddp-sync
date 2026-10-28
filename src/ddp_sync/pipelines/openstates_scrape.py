@@ -1271,7 +1271,8 @@ async def _run_scrape_impl(
                 stall_seconds=SCRAPE_STALL_SECONDS,
                 duration_seconds=duration,
             )
-            await asyncio.to_thread(_alert_scrape_failure,
+            await asyncio.to_thread(
+                _alert_scrape_failure,
                 label,
                 f"stalled — no new bill files for {SCRAPE_STALL_SECONDS}s "
                 f"(killed after {duration:.0f}s; the wall-clock ceiling was {timeout}s)",

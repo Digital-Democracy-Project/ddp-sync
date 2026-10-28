@@ -269,7 +269,8 @@ async def _run(config: dict, *, trigger: str) -> dict:
         oldest_left = min(float(c["ts"]) for c, _ in new if c["ts"] not in handled)
         age_days = (time.time() - oldest_left) / 86400
         if age_days >= float(config.get("lookback_days", 30)) - _AGE_OUT_WARNING_DAYS:
-            await asyncio.to_thread(post_alert,
+            await asyncio.to_thread(
+                post_alert,
                 f"Slack citation pull: {summary['left_for_next_run']} citations wait beyond the nightly cap of "
                 f"{cap}; the oldest is {age_days:.0f} days old and drops out of the "
                 f"{config.get('lookback_days', 30)}-day window unsent unless max_citations_per_run is raised.",
