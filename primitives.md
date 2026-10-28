@@ -410,7 +410,9 @@ that correcting it clears the signature. Mac first.
   `OPERATOR_ALERT_VIA_CAMS` is not `false`, POSTs `{v:1, source:"ddp-sync/<source>", text, channel?, dedupe_key?}` to
   ddp-agents' `/api/v1/operator-alerts` (5s, no redirects); any 2xx (`queued`, `duplicate`, `dropped_rate_limited`)
   means done, anything else logs `operator_alert_rejected` / `operator_alert_cams_unreachable` and falls through to
-  the direct post. `source` must match `[a-z0-9._-]{1,40}` (the route's format; a test scans every caller). The token
+  the direct post (a CAMS-sent alert logs `operator_alert_sent_via_cams`, so route delivery is told apart from the
+  fallback; to turn the route off on EC2 delete the `OPERATOR_ALERT_URL` line in `docker-compose.prod.yml` and recreate the
+  container, since `render-env.sh` rewrites `.env`). `source` must match `[a-z0-9._-]{1,40}` (the route's format; a test scans every caller). The token
   is the main CAMS token: it is scrubbed from logs and goes only to `OPERATOR_ALERT_URL`. **Never read the token from
   `get_settings().cams_api_token`, and never store it in `ddp-sync/credentials` under `cams_api_token`**: that field
   is the code's "this host is the Mac" signal (`_mac_capable()`, replica routing), so EC2 would start behaving like

@@ -100,6 +100,16 @@ def test_the_route_takes_the_alert_and_slack_is_not_called(route):
     assert call.kwargs["allow_redirects"] is False
 
 
+def test_a_cams_sent_alert_is_logged_and_a_fallback_is_not(route):
+    """Route delivery must be distinguishable from the direct fallback in the logs."""
+    with capture_logs() as logs, patch("requests.post", return_value=_route_resp(202, {"status": "queued"})):
+        post_alert("x", source="t")
+    assert [log["event"] for log in logs] == ["operator_alert_sent_via_cams"]
+    with capture_logs() as logs, patch("requests.post", side_effect=[_route_resp(503), _resp()]):
+        post_alert("x", source="t")
+    assert "operator_alert_sent_via_cams" not in [log["event"] for log in logs]
+
+
 def test_channel_and_dedupe_key_ride_along_only_when_given(route):
     with patch("requests.post", return_value=_route_resp(202, {"status": "queued"})) as post:
         post_alert("a", source="t", channel="#other", dedupe_key="fork:people")

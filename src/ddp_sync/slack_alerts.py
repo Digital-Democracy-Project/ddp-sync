@@ -84,6 +84,7 @@ def _post_to_route(text: str, *, source: str, channel: str | None, dedupe_key: s
             allow_redirects=False,
         )
         if 200 <= resp.status_code < 300:
+            logger.info("operator_alert_sent_via_cams", source=source, http_status=resp.status_code)
             return True
         logger.error(
             "operator_alert_rejected", source=source, status=resp.status_code, body=resp.text[:200].replace(token, "[token]"),
