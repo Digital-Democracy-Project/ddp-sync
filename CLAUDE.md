@@ -620,8 +620,8 @@ evening: `/trigger/bill-artifact-generation`, `jurisdiction_iso2=ut`, `session_c
   transition and nothing rewrites their changelogs; they remain `rejected` and never show publicly.
 - **The EC2-broker host's ddp-sync cannot read artifact status.** Its `DDP_BROKER_API_TOKEN` is the
   placeholder `public-endpoint-no-auth` (`infrastructure/docker-compose.prod.yml`), so a status read
-  there returns 401. That host relays LegBot to the Mac and does not generate; it is on `af6b098`
-  (2026-10-27, SYNC-131). Do not run bill artifact generation on it without fixing that first.
+  there returns 401. That host relays LegBot to the Mac and does not generate; it is on `b6d5efa`
+  (2026-10-28: SYNC-130's FL change and the OPEN-330 drift check). Do not run bill artifact generation on it without fixing that first.
 - **Known quality gaps in the rewritten text** (SYNC-117, not part of the cleanup): the closing "Key
   Policy Implications" paragraph can contradict the diff; a change can land under the wrong heading;
   date-only changes read as "None added, none removed". Separate and not Utah-specific:
