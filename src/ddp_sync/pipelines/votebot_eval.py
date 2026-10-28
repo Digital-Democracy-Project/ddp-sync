@@ -441,7 +441,9 @@ def post_eval_slack_alerts(
     Zapier cannot reach CAMS, so the Zap behind ``push_eval_alert`` cannot use the operator-alert route; this can.
     Posts only for the three cases the Zap's filters routed on: a failed run, a regression, a bill-history leak.
     A healthy run posts nothing here (``push_eval_alert`` still carries the full summary). Each case has its own
-    ``source`` and ``dedupe_key``, so CAMS posts a repeat of the same case once a day. Blocking, like
+    ``source`` and ``dedupe_key``, so CAMS posts a repeat of the same case once a day (its default window is 24 h,
+    and this job runs weekly, so two scheduled runs never share a window; a manual re-run within a day of the same
+    problem is deliberately not posted again). Blocking, like
     ``post_alert`` (which never raises, so neither does this): call it with ``asyncio.to_thread``.
     Returns the cases that were sent.
     """
@@ -835,7 +837,18 @@ async def _run_eval_holding_lock(
                 trigger=trigger,
                 previous_headline=last_run,
             )
-            # SYNC-138: the operator-alert path for the same three cases, until the Zap's Slack step is turned off.
+        except Exception as e:  # noqa: BLE001
+            # push_eval_alert never raises, but defend against
+            # asyncio.to_thread surprises so a webhook hiccup doesn't
+            # mask a successful eval run.
+            logger.error(
+                "votebot_eval: Zapier alert task crashed",
+                error=str(e),
+                metric=METRIC_ALERT_FAILED,
+            )
+        # SYNC-138: the operator-alert path for the same three cases, until the Zap's Slack step is turned off.
+        # Its own try, so neither path can stop the other.
+        try:
             await asyncio.to_thread(
                 post_eval_slack_alerts,
                 headline,
@@ -844,11 +857,8 @@ async def _run_eval_holding_lock(
                 trigger=trigger,
             )
         except Exception as e:  # noqa: BLE001
-            # push_eval_alert never raises, but defend against
-            # asyncio.to_thread surprises so a webhook hiccup doesn't
-            # mask a successful eval run.
             logger.error(
-                "votebot_eval: Zapier alert task crashed",
+                "votebot_eval: operator alert task crashed",
                 error=str(e),
                 metric=METRIC_ALERT_FAILED,
             )
@@ -920,13 +930,21 @@ async def _send_failure_alert(
             trigger=trigger,
             error=error,
         )
-        # SYNC-138: the operator-alert path for the failed run, until the Zap's Slack step is turned off.
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "votebot_eval: failure-alert task crashed",
+            error=str(e),
+            metric=METRIC_ALERT_FAILED,
+        )
+    # SYNC-138: the operator-alert path for the failed run, until the Zap's Slack step is turned off. Its own
+    # try, so neither path can stop the other.
+    try:
         await asyncio.to_thread(
             post_eval_slack_alerts, {}, [], report_path=report_path, trigger=trigger, error=error,
         )
     except Exception as e:  # noqa: BLE001
         logger.error(
-            "votebot_eval: failure-alert task crashed",
+            "votebot_eval: operator failure-alert task crashed",
             error=str(e),
             metric=METRIC_ALERT_FAILED,
         )

@@ -972,3 +972,46 @@ async def test_a_failed_run_posts_the_failure_alert_off_the_event_loop(fake_redi
     assert [c.kwargs["source"] for c in alert.call_args_list] == ["votebot_eval.failure"]
     assert "some error" in alert.call_args.args[0]
     assert "post_eval_slack_alerts" in to_thread_calls
+
+
+@pytest.mark.asyncio
+async def test_the_operator_alerts_are_still_sent_when_the_zapier_push_crashes(fake_redis_store, monkeypatch, tmp_path):
+    """Neither path may stop the other: a Zapier push that raises must not skip the CAMS alert, on the failed-run
+    path or the finished-run path, and must not change the run's result."""
+    monkeypatch.setattr("ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store)
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
+    )
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.resolve_votebot_path", lambda c: str(tmp_path))
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+    mode = {"fail": False}
+
+    def fake_run(cmd, **kwargs):
+        m = MagicMock()
+        m.stderr = b"some error"
+        if mode["fail"]:
+            m.returncode = 1
+            return m
+        with open(cmd[cmd.index("--output") + 1], "w") as f:
+            json.dump({"headline": _BAD_HEADLINE}, f)
+        m.returncode = 0
+        return m
+
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+    settings = MagicMock(zapier_webhook_url="https://hooks.zapier.example/x")
+
+    with patch("ddp_sync.pipelines.votebot_eval.post_alert", return_value=True) as alert, patch(
+        "ddp_sync.pipelines.votebot_eval.push_eval_alert", side_effect=RuntimeError("zapier is down")
+    ):
+        finished = await run_votebot_eval(days=7, settings=settings)
+        assert finished["success"] is True
+        assert {c.kwargs["source"] for c in alert.call_args_list} == {
+            "votebot_eval.regression", "votebot_eval.bill_history_leak"
+        }
+        alert.reset_mock()
+        mode["fail"] = True
+        failed = await run_votebot_eval(days=7, settings=settings)
+        assert failed["success"] is False
+        assert [c.kwargs["source"] for c in alert.call_args_list] == ["votebot_eval.failure"]
