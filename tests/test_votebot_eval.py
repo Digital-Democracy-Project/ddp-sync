@@ -829,3 +829,146 @@ async def test_run_votebot_eval_lock_ttl_matches_timeout_plus_safety(
     assert lock_set_calls[0][1] == 4020, (
         f"expected lock TTL 3720+300=4020, got {lock_set_calls[0][1]}"
     )
+
+
+# -----------------------------------------------------------------------------
+# SYNC-138: the operator-alert path for a bad run (post_alert, not the Zap)
+# -----------------------------------------------------------------------------
+
+_BAD_HEADLINE = {"n_query_processed": 100, "citation_rate": 0.1, "pass_rate": 0.5, "bill_history_leak_count": 3}
+
+
+def _eval_alerts(headline, regressions, **kwargs):
+    with patch("ddp_sync.pipelines.votebot_eval.post_alert", return_value=True) as alert:
+        sent = votebot_eval.post_eval_slack_alerts(
+            headline, regressions, report_path="/tmp/r.json", trigger="scheduled", **kwargs
+        )
+    return sent, alert
+
+
+def test_a_healthy_run_posts_no_slack_alert():
+    headline = {"n_query_processed": 100, "citation_rate": 0.3, "pass_rate": 0.5, "bill_history_leak_count": 0}
+    sent, alert = _eval_alerts(headline, detect_regressions(headline, last_run=None, config=None))
+    assert sent == []
+    alert.assert_not_called()
+
+
+def test_a_failed_run_posts_one_failure_alert_with_its_own_source_and_dedupe_key():
+    sent, alert = _eval_alerts({}, [], error="exit code 1: boom")
+    assert sent == ["failure"]
+    alert.assert_called_once()
+    text = alert.call_args.args[0]
+    assert "failed" in text and "boom" in text and "/tmp/r.json" in text
+    assert alert.call_args.kwargs == {"source": "votebot_eval.failure", "dedupe_key": "votebot_eval:failure"}
+
+
+def test_a_regression_and_a_leak_are_two_messages_and_the_leak_is_not_repeated_in_the_regression_text():
+    regressions = detect_regressions(_BAD_HEADLINE, last_run=None, config=None)
+    assert {r["metric"] for r in regressions} == {"bill_history_leak_count", "citation_rate"}  # the leak is in the list
+    sent, alert = _eval_alerts(_BAD_HEADLINE, regressions)
+    assert sent == ["regression", "bill_history_leak"]
+    by_source = {c.kwargs["source"]: c for c in alert.call_args_list}
+    assert set(by_source) == {"votebot_eval.regression", "votebot_eval.bill_history_leak"}
+    assert "citation_rate" in by_source["votebot_eval.regression"].args[0]
+    assert "bill_history_leak_count" not in by_source["votebot_eval.regression"].args[0]
+    assert "bill_history_leak_count = 3" in by_source["votebot_eval.bill_history_leak"].args[0]
+    assert by_source["votebot_eval.bill_history_leak"].kwargs["dedupe_key"] == "votebot_eval:bill_history_leak"
+
+
+def test_a_leak_alone_posts_only_the_leak_message():
+    headline = {"n_query_processed": 100, "citation_rate": 0.3, "pass_rate": 0.5, "bill_history_leak_count": 2}
+    sent, alert = _eval_alerts(headline, detect_regressions(headline, last_run=None, config=None))
+    assert sent == ["bill_history_leak"]
+    alert.assert_called_once()
+
+
+def test_nothing_is_reported_sent_when_post_alert_fails():
+    with patch("ddp_sync.pipelines.votebot_eval.post_alert", return_value=False):
+        sent = votebot_eval.post_eval_slack_alerts(
+            {}, [], report_path="/tmp/r.json", trigger="scheduled", error="boom"
+        )
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_with_a_regression_and_a_leak_posts_both_alerts_off_the_event_loop(
+    fake_redis_store, monkeypatch, tmp_path
+):
+    """The success path end to end: the eval script 'writes' a report, the run detects the regression and the leak,
+    pushes the Zapier summary as before, and also sends the two operator alerts through asyncio.to_thread."""
+    monkeypatch.setattr("ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store)
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
+    )
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.resolve_votebot_path", lambda c: str(tmp_path))
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+
+    def fake_run(cmd, **kwargs):
+        output = cmd[cmd.index("--output") + 1]
+        with open(output, "w") as f:
+            json.dump({"headline": _BAD_HEADLINE}, f)
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b""
+        return m
+
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    to_thread_calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spying_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", ""))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.asyncio.to_thread", spying_to_thread)
+
+    with patch("ddp_sync.pipelines.votebot_eval.post_alert", return_value=True) as alert, patch(
+        "ddp_sync.pipelines.votebot_eval.push_eval_alert", return_value=True
+    ) as zap:
+        result = await run_votebot_eval(days=7, settings=MagicMock(zapier_webhook_url="https://hooks.zapier.example/x"))
+
+    assert result["success"] is True
+    zap.assert_called_once()  # the Zap keeps getting its summary until its Slack step is turned off
+    assert {c.kwargs["source"] for c in alert.call_args_list} == {
+        "votebot_eval.regression", "votebot_eval.bill_history_leak"
+    }
+    assert "post_eval_slack_alerts" in to_thread_calls
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_posts_the_failure_alert_off_the_event_loop(fake_redis_store, monkeypatch, tmp_path):
+    monkeypatch.setattr("ddp_sync.services.redis_store.get_redis_store", lambda: fake_redis_store)
+    monkeypatch.setattr(
+        "ddp_sync.pipelines.votebot_eval.validate_votebot_path",
+        lambda p: (True, None, __import__("pathlib").Path(p) / ".venv" / "bin" / "python"),
+    )
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.resolve_votebot_path", lambda c: str(tmp_path))
+    (tmp_path / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "bin" / "python").touch()
+
+    def fake_run(*a, **kw):
+        m = MagicMock()
+        m.returncode = 1
+        m.stderr = b"some error"
+        return m
+
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.subprocess.run", fake_run)
+
+    to_thread_calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spying_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", ""))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("ddp_sync.pipelines.votebot_eval.asyncio.to_thread", spying_to_thread)
+
+    with patch("ddp_sync.pipelines.votebot_eval.post_alert", return_value=True) as alert:
+        await run_votebot_eval(days=7, settings=MagicMock(zapier_webhook_url=""))
+
+    assert [c.kwargs["source"] for c in alert.call_args_list] == ["votebot_eval.failure"]
+    assert "some error" in alert.call_args.args[0]
+    assert "post_eval_slack_alerts" in to_thread_calls
