@@ -85,6 +85,13 @@ KEY_MAP = {
     # them its alerts post as CodeBot with the default :robot_face: icon instead of :codebot:.
     "codebot_slack_username": "CODEBOT_SLACK_USERNAME",
     "codebot_slack_icon_emoji": "CODEBOT_SLACK_ICON_EMOJI",
+    # SYNC-132: the CAMS token slack_alerts.post_alert presents to CAMS's /api/v1/operator-alerts (owner decision
+    # 2026-10-28: the regular CAMS token, no second token). Deliberately NOT stored under the key `cams_api_token`:
+    # get_settings() copies every secret key that matches a SyncSettings field, and a set `cams_api_token` is the
+    # code's "this host is the Mac" signal (openstates_archive._mac_capable(), replica routing in ingestion/sources/
+    # openstates.py), so that key would send EC2's replica reads to localhost:8002 and make it behave like the Mac
+    # at the next process start. `operator_alert_token` is not a SyncSettings field; only post_alert reads it.
+    "operator_alert_token": "OPERATOR_ALERT_TOKEN",
     # SYNC-59: this EC2 process's Bearer token for calling the Mac Studio's own ddp-sync
     # (/trigger/scraper-session-legbot), to trigger LegBot after a cloud-owned scrape's
     # RDS-load finishes. Must match the Mac's own DDP_SYNC_API_KEY exactly -- a fresh one was

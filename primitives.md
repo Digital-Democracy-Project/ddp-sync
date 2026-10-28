@@ -405,9 +405,18 @@ that correcting it clears the signature. Mac first.
 
 **Every alert posted to Slack with `chat.postMessage` goes through one function. Don't write another `requests.post` to it.**
 
-- **`post_alert(text, *, source, channel=None) -> bool`** (`slack_alerts.py`) — posts to the alerts channel
+- **`post_alert(text, *, source, channel=None, dedupe_key=None) -> bool`** (`slack_alerts.py`) — **route first
+  (SYNC-132):** when `OPERATOR_ALERT_URL` and a token (`OPERATOR_ALERT_TOKEN`, else `CAMS_API_TOKEN`) are set and
+  `OPERATOR_ALERT_VIA_CAMS` is not `false`, POSTs `{v:1, source:"ddp-sync/<source>", text, channel?, dedupe_key?}` to
+  ddp-agents' `/api/v1/operator-alerts` (5s, no redirects); any 2xx (`queued`, `duplicate`, `dropped_rate_limited`)
+  means done, anything else logs `operator_alert_rejected` / `operator_alert_cams_unreachable` and falls through to
+  the direct post. `source` must match `[a-z0-9._-]{1,40}` (the route's format; a test scans every caller). The token
+  is the main CAMS token: it is scrubbed from logs and goes only to `OPERATOR_ALERT_URL`. **Never read the token from
+  `get_settings().cams_api_token`, and never store it in `ddp-sync/credentials` under `cams_api_token`**: that field
+  is the code's "this host is the Mac" signal (`_mac_capable()`, replica routing), so EC2 would start behaving like
+  the Mac. **Direct post:** the alerts channel
   (`HEALTH_ALERT_SLACK_CHANNEL`, default `#automation-errors`) with `SLACK_BOT_TOKEN`, 15s timeout, **as CodeBot**.
-  Never raises; returns whether Slack accepted it. `source` (e.g. `"openstates_scrape.scrape_failure"`) names the
+  Never raises; returns whether CAMS queued it or Slack accepted it. Via the route the channel comes from CAMS's own map. `source` (e.g. `"openstates_scrape.scrape_failure"`) names the
   caller in the log line. A missing token or a refused post logs `slack_alert_not_sent_no_token` /
   `slack_alert_failed` / `slack_alert_error` (with `source`) instead of a per-site event.
 - **`codebot_identity() -> dict`** (`slack_identity.py`) — the `username` / `icon_emoji` fields. Mirrors

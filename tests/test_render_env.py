@@ -42,3 +42,18 @@ def test_the_codebot_persona_is_written_when_the_secret_has_it(tmp_path):
 def test_absent_or_empty_keys_are_left_out_so_the_code_defaults_apply(tmp_path):
     got = _render(tmp_path, '{"slack_bot_token": "xoxb-t", "codebot_slack_icon_emoji": ""}')
     assert "CODEBOT_SLACK_ICON_EMOJI" not in got and "CODEBOT_SLACK_USERNAME" not in got
+
+
+def test_the_cams_token_is_written_as_the_alert_only_variable(tmp_path):
+    """SYNC-132: the token for the operator-alert route reaches EC2's container as OPERATOR_ALERT_TOKEN."""
+    got = _render(tmp_path, '{"slack_bot_token": "xoxb-t", "operator_alert_token": "tok"}')
+    assert got["OPERATOR_ALERT_TOKEN"] == "tok"
+    assert "CAMS_API_TOKEN" not in got
+
+
+def test_a_cams_api_token_secret_key_is_never_rendered_into_the_env(tmp_path):
+    """`cams_api_token` set is the code's "this host is the Mac" signal (openstates_archive._mac_capable(), replica
+    routing), so it must not reach EC2's environment even if the secret carries it. (The app also reads the secret
+    directly through get_settings(); that is why the token's secret key is `operator_alert_token`, see render-env.sh.)"""
+    got = _render(tmp_path, '{"slack_bot_token": "xoxb-t", "cams_api_token": "tok"}')
+    assert "CAMS_API_TOKEN" not in got and "OPERATOR_ALERT_TOKEN" not in got
