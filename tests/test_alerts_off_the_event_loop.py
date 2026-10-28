@@ -43,7 +43,9 @@ def _own_calls(func: ast.AST):
 def test_no_async_function_calls_a_blocking_alert_directly():
     """`post_alert`, and every plain function in the package that calls it (`_alert_scrape_failure`,
     `_alert_archive_failure`, ...), is blocking. An `async def` must hand it to `asyncio.to_thread`
-    (which takes the function as an argument, so it is not a call here)."""
+    (which takes the function as an argument, so it is not a call here). The scan follows one hop (a plain function
+    that calls `post_alert` directly) and plain names only: it guards today's call shapes, not every way a
+    future one could be written."""
     trees = {path: ast.parse(path.read_text()) for path in (_SRC / "ddp_sync").rglob("*.py")}
     blocking = {"post_alert"}
     for tree in trees.values():
