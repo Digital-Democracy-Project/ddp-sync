@@ -120,6 +120,13 @@ services:
       # that EC2 is on) -- flagged to the dev agent to confirm/flip if needed.
       - LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED=true
       - MAC_DDP_SYNC_BASE_URL=http://10.0.0.8:8001
+      # SYNC-132: alerts try the Mac's CAMS first over WireGuard (reachable from the EC2 broker host: /api/v1/health
+      # answered 200 in 0.03 s on 2026-10-26, INFRA-12) and fall back to a direct Slack post on any failure. Not a
+      # secret, so it lives here like the two addresses above; the token is OPERATOR_ALERT_TOKEN from render-env.sh.
+      # To go back to direct posts: delete this line (or the secret's operator_alert_token and re-run render-env.sh), then
+      # recreate the container (`docker compose up -d`). OPERATOR_ALERT_VIA_CAMS=false is NOT wired here: render-env.sh
+      # rewrites ../.env, so a hand-added line would not survive. A CAMS-sent alert logs operator_alert_sent_via_cams.
+      - OPERATOR_ALERT_URL=http://10.0.0.8:8000/api/v1/operator-alerts
       # SYNC-59/SYNC-65's "known partial-rollout gap": this host's own RDS-backed api-v3
       # (OPEN-279), on the host's own network (different Docker network than this container,
       # confirmed reachable via this address, not localhost). RDS_OPENSTATES_API_KEY (the
