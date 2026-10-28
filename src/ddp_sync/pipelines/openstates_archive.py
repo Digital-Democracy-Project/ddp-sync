@@ -260,7 +260,7 @@ async def _run_archive(
             # Whole process group killed above, before run-archive.sh's own ERR trap ever got
             # a chance to run -- it never alerted on this one. We're the only ones who know it
             # happened, so we're the only ones who can alert.
-            _alert_archive_failure(jurisdiction, f"timed out after {timeout}s", duration)
+            await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"timed out after {timeout}s", duration)
             return {
                 "success": False,
                 "error": "timeout",
@@ -283,7 +283,7 @@ async def _run_archive(
                 # run-archive.sh's own ERR trap only fires on an ordinary command failure inside
                 # the script, not on the script's own process receiving a terminating signal --
                 # so unlike a plain nonzero exit, this one was never self-alerted.
-                _alert_archive_failure(jurisdiction, f"killed by signal {-returncode}", duration)
+                await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"killed by signal {-returncode}", duration)
             # else (positive returncode): run-archive.sh's own ERR trap already fired its
             # Slack/CAMS alert from inside the process before exiting nonzero -- alerting again
             # here would double-page for the exact same failure.
@@ -312,7 +312,7 @@ async def _run_archive(
         # Something failed before/while invoking the subprocess itself (e.g. the script or
         # openstates_root path doesn't exist) -- run-archive.sh never started, so it never had
         # a chance to alert either.
-        _alert_archive_failure(jurisdiction, str(e), duration)
+        await asyncio.to_thread(_alert_archive_failure, jurisdiction, str(e), duration)
         return {
             "success": False,
             "error": str(e),
@@ -452,7 +452,7 @@ async def _run_archive_fargate(
         logger.error(
             "openstates_archive: fargate launch failed", jurisdiction=jurisdiction, detail=detail
         )
-        _alert_archive_failure(jurisdiction, f"fargate run_task failed: {detail}", duration)
+        await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"fargate run_task failed: {detail}", duration)
         return {
             "success": False,
             "error": f"run_task_failed: {detail}",
@@ -474,7 +474,7 @@ async def _run_archive_fargate(
             detail=wait_detail,
             duration_seconds=duration,
         )
-        _alert_archive_failure(jurisdiction, f"{error}: {wait_detail}", duration)
+        await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"{error}: {wait_detail}", duration)
         return {
             "success": False,
             "error": error,
@@ -895,7 +895,7 @@ async def _maybe_embed_knowledge_base(
     try:  # an alert is best-effort: building it must never turn a finished embedding run into a hook failure
         text = _backlog_alert_text(jurisdiction, totals, _alert_backlog_over(config))
         if text:
-            _post_slack_alert(text)
+            await asyncio.to_thread(_post_slack_alert, text)
     except Exception as e:  # noqa: BLE001
         logger.error("knowledge_base_alert_error", jurisdiction=jurisdiction, error=str(e))
 

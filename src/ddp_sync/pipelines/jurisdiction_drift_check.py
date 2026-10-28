@@ -20,6 +20,7 @@ Default OFF per host (`JURISDICTION_DRIFT_CHECK_ENABLED`), like the fork check.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -119,7 +120,7 @@ async def run_jurisdiction_drift_check(config: dict | None = None) -> dict[str, 
         )
         alerted = False
         if due:
-            alerted = post_alert(_alert_text(findings, root), source="jurisdiction_drift_check")
+            alerted = await asyncio.to_thread(post_alert, _alert_text(findings, root), source="jurisdiction_drift_check")
         result = {
             "flow": FLOW_KEY, "status": "drift" if problem else "ok", "checked_at": now.isoformat(),
             "signature": sig if problem else "", "findings": findings,
@@ -134,7 +135,7 @@ async def run_jurisdiction_drift_check(config: dict | None = None) -> dict[str, 
         logger.error("jurisdiction_drift_check: failed", error=str(exc))
         # A monitor that cannot run is an alert condition too. Not de-duplicated: a check that breaks should nag.
         try:
-            post_alert(f":warning: jurisdiction drift check could not run on this host: {exc}", source="jurisdiction_drift_check")
+            await asyncio.to_thread(post_alert, f":warning: jurisdiction drift check could not run on this host: {exc}", source="jurisdiction_drift_check")
         except Exception:  # noqa: BLE001 - never let the alert path escape into the scheduler
             logger.error("jurisdiction_drift_check: failure alert also failed")
         return {"flow": FLOW_KEY, "status": "error", "error": str(exc)}
