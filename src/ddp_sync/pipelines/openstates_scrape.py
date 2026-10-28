@@ -1271,7 +1271,7 @@ async def _run_scrape_impl(
                 stall_seconds=SCRAPE_STALL_SECONDS,
                 duration_seconds=duration,
             )
-            _alert_scrape_failure(
+            await asyncio.to_thread(_alert_scrape_failure,
                 label,
                 f"stalled — no new bill files for {SCRAPE_STALL_SECONDS}s "
                 f"(killed after {duration:.0f}s; the wall-clock ceiling was {timeout}s)",
@@ -1300,7 +1300,7 @@ async def _run_scrape_impl(
             # Whole process group killed above, before run-scrape.sh's own ERR trap ever got a
             # chance to run — it never alerted on this one. We're the only ones who know it
             # happened, so we're the only ones who can alert.
-            _alert_scrape_failure(label, f"timed out after {timeout}s", duration)
+            await asyncio.to_thread(_alert_scrape_failure, label, f"timed out after {timeout}s", duration)
             return {
                 "success": False,
                 "error": "timeout",
@@ -1331,7 +1331,7 @@ async def _run_scrape_impl(
                 # failure inside the script, not on the script's own process receiving a
                 # terminating signal — so unlike a plain nonzero exit, this one was never
                 # self-alerted, and we're the only ones who saw it.
-                _alert_scrape_failure(label, f"killed by signal {-returncode}", duration)
+                await asyncio.to_thread(_alert_scrape_failure, label, f"killed by signal {-returncode}", duration)
             # else (positive returncode): run-scrape.sh's own on_failure() already fired its
             # Slack/CAMS alert from inside the process before exiting nonzero — alerting again
             # here would double-page for the exact same failure.
@@ -1370,7 +1370,7 @@ async def _run_scrape_impl(
         # Something failed before/while invoking the subprocess itself (e.g. the script or
         # openstates_root path doesn't exist) — run-scrape.sh never started, so it never had a
         # chance to alert either.
-        _alert_scrape_failure(label, str(e), duration)
+        await asyncio.to_thread(_alert_scrape_failure, label, str(e), duration)
         error = str(e)
         return {
             "success": False,
@@ -1503,7 +1503,7 @@ async def _check_sustained_blocking(
                 window=window,
                 threshold=threshold,
             )
-            _alert_sustained_block(jurisdiction, blocked, window)
+            await asyncio.to_thread(_alert_sustained_block, jurisdiction, blocked, window)
 
         # OPEN-139. Gated off by default: this needs a few runs of history before it can say
         # anything, and until then it would only ever be wrong in one direction or the other.
@@ -1513,7 +1513,7 @@ async def _check_sustained_blocking(
                 jurisdiction=jurisdiction,
                 quiet_window=quiet_window,
             )
-            _alert_quiet_jurisdiction(jurisdiction, quiet_window)
+            await asyncio.to_thread(_alert_quiet_jurisdiction, jurisdiction, quiet_window)
 
 
 # ---------------------------------------------------------------------------
@@ -1562,7 +1562,7 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
             })
             # We killed the script's whole process group, so its own ERR trap never ran and it
             # never alerted. We're the only ones who know this happened.
-            _alert_scrape_failure("patch refresh", "timed out after 300s", duration)
+            await asyncio.to_thread(_alert_scrape_failure, "patch refresh", "timed out after 300s", duration)
             return {"success": False, "error": "timeout", "duration_seconds": duration}
 
         if returncode != 0:
@@ -1581,7 +1581,7 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            _alert_scrape_failure("patch refresh", f"exited {returncode}: {stderr[-200:]}", duration)
+            await asyncio.to_thread(_alert_scrape_failure, "patch refresh", f"exited {returncode}: {stderr[-200:]}", duration)
             return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_patch_refresh: done", duration_seconds=duration)
@@ -1859,7 +1859,7 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "error": "timeout",
                 "duration_seconds": duration,
             })
-            _alert_scrape_failure("people refresh", "timed out after 3600s", duration)
+            await asyncio.to_thread(_alert_scrape_failure, "people refresh", "timed out after 3600s", duration)
             return {"success": False, "error": "timeout", "duration_seconds": duration}
 
         if returncode != 0:
@@ -1878,7 +1878,7 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
                 "error": f"exit_code_{returncode}",
                 "duration_seconds": duration,
             })
-            _alert_scrape_failure("people refresh", f"exited {returncode}: {stderr_tail[-200:]}", duration)
+            await asyncio.to_thread(_alert_scrape_failure, "people refresh", f"exited {returncode}: {stderr_tail[-200:]}", duration)
             return {"success": False, "error": f"exit_code_{returncode}", "duration_seconds": duration}
 
         logger.info("openstates_people_refresh: done", duration_seconds=duration)
@@ -1955,7 +1955,7 @@ async def run_people_pull_job(config: dict | None = None) -> dict[str, Any]:
         await _write_flow_status("openstates_people_pull", record)
         if status == "failed":
             logger.error("openstates_people_pull: failed", error=error, duration_seconds=duration)
-            _alert_scrape_failure("people pull", error or "unknown error", duration)
+            await asyncio.to_thread(_alert_scrape_failure, "people pull", error or "unknown error", duration)
         return {"success": status == "completed", "error": error, "duration_seconds": duration, **extra}
 
     try:

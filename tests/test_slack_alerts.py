@@ -214,7 +214,16 @@ def test_every_alert_source_is_a_valid_route_source():
     seen = []
     for path in src.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "post_alert":
+            if not isinstance(node, ast.Call):
+                continue
+            direct = getattr(node.func, "id", getattr(node.func, "attr", "")) == "post_alert"
+            # async callers send it as `asyncio.to_thread(post_alert, text, source=...)` (SYNC-137)
+            threaded = (
+                getattr(node.func, "attr", "") == "to_thread"
+                and bool(node.args)
+                and getattr(node.args[0], "id", "") == "post_alert"
+            )
+            if direct or threaded:
                 kw = {k.arg: k.value for k in node.keywords}
                 assert isinstance(kw.get("source"), ast.Constant), f"{path.name}:{node.lineno} needs a literal source"
                 assert pattern.match(f"ddp-sync/{kw['source'].value}"), f"{path.name}:{node.lineno} {kw['source'].value!r}"

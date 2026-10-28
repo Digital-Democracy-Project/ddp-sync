@@ -412,7 +412,7 @@ that correcting it clears the signature. Mac first.
   means done, anything else logs `operator_alert_rejected` / `operator_alert_cams_unreachable` and falls through to
   the direct post (a CAMS-sent alert logs `operator_alert_sent_via_cams`, so route delivery is told apart from the
   fallback; to turn the route off on EC2 delete the `OPERATOR_ALERT_URL` line in `docker-compose.prod.yml` and recreate the
-  container, since `render-env.sh` rewrites `.env`). `source` must match `[a-z0-9._-]{1,40}` (the route's format; a test scans every caller). The token
+  container, since `render-env.sh` rewrites `.env`). `source` must match `[a-z0-9._-]{1,40}` (the route's format; a test scans every caller). **`post_alert` blocks (up to ~20s with the route unreachable): from an `async def` send it with `await asyncio.to_thread(post_alert, ...)` (SYNC-137; the same for the plain helpers that call it, e.g. `_alert_scrape_failure`); `tests/test_alerts_off_the_event_loop.py` fails if an async function calls one directly.** The token
   is the main CAMS token: it is scrubbed from logs and goes only to `OPERATOR_ALERT_URL`. **Never read the token from
   `get_settings().cams_api_token`, and never store it in `ddp-sync/credentials` under `cams_api_token`**: that field
   is the code's "this host is the Mac" signal (`_mac_capable()`, replica routing), so EC2 would start behaving like

@@ -289,7 +289,7 @@ async def run_fork_upstream_check_job(config: dict | None = None) -> dict[str, A
         alerts.append(f":x: *fork upstream check could not write its status file* ({e}); alerts may repeat.")
 
     for text in alerts:
-        post_alert(text, source="fork_upstream_check")
+        await asyncio.to_thread(post_alert, text, source="fork_upstream_check")
 
     failed = [n for n, e in repos.items() if e["status"] == "failed"]
     duration = round(time.monotonic() - start, 1)

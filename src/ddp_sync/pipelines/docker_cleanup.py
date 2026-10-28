@@ -60,7 +60,7 @@ async def _run_once(script_path: str, timeout_seconds: int) -> dict:
     duration = round(time.monotonic() - t, 1)
     if error:
         logger.error("docker_cleanup: failed", error=error, duration_seconds=duration)
-        post_alert(
+        await asyncio.to_thread(post_alert,
             f":red_circle: Nightly Docker cleanup failed ({error[:200]}). "
             "See ddp-agents logs/docker-prune.log.",
             source="docker_cleanup",
