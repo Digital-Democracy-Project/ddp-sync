@@ -14,6 +14,8 @@ def _no_operator_alert_route(monkeypatch):
     posts a test sees). The route's own tests set these back."""
     for name in ("OPERATOR_ALERT_URL", "OPERATOR_ALERT_TOKEN", "OPERATOR_ALERT_VIA_CAMS"):
         monkeypatch.delenv(name, raising=False)
+    # SYNC-138: nor may the direct fallback post a test's alert to real Slack with a developer's token.
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
 
 
 def pytest_collection_modifyitems(config, items):

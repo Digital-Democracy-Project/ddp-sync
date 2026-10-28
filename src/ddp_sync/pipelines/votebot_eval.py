@@ -38,6 +38,7 @@ import requests
 import structlog
 
 from ddp_sync.config import Settings, get_settings
+from ddp_sync.slack_alerts import post_alert
 
 logger = structlog.get_logger()
 
@@ -427,6 +428,49 @@ def push_eval_alert(
     return False
 
 
+def post_eval_slack_alerts(
+    headline: dict,
+    regression_details: list[dict],
+    *,
+    report_path: str,
+    trigger: str,
+    error: str | None = None,
+) -> list[str]:
+    """Tell the operators about a bad eval run through ``post_alert`` (SYNC-138), one message per problem.
+
+    Zapier cannot reach CAMS, so the Zap behind ``push_eval_alert`` cannot use the operator-alert route; this can.
+    Posts only for the three cases the Zap's filters routed on: a failed run, a regression, a bill-history leak.
+    A healthy run posts nothing here (``push_eval_alert`` still carries the full summary). Each case has its own
+    ``source`` and ``dedupe_key``, so CAMS posts a repeat of the same case once a day (its default window is 24 h,
+    and this job runs weekly, so two scheduled runs never share a window; a manual re-run within a day of the same
+    problem is deliberately not posted again). Blocking, like
+    ``post_alert`` (which never raises, so neither does this): call it with ``asyncio.to_thread``.
+    Returns the cases that were sent.
+    """
+    where = f"(trigger: {trigger}; report: {report_path})"
+    leak = headline.get("bill_history_leak_count") or 0
+    # the leak is also in `regression_details` (type leak_canary); it gets its own message below, so skip it here
+    regressions = [r for r in regression_details if r.get("metric") != "bill_history_leak_count"]
+    sent: list[str] = []
+    if error is not None:
+        text = f":red_circle: *VoteBot eval run failed* — {error[:300]} {where}"
+        if post_alert(text, source="votebot_eval.failure", dedupe_key="votebot_eval:failure"):
+            sent.append("failure")
+    if regressions:
+        parts = "; ".join(
+            f"{r.get('type', 'regression')}: {r.get('metric')}={r.get('value')} (threshold {r.get('threshold')})"
+            for r in regressions
+        )
+        text = f":warning: *VoteBot eval regression* — {parts} {where}"
+        if post_alert(text, source="votebot_eval.regression", dedupe_key="votebot_eval:regression"):
+            sent.append("regression")
+    if leak > 0:
+        text = f":rotating_light: *VoteBot eval: bill_history_leak_count = {leak}* {where}"
+        if post_alert(text, source="votebot_eval.bill_history_leak", dedupe_key="votebot_eval:bill_history_leak"):
+            sent.append("bill_history_leak")
+    return sent
+
+
 # -----------------------------------------------------------------------------
 # Regression detection (plan §3.2 step 5)
 # -----------------------------------------------------------------------------
@@ -802,6 +846,22 @@ async def _run_eval_holding_lock(
                 error=str(e),
                 metric=METRIC_ALERT_FAILED,
             )
+        # SYNC-138: the operator-alert path for the same three cases, until the Zap's Slack step is turned off.
+        # Its own try, so neither path can stop the other.
+        try:
+            await asyncio.to_thread(
+                post_eval_slack_alerts,
+                headline,
+                regressions,
+                report_path=str(report_path),
+                trigger=trigger,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "votebot_eval: operator alert task crashed",
+                error=str(e),
+                metric=METRIC_ALERT_FAILED,
+            )
 
     # Run-completed metric event (info level — distinct from regression_detected).
     logger.info(
@@ -873,6 +933,18 @@ async def _send_failure_alert(
     except Exception as e:  # noqa: BLE001
         logger.error(
             "votebot_eval: failure-alert task crashed",
+            error=str(e),
+            metric=METRIC_ALERT_FAILED,
+        )
+    # SYNC-138: the operator-alert path for the failed run, until the Zap's Slack step is turned off. Its own
+    # try, so neither path can stop the other.
+    try:
+        await asyncio.to_thread(
+            post_eval_slack_alerts, {}, [], report_path=report_path, trigger=trigger, error=error,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "votebot_eval: operator failure-alert task crashed",
             error=str(e),
             metric=METRIC_ALERT_FAILED,
         )
