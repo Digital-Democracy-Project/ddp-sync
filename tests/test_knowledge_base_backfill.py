@@ -144,7 +144,9 @@ class Env:
 
     async def run(self, stages, *, dry_run=False, restart=False, config=None, run_id="r1"):
         source = MagicMock()
-        source.get_current_session_identifier = AsyncMock(return_value=self.session)
+        source.get_current_session_identifiers = AsyncMock(
+            return_value=self.session if isinstance(self.session, list) else ([self.session] if self.session else [])
+        )
         with patch.object(bf, "get_redis_store", return_value=self.redis), \
              patch.object(bf.local_openstates_client, "list_touched_bill_ids", new=self._list), \
              patch.object(bf.local_openstates_client, "fetch_bill_for_embedding", new=self._fetch), \
@@ -214,6 +216,20 @@ async def test_stage_selection_uses_the_session_filter_not_a_detail_fetch_per_bi
     await env.run(["current"])
     assert env.fetched == [A, C]  # only current-session bills were ever fetched (B was not)
     env = Env()
+    await env.run(["prior-sessions"])
+    assert env.fetched == [B]
+
+
+async def test_two_current_sessions_are_both_current_and_prior_is_everything_else():
+    # SYNC-139: api-v3 can flag two sessions current at once (a special session running)
+    listing = {"2026": [A, C], "2025": [B], None: [A, B, C]}
+    env = Env(listing=listing, session=["2026", "2025"])
+    await env.run(["current"])
+    assert env.fetched == [A, B, C]  # the union of both current sessions' bills
+    env = Env(listing=listing, session=["2026", "2025"])
+    result = await env.run(["prior-sessions"])
+    assert env.fetched == [] and result["status"] == "complete"  # nothing is left over
+    env = Env(listing=listing, session=["2026"])  # one current session: B is prior, as before
     await env.run(["prior-sessions"])
     assert env.fetched == [B]
 
@@ -437,7 +453,7 @@ async def test_a_run_inside_the_window_sleeps_until_it_ends_then_proceeds():
         slept.append(seconds)
 
     source = MagicMock()
-    source.get_current_session_identifier = AsyncMock(return_value="2026")
+    source.get_current_session_identifiers = AsyncMock(return_value=["2026"])
     inside = datetime(2026, 10, 1, 5, 0, tzinfo=timezone.utc)
     with patch.object(bf, "get_redis_store", return_value=env.redis), \
          patch.object(bf.local_openstates_client, "list_touched_bill_ids", new=env._list), \

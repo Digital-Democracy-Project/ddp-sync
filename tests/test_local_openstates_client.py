@@ -38,9 +38,11 @@ def _patch_async_client(mock_client):
 
 
 def _patch_current_session(session_code):
+    """session_code: one identifier, None (unknown) or a list (several current sessions)."""
+    codes = session_code if isinstance(session_code, list) else ([session_code] if session_code else [])
     return patch(
-        "ddp_sync.ingestion.sources.openstates.OpenStatesSource.get_current_session_identifier",
-        new=AsyncMock(return_value=session_code),
+        "ddp_sync.ingestion.sources.openstates.OpenStatesSource.get_current_session_identifiers",
+        new=AsyncMock(return_value=codes),
     )
 
 
@@ -161,7 +163,7 @@ async def test_truncates_to_limit():
 @pytest.mark.asyncio
 async def test_explicit_session_code_skips_current_session_resolution():
     """Step 1's own real need (session-targeted, not just 'current') --
-    supplying session_code bypasses get_current_session_identifier entirely,
+    supplying session_code bypasses get_current_session_identifiers entirely,
     and that value is what's sent as the session query param and stamped
     on every returned candidate."""
     mock_client = AsyncMock()
@@ -180,7 +182,7 @@ async def test_explicit_session_code_skips_current_session_resolution():
         "ddp_sync.services.local_openstates_client.get_settings",
         return_value=_FakeSettings(),
     ), _patch_async_client(mock_client), patch(
-        "ddp_sync.ingestion.sources.openstates.OpenStatesSource.get_current_session_identifier",
+        "ddp_sync.ingestion.sources.openstates.OpenStatesSource.get_current_session_identifiers",
         new=AsyncMock(side_effect=AssertionError("should not be called when session_code is supplied")),
     ):
         result = await list_current_session_bill_candidates("fl", session_code="2026F", limit=10)

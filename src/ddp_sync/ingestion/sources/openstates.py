@@ -26,19 +26,11 @@ class LegislativeSession:
     start_date: str
     end_date: str
 
-    def is_current(self) -> bool:
-        """Check if this session is currently active."""
-        today = datetime.now().date()
-        try:
-            start = datetime.strptime(self.start_date, "%Y-%m-%d").date()
-            end = datetime.strptime(self.end_date, "%Y-%m-%d").date()
-            return start <= today <= end
-        except (ValueError, TypeError):
-            return False
-
-    def is_primary(self) -> bool:
-        """Check if this is a primary (regular) session."""
-        return self.classification == "primary"
+    # SYNC-139: the one "current / previous" rule lives in api-v3 (OPEN-467), which publishes these two
+    # flags on each session of /jurisdictions/{id}?include=legislative_sessions. None = api-v3 did not
+    # send the flag (an older api-v3); it is never guessed from the dates here.
+    is_current: bool | None = None
+    is_previous: bool | None = None
 
 
 @dataclass
@@ -58,26 +50,16 @@ class JurisdictionInfo:
     sessions: list[LegislativeSession] = field(default_factory=list)
     organizations: list[dict[str, Any]] = field(default_factory=list)
 
-    def get_current_session(self) -> LegislativeSession | None:
-        """Get the currently active session, preferring primary sessions."""
-        # First try to find an active primary session
-        for session in self.sessions:
-            if session.is_current() and session.is_primary():
-                return session
+    def flags_published(self) -> bool:
+        """True when api-v3 sent is_current on every one of this jurisdiction's sessions.
 
-        # Fall back to any active session (including special)
-        for session in self.sessions:
-            if session.is_current():
-                return session
+        One session without it means a partial answer: unknown, never read as "not current".
+        """
+        return bool(self.sessions) and all(session.is_current is not None for session in self.sessions)
 
-        # If no active session, return the most recent primary session
-        primary_sessions = [s for s in self.sessions if s.is_primary()]
-        if primary_sessions:
-            # Sort by start_date descending
-            primary_sessions.sort(key=lambda s: s.start_date, reverse=True)
-            return primary_sessions[0]
-
-        return None
+    def current_sessions(self) -> list[LegislativeSession]:
+        """The sessions api-v3 flags is_current. Usually one; two while a special session runs (VA, UT)."""
+        return [session for session in self.sessions if session.is_current]
 
     def get_session_by_identifier(self, identifier: str) -> LegislativeSession | None:
         """Get a session by its identifier (e.g., '2026', '2025A')."""
@@ -287,6 +269,8 @@ class OpenStatesSource:
                         classification=session_data.get("classification", ""),
                         start_date=session_data.get("start_date", ""),
                         end_date=session_data.get("end_date", ""),
+                        is_current=session_data.get("is_current"),
+                        is_previous=session_data.get("is_previous"),
                     )
                 )
 
@@ -320,22 +304,29 @@ class OpenStatesSource:
                 organizations=data.get("organizations", []),
             )
 
-    async def get_current_session_identifier(self, jurisdiction: str) -> str | None:
+    async def get_current_session_identifiers(self, jurisdiction: str) -> list[str]:
         """
-        Get the current session identifier for a jurisdiction.
+        The current session identifiers for a jurisdiction, as flagged by api-v3 (SYNC-139).
 
         Args:
             jurisdiction: State abbreviation (e.g., 'fl', 'wa')
 
         Returns:
-            Session identifier (e.g., '2026', '119') or None
+            Usually one identifier (e.g., '2026', '119'); two while a special session is active.
+            An empty list means "could not tell" (api-v3 unreachable, or it did not publish the
+            flag): callers skip the jurisdiction rather than guess.
         """
         info = await self.fetch_jurisdiction(jurisdiction)
-        if info:
-            session = info.get_current_session()
-            if session:
-                return session.identifier
-        return None
+        if not info:
+            return []
+        if not info.flags_published():
+            logger.error(
+                "api-v3 did not publish is_current on this jurisdiction's sessions; "
+                "no current session can be named (needs api-v3 with OPEN-467)",
+                jurisdiction=jurisdiction,
+            )
+            return []
+        return [session.identifier for session in info.current_sessions()]
 
     async def _build_legislator_mapping(self) -> None:
         """

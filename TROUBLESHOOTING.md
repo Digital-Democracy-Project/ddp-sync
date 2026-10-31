@@ -42,7 +42,7 @@ Known issues, past bugs, and their resolutions. Entries are grouped by subsystem
 
 1. **Null `end_date` from OpenStates** (WA, UT) — `_check_live_sessions()` required both dates non-None. Fix: treat `end_date=None` with valid `start_date` as active.
 2. **Stale `end_date` for multi-year sessions** (MI) — Session `2025-2026` has `end_date=2025-12-31`. Fix: parse years from identifier and check if current year is in range.
-3. **Non-standard session identifiers** (AZ `57th-2nd-regular`, MA `194th`) — Regex `\d{4}` finds no year. Fix: switched to `is_current_session_async()` which queries OpenStates API directly.
+3. **Non-standard session identifiers** (AZ `57th-2nd-regular`, MA `194th`) — Regex `\d{4}` finds no year. Fix: switched to `is_current_session_async()`, which since SYNC-139 reads api-v3's `is_current` flag (no date rule in ddp-sync).
 4. **Wrong Webflow field name** (all states) — Code read `session-year` (nonexistent). Actual field is `bill-session` (integer). Fix: `str(fields.get("bill-session", ""))`.
 
 **Files:** `services/legislative_calendar.py`, `pipelines/bill_version.py`, `pipelines/bill_sync.py`

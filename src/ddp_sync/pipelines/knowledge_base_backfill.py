@@ -7,7 +7,7 @@ same code the live hook runs, narrowed by an `EmbedScope`, so live and backfill 
 diverge and an already-embedded document is skipped by the same content-hash check.
 
 Stages, in order (`STAGES`). "Current" is api-v3's own newest classifiable version of a bill and
-"current session" is the jurisdiction's current session (`OpenStatesSource`), nothing re-derived:
+"current session" is what api-v3 flags `is_current` (`OpenStatesSource.get_current_session_identifiers`, one or more), nothing re-derived:
 
 1. `current`        current version text of every current-session bill
 2. `diffs`          the `bill-version-diff` documents of every bill. NOT part of a default run and not to be run:
@@ -139,14 +139,17 @@ async def _select_bills(
         return set(result[0])
 
     if stage in ("current", "prior-sessions"):
-        session = await OpenStatesSource().get_current_session_identifier(jurisdiction)
-        if not session:
+        sessions = await OpenStatesSource().get_current_session_identifiers(jurisdiction)
+        if not sessions:
             logger.error("knowledge_base_backfill_failed", run_id=run_id, jurisdiction=jurisdiction,
                          stage=stage, error="current session could not be determined")
             return None
-        current = await listing(session)
-        if current is None:
-            return None
+        current: set[str] = set()
+        for session in sessions:  # more than one while a special session runs (VA, UT)
+            listed = await listing(session)
+            if listed is None:
+                return None
+            current |= listed
         if stage == "current":
             return sorted(current)
         everything = await listing()
