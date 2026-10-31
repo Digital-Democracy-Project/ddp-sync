@@ -895,7 +895,7 @@ class BillSyncService:
             logger.info(
                 "Cached jurisdiction info",
                 jurisdiction=jurisdiction,
-                current_session=info.get_current_session().identifier if info.get_current_session() else None,
+                current_sessions=[s.identifier for s in info.current_sessions()],
                 latest_bill_update=str(info.latest_bill_update) if info.latest_bill_update else None,
             )
 
@@ -910,7 +910,7 @@ class BillSyncService:
         """
         Determine if a bill is from the current legislative session (async version).
 
-        Uses OpenStates API for accurate session detection when available.
+        Reads api-v3's is_current flag (SYNC-139); there is no date-based fallback.
 
         Args:
             session_year: Session year from Webflow (e.g., "2025", "2025-2026")
@@ -920,75 +920,25 @@ class BillSyncService:
         Returns:
             True if this is a current session bill
         """
-        # Try to get accurate session info from OpenStates API
         info = await self.get_jurisdiction_info(jurisdiction)
-        if info:
-            current_session = info.get_current_session()
-            if current_session:
-                # Check if the bill's session matches the current session
-                if session_code and session_code == current_session.identifier:
-                    return True
-                # Also check if session_year matches (some use year format)
-                if session_year and session_year == current_session.identifier:
-                    return True
-                # Check if the session identifier is in the session_year string
-                if session_year and current_session.identifier in session_year:
-                    return True
-
-        # Fall back to heuristic-based detection
-        return self.is_current_session(session_year, session_code, jurisdiction)
-
-    def is_current_session(
-        self,
-        session_year: str | None,
-        session_code: str | None,
-        jurisdiction: str,
-    ) -> bool:
-        """
-        Determine if a bill is from the current legislative session.
-
-        Uses year-based heuristics. For more accurate detection, use
-        is_current_session_async() which queries the OpenStates API.
-
-        Args:
-            session_year: Session year from Webflow (e.g., "2025", "2025-2026")
-            session_code: Session code from Webflow (e.g., "2025", "119")
-            jurisdiction: State code (e.g., "FL", "US")
-
-        Returns:
-            True if this is a current session bill
-        """
-        current_year = date.today().year
-
-        # Handle federal congress (e.g., session_code="119")
-        if jurisdiction.upper() == "US":
-            # 119th Congress: 2025-2027
-            # 118th Congress: 2023-2025
-            # Congress number = (year - 1789) / 2 + 1
-            if session_code and session_code.isdigit():
-                congress_num = int(session_code)
-                congress_start_year = 1789 + (congress_num - 1) * 2
-                congress_end_year = congress_start_year + 2
-                return congress_start_year <= current_year <= congress_end_year
-
-        # Handle state sessions by year
-        if session_year:
-            # Parse years from formats like "2025", "2025-2026", "2025-2027"
-            years = re.findall(r"\d{4}", session_year)
-            if years:
-                years = [int(y) for y in years]
-                # Current if we're within the session years
-                if current_year in years or (len(years) > 1 and years[0] <= current_year <= years[-1]):
-                    return True
-
-        # Fall back to checking session_code as year
-        if session_code:
-            years = re.findall(r"\d{4}", session_code)
-            if years:
-                years = [int(y) for y in years]
-                if current_year in years or (len(years) > 1 and years[0] <= current_year <= years[-1]):
-                    return True
-
+        if not info or not info.flags_published():
+            # SYNC-139: never guess from dates; api-v3's flag is the only answer.
+            logger.warning(
+                "Cannot tell the current session (api-v3 unreachable or no is_current flag); "
+                "treating bill as not current",
+                jurisdiction=jurisdiction,
+            )
+            return False
+        for current_session in info.current_sessions():
+            # Check if the bill's session matches a current session
+            if session_code and session_code == current_session.identifier:
+                return True
+            # Also check if session_year matches (some use year format)
+            if session_year and session_year == current_session.identifier:
+                return True
+            # Check if the session identifier is in the session_year string
+            if session_year and current_session.identifier in session_year:
+                return True
         return False
 
     def should_sync_jurisdiction(self, jurisdiction_code: str) -> bool:

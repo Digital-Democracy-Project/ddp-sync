@@ -679,9 +679,9 @@ async def list_current_session_bill_candidates(
             Step 1's session-targeted use. When omitted (the original,
             still-supported caller in concept_statement_dispatch.py),
             "current session" is resolved via
-            OpenStatesSource.get_current_session_identifier() -- the same
-            session-resolution call bill_sync.py's own
-            is_current_session_async() already makes, not a new
+            OpenStatesSource.get_current_session_identifiers() -- api-v3's
+            is_current flag, the same one bill_sync.py's own
+            is_current_session_async() reads, not a new
             session-detection mechanism. Fully backward-compatible: the
             existing caller passes nothing, behavior is unchanged.
         limit: maximum number of candidates to return, across however many
@@ -744,16 +744,29 @@ async def list_current_session_bill_candidates(
         # the dependency direction local and explicit rather than assumed).
         from ddp_sync.ingestion.sources.openstates import OpenStatesSource
 
-        resolved_session_code = await OpenStatesSource().get_current_session_identifier(
+        current_codes = await OpenStatesSource().get_current_session_identifiers(
             jurisdiction_iso2
         )
-        if not resolved_session_code:
+        if not current_codes:
             logger.warning(
                 "No current session identifier resolved -- skipping jurisdiction "
                 "for this batch run",
                 jurisdiction_iso2=jurisdiction_iso2,
             )
             return []
+        if len(current_codes) > 1:
+            # SYNC-139: more than one current session (a special session running next to
+            # the regular one, VA/UT): list each, sharing the one overall limit.
+            combined: list[dict] = []
+            for code in current_codes:
+                remaining = None if limit is None else limit - len(combined)
+                if remaining is not None and remaining <= 0:
+                    break
+                combined += await list_current_session_bill_candidates(
+                    jurisdiction_iso2, session_code=code, limit=remaining
+                )
+            return combined
+        resolved_session_code = current_codes[0]
 
     settings = get_settings()
     if not settings.local_openstates_api_base:
