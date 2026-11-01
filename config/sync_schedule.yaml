@@ -469,7 +469,13 @@ openstates_scrape:
       container_name: "scraper" # matches the task definition's container name
       memory_bucket: "ddp-openstates-scraper-memory"
       memory_prefix: "prod"     # matches cloud_collector.py's own MEMORY_PREFIX convention
-      max_wait_seconds: 43200   # 12h backstop; MA's cold-start rehearsal run took ~9.5h
+      max_wait_seconds: 43200   # 12h backstop for every state not named below
+      # OPEN-476: MA's weekly run walks every bill (OPEN-128 ignores the start date): 10.35 h on
+      # 10-25, and about 13.8 h at 11-01's slower pace (malegislature.gov answered ~33% slower, no
+      # blocking; OPEN-475). The shared 12 h cut it off and nothing loaded. 24 h per Ramon,
+      # 2026-11-01. Only the named states change; OPEN-477 replaces this limit with a stall check.
+      max_wait_seconds_by_jurisdiction:
+        ma: 86400
       load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
                                   # loads were minutes even for multi-thousand-row jurisdictions
 

@@ -125,7 +125,7 @@ def _generate_run_id(jurisdiction: str) -> str:
     return f"{jurisdiction}-{uuid.uuid4().hex[:12]}"
 
 
-def _fargate_config(config: dict | None) -> dict:
+def _fargate_config(config: dict | None, jurisdiction: str | None = None) -> dict:
     """Raises ValueError -- never anything else -- for every malformed shape, including a
     hand-authored YAML mistake that makes `cloud_path` or `cloud_path.fargate` the wrong type
     (found in independent review: the original version called `.get()` on whatever was there
@@ -154,6 +154,28 @@ def _fargate_config(config: dict | None) -> dict:
     missing = [k for k in required if not cfg.get(k)]
     if missing:
         raise ValueError(f"cloud_path.fargate is missing required config: {', '.join(missing)}")
+
+    # OPEN-476: `max_wait_seconds` is one value for every state, but states need different
+    # ceilings (MA's full walk ran 10.35 h on 10-25 and was heading for ~13.8 h on 11-01 when the
+    # shared 12 h cut it off and nothing loaded). `max_wait_seconds_by_jurisdiction` overrides it
+    # for the named states only, so raising one state's ceiling does not loosen the guard on the
+    # rest. Validated even when no jurisdiction is asked for, so a bad value fails loudly at the
+    # first call instead of only when that one state happens to run.
+    by_state = cfg.get("max_wait_seconds_by_jurisdiction", {})  # absent is fine; blank (null) is not
+    if not isinstance(by_state, dict):
+        raise ValueError(  # noqa: TRY004
+            "cloud_path.fargate.max_wait_seconds_by_jurisdiction must be a mapping, "
+            f"got {type(by_state).__name__}"
+        )
+    for state, seconds in by_state.items():
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            raise ValueError(
+                f"cloud_path.fargate.max_wait_seconds_by_jurisdiction[{state!r}] must be a "
+                f"positive whole number of seconds, got {seconds!r}"
+            )
+    if jurisdiction is not None and jurisdiction in by_state:
+        # A copy: the caller's config dict is shared across jurisdictions and must not change.
+        return {**cfg, "max_wait_seconds": by_state[jurisdiction]}
     return cfg
 
 
@@ -631,7 +653,7 @@ def run_cloud_scrape(
         # docstring), but nesting this inside the outer catch-all below means that guarantee
         # no longer has to hold perfectly forever for this function's own promise to hold.
         try:
-            fargate_cfg = _fargate_config(config)
+            fargate_cfg = _fargate_config(config, jurisdiction)
         except ValueError as e:
             duration = round(time.monotonic() - start, 1)
             logger.error("cloud_scrape: bad config", jurisdiction=jurisdiction, error=str(e))

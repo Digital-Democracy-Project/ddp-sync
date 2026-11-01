@@ -299,6 +299,17 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
+## Cloud scrape wait limit (`pipelines/cloud_scrape_trigger.py`, OPEN-476)
+
+How long ddp-sync waits for a Fargate scrape task before it asks ECS to stop it. One shared value,
+`openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus an optional per-state override,
+`max_wait_seconds_by_jurisdiction: {ma: 86400}`, applied by `_fargate_config(config, jurisdiction)` in
+`run_cloud_scrape()`. The overridden value is the one persisted in the in-flight record, so a resumed job
+replays it. **Do not** read `SCRAPE_TIMEOUT_S` for this: that dict is the older Mac-path ceiling and the cloud
+path never used it (MA's 16 h entry there did nothing on Fargate). The archive block has its own separate
+`max_wait_seconds`, which the override does not touch. OPEN-477 replaces the fixed limit with a stall check;
+until then, a state that needs longer gets an entry here rather than a bigger shared value.
+
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida

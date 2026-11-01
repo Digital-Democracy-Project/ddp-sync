@@ -762,3 +762,104 @@ async def test_reconciliation_tasks_are_retained_and_survive_without_external_re
         await asyncio.sleep(0.2)
 
     assert finished.is_set()
+
+
+# --- OPEN-476: a per-state wait limit, so MA can run longer without loosening the other states ---
+
+
+def _with_overrides(by_state, **fargate):
+    config = _fargate_config(max_wait_seconds=43200, **fargate)
+    config["cloud_path"]["fargate"]["max_wait_seconds_by_jurisdiction"] = by_state
+    return config
+
+
+def test_per_state_wait_overrides_only_the_named_state():
+    config = _with_overrides({"ma": 86400})
+    assert cst._fargate_config(config, "ma")["max_wait_seconds"] == 86400
+    assert cst._fargate_config(config, "fl")["max_wait_seconds"] == 43200
+    assert cst._fargate_config(config)["max_wait_seconds"] == 43200  # no state asked for
+    # the shared config dict is not changed by asking for MA's copy
+    assert config["cloud_path"]["fargate"]["max_wait_seconds"] == 43200
+
+
+def test_per_state_wait_is_used_by_run_cloud_scrape_and_persisted_for_resume():
+    """The value the wait loop receives and the value written to the in-flight record (which a
+    resumed job replays) must both be MA's own, not the shared 12 h."""
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+    )
+    waited_with, persisted = [], []
+
+    def fake_wait(task_arn, fargate_cfg, ecs_client):
+        waited_with.append(fargate_cfg["max_wait_seconds"])
+        return 1, "stopped for the test"  # a failed run: skips the load step
+
+    with (
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger._wait_for_task_stop", side_effect=fake_wait),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.inflight_fargate_jobs.record_started",
+              side_effect=lambda *a: persisted.append(a[4]["max_wait_seconds"])),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
+        cst.run_cloud_scrape("ma", None, "/fake/root", _with_overrides({"ma": 86400}), ecs_client=ecs)
+        cst.run_cloud_scrape("fl", None, "/fake/root", _with_overrides({"ma": 86400}), ecs_client=ecs)
+
+    assert waited_with == [86400, 43200]  # MA, then FL
+    assert persisted == [86400, 43200]
+
+
+@pytest.mark.parametrize("bad", [0, -5, 1.5, "86400", True, None])
+def test_per_state_wait_rejects_values_that_are_not_positive_whole_seconds(bad):
+    with pytest.raises(ValueError, match="max_wait_seconds_by_jurisdiction"):
+        cst._fargate_config(_with_overrides({"ma": bad}), "ma")
+
+
+@pytest.mark.parametrize("bad", [["ma"], [], None, False, 0, ""])
+def test_per_state_wait_must_be_a_mapping(bad):
+    """A blank `max_wait_seconds_by_jurisdiction:` in YAML loads as None. It must fail loudly,
+    not quietly put MA back on the shared 12 h (pm-review, round 1)."""
+    with pytest.raises(ValueError, match="must be a mapping"):
+        cst._fargate_config(_with_overrides(bad), "ma")
+
+
+def test_absent_per_state_wait_is_fine():
+    config = _fargate_config(max_wait_seconds=43200)  # no override key at all
+    assert cst._fargate_config(config, "ma")["max_wait_seconds"] == 43200
+
+
+def test_a_resumed_job_waits_with_the_persisted_per_state_value():
+    """resume_inflight_fargate_job replays the fargate_cfg saved at launch, so the override must
+    survive the round trip through the record (pm-review, round 1: assert it directly)."""
+    record = {
+        "jurisdiction": "ma", "session_arg": None, "task_arn": "arn:task/1",
+        "openstates_root": "/fake/root",
+        "fargate_cfg": cst._fargate_config(_with_overrides({"ma": 86400}), "ma"),
+    }
+    waited_with = []
+
+    def fake_wait(task_arn, fargate_cfg, ecs_client):
+        waited_with.append(fargate_cfg["max_wait_seconds"])
+        return 1, "stopped for the test"
+
+    with (
+        patch("ddp_sync.pipelines.cloud_scrape_trigger._wait_for_task_stop", side_effect=fake_wait),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.inflight_fargate_jobs.clear"),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
+    ):
+        cst.resume_inflight_fargate_job("ma-abc123", record, ecs_client=FakeEcsClient())
+
+    assert waited_with == [86400]
+
+
+def test_real_schedule_gives_ma_24_hours_and_leaves_every_other_state_at_12():
+    """Reads the real sync_schedule.yaml (the file the EC2 host runs), not a fixture, so putting
+    MA back to the shared 12 h, or loosening another state, fails here."""
+    import pathlib
+
+    import yaml
+
+    path = pathlib.Path(cst.__file__).resolve().parents[3] / "config" / "sync_schedule.yaml"
+    scrape_block = yaml.safe_load(path.read_text())["openstates_scrape"]
+    assert cst._fargate_config(scrape_block, "ma")["max_wait_seconds"] == 24 * 3600
+    for state in ("fl", "wa", "usa", "va", "mi", "ut", "az", "nc"):
+        assert cst._fargate_config(scrape_block, state)["max_wait_seconds"] == 12 * 3600, state
