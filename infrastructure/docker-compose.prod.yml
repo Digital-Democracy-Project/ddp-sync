@@ -78,6 +78,10 @@ services:
       # ddp-open-states' jurisdictions.yaml and that the manifest here can be read and is current. Per host and
       # default off, so it is set here and NOT in the shared `ddp-sync/credentials` secret. Alerts only; changes nothing.
       - JURISDICTION_DRIFT_CHECK_ENABLED=true
+      # OPEN-318 cutover (Ramon, 2026-11-02): this host's ddp-sync takes its jurisdiction lists from
+      # ddp-open-states' jurisdictions.yaml instead of only comparing them (the dual-read's shadow mode).
+      # Rollback: delete this line and `sudo systemctl restart ddp-sync`. Per host, never in the shared secret.
+      - JURISDICTION_MANIFEST_MODE=authoritative
       # OPENSTATES_ARCHIVE_ENABLED/MI_COOKIE_PUBLISH_ENABLED: the handoff note left these as
       # "your call" (OpenStates-domain, not Voatz/Webflow/LegBot, so plausible either way) --
       # defaulted to false here too, since this host's mandate is specifically the OPEN-193
