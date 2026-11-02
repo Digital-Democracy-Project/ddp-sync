@@ -456,8 +456,8 @@ openstates_scrape:
   # what actually starts NC's recurring cloud cycles so Stage 6's soak period can begin for real.
   cloud_path:
     enabled: true
-    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc"]
-    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc"]
+    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la"]
+    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la"]
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
@@ -682,6 +682,14 @@ openstates_scrape:
       # is intentionally NOT enabled for nc below yet -- that's Stage 4, gated on watching this
       # first scrape succeed.
       - nc
+      # OPEN-478/479/480 (pilot #2, Stage 2): pa, ne, la, the same way. DO NOT PULL THIS ON A HOST UNTIL RAMON SAYS GO:
+      # a host that has it schedules three real production scrapes in the next Sunday 02:00 UTC batch, none of them has
+      # ever run a full walk (the bills scrapers do not accept start=, so every run walks every bill; the 12 h cloud
+      # wait limit applies to each until a measured runtime sets a per-state value, OPEN-476). Cloud path and S3 memory
+      # lists above carry the same three. Archive stays off (Stage 4).
+      - pa
+      - ne
+      - la
 
     # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
     # WAF block from MI having been blocked for a month straight -- every weekly failure got
