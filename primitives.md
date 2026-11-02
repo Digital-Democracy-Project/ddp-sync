@@ -347,7 +347,10 @@ logged `jurisdiction_manifest_agrees` at start-up and from the OPEN-330 daily ch
 with no unexplained `jurisdiction_manifest_disagrees`; (2) `git -C <openstates_root> log -1` shows the host's
 ddp-open-states checkout is current on `main` (pull it first on the EC2 broker host: nothing does it
 automatically); (3) the deployed `sync_schedule.yaml` on that host has all six lists; (4) rollback is removing
-the env var and restarting. Do the Mac first, the EC2 broker host second.
+the env var and restarting. Do the Mac first, the EC2 broker host second. **Where the setting lives (OPEN-318,
+cut over 2026-11-02 UTC on both hosts):** the Mac's `.env`; the EC2 broker host's `infrastructure/docker-compose.prod.yml`
+(committed there, next to `JURISDICTION_DRIFT_CHECK_ENABLED`, so a pull does not collide with a hand edit). Still
+wired only for the features listed above; the per-feature opt-in lists stay yaml-only on purpose.
 
 ## Jurisdiction drift check (`pipelines/jurisdiction_drift_check.py`, OPEN-330)
 
