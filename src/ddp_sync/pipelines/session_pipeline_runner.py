@@ -272,6 +272,10 @@ async def _run_org_research(
         "org_research_dispatched": False,
         "org_research_skipped_reason": None,
         "org_research_duration_seconds": None,
+        # SYNC-140: the bill version this research used (LegBot never sees a version, so this is the only record of
+        # it); None when nothing was researched
+        "org_research_version_date": None,
+        "org_research_version_note": None,
     }
     try:
         org_status = await get_bill_organization_positions_status(
@@ -286,6 +290,9 @@ async def _run_org_research(
     if org_status["has_rows"]:
         out["org_research_skipped_reason"] = "already_researched"
         return out
+    if version is not None:
+        out["org_research_version_date"] = version["version_date"]
+        out["org_research_version_note"] = version["version_note"]
     if dry_run:
         out["org_research_dispatched"] = True
         return out
@@ -491,6 +498,8 @@ async def _process_bill_inner(
     run_id: str,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    request_id: str | None = None,
+    redo: dict | None = None,
 ) -> dict:
     gov_id = candidate["gov_id"]
     bill_openstates_id = candidate["bill_openstates_id"]
@@ -506,6 +515,8 @@ async def _process_bill_inner(
         "org_research_dispatched": False,
         "org_research_skipped_reason": None,
         "org_research_duration_seconds": None,
+        "org_research_version_date": None,
+        "org_research_version_note": None,
         "concept_statements_dispatched": False,
         "concept_statements_skipped_reason": None,
         "concept_statements_duration_seconds": None,
@@ -800,6 +811,9 @@ async def _process_bill_inner(
                     artifact_type=artifact_type,
                     broker_api_base=broker_api_base,
                     broker_api_token=broker_api_token,
+                    # SYNC-140: only a single-type request carries an id (run_single_bill_full checks that), so
+                    # this is the one task the id belongs to; every other pass sends nothing extra
+                    **({"request_id": request_id, "redo": redo} if request_id is not None else {}),
                 )
             # SYNC-24: a normal (non-raising) return doesn't mean success --
             # generate_and_store_bill_artifact/_changelog deliberately return
@@ -1377,11 +1391,24 @@ async def run_single_bill_full(
     dry_run: bool = False,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    request_id: str | None = None,
+    redo: dict | None = None,
 ) -> dict:
     """Run every requested artifact type (default: all of
     ALL_ARTIFACT_TYPES) plus optional org research and concept-statement
     generation for ONE caller-specified bill, in a single call -- SYNC-15
     (include_concept_statements added SYNC-31).
+
+    SYNC-140: an EMPTY artifact_types is allowed when include_org_research is true: organization research
+    alone, no result type regenerated. With research off an empty list is still refused. (Research is still
+    skipped as "already_researched" for a bill that has been researched before: that gate is per bill, not
+    per version, and is unchanged here.)
+
+    request_id / redo (SYNC-140; ddp-agents docs/reference/legbot-redo-contract.md): the caller's id for this
+    request and, for a staff redo of one result, its reason and note. They belong to ONE LegBot task (LegBot
+    keeps ids per bot, so one id cannot cover several types), so they need exactly one artifact type, and not
+    bill_changelog, which is one task per version change. redo needs a request_id. A rejected row is already
+    regenerated (SYNC-115); nothing here forces a present result to be redone.
 
     The single-bill counterpart to run_legbot_pipeline: that function lists
     candidates across a whole jurisdiction/session and loops _process_bill
@@ -1426,11 +1453,21 @@ async def run_single_bill_full(
     resolved_artifact_types = (
         list(ALL_ARTIFACT_TYPES) if artifact_types is None else artifact_types
     )
-    if not resolved_artifact_types:
-        raise ValueError("artifact_types must be non-empty")
+    if not resolved_artifact_types and not include_org_research:
+        raise ValueError("artifact_types must be non-empty unless include_org_research is true")
     unrecognized = set(resolved_artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:
         raise ValueError(f"Unrecognized artifact_types: {sorted(unrecognized)}")
+    if redo is not None and request_id is None:
+        raise ValueError("redo needs a request_id")
+    if request_id is not None:
+        if len(resolved_artifact_types) != 1:
+            raise ValueError("request_id and redo belong to one LegBot task: send exactly one artifact type")
+        if resolved_artifact_types == ["bill_changelog"]:
+            raise ValueError(
+                "request_id and redo are not supported for bill_changelog yet: it is generated once per "
+                "version change, so one request id cannot cover it"
+            )
 
     run_id = str(uuid.uuid4())
     logger.info(
@@ -1444,6 +1481,8 @@ async def run_single_bill_full(
         include_org_research=include_org_research,
         include_concept_statements=include_concept_statements,
         dry_run=dry_run,
+        request_id=request_id,
+        redo_reason=(redo or {}).get("reason"),
     )
 
     candidate = {
@@ -1463,6 +1502,7 @@ async def run_single_bill_full(
         run_id=run_id,
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
+        **({"request_id": request_id, "redo": redo} if request_id is not None else {}),
     )
     result["run_id"] = run_id
     logger.info("single_bill_full_run_end", run_id=run_id, **{k: v for k, v in result.items() if k != "run_id"})

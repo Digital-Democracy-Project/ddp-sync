@@ -1070,3 +1070,128 @@ async def test_resolve_organization_sends_the_name_the_citation_and_the_candidat
         "question_type": "resolve_organization",
         "caller": "ddp_sync",
     }
+
+
+# --- SYNC-140 / AGENTS-201: request_id and redo ----------------------------------------------------------
+
+def _write_result(artifacts_dir, task_id, **fields):
+    (artifacts_dir / task_id).mkdir(parents=True, exist_ok=True)
+    (artifacts_dir / task_id / "task_result.json").write_text(
+        json.dumps({"answer": {"text": "A summary.", "insufficient_information": False}, "backend": "mlx", **fields})
+    )
+
+
+async def _dispatch(tmp_path, mock_client, **kwargs):
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(tmp_path / "artifacts")),
+    ), _patch_async_client(mock_client), patch("ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock):
+        return await dispatch_bill_question("https://example.com/bill.pdf", "summary_500char", **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_request_id_and_redo_are_sent_in_the_task_payload(tmp_path):
+    _write_result(tmp_path / "artifacts", "t1", request_id="broker-redo:9")
+    client = _mock_client(statuses=["completed"], task_id="t1")
+    client.post.return_value.status_code = 201
+
+    result = await _dispatch(tmp_path, client, request_id="broker-redo:9", redo={"reason": "other", "note": "Wrong bill."})
+
+    payload = client.post.await_args.kwargs["json"]["payload"]
+    assert payload["request_id"] == "broker-redo:9"
+    assert payload["redo"] == {"reason": "other", "note": "Wrong bill."}
+    assert result["request_id"] == "broker-redo:9"
+
+
+@pytest.mark.asyncio
+async def test_a_redo_without_a_note_sends_no_note_key(tmp_path):
+    _write_result(tmp_path / "artifacts", "t1", request_id="r1")
+    client = _mock_client(statuses=["completed"], task_id="t1")
+    client.post.return_value.status_code = 201
+
+    await _dispatch(tmp_path, client, request_id="r1", redo={"reason": "other", "note": None})
+
+    assert client.post.await_args.kwargs["json"]["payload"]["redo"] == {"reason": "other"}
+
+
+@pytest.mark.asyncio
+async def test_without_a_request_id_the_payload_is_exactly_what_it_was(tmp_path):
+    _write_result(tmp_path / "artifacts", "t1")
+    client = _mock_client(statuses=["completed"], task_id="t1")
+
+    result = await _dispatch(tmp_path, client)
+
+    payload = client.post.await_args.kwargs["json"]["payload"]
+    assert "request_id" not in payload and "redo" not in payload
+    assert "request_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_redo_without_a_request_id_is_refused_before_any_call(tmp_path):
+    client = _mock_client(statuses=["completed"])
+
+    with pytest.raises(ValueError, match="request_id"):
+        await _dispatch(tmp_path, client, redo={"reason": "other"})
+
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_200_for_a_repeated_request_id_is_the_existing_task_not_an_error(tmp_path):
+    """LegBot answers 200 (not 201) with the task it already made: one run, and the answer is read from that task."""
+    _write_result(tmp_path / "artifacts", "first-task", request_id="r1")
+    client = _mock_client(statuses=["completed"], task_id="first-task")
+    client.post.return_value.status_code = 200
+
+    result = await _dispatch(tmp_path, client, request_id="r1")
+
+    assert result["answer"]["text"] == "A summary."
+    client.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_409_for_a_claimed_but_unstored_request_id_raises_a_plain_error_and_polls_nothing(tmp_path):
+    client = _mock_client(statuses=["completed"])
+    client.post.return_value.status_code = 409
+
+    with pytest.raises(LegBotDispatchError, match="409"):
+        await _dispatch(tmp_path, client, request_id="r1")
+
+    client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_result_for_another_request_id_is_ignored(tmp_path):
+    _write_result(tmp_path / "artifacts", "t1", request_id="someone-elses-request")
+    client = _mock_client(statuses=["completed"], task_id="t1")
+    client.post.return_value.status_code = 201
+
+    with pytest.raises(LegBotDispatchError, match="ignored"):
+        await _dispatch(tmp_path, client, request_id="mine")
+
+
+@pytest.mark.asyncio
+async def test_a_result_with_no_request_id_when_one_was_sent_is_ignored(tmp_path):
+    """A CAMS that predates AGENTS-201 neither echoes the id nor made the request repeat-safe: fail loudly."""
+    _write_result(tmp_path / "artifacts", "t1")
+    client = _mock_client(statuses=["completed"], task_id="t1")
+    client.post.return_value.status_code = 201
+
+    with pytest.raises(LegBotDispatchError, match="ignored"):
+        await _dispatch(tmp_path, client, request_id="mine")
+
+
+def test_read_task_result_carries_the_request_id_only_when_legbot_wrote_one(tmp_path):
+    from ddp_sync.services.legbot_client import read_task_result
+
+    artifacts = tmp_path / "artifacts"
+    _write_result(artifacts, "with-id", request_id="r1")
+    _write_result(artifacts, "without-id")
+
+    with patch("ddp_sync.services.legbot_client.get_settings", return_value=_FakeSettings(cams_artifacts_dir=str(artifacts))):
+        with_id = read_task_result("with-id")
+        without_id = read_task_result("without-id")
+
+    assert with_id["request_id"] == "r1"
+    assert "request_id" not in without_id
+

@@ -364,8 +364,15 @@ async def generate_and_store_bill_artifact(
     target_artifact_id: int | None = None,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    request_id: str | None = None,
+    redo: dict | None = None,
 ) -> dict:
     """Dispatch to LegBot, then persist the result to ddp-broker-py.
+
+    request_id / redo (SYNC-140): the caller's id for this one request and, for a staff redo, its
+    reason and note, sent to LegBot unchanged (see legbot_client.dispatch_bill_question). A result
+    LegBot answers for another request id is never written. Both default to None: nothing about
+    the call changes for any caller that sends neither.
 
     No bill_source parameter -- removed along with _resolve_bill_source's
     live-URL fallback (see that function's own docstring). This function
@@ -463,7 +470,8 @@ async def generate_and_store_bill_artifact(
         generation_config = {"bill_topics_list_version": taxonomy["version"]}
 
     # The answer is checked against the same list LegBot was given (AGENTS-181 takes it from the request).
-    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type, topic_list=taxonomy)
+    redo_args = {"request_id": request_id, "redo": redo} if request_id is not None else {}
+    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type, topic_list=taxonomy, **redo_args)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
     if taxonomy is not None and answer.get("topics_version") not in (None, taxonomy["version"]):

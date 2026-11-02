@@ -3399,3 +3399,119 @@ async def test_a_bill_with_no_classified_versions_at_all_is_not_dispatched():
         )
 
     mock_changelog.assert_not_awaited()
+
+
+# --- SYNC-140: organization research alone, the version it used, request_id and redo --------------------------
+
+_RESEARCH_KWARGS = {**_SINGLE_BILL_KWARGS, "include_org_research": True}
+
+
+@pytest.mark.asyncio
+async def test_single_bill_empty_artifact_types_with_research_runs_research_alone():
+    with _patch_coverage(None), _patch_version(), _patch_org_status({"has_rows": False, "row_count": 0}), \
+            _patch_org_dispatch() as mock_org, _patch_artifact() as mock_artifact:
+        result = await run_single_bill_full(**_RESEARCH_KWARGS, artifact_types=[])
+
+    mock_artifact.assert_not_awaited()  # no result type is regenerated
+    mock_org.assert_awaited_once()
+    assert result["org_research_dispatched"] is True
+    assert (result["artifacts_generated"], result["artifacts_failed"], result["artifacts_skipped_present"]) == ([], [], [])
+
+
+@pytest.mark.asyncio
+async def test_single_bill_empty_artifact_types_without_research_is_refused_naming_the_condition():
+    with pytest.raises(ValueError, match="unless include_org_research is true"):
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=[])
+
+
+@pytest.mark.asyncio
+async def test_research_reports_the_bill_version_it_used():
+    with _patch_coverage(None), _patch_version(), _patch_org_status({"has_rows": False, "row_count": 0}), _patch_org_dispatch() as mock_org:
+        result = await run_single_bill_full(**_RESEARCH_KWARGS, artifact_types=[])
+
+    assert (result["org_research_version_date"], result["org_research_version_note"]) == ("2026-06-01", "c1")
+    assert mock_org.await_args.kwargs["version_date"] == "2026-06-01"  # the same version the research was given
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_of_research_alone_reports_the_version_it_would_use_and_dispatches_nothing():
+    with _patch_coverage(None), _patch_version(), _patch_org_status({"has_rows": False, "row_count": 0}), _patch_org_dispatch() as mock_org:
+        result = await run_single_bill_full(**_RESEARCH_KWARGS, artifact_types=[], dry_run=True)
+
+    mock_org.assert_not_awaited()
+    assert result["org_research_dispatched"] is True and result["org_research_version_date"] == "2026-06-01"
+
+
+@pytest.mark.asyncio
+async def test_an_already_researched_bill_is_skipped_and_reports_no_version():
+    """The gate is per bill and unchanged here: nothing was researched, so no version is claimed."""
+    with _patch_coverage(None), _patch_version(), _patch_org_status({"has_rows": True, "row_count": 3}), _patch_org_dispatch() as mock_org:
+        result = await run_single_bill_full(**_RESEARCH_KWARGS, artifact_types=[])
+
+    mock_org.assert_not_awaited()
+    assert result["org_research_skipped_reason"] == "already_researched"
+    assert (result["org_research_version_date"], result["org_research_version_note"]) == (None, None)
+
+
+_REDO = {"reason": "bill_information_wrong_or_missing", "note": "The bill was amended."}
+
+
+@pytest.mark.asyncio
+async def test_request_id_and_redo_reach_the_one_artifact_dispatch():
+    with _patch_coverage(None), _patch_version(), _patch_artifact() as mock_artifact:
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"], request_id="broker-redo:1", redo=_REDO)
+
+    kwargs = mock_artifact.await_args.kwargs
+    assert kwargs["request_id"] == "broker-redo:1" and kwargs["redo"] == _REDO
+
+
+@pytest.mark.asyncio
+async def test_a_request_id_alone_makes_a_plain_run_repeat_safe_without_a_redo_block():
+    with _patch_coverage(None), _patch_version(), _patch_artifact() as mock_artifact:
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"], request_id="broker-run:7")
+
+    kwargs = mock_artifact.await_args.kwargs
+    assert kwargs["request_id"] == "broker-run:7" and kwargs["redo"] is None
+
+
+@pytest.mark.asyncio
+async def test_without_a_request_id_the_artifact_dispatch_gets_neither_keyword():
+    with _patch_coverage(None), _patch_version(), _patch_artifact() as mock_artifact:
+        await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"])
+
+    assert "request_id" not in mock_artifact.await_args.kwargs and "redo" not in mock_artifact.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label, kwargs, match", [
+    ("all types (None)", dict(artifact_types=None, request_id="r1"), "exactly one artifact type"),
+    ("two types", dict(artifact_types=["bill_summary", "bill_pros_cons"], request_id="r1"), "exactly one artifact type"),
+    ("research alone", dict(artifact_types=[], include_org_research=True, request_id="r1"), "exactly one artifact type"),
+    ("changelog", dict(artifact_types=["bill_changelog"], request_id="r1"), "bill_changelog"),
+    ("redo without an id", dict(artifact_types=["bill_summary"], redo=_REDO), "needs a request_id"),
+])
+async def test_a_request_id_or_redo_that_cannot_belong_to_one_task_is_refused_before_anything_runs(label, kwargs, match):
+    with _patch_coverage(None), _patch_version(), _patch_artifact() as mock_artifact, _patch_org_dispatch() as mock_org:
+        with pytest.raises(ValueError, match=match):
+            await run_single_bill_full(**{**_SINGLE_BILL_KWARGS, **kwargs})
+
+    mock_artifact.assert_not_awaited()
+    mock_org.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retrying_the_same_request_after_it_was_written_dispatches_and_writes_nothing_more():
+    """The retry that matters. The first call wrote a complete row, so the coverage check skips the type the second time:
+    no second dispatch and no second write. (Two calls at the same moment are held apart by the caller: the broker allows
+    one active request per bill and result type, BROKER-388.)"""
+    present = {"bill_version_id": 2, "artifacts": {"bill_summary": {"status": "complete"}}}
+    with patch(
+        "ddp_sync.pipelines.session_pipeline_runner.get_bill_artifacts", new=AsyncMock(side_effect=[None, present]),
+    ), _patch_version(), _patch_artifact() as mock_artifact:
+        first = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"], request_id="broker-redo:5", redo=_REDO)
+        second = await run_single_bill_full(**_SINGLE_BILL_KWARGS, artifact_types=["bill_summary"], request_id="broker-redo:5", redo=_REDO)
+
+    assert mock_artifact.await_count == 1
+    assert first["artifacts_generated"] == ["bill_summary"]
+    assert second["artifacts_skipped_present"] == ["bill_summary"]
+

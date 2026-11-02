@@ -319,3 +319,77 @@ def test_retry_failed_is_passed_through():
 
         assert response.status_code == 200
         assert mock_run.await_args.kwargs["retry_failed"] is value
+
+
+# --- SYNC-140: research alone, request_id and redo ---------------------------------------------------
+
+def _post(payload):
+    client = _make_authed_client()
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_configured_settings()), \
+            _patch_run() as mock_run:
+        response = client.post("/trigger/legbot-analyze-bill-full", json=payload, headers={"X-DDP-Environment": "dev"})
+    return response, mock_run
+
+
+def test_an_empty_artifact_types_list_is_accepted_and_reaches_the_runner_for_research_alone():
+    response, mock_run = _post({**_VALID_PAYLOAD, "artifact_types": [], "include_org_research": True})
+
+    assert response.status_code == 200
+    kwargs = mock_run.await_args.kwargs
+    assert kwargs["artifact_types"] == [] and kwargs["include_org_research"] is True
+
+
+def test_request_id_and_redo_reach_the_runner_as_sent():
+    response, mock_run = _post({
+        **_VALID_PAYLOAD, "artifact_types": ["bill_summary"], "request_id": "broker-redo:42",
+        "redo": {"reason": "result_does_not_match_bill", "note": "It says the opposite of the bill."},
+    })
+
+    assert response.status_code == 200
+    kwargs = mock_run.await_args.kwargs
+    assert kwargs["request_id"] == "broker-redo:42"
+    assert kwargs["redo"] == {"reason": "result_does_not_match_bill", "note": "It says the opposite of the bill."}
+
+
+def test_without_request_id_and_redo_the_runner_gets_none_of_either():
+    response, mock_run = _post(_VALID_PAYLOAD)
+
+    assert response.status_code == 200
+    assert mock_run.await_args.kwargs["request_id"] is None and mock_run.await_args.kwargs["redo"] is None
+
+
+def test_the_shapes_the_contract_refuses_are_a_422_and_nothing_runs():
+    base = {**_VALID_PAYLOAD, "artifact_types": ["bill_summary"], "request_id": "r1"}
+    for label, payload in {
+        "unknown reason": {**base, "redo": {"reason": "because"}},
+        "note over 500 characters": {**base, "redo": {"reason": "other", "note": "x" * 501}},
+        "request_id with a space": {**base, "request_id": "has space"},
+        "request_id over 120 characters": {**base, "request_id": "a" * 121},
+        "empty request_id": {**base, "request_id": ""},
+    }.items():
+        response, mock_run = _post(payload)
+        assert response.status_code == 422, label
+        mock_run.assert_not_awaited()
+
+
+def test_a_note_of_exactly_500_characters_and_a_request_id_of_exactly_120_are_accepted():
+    response, _ = _post({
+        **_VALID_PAYLOAD, "artifact_types": ["bill_summary"], "request_id": "a" * 120,
+        "redo": {"reason": "other", "note": "x" * 500},
+    })
+
+    assert response.status_code == 200
+
+
+def test_a_runner_refusal_of_the_combination_is_a_400_with_its_words():
+    client = _make_authed_client()
+    with patch("ddp_sync.api.routes.triggers.get_settings", return_value=_configured_settings()), \
+            _patch_run(side_effect=ValueError("request_id and redo belong to one LegBot task: send exactly one artifact type")):
+        response = client.post(
+            "/trigger/legbot-analyze-bill-full", json={**_VALID_PAYLOAD, "request_id": "r1"},
+            headers={"X-DDP-Environment": "dev"},
+        )
+
+    assert response.status_code == 400
+    assert "exactly one artifact type" in response.json()["detail"]
+
