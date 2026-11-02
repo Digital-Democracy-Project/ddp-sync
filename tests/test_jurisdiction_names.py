@@ -37,6 +37,16 @@ EXISTING = {
 }
 
 
+# OPEN-478/479/480: pilot #2's states carry their own names, not the "<CODE> Legislature" fallback.
+PILOT_2 = {"pa": "Pennsylvania Legislature", "ne": "Nebraska Legislature", "la": "Louisiana Legislature"}
+
+
+@pytest.mark.parametrize("code,expected", sorted(PILOT_2.items()))
+def test_pilot_2_states_have_their_own_source_name(code, expected):
+    assert JURISDICTION_SOURCE_NAMES[code] == expected
+    assert source_name(code) == expected and source_name(code) != f"{code.upper()} Legislature"
+
+
 @pytest.mark.parametrize("code,expected", sorted(EXISTING.items()))
 def test_the_existing_names_are_unchanged(code, expected):
     assert source_name(code) == expected
@@ -54,8 +64,8 @@ def test_unknown_and_empty_codes_keep_the_old_fallbacks():
     assert source_name(None) == "State Legislature"
 
 
-def test_the_table_is_the_existing_names_plus_nc_and_nothing_else():
-    assert JURISDICTION_SOURCE_NAMES == {**EXISTING, "nc": "North Carolina Legislature"}
+def test_the_table_is_the_existing_names_plus_nc_and_pilot_2_and_nothing_else():
+    assert JURISDICTION_SOURCE_NAMES == {**EXISTING, "nc": "North Carolina Legislature", **PILOT_2}
 
 
 @pytest.mark.parametrize("cls", [BillSyncService, LegislatorSyncService, OpenStatesSource])
