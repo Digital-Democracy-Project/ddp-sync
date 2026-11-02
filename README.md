@@ -472,6 +472,32 @@ Reuses `_process_bill`'s existing coverage-check skip logic unchanged — alread
 skipped, this is not a force-regenerate mode. Same `X-DDP-Environment: dev|prod` header requirement and
 Mac-Studio-only construction as `/trigger/legbot-analyze-bill` above.
 
+**Organization research alone, and staff redo (SYNC-140; the LegBot side is ddp-agents AGENTS-201,
+`docs/reference/legbot-redo-contract.md`).** Three additions to `/trigger/legbot-analyze-bill-full`, all for the broker's
+staff-tools screens (BROKER-388, 390, 391); a call that sends none of them behaves exactly as before.
+* **Research alone:** `artifact_types: []` with `include_org_research: true` runs organization research for the bill and
+  dispatches **no** result type. An empty list with research off is still refused (400). The `already_researched` skip is
+  unchanged: it is per bill (any earlier completed research), not per bill version, so research alone on a bill that has
+  been researched before answers `org_research_skipped_reason: "already_researched"` and does nothing. The batch pipeline
+  (`run_legbot_pipeline`) still refuses an empty list.
+* **The version research used:** the result has `org_research_version_date` and `org_research_version_note` (the version
+  ddp-sync resolved and gave to the research; LegBot never sees a version), `null` when nothing was researched. They are in
+  the response and in the `single_bill_full_run_end` log line.
+* **`request_id` and `redo`:** `request_id` (1 to 120 of `A-Za-z0-9:._-`, made by the **caller**, never per attempt here) goes
+  to LegBot unchanged, so a retry with the same id is **one** LegBot run (LegBot answers 200, not 201, with the task it already
+  made; ddp-sync reads that task's answer). `redo` is `{reason, note}` (`reason` one of `bill_information_wrong_or_missing`,
+  `result_does_not_match_bill`, `other`; `note` at most 500 characters) and needs a `request_id`. Bad shapes are a 422. An id
+  belongs to **one** LegBot task (LegBot keeps ids per bot), so both need **exactly one** artifact type and not `bill_changelog`
+  (one task per version change): anything else is a 400. A result is regenerated only when its stored row is rejected or
+  missing (SYNC-115): a present result is skipped, so the broker records the rejection before it asks for the redo.
+  **Failure handling:** a LegBot 409 (id claimed, task not stored yet) is an error to retry or to replace with a new id; a
+  result LegBot wrote for a different `request_id`, or with none (a CAMS that predates AGENTS-201), is **ignored** and the
+  type is reported failed; after a failure or a cancel the id stays claimed in LegBot, so the next request needs a **new** id.
+  **One id, one request:** LegBot's contract is that an id means "this request", not "this content", and its result records the id, not
+  the bill: reusing an id for a different bill or result type returns LegBot's old task, and ddp-sync cannot tell. The caller makes one id
+  per request (BROKER-388 uses its own request row's id). A retry after the result was written is skipped by the coverage check (no
+  second dispatch or write); after a failed write it reuses LegBot's task (200) and writes once.
+
 `/trigger/legislator-bio-sync` accepts query params:
 - `dry_run` (bool) — preview the diff without writing
 - `auto_create` (bool) — create drafts for upstream-only members

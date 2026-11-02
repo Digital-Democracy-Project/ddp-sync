@@ -159,6 +159,8 @@ async def dispatch_bill_question(
     *,
     timeout_seconds: float | None = None,
     topic_list: dict | None = None,
+    request_id: str | None = None,
+    redo: dict | None = None,
 ) -> dict:
     """Dispatch an analyze_bill task to LegBot and return its structured answer.
 
@@ -172,6 +174,14 @@ async def dispatch_bill_question(
         topic_list: bill_topics only (SYNC-134 / AGENTS-181): the broker's live list as
             get_bill_topics_taxonomy returns it. Sent as topics, max_topics and
             topics_version; LegBot fails a bill_topics request without them.
+        request_id (SYNC-140 / AGENTS-201): the caller's id for THIS request. Sent as-is, so a retry
+            with the same id is one LegBot run: LegBot answers 200 with the task it already made. The
+            id is never made up here, and it belongs to ONE task (LegBot keeps ids per bot, not per
+            question type). After a failure a new request needs a new id: a cancelled or failed
+            request keeps its id.
+        redo: a staff redo of one result: {"reason": one of LegBot's three codes, "note": optional,
+            at most 500 characters} (ddp-agents docs/reference/legbot-redo-contract.md). Needs a
+            request_id; LegBot refuses a redo without one before any model call.
 
     Returns:
         See _dispatch_and_await.
@@ -191,6 +201,12 @@ async def dispatch_bill_question(
         payload["topics"] = list(topic_list["topics"])
         payload["max_topics"] = topic_list["max_topics"]
         payload["topics_version"] = topic_list["version"]
+    if redo is not None and request_id is None:
+        raise ValueError("a redo needs a request_id (the contract refuses one without)")
+    if request_id is not None:
+        payload["request_id"] = request_id
+    if redo is not None:
+        payload["redo"] = {"reason": redo["reason"], **({"note": redo["note"]} if redo.get("note") else {})}
     return await _dispatch_and_await(
         payload,
         question_type=question_type,
@@ -445,10 +461,21 @@ async def _dispatch_and_await(
         resp = await client.post(
             f"{settings.cams_base_url}/api/v1/tasks", headers=headers, json=create_payload
         )
+        request_id = payload.get("request_id")
+        if request_id is not None and resp.status_code == 409:
+            # AGENTS-201: the id is claimed but its task is not stored yet (a first create still in
+            # flight, or a task since pruned). Nothing was queued; LegBot never takes the id over.
+            raise LegBotDispatchError(
+                f"LegBot has request_id {request_id!r} claimed but no task stored for it (409): "
+                "retry in a moment, or send a new request_id"
+            )
         resp.raise_for_status()
         task_id = resp.json()["task_id"]
         logger.info(
             "LegBot task dispatched", task_id=task_id, question_type=question_type,
+            request_id=request_id,
+            # 200 (not 201) is LegBot saying "this request_id already made this task": one run, not two
+            reused_existing_task=request_id is not None and resp.status_code == 200,
         )
         if on_task_created is not None:
             # SYNC-61: recorded before any polling, deliberately -- the whole
@@ -575,6 +602,13 @@ async def _dispatch_and_await(
         raise LegBotDispatchError(f"LegBot task {task_id} ended with status={status}")
 
     result = read_task_result(task_id)
+    if request_id is not None and result.get("request_id") != request_id:
+        # SYNC-140: a result for some other request (or from a CAMS that predates AGENTS-201 and does not
+        # echo the id, so it also did not make the request repeat-safe) is ignored, never written.
+        raise LegBotDispatchError(
+            f"LegBot task {task_id} answered for request_id {result.get('request_id')!r}, not "
+            f"{request_id!r}: its result is ignored"
+        )
     logger.info(
         "LegBot task completed", task_id=task_id, question_type=question_type,
         insufficient_information=result["answer"].get("insufficient_information"),
@@ -600,7 +634,8 @@ def read_task_result(task_id: str) -> dict:
 
     Returns:
         {"answer": ..., "backend": ...} -- same shape _dispatch_and_await
-        itself returns on success.
+        itself returns on success, plus "request_id" when LegBot wrote one
+        into the result (AGENTS-201; absent for a task made without one).
 
     Raises:
         LegBotDispatchError: the file is missing/unreadable/not valid JSON,
@@ -631,7 +666,10 @@ def read_task_result(task_id: str) -> dict:
             f"task_result.json for {task_id} has a non-dict 'answer' "
             f"(got {type(answer).__name__}): {answer!r}"
         )
-    return {"answer": answer, "backend": snapshot.get("backend")}
+    out = {"answer": answer, "backend": snapshot.get("backend")}
+    if snapshot.get("request_id") is not None:
+        out["request_id"] = snapshot["request_id"]
+    return out
 
 
 async def check_task_status(task_id: str) -> dict:

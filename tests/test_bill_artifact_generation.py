@@ -2622,3 +2622,39 @@ async def test_a_failed_artifact_carries_no_source_support():
     write_kwargs = mock_write.await_args.kwargs
     assert write_kwargs["status"] == "failed"
     assert "source_support" not in write_kwargs
+
+
+# --- SYNC-140: request_id and redo reach LegBot's dispatch ----------------------------------------------
+
+_DISPATCHED = {"answer": {"text": "A plain-language summary.", "insufficient_information": False}, "backend": "mlx"}
+
+
+@pytest.mark.asyncio
+async def test_request_id_and_redo_are_handed_to_the_legbot_dispatch():
+    redo = {"reason": "other", "note": "Wrong sponsor."}
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=_DISPATCHED),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_summary", request_id="broker-redo:3", redo=redo)
+
+    assert mock_dispatch.await_args.kwargs["request_id"] == "broker-redo:3"
+    assert mock_dispatch.await_args.kwargs["redo"] == redo
+
+
+@pytest.mark.asyncio
+async def test_without_a_request_id_the_legbot_dispatch_is_called_exactly_as_before():
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_question",
+        new=AsyncMock(return_value=_DISPATCHED),
+    ) as mock_dispatch, patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        await generate_and_store_bill_artifact(**_COMMON_KWARGS, artifact_type="bill_summary")
+
+    assert "request_id" not in mock_dispatch.await_args.kwargs and "redo" not in mock_dispatch.await_args.kwargs
+

@@ -531,6 +531,13 @@ async def trigger_legbot_analyze_bill(
     }
 
 
+class LegBotRedo(BaseModel):
+    """A staff redo of one result (SYNC-140; ddp-agents docs/reference/legbot-redo-contract.md): sent to LegBot as given."""
+
+    reason: Literal["bill_information_wrong_or_missing", "result_does_not_match_bill", "other"]
+    note: str | None = Field(None, max_length=500, description="Optional free text, at most 500 characters.")
+
+
 class LegBotAnalyzeBillFullRequest(BaseModel):
     """Request body for POST /trigger/legbot-analyze-bill-full (SYNC-15).
 
@@ -556,7 +563,28 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
         description=(
             "BillArtifact types to run for this bill. Omit or pass null "
             "for all of ALL_ARTIFACT_TYPES -- this endpoint's whole "
-            "point is not having to enumerate them."
+            "point is not having to enumerate them. An EMPTY list is "
+            "organization research alone (SYNC-140): it needs "
+            "include_org_research true, and runs no result type; with "
+            "research off an empty list is refused."
+        ),
+    )
+    request_id: str | None = Field(
+        None,
+        pattern=r"^[A-Za-z0-9:._-]{1,120}$",
+        description=(
+            "SYNC-140: the caller's id for this request, sent to LegBot unchanged, so a retry with the same id is ONE "
+            "LegBot run (LegBot answers 200 with the task it already made). Made by the caller, never per attempt here. "
+            "It belongs to one LegBot task, so it needs exactly one artifact type, and not bill_changelog (one task per "
+            "version change). After a failure send a NEW id: a cancelled or failed request keeps its id."
+        ),
+    )
+    redo: LegBotRedo | None = Field(
+        None,
+        description=(
+            "SYNC-140: a staff redo of the one result type in artifact_types: its reason and note go to LegBot. Needs "
+            "request_id. The result is regenerated only when its stored row is rejected or missing (SYNC-115): a present "
+            "result is skipped, as everywhere here."
         ),
     )
     include_org_research: bool = Field(
@@ -649,6 +677,8 @@ async def trigger_legbot_analyze_bill_full(
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
+            request_id=body.request_id,
+            redo=body.redo.model_dump() if body.redo is not None else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
