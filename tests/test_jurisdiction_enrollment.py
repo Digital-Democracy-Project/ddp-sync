@@ -71,6 +71,23 @@ def test_a_paused_jurisdiction_is_on_no_scrape_list(root):
     assert je.manifest_codes("scrape_secondary", root) == ["nc"]
 
 
+@pytest.mark.parametrize("tier", ["primary", "secondary"])
+def test_a_probing_jurisdiction_is_on_no_scrape_list(tmp_path, tier):
+    """OPEN-478/479/480: a state added at Stage 0 has a (required) tier but is on no schedule until Stage 2."""
+    manifest = {**MANIFEST, "pa": _entry(tier, status="probing", archive=False)}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    assert "pa" not in je.manifest_codes("scrape_primary", str(tmp_path))
+    assert "pa" not in je.manifest_codes("scrape_secondary", str(tmp_path))
+
+
+@pytest.mark.parametrize("tier", ["primary", "secondary"])
+@pytest.mark.parametrize("status", ["scraping", "validating", "archived", "live"])
+def test_a_jurisdiction_past_probing_is_on_its_tiers_scrape_list(tmp_path, tier, status):
+    manifest = {**MANIFEST, "pa": _entry(tier, status=status, archive=False)}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    assert "pa" in je.manifest_codes(f"scrape_{tier}", str(tmp_path))
+
+
 # --- never raises; degrades to the yaml ------------------------------------------------------------------
 
 def test_a_missing_manifest_gives_none_and_logs_once(tmp_path):

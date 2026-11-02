@@ -35,6 +35,8 @@ MANIFEST_FILENAME = "jurisdictions.yaml"
 
 # feature -> (does this manifest entry belong?, does ddp-sync spell the federal jurisdiction "usa" here?)
 # The scrape tables and the cloud path say "usa"; archive, embedding and search refresh say "us".
+_UNSCHEDULED_STATUSES = ("paused", "probing")
+
 _FEATURES = {
     # OPEN-418: the RECURRING archive list is the manifest's archive.scheduled, not archive.enabled (which only means
     # "may be archived", the Stage 4 manual run). A pre-OPEN-418 manifest has no `scheduled`, which reads as "cannot say".
@@ -45,9 +47,11 @@ _FEATURES = {
     # OPEN-330: the two env-var lists, spelled "us" like the env values themselves.
     "replica_routing": (lambda e: e["enrollment"]["replica_routing"], False),
     "legbot_replica": (lambda e: e["enrollment"]["legbot_replica"], False),
-    # A paused jurisdiction is on no scrape schedule whatever its (required) tier says.
-    "scrape_primary": (lambda e: e["tier"] == "primary" and e["status"] != "paused", True),
-    "scrape_secondary": (lambda e: e["tier"] == "secondary" and e["status"] != "paused", True),
+    # A paused or probing jurisdiction is on no scrape schedule whatever its (required) tier says: a state added at
+    # Stage 0 joins the list when its status moves to `scraping` (OPEN-478/479/480; mirrors check-jurisdiction-drift.py's
+    # UNSCHEDULED_STATUSES in ddp-open-states).
+    "scrape_primary": (lambda e: e["tier"] == "primary" and e["status"] not in _UNSCHEDULED_STATUSES, True),
+    "scrape_secondary": (lambda e: e["tier"] == "secondary" and e["status"] not in _UNSCHEDULED_STATUSES, True),
 }
 
 _lock = threading.Lock()
