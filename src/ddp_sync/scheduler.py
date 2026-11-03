@@ -32,6 +32,19 @@ _cwd_config = Path.cwd() / "config" / "sync_schedule.yaml"
 DEFAULT_CONFIG_PATH = _pkg_config if _pkg_config.exists() else _cwd_config
 
 
+
+def _secondary_jurisdictions(config: dict) -> list[str]:
+    """The secondary batch (SYNC-146). In `authoritative` mode: every state the shared list has at tier `secondary` and
+    a status other than paused or probing, so a new state needs no entry in sync_schedule.yaml; in `shadow` mode, or when
+    the shared list cannot be read, the yaml's own list exactly as before. Same answer the manual trigger and the batch
+    run already use (`enrolled("scrape_secondary", ...)`); the scheduler was the one reader still taking the yaml."""
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import enrolled
+
+    listed = enrolled("scrape_secondary", (config.get("secondary") or {}).get("jurisdictions", []), _get_root(config))
+    return [] if listed is None else list(listed)
+
+
 class UpdateScheduler:
     """
     Scheduler for periodic content updates.
@@ -715,7 +728,7 @@ class UpdateScheduler:
             sec_day = sec_cfg.get("sync_day", "sunday")
             sec_time = sec_cfg.get("sync_time_utc", "02:00")
             sh, sm = map(int, sec_time.split(":"))
-            all_secondary: list[str] = list(sec_cfg.get("jurisdictions", []))
+            all_secondary: list[str] = _secondary_jurisdictions(config)
 
             # OPEN-140: the secondary states do not have one job each -- they share a
             # single weekly job that fans out over a list. So escalating one to nightly
@@ -1049,7 +1062,7 @@ class UpdateScheduler:
         if sec_cfg.get("enabled", True):
             # The batch's own sync_day is the floor for every jurisdiction in it.
             sec_floor = cadence_from_yaml(sec_cfg)
-            for j in sec_cfg.get("jurisdictions", []):
+            for j in _secondary_jurisdictions(config):
                 floors[j] = sec_floor
 
         # Read and decide for EVERY jurisdiction before writing anything. pm-review

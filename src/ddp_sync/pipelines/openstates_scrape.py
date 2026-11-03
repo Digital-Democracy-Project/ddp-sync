@@ -528,7 +528,17 @@ def _cloud_path_owns(jurisdiction: str, config: dict | None) -> bool:
     cloud_cfg = (config or {}).get("cloud_path", {})
     if not cloud_cfg.get("enabled", False):
         return False
-    return jurisdiction in cloud_cfg.get("jurisdictions", [])
+    return jurisdiction in _cloud_path_jurisdictions(cloud_cfg, config)
+
+
+def _cloud_path_jurisdictions(cloud_cfg: dict, config: dict | None) -> list[str]:
+    """Who the Fargate path owns right now (SYNC-146). In `authoritative` mode this is the shared list's
+    `enrollment.cloud_path` (a state needs no entry in sync_schedule.yaml); in `shadow` mode, or when the shared
+    list cannot be read, it is the yaml's own list exactly as before. `enabled` above stays the global switch."""
+    # Pass the yaml's list as it is, [] when the key is missing: shadow mode then gives exactly the answer this code gave
+    # before SYNC-146 (see `enrolled`'s docstring on the hook gates).
+    listed = enrolled("cloud_path", cloud_cfg.get("jurisdictions", []), _get_root(config))
+    return [] if listed is None else listed
 
 
 def _memory_backend_enabled(jurisdiction: str, config: dict | None) -> bool:
@@ -549,9 +559,14 @@ def _memory_backend_enabled(jurisdiction: str, config: dict | None) -> bool:
     operator adds a name here at the same time as adding it to `jurisdictions`, and never
     removes it on rollback -- only `jurisdictions` shrinks). A jurisdiction in either list
     gets the S3 backend.
+
+    SYNC-146: "cloud owns it right now" now comes from the shared list in authoritative mode, so a new state is covered
+    the moment its `enrollment.cloud_path` is true, with no yaml entry. The yaml `memory_backend_jurisdictions` list is
+    what remembers a state AFTER it leaves the cloud path: add the state to it BEFORE turning its cloud_path off
+    (nothing can remember that for you once the manifest says false).
     """
     cloud_cfg = (config or {}).get("cloud_path", {})
-    if jurisdiction in cloud_cfg.get("jurisdictions", []):
+    if jurisdiction in _cloud_path_jurisdictions(cloud_cfg, config):
         return True
     return jurisdiction in cloud_cfg.get("memory_backend_jurisdictions", [])
 
