@@ -322,6 +322,17 @@ the knowledge base, pinned exactly by `tests/test_jurisdiction_names.py`. **Addi
 code not in the table is labelled "<manifest name> Legislature" from the shared list (`jurisdiction_enrollment.manifest_name`);
 only when the manifest cannot be read does it fall back to "<CODE> Legislature".
 
+## First scrape needs legislators (`openstates_scrape.people_check_refusal`, SYNC-147)
+
+Runbook rule 1 (people before the first import) was text nobody checked: pilot #2's first scrapes loaded with 0 legislators in
+production, so every vote and sponsor was stored with a name and no person. `_run_scrape_impl` (the one funnel every launch
+goes through) now asks api-v3 for the state's legislator count (`local_openstates_client.count_current_people`, `/people`'s
+`total_items`) and refuses, with a log line and a failed result (`refused: no_legislators_in_production`), when it is 0 **or cannot
+be read**, but only for a state whose manifest status is `scraping`, `validating` or `archived`. Live, paused, probing and unknown
+states (and an unreadable manifest) are never checked, so the live states cannot change. The manual trigger
+(`POST /trigger/openstates-scrape/<state>`) answers **409** with the reason; `?skip_people_check=true` starts it anyway, on
+purpose (`run_single_scrape_job(..., skip_people_check=True)`, logged, not sticky). Do not write a second people count. It counts CURRENT legislators (a state still onboarding has a session in progress, and its votes need current people to resolve against); the manual trigger checks once for its answer and the funnel checks again before launching, so in the rare case the two reads differ, the refusal is logged and in the flow result, never silent.
+
 ## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
 
 ddp-open-states' `jurisdictions.yaml` says which jurisdictions are enrolled in which feature; ddp-sync's own

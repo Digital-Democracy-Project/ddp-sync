@@ -16,6 +16,7 @@ at 01:00 UTC handles apply-local-patches.sh before the 02:00 UTC scrapes.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import signal
@@ -29,6 +30,7 @@ import requests
 import structlog
 
 from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
+from ddp_sync.services import jurisdiction_enrollment as enrollment
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.jurisdiction_enrollment import enrolled
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
@@ -1054,6 +1056,64 @@ async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | Non
         logger.warning("broker_bill_event_signal_failed", jurisdiction=jurisdiction, error=str(e))
 
 
+# SYNC-147: runbook rule 1 (people before the first import). Pilot #2's first scrapes loaded with 0 legislators in
+# production because nothing checked, and every vote and sponsorship was stored unresolved. A state that is not yet live
+# (the manifest's status `scraping`, `validating` or `archived`) is refused when api-v3 holds no legislators for it.
+# Live, paused and probing states are never checked, so the live states' behaviour cannot change.
+_STATES_THAT_NEED_PEOPLE = ("scraping", "validating", "archived")
+_SKIP_PEOPLE_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar("skip_people_check", default=False)
+_PEOPLE_ALREADY_CHECKED: contextvars.ContextVar[bool] = contextvars.ContextVar("people_already_checked", default=False)
+
+
+async def people_check_refusal(jurisdiction: str, config: dict | None) -> str | None:
+    """A plain-language refusal when this state's first scrape would load votes with no legislators to attach them to,
+    else None. Asks api-v3 (`local_openstates_client.count_current_people`: the same database the rest of ddp-sync and
+    the broker read) only for a state the manifest says is not live yet; an unreadable manifest, an unknown state or a
+    live one is not checked. A count of 0, and a count that cannot be read, both refuse (a first scrape without proof is
+    exactly the failure this prevents). The manual trigger can override on purpose; the override is logged.
+
+    Only zero versus non-zero matters here. `/people` counts CURRENT legislators, which is the right condition: a state's
+    votes resolve against current legislators. The SQL `count_people_loaded` in ddp-open-states (anyone with a membership,
+    retired included) cannot be imported into ddp-sync, so this is the accepted equivalent for a zero check; the two NUMBERS
+    differ (Pennsylvania: 257 current, 583 members) and nothing here relies on them matching. Replication lag on the Mac's
+    api-v3 can make a just-loaded state read 0 for a short time: the check then refuses, which is the safe direction, and
+    `?skip_people_check=true` overrides."""
+    code = "us" if jurisdiction.lower() == "usa" else jurisdiction.lower()
+    manifest = enrollment.load_manifest(_get_root(config))
+    entry = (manifest or {}).get(code)
+    if not isinstance(entry, dict) or entry.get("status") not in _STATES_THAT_NEED_PEOPLE:
+        return None
+    if _SKIP_PEOPLE_CHECK.get():
+        logger.warning("openstates_scrape: people check skipped on purpose", jurisdiction=jurisdiction, status=entry["status"])
+        return None
+    if _PEOPLE_ALREADY_CHECKED.get():
+        return None  # the manual trigger read the count moments ago and answered its caller (one read, not two)
+    from ddp_sync.config import get_settings
+    from ddp_sync.services import local_openstates_client
+
+    settings = get_settings()
+    # Production's people: the RDS-facing api-v3 when this host has one configured (EC2: no local api-v3 in the
+    # container); otherwise the local api-v3, which on the Mac reads a logical replica of production's RDS (so it is
+    # production's data plus replication lag).
+    if settings.rds_openstates_api_base:
+        source, base, key = "rds", settings.rds_openstates_api_base, settings.rds_openstates_api_key
+    else:
+        source, base, key = "local", settings.local_openstates_api_base, settings.local_openstates_api_key
+    count = await local_openstates_client.count_current_people(code, api_base=base, api_key=key)
+    logger.info("openstates_scrape: people count read", jurisdiction=jurisdiction, count=count, source=source, base=base)
+    if count is None:
+        return (
+            f"cannot read the legislator count for {code.upper()} from api-v3, so the first scrape is refused rather than "
+            f"started without proof that its legislators are loaded (runbook rule 1)."
+        )
+    if count == 0:
+        return (
+            f"{code.upper()} has no legislators in production (0 people): load them first (`os-people to-database {code}`), "
+            f"or every vote and sponsor will be stored with a name and no person (runbook rule 1, SYNC-147)."
+        )
+    return None
+
+
 async def _run_scrape(
     jurisdiction: str,
     session_arg: str | None,
@@ -1130,6 +1190,14 @@ async def _run_scrape_impl(
     now rather than reactive-after-failure. A no-op for every jurisdiction not
     opted in (config defaults to None, in which case it's always a no-op).
     """
+    # SYNC-147: before anything runs (cloud or local), a state that is not live yet and has no legislators in
+    # production is refused, with a log line and a failed result. Same one funnel, so the manual trigger, the scheduled
+    # batch and a retry are all covered.
+    refusal = await people_check_refusal(jurisdiction, config)
+    if refusal:
+        logger.warning("openstates_scrape: refused, no legislators in production", jurisdiction=jurisdiction, reason=refusal)
+        return {"success": False, "error": refusal, "refused": "no_legislators_in_production", "duration_seconds": 0.0}
+
     # OPEN-208: checked first, before anything else -- including ScrapeBot pre-seeding and
     # full-walk forcing below, both of which would be wasted work (and, for ScrapeBot, a
     # real mint against MI's WAF) for a jurisdiction this mac is not supposed to touch at
@@ -1799,6 +1867,8 @@ async def run_secondary_scrapes_job(
 async def run_single_scrape_job(
     jurisdiction: str,
     config: dict | None = None,
+    skip_people_check: bool = False,
+    people_checked: bool = False,
 ) -> dict[str, Any]:
     """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint.
 
@@ -1808,7 +1878,13 @@ async def run_single_scrape_job(
     of the full secondary batch, with no separate call needed at this level.
     """
     openstates_root = _get_root(config)
-    return await _run_scrape(jurisdiction, None, openstates_root, config=config)
+    token = _SKIP_PEOPLE_CHECK.set(bool(skip_people_check))  # SYNC-147: the manual trigger's explicit, logged override
+    token_checked = _PEOPLE_ALREADY_CHECKED.set(bool(people_checked))  # the trigger already read the count (one read)
+    try:
+        return await _run_scrape(jurisdiction, None, openstates_root, config=config)
+    finally:
+        _PEOPLE_ALREADY_CHECKED.reset(token_checked)
+        _SKIP_PEOPLE_CHECK.reset(token)
 
 
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:

@@ -1311,3 +1311,40 @@ async def find_bill(jurisdiction_iso2: str, session: str, identifier: str) -> tu
         "session_code": session,
         "gov_id": gov_id,
     }, True
+
+
+# SYNC-147: the people count gates a scrape, so it gets its own short timeout and at most ONE retry (the shared client's
+# defaults, 120 s with 3 attempts, could hold one check for about 6 minutes). Unreadable after that means refuse.
+_PEOPLE_COUNT_TIMEOUT_SECONDS = 8.0
+_PEOPLE_COUNT_ATTEMPTS = 2
+_PEOPLE_COUNT_RETRY_GAP_SECONDS = 1.0
+
+
+async def count_current_people(jurisdiction: str, *, api_base: str, api_key: str = "") -> int | None:
+    """SYNC-147: how many CURRENT legislators api-v3 holds for a jurisdiction (`/people`'s own `total_items`; the jurisdiction
+    may be a code in either case or a name). 0 is a real answer (nothing loaded); None means the count could not be read
+    (no base URL, api-v3 unreachable, an error status, a body that is not a count). One short timeout, at most one retry.
+    Never raises."""
+    if not api_base:
+        return None
+    for attempt in range(1, _PEOPLE_COUNT_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=_PEOPLE_COUNT_TIMEOUT_SECONDS) as http:
+                resp = await http.get(
+                    f"{api_base}/people", params={"jurisdiction": jurisdiction.upper(), "per_page": "1"},
+                    headers={"x-api-key": api_key} if api_key else {},
+                )
+            if resp.status_code >= 400:
+                logger.warning("api-v3 rejected the people count", jurisdiction=jurisdiction, status_code=resp.status_code)
+                data = None
+            else:
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - the caller needs the structured "cannot read it" answer, never a 500
+            logger.warning("api-v3 people count failed", jurisdiction=jurisdiction, attempt=attempt, error=str(exc))
+            data = None
+        total = ((data if isinstance(data, dict) else {}).get("pagination") or {}).get("total_items")
+        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+            return total
+        if attempt < _PEOPLE_COUNT_ATTEMPTS:
+            await asyncio.sleep(_PEOPLE_COUNT_RETRY_GAP_SECONDS)
+    return None
