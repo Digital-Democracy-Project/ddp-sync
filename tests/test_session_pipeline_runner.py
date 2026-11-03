@@ -3515,3 +3515,127 @@ async def test_retrying_the_same_request_after_it_was_written_dispatches_and_wri
     assert first["artifacts_generated"] == ["bill_summary"]
     assert second["artifacts_skipped_present"] == ["bill_summary"]
 
+
+
+# --- SYNC-142: the LegBot gate reads each state's `legbot_replica` from the shared list -------------------------
+
+
+def _shared_list(tmp_path, monkeypatch, *, legbot_true=(), mode="authoritative"):
+    """A tiny shared list (ddp-open-states jurisdictions.yaml) at OPENSTATES_ROOT, as on a production host."""
+    import yaml
+
+    from ddp_sync.services import jurisdiction_enrollment as je
+
+    je._cache.clear()
+    je._logged.clear()
+    codes = ["us", "fl", "wa", "va", "mi", "ut", "az", "ma", "nc", "al", "pa", "ne", "la"]
+    manifest = {c: {"name": c, "status": "live", "tier": "secondary",
+                    "enrollment": {"legbot_replica": c in legbot_true}} for c in codes}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path))
+    if mode:
+        monkeypatch.setenv(je.MODE_ENV, mode)
+    else:
+        monkeypatch.delenv(je.MODE_ENV, raising=False)
+
+
+def _env(*codes):
+    return SimpleNamespace(legbot_rds_replica_jurisdiction_allowlist=frozenset(c.upper() for c in codes))
+
+
+NINE_LIVE = ("us", "fl", "wa", "va", "mi", "ut", "az", "ma", "nc")
+MAC_ENV_LIST = ("mi", "ut", "fl", "va", "wa", "us", "ma", "az", "nc")  # what the Mac's env list holds today
+
+
+def test_the_shared_list_is_the_switch_and_the_env_list_is_ignored_in_authoritative_mode(tmp_path, monkeypatch):
+    _shared_list(tmp_path, monkeypatch, legbot_true=("fl", "us"))
+    assert session_pipeline_runner._legbot_allowed_codes(_env("wa", "nc")) == {"FL", "US"}
+
+
+def test_a_new_state_stays_off_until_a_human_sets_legbot_replica(tmp_path, monkeypatch):
+    _shared_list(tmp_path, monkeypatch, legbot_true=NINE_LIVE)
+    allowed = session_pipeline_runner._legbot_allowed_codes(_env())
+    assert {"PA", "NE", "LA", "AL"}.isdisjoint(allowed)
+    _shared_list(tmp_path, monkeypatch, legbot_true=(*NINE_LIVE, "pa"))   # the ONE human switch
+    assert "PA" in session_pipeline_runner._legbot_allowed_codes(_env())
+
+
+def test_the_nine_live_states_get_what_the_mac_env_list_gave_them(tmp_path, monkeypatch):
+    """Mac: the same nine. EC2 (env unset) used to send nothing; it now follows the shared list (named in the PR)."""
+    _shared_list(tmp_path, monkeypatch, legbot_true=NINE_LIVE)
+    assert session_pipeline_runner._legbot_allowed_codes(_env(*MAC_ENV_LIST)) == {c.upper() for c in MAC_ENV_LIST}
+    assert session_pipeline_runner._legbot_allowed_codes(_env()) == {c.upper() for c in MAC_ENV_LIST}
+
+
+def test_massachusetts_legbot_true_with_routing_false_is_unchanged(tmp_path, monkeypatch):
+    _shared_list(tmp_path, monkeypatch, legbot_true=("ma",))
+    assert session_pipeline_runner._legbot_allowed_codes(_env()) == {"MA"}
+
+
+def test_an_unreadable_shared_list_sends_nothing_when_the_host_sets_no_env_list(tmp_path, monkeypatch):
+    from ddp_sync.services import jurisdiction_enrollment as je
+
+    je._cache.clear()
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path / "nowhere"))
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    assert session_pipeline_runner._legbot_allowed_codes(_env()) == set()
+
+
+def test_an_unreadable_shared_list_falls_back_to_the_env_list(tmp_path, monkeypatch):
+    from ddp_sync.services import jurisdiction_enrollment as je
+
+    je._cache.clear()
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path / "nowhere"))
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    assert session_pipeline_runner._legbot_allowed_codes(_env("fl", "ut")) == {"FL", "UT"}
+
+
+def test_shadow_mode_keeps_the_env_list_exactly_and_logs_a_difference(tmp_path, monkeypatch):
+    from structlog.testing import capture_logs
+
+    _shared_list(tmp_path, monkeypatch, legbot_true=("fl", "us"), mode=None)
+    with capture_logs() as logs:
+        got = session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
+    assert got == {"FL", "WA"}
+    assert any(l["event"] == "jurisdiction_manifest_disagrees" and l["feature"] == "legbot_replica" for l in logs)
+
+
+def test_an_env_list_that_differs_from_the_shared_list_is_logged_once_not_applied(tmp_path, monkeypatch):
+    from structlog.testing import capture_logs
+
+    _shared_list(tmp_path, monkeypatch, legbot_true=("fl",))
+    with capture_logs() as logs:
+        session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
+        session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
+    assert [l["event"] for l in logs].count("jurisdiction_manifest_disagrees") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_state_with_legbot_replica_false_is_skipped_with_no_write_through_the_real_gate(tmp_path, monkeypatch):
+    """SYNC-142: the same skip as a state off the old list, driven by the shared list, with the env list SET to allow it."""
+    _shared_list(tmp_path, monkeypatch, legbot_true=("wa",))   # fl is false in the shared list
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=frozenset({"FL"})), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness", new=AsyncMock()
+    ) as mock_freshness, _patch_coverage(None) as mock_coverage, patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact", new=AsyncMock()
+    ) as mock_artifact:
+        result = await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10,
+                                           include_concept_statements=False, retry_failed=False)
+    mock_freshness.assert_not_awaited()
+    mock_coverage.assert_not_awaited()
+    mock_artifact.assert_not_awaited()
+    assert result["results"][0]["error"] == "jurisdiction_not_on_rds_replica_allowlist: FL"
+
+
+@pytest.mark.asyncio
+async def test_a_state_with_legbot_replica_true_proceeds_even_with_no_env_list(tmp_path, monkeypatch):
+    _shared_list(tmp_path, monkeypatch, legbot_true=("fl",))
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=frozenset()), _patch_freshness_check(
+        True
+    ), _patch_coverage(None), _patch_version(), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline("fl", "2026F", ["bill_summary"], True, limit=10,
+                                           include_concept_statements=False, retry_failed=False)
+    assert result["results"][0]["error"] is None

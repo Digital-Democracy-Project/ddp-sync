@@ -97,6 +97,11 @@ separate RDS-facing api-v3 instance. Two gates sit in `session_pipeline_runner.p
   check (cheap local test, no reason to pay an RDS round-trip for a jurisdiction dispatch
   won't trust regardless), gates which jurisdictions may dispatch from the RDS-fed replica
   at all.
+  **SYNC-142 (2026-11-03): the switch is now the shared list.** The gate reads each state's
+  `enrollment.legbot_replica` from ddp-open-states' `jurisdictions.yaml` (the ONE setting a human flips for
+  LegBot, because it depends on the data being good); in `authoritative` mode the env list is ignored (a log line when
+  it differs) and is only the fallback in `shadow` mode or when the shared list cannot be read. An empty answer
+  sends nothing.
 
 **As of 2026-09-13, both are live in production**, not just built: real logical replication
 from production RDS is up (OPEN-271/272/273/274 all Done, independently verified), and

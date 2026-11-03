@@ -80,12 +80,26 @@ from ddp_sync.services.broker_client import (
     get_bill_organization_positions_status,
     get_concept_statement_statuses,
 )
+from ddp_sync.services.jurisdiction_enrollment import default_root, enrolled
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
     get_current_version_identity,
     list_current_session_bill_candidates,
 )
 from ddp_sync.services.replica_freshness import check_bill_version_freshness
+
+
+def _legbot_allowed_codes(settings) -> set[str]:
+    """The jurisdictions LegBot may be sent bills for from the replica (SYNC-142). The switch is the shared list
+    (ddp-open-states jurisdictions.yaml): a state's `enrollment.legbot_replica` is the ONE setting a human flips, because
+    it depends on the data being good. In `authoritative` mode (every production host) the shared list answers and the
+    old per-host env list `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` is ignored, with a one-line log when the two
+    differ. It is used only as the documented fallback: in `shadow` mode (the default), and when the shared list cannot be
+    read. An EMPTY answer is a real answer and means nothing is dispatched, so an unreadable shared list on a host that
+    sets no env list sends no bill anywhere (the safe default)."""
+    env_list = sorted(str(c).strip().lower() for c in settings.legbot_rds_replica_jurisdiction_allowlist)
+    listed = enrolled("legbot_replica", env_list, default_root())
+    return {str(c).upper() for c in (listed or [])}
 
 logger = structlog.get_logger()
 
@@ -558,7 +572,7 @@ async def _process_bill_inner(
         # replica_freshness_check_enabled as an incident workaround without first re-narrowing (or
         # emptying) this allowlist -- doing so removes BOTH safety nets at once and would let
         # every jurisdiction dispatch untrusted, not just skip the freshness check alone.
-        allowlist = {code.upper() for code in settings.legbot_rds_replica_jurisdiction_allowlist}
+        allowlist = _legbot_allowed_codes(settings)
         if jurisdiction_iso2.upper() not in allowlist:
             logger.info(
                 "session_pipeline_bill_skipped_jurisdiction_not_on_rds_replica_allowlist",
