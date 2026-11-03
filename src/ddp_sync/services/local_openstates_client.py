@@ -1311,3 +1311,21 @@ async def find_bill(jurisdiction_iso2: str, session: str, identifier: str) -> tu
         "session_code": session,
         "gov_id": gov_id,
     }, True
+
+
+async def count_current_people(jurisdiction: str, *, api_base: str, api_key: str = "") -> int | None:
+    """SYNC-147: how many legislators api-v3 holds for a jurisdiction (`/people`'s own `total_items`; the jurisdiction
+    may be a code in either case or a name). 0 is a real answer (nothing loaded); None means the count could not be
+    read at all (no base URL, api-v3 unreachable or rejecting the read). Never raises."""
+    if not api_base:
+        return None
+    try:
+        data = await _get_json_with_retry(
+            f"{api_base}/people", {"jurisdiction": jurisdiction.upper(), "per_page": "1"},
+            {"x-api-key": api_key} if api_key else {}, {"jurisdiction": jurisdiction, "check": "people_count"},
+        )
+    except Exception as exc:  # noqa: BLE001 - the caller needs the structured "cannot read it" answer, never a 500
+        logger.warning("api-v3 people count failed", jurisdiction=jurisdiction, error=str(exc))
+        return None
+    total = ((data or {}).get("pagination") or {}).get("total_items")
+    return total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None

@@ -1180,6 +1180,7 @@ def _single_jurisdiction_targets(config: dict) -> set[str]:
 async def trigger_openstates_scrape(
     target: str,
     background_tasks: BackgroundTasks,
+    skip_people_check: bool = False,
     token: str = Depends(api_key_auth),
 ):
     """Trigger an OpenStates scrape job immediately, without waiting for its cron.
@@ -1199,7 +1200,9 @@ async def trigger_openstates_scrape(
         fork-check  — how far each DDP fork is behind its upstream (measure and alert only)
         drift-check — compare this host's jurisdiction lists with jurisdictions.yaml (OPEN-330; alerts on drift)
         <state>     — one state from openstates_scrape.secondary.jurisdictions in
-                      sync_schedule.yaml (va, mi, ma, ut, az, nc today), scraped alone
+                      sync_schedule.yaml (va, mi, ma, ut, az, nc today), scraped alone.
+                      SYNC-147: a state that is not live yet and has no legislators in production
+                      answers 409 (runbook rule 1); `?skip_people_check=true` starts it anyway.
     """
     from ddp_sync.pipelines.openstates_scrape import (
         run_patch_refresh_job,
@@ -1235,6 +1238,17 @@ async def trigger_openstates_scrape(
 
     single_targets = _single_jurisdiction_targets(config)
     if target in single_targets:
+        # SYNC-147: a state that is not live yet and has no legislators in production is refused HERE, so the answer
+        # to the person triggering it says so (the job itself runs in the background). `?skip_people_check=true` starts
+        # it anyway, on purpose; the job logs that.
+        from ddp_sync.pipelines.openstates_scrape import people_check_refusal
+
+        if skip_people_check:
+            background_tasks.add_task(run_single_scrape_job, target, config, skip_people_check=True)
+            return {"status": "started", "target": target, "people_check": "skipped on purpose"}
+        refusal = await people_check_refusal(target, config)
+        if refusal:
+            raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
         background_tasks.add_task(run_single_scrape_job, target, config)
         return {"status": "started", "target": target}
 
