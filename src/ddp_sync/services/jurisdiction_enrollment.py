@@ -117,6 +117,23 @@ def manifest_codes(feature: str, root: str) -> list[str] | None:
     return sorted("usa" if (uses_usa and c == "us") else c for c in codes)
 
 
+# Where a caller with no sync config in hand (the source-name labels) finds the ddp-open-states checkout: the same
+# per-host env var the pipelines read, then their documented default. Mirrors openstates_scrape._get_root.
+_DEFAULT_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
+
+
+def default_root() -> str:
+    return os.environ.get("OPENSTATES_ROOT") or _DEFAULT_ROOT
+
+
+def manifest_name(code: str, root: str | None = None) -> str | None:
+    """The manifest's `name` for a jurisdiction code (e.g. 'Pennsylvania'), or None when the manifest cannot say."""
+    manifest = load_manifest(root or default_root())
+    entry = (manifest or {}).get(str(code).strip().lower())
+    name = entry.get("name") if isinstance(entry, dict) else None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
 def _mode() -> str:
     return "authoritative" if os.environ.get(MODE_ENV, "").strip().lower() == "authoritative" else "shadow"
 

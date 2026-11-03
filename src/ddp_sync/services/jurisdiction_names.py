@@ -6,13 +6,16 @@ These strings label the SOURCE of ingested documents (the knowledge base, and so
 have been labelled "NC Legislature" once it was enrolled in embedding (SYNC-95) instead of "North Carolina
 Legislature" like the others.
 
-The manifest (`jurisdictions.yaml`) cannot supply these strings: its `name` is "North Carolina", this label adds
-"Legislature", and the federal entry reads "US Congress" here but "United States (Congress)" there. So this stays a
-table of its own; `tests/test_jurisdiction_names.py` fails if a manifest jurisdiction is missing from it, so the next
-state cannot forget it. `ca`, `ny` and `tx` are not tracked states; they stay for any non-enrolled caller.
+The table keeps every name that is already in the knowledge base exactly as it is (pinned in
+`tests/test_jurisdiction_names.py`), including the federal entry, which reads "US Congress" here but "United States
+(Congress)" in the manifest. A state that is NOT in the table (every state added after Louisiana) is labelled "<manifest name> Legislature" from the shared
+list (`jurisdictions.yaml`), so adding a state needs no edit here (SYNC-146); only when the manifest cannot be read does
+it fall back to "<CODE> Legislature". `ca`, `ny` and `tx` are not tracked states; they stay for any non-enrolled caller.
 """
 
 from __future__ import annotations
+
+from ddp_sync.services.jurisdiction_enrollment import manifest_name
 
 JURISDICTION_SOURCE_NAMES = {
     "us": "US Congress",
@@ -38,7 +41,9 @@ def source_name(jurisdiction: str | None) -> str:
     """Human-readable source name for a jurisdiction code (e.g. 'fl' -> 'Florida Legislature'). An unknown code falls
     back to '<CODE> Legislature'; an empty one to 'State Legislature' (the behavior of the three copies this replaces)."""
     jurisdiction_lower = jurisdiction.lower() if jurisdiction else ""
-    return JURISDICTION_SOURCE_NAMES.get(
-        jurisdiction_lower,
-        f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature",
-    )
+    if jurisdiction_lower in JURISDICTION_SOURCE_NAMES:
+        return JURISDICTION_SOURCE_NAMES[jurisdiction_lower]
+    from_manifest = manifest_name(jurisdiction_lower) if jurisdiction else None
+    if from_manifest:
+        return f"{from_manifest} Legislature"
+    return f"{jurisdiction.upper()} Legislature" if jurisdiction else "State Legislature"

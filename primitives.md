@@ -317,9 +317,10 @@ until then, a state that needs longer gets an entry here rather than a bigger sh
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida
 Legislature", "US Congress"), used by `bill_sync`, `legislator_sync` and the OpenStates source (each keeps a thin
 `_get_source_name` that delegates). It was three identical copies, none with `nc`. The manifest cannot supply the strings
-(its `name` is "North Carolina"), so this stays its own table; `tests/test_jurisdiction_names.py` pins the existing names
-and, when `OPENSTATES_ROOT` points at a ddp-open-states checkout (set at import, other tests clear it), fails if a manifest
-jurisdiction has no entry. **Adding a state: add its line here.** An unknown code still falls back to "<CODE> Legislature".
+(its `name` is "North Carolina", and the federal entry reads differently), so the table keeps every name that is already in
+the knowledge base, pinned exactly by `tests/test_jurisdiction_names.py`. **Adding a state needs no line here (SYNC-146):** a
+code not in the table is labelled "<manifest name> Legislature" from the shared list (`jurisdiction_enrollment.manifest_name`);
+only when the manifest cannot be read does it fall back to "<CODE> Legislature".
 
 ## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
 
@@ -352,6 +353,15 @@ cut over 2026-11-02 UTC on both hosts):** the Mac's `.env`; the EC2 broker host'
 (committed there, next to `JURISDICTION_DRIFT_CHECK_ENABLED`, so a pull does not collide with a hand edit). Still
 wired only for the features listed above; the per-feature opt-in lists stay yaml-only on purpose.
 
+**SYNC-146: a new state needs no ddp-sync edit.** In `authoritative` mode three more readers take their answer from the shared
+list through `enrolled(...)`: the scheduler's secondary batch (`scheduler._secondary_jurisdictions`, `scrape_secondary`: tier
+secondary and a status other than paused or probing), the cloud-run ownership gate (`openstates_scrape._cloud_path_owns`, via
+`_cloud_path_jurisdictions`, `cloud_path`: `enrollment.cloud_path`) and the S3 memory floor (`_memory_backend_enabled`: a state
+the cloud owns is covered automatically). `cloud_path.enabled` stays the global switch. `shadow` mode and an unreadable shared
+list give the yaml's answer exactly as before. **Rolling a state back off the cloud path:** the yaml
+`memory_backend_jurisdictions` list is what remembers it afterwards, so add the state to it BEFORE setting `cloud_path` false in
+the shared list (nothing can remember it once the manifest says false). The archive, embedding and search-refresh
+registrations are unchanged by this ticket.
 ## Jurisdiction drift check (`pipelines/jurisdiction_drift_check.py`, OPEN-330)
 
 A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
