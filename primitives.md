@@ -460,6 +460,11 @@ that correcting it clears the signature. Mac first.
   Never raises; returns whether CAMS queued it or Slack accepted it. Via the route the channel comes from CAMS's own map. `source` (e.g. `"openstates_scrape.scrape_failure"`) names the
   caller in the log line. A missing token or a refused post logs `slack_alert_not_sent_no_token` /
   `slack_alert_failed` / `slack_alert_error` (with `source`) instead of a per-site event.
+  **Tests can never send one (SYNC-148):** `tests/conftest.py` clears every alert variable (including `CAMS_API_TOKEN`), turns
+  `dotenv.load_dotenv` into a no-op (a worktree inside the production folder used to find its `.env` and restore the route), and
+  replaces `requests` inside `slack_alerts` with a stand-in whose `post` fails the test unless the test patched it
+  (`ddp_sync.slack_alerts.requests.post` or `requests.post`). `tests/test_no_real_alerts_from_tests.py` pins all three. **Do not
+  mock `post_alert` by clearing variables alone, and do not call `load_dotenv()` in a new test.**
 - **`codebot_identity() -> dict`** (`slack_identity.py`) — the `username` / `icon_emoji` fields. Mirrors
   ddp-agents' `cams.slack_identity.identity_kwargs("codebot")` (this service can't import `cams`): same
   `CODEBOT_SLACK_USERNAME` / `CODEBOT_SLACK_ICON_EMOJI` variables, same defaults (`CodeBot`, `:robot_face:`), and an

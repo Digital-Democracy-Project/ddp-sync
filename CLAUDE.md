@@ -519,6 +519,13 @@ PYTHONPATH="$PWD/src" ~/Developer/repos/ddp-sync/.venv/bin/ruff check src/ tests
 `PYTHONPATH` override, you'd silently run tests against the live checkout's code instead of this
 clone's.
 
+**Run tests from a checkout or worktree that is NOT inside `~/Developer/repos/ddp-sync/` (SYNC-148).** `config._load_from_env()`
+calls `load_dotenv()`, which walks up from the code's folder, so a worktree under `ddp-sync/.worktrees/` finds the production
+checkout's real `.env` (a live alert route and tokens). `tests/conftest.py` now blocks that and fails any test that tries a real
+alert post, but a worktree inside the production folder also shows about 28 spurious failures on `main` from the same `.env`.
+On 2026-11-03 such a run sent two real false alerts ("scrape failed for va / mi") to #automation-errors. `ddp-sync-dev/` and a
+worktree of it outside any repo folder are fine.
+
 **Work developed here must land in production via a pull request** — same discipline as
 `ddp-open-states`: branch, commit, push, open a PR against this repo's `main` on GitHub. Never
 push directly to `main` or fast-forward-merge locally and push. After a PR merges, updating the
