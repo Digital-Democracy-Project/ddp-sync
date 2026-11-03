@@ -1249,7 +1249,7 @@ async def trigger_openstates_scrape(
         refusal = await people_check_refusal(target, config)
         if refusal:
             raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
-        background_tasks.add_task(run_single_scrape_job, target, config)
+        background_tasks.add_task(run_single_scrape_job, target, config, people_checked=True)
         return {"status": "started", "target": target}
 
     available = sorted(_OPENSTATES_JOB_TARGETS | single_targets)

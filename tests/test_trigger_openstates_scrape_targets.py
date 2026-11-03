@@ -35,7 +35,7 @@ def test_a_state_only_in_the_schedule_config_is_a_single_target():
     resp, single, _ = _post("zz", config)
     assert resp.status_code == 200
     assert resp.json() == {"status": "started", "target": "zz"}
-    single.assert_awaited_once_with("zz", config)
+    single.assert_awaited_once_with("zz", config, people_checked=True)
 
 
 def test_a_state_missing_from_the_config_is_404_and_the_list_comes_from_the_config():
@@ -59,4 +59,4 @@ def test_nc_is_a_single_target_in_the_checked_in_schedule():
     openstates_scrape = yaml.safe_load(config_path.read_text())["openstates_scrape"]
     resp, single, _ = _post("nc", openstates_scrape)
     assert resp.status_code == 200
-    single.assert_awaited_once_with("nc", openstates_scrape)
+    single.assert_awaited_once_with("nc", openstates_scrape, people_checked=True)

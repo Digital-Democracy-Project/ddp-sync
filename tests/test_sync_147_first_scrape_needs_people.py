@@ -158,7 +158,7 @@ def test_the_trigger_answers_409_with_the_reason_and_does_not_start_the_job(cfg)
 def test_the_trigger_starts_a_state_that_has_legislators_exactly_as_before(cfg):
     resp, single = _post("pa", cfg, 253)
     assert resp.status_code == 200 and resp.json() == {"status": "started", "target": "pa"}
-    single.assert_awaited_once_with("pa", cfg)
+    single.assert_awaited_once_with("pa", cfg, people_checked=True)   # the job is told: one read, not two
 
 
 def test_the_trigger_override_starts_it_and_says_so(cfg):
@@ -170,46 +170,166 @@ def test_the_trigger_override_starts_it_and_says_so(cfg):
 def test_a_live_state_is_triggered_with_no_check(cfg):
     resp, single = _post("nc", cfg, 0)
     assert resp.status_code == 200
-    single.assert_awaited_once_with("nc", cfg)
+    single.assert_awaited_once_with("nc", cfg, people_checked=True)
 
 
-# --- the count itself -------------------------------------------------------------------------------------------
+# --- the count itself: its own short timeout, at most one retry ---------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, status=200, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+def _fake_http(script, seen):
+    """A stand-in for httpx.AsyncClient: `script` is a list of responses or exceptions, one per get()."""
+
+    class _C:
+        def __init__(self, *a, **kw):
+            seen["timeouts"].append(kw.get("timeout"))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            seen["gets"].append((url, params, headers))
+            item = script[min(len(seen["gets"]) - 1, len(script) - 1)]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    return _C
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer,expected", [
-    ({"pagination": {"total_items": 0}}, 0), ({"pagination": {"total_items": 253}}, 253), (None, None),
-    ({"pagination": {}}, None), ({"pagination": {"total_items": "253"}}, None), ({"pagination": {"total_items": True}}, None),
-    ({"pagination": {"total_items": -1}}, None),
+@pytest.mark.parametrize("body,expected", [
+    ({"pagination": {"total_items": 0}}, 0), ({"pagination": {"total_items": 253}}, 253), ({"pagination": {}}, None),
+    ({"pagination": {"total_items": "253"}}, None), ({"pagination": {"total_items": True}}, None),
+    ({"pagination": {"total_items": -1}}, None), (["not", "a", "dict"], None),
 ])
-async def test_count_current_people_reads_total_items_and_says_none_when_it_cannot(answer, expected):
-    with patch.object(client, "_get_json_with_retry", new=AsyncMock(return_value=answer)) as get:
+async def test_count_current_people_reads_total_items_and_says_none_when_it_cannot(body, expected):
+    seen = {"gets": [], "timeouts": []}
+    with patch.object(client.httpx, "AsyncClient", _fake_http([_FakeResp(200, body)], seen)), \
+            patch.object(client.asyncio, "sleep", new=AsyncMock()):
         assert await client.count_current_people("pa", api_base="http://x", api_key="k") == expected
-    assert get.await_args.args[1] == {"jurisdiction": "PA", "per_page": "1"}
+    assert seen["gets"][0][1] == {"jurisdiction": "PA", "per_page": "1"} and seen["gets"][0][2] == {"x-api-key": "k"}
 
 
 @pytest.mark.asyncio
-async def test_count_current_people_with_no_base_url_is_unreadable():
-    assert await client.count_current_people("pa", api_base="") is None
+async def test_count_current_people_with_no_base_url_is_unreadable_and_makes_no_call():
+    seen = {"gets": [], "timeouts": []}
+    with patch.object(client.httpx, "AsyncClient", _fake_http([], seen)):
+        assert await client.count_current_people("pa", api_base="") is None
+    assert seen["gets"] == []
 
 
 @pytest.mark.asyncio
-async def test_a_client_that_raises_is_an_unreadable_count_not_a_crash():
-    with patch.object(client, "_get_json_with_retry", new=AsyncMock(side_effect=RuntimeError("boom"))):
+async def test_the_count_has_a_short_timeout_of_its_own_and_at_most_one_retry():
+    seen = {"gets": [], "timeouts": []}
+    boom = RuntimeError("down")
+    with patch.object(client.httpx, "AsyncClient", _fake_http([boom, boom, boom], seen)), \
+            patch.object(client.asyncio, "sleep", new=AsyncMock()) as nap:
+        assert await client.count_current_people("pa", api_base="http://x") is None
+    assert len(seen["gets"]) == 2 and nap.await_count == 1            # one retry, not three attempts
+    assert all(t is not None and t <= 10 for t in seen["timeouts"])  # not the shared client's 120 s
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_read_is_retried_once_and_the_second_answer_is_used():
+    seen = {"gets": [], "timeouts": []}
+    script = [RuntimeError("blip"), _FakeResp(200, {"pagination": {"total_items": 7}})]
+    with patch.object(client.httpx, "AsyncClient", _fake_http(script, seen)), patch.object(client.asyncio, "sleep", new=AsyncMock()):
+        assert await client.count_current_people("pa", api_base="http://x") == 7
+    assert len(seen["gets"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_error_status_and_a_raising_client_are_unreadable_not_a_crash():
+    seen = {"gets": [], "timeouts": []}
+    with patch.object(client.httpx, "AsyncClient", _fake_http([_FakeResp(500, None)], seen)), \
+            patch.object(client.asyncio, "sleep", new=AsyncMock()):
         assert await client.count_current_people("pa", api_base="http://x") is None
 
 
 @pytest.mark.asyncio
 async def test_a_raising_client_still_gives_the_manual_trigger_its_409_and_the_funnel_its_structured_refusal(cfg):
-    with patch.object(client, "_get_json_with_retry", new=AsyncMock(side_effect=RuntimeError("boom"))), patch(CLOUD) as cloud:
+    seen = {"gets": [], "timeouts": []}
+    with patch.object(client.httpx, "AsyncClient", _fake_http([RuntimeError("boom")], seen)), \
+            patch.object(client.asyncio, "sleep", new=AsyncMock()), patch(CLOUD) as cloud:
         result = await scrape._run_scrape_impl("pa", None, cfg["openstates_root"], config=cfg)
-    cloud.assert_not_called()
-    assert result["success"] is False and "cannot read the legislator count" in result["error"]
-    app = FastAPI()
-    app.include_router(router)
-    app.dependency_overrides[api_key_auth] = lambda: "test-token"
-    scheduler = SimpleNamespace(_sync_config={"openstates_scrape": cfg})
-    with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), \
-            patch.object(client, "_get_json_with_retry", new=AsyncMock(side_effect=RuntimeError("boom"))):
-        resp = TestClient(app).post("/trigger/openstates-scrape/pa")
+        cloud.assert_not_called()
+        assert result["success"] is False and "cannot read the legislator count" in result["error"]
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[api_key_auth] = lambda: "test-token"
+        scheduler = SimpleNamespace(_sync_config={"openstates_scrape": cfg})
+        with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler):
+            resp = TestClient(app).post("/trigger/openstates-scrape/pa")
     assert resp.status_code == 409 and "cannot read the legislator count" in resp.json()["detail"]
+
+
+# --- which database it reads: production's, not a stand-in -----------------------------------------------------------
+
+
+def _settings(rds_base="", local_base="http://localhost:8002"):
+    return SimpleNamespace(rds_openstates_api_base=rds_base, rds_openstates_api_key="rds-key",
+                           local_openstates_api_base=local_base, local_openstates_api_key="local-key")
+
+
+@pytest.mark.asyncio
+async def test_it_reads_the_rds_facing_api_v3_when_one_is_configured_and_never_the_local_one(cfg):
+    with patch("ddp_sync.config.get_settings", return_value=_settings("http://rds:8002")), \
+            patch(COUNT, new=AsyncMock(return_value=253)) as count, capture_logs() as logs:
+        assert await scrape.people_check_refusal("pa", cfg) is None
+    assert count.await_args.kwargs == {"api_base": "http://rds:8002", "api_key": "rds-key"}
+    assert all("localhost" not in str(c) for c in count.await_args_list)          # fails if the local base is read here
+    assert [l["source"] for l in logs if l["event"] == "openstates_scrape: people count read"] == ["rds"]
+
+
+@pytest.mark.asyncio
+async def test_it_falls_back_to_the_local_api_v3_only_when_the_rds_base_is_empty(cfg):
+    with patch("ddp_sync.config.get_settings", return_value=_settings("")), \
+            patch(COUNT, new=AsyncMock(return_value=253)) as count, capture_logs() as logs:
+        assert await scrape.people_check_refusal("pa", cfg) is None
+    assert count.await_args.kwargs == {"api_base": "http://localhost:8002", "api_key": "local-key"}
+    assert [l["source"] for l in logs if l["event"] == "openstates_scrape: people count read"] == ["local"]
+
+
+@pytest.mark.asyncio
+async def test_a_zero_from_the_rds_base_refuses_even_though_the_local_copy_has_people(cfg):
+    """The pilot #2 failure: people on the Mac's copy, none in production."""
+    async def by_base(code, *, api_base, api_key=""):
+        return 0 if "rds" in api_base else 257
+
+    with patch("ddp_sync.config.get_settings", return_value=_settings("http://rds:8002")), patch(COUNT, new=by_base):
+        msg = await scrape.people_check_refusal("pa", cfg)
+    assert msg and "no legislators in production" in msg
+
+
+# --- one read, not two ----------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_job_the_trigger_already_checked_does_not_read_the_count_again(cfg):
+    with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD, return_value={"success": True}) as cloud:
+        await scrape.run_single_scrape_job("pa", cfg, people_checked=True)
+    count.assert_not_awaited()
+    cloud.assert_called_once()
+    assert scrape._PEOPLE_ALREADY_CHECKED.get() is False          # not sticky
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_run_with_no_trigger_still_reads_the_count_in_the_funnel(cfg):
+    with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD) as cloud:
+        result = await scrape._run_scrape_impl("pa", None, cfg["openstates_root"], config=cfg)
+    count.assert_awaited_once()
+    cloud.assert_not_called()
+    assert result["success"] is False

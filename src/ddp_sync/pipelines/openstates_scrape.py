@@ -1062,6 +1062,7 @@ async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | Non
 # Live, paused and probing states are never checked, so the live states' behaviour cannot change.
 _STATES_THAT_NEED_PEOPLE = ("scraping", "validating", "archived")
 _SKIP_PEOPLE_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar("skip_people_check", default=False)
+_PEOPLE_ALREADY_CHECKED: contextvars.ContextVar[bool] = contextvars.ContextVar("people_already_checked", default=False)
 
 
 async def people_check_refusal(jurisdiction: str, config: dict | None) -> str | None:
@@ -1069,7 +1070,14 @@ async def people_check_refusal(jurisdiction: str, config: dict | None) -> str | 
     else None. Asks api-v3 (`local_openstates_client.count_current_people`: the same database the rest of ddp-sync and
     the broker read) only for a state the manifest says is not live yet; an unreadable manifest, an unknown state or a
     live one is not checked. A count of 0, and a count that cannot be read, both refuse (a first scrape without proof is
-    exactly the failure this prevents). The manual trigger can override on purpose; the override is logged."""
+    exactly the failure this prevents). The manual trigger can override on purpose; the override is logged.
+
+    Only zero versus non-zero matters here. `/people` counts CURRENT legislators, which is the right condition: a state's
+    votes resolve against current legislators. The SQL `count_people_loaded` in ddp-open-states (anyone with a membership,
+    retired included) cannot be imported into ddp-sync, so this is the accepted equivalent for a zero check; the two NUMBERS
+    differ (Pennsylvania: 257 current, 583 members) and nothing here relies on them matching. Replication lag on the Mac's
+    api-v3 can make a just-loaded state read 0 for a short time: the check then refuses, which is the safe direction, and
+    `?skip_people_check=true` overrides."""
     code = "us" if jurisdiction.lower() == "usa" else jurisdiction.lower()
     manifest = enrollment.load_manifest(_get_root(config))
     entry = (manifest or {}).get(code)
@@ -1078,13 +1086,21 @@ async def people_check_refusal(jurisdiction: str, config: dict | None) -> str | 
     if _SKIP_PEOPLE_CHECK.get():
         logger.warning("openstates_scrape: people check skipped on purpose", jurisdiction=jurisdiction, status=entry["status"])
         return None
+    if _PEOPLE_ALREADY_CHECKED.get():
+        return None  # the manual trigger read the count moments ago and answered its caller (one read, not two)
     from ddp_sync.config import get_settings
     from ddp_sync.services import local_openstates_client
 
     settings = get_settings()
-    count = await local_openstates_client.count_current_people(
-        code, api_base=settings.local_openstates_api_base, api_key=settings.local_openstates_api_key
-    )
+    # Production's people: the RDS-facing api-v3 when this host has one configured (EC2: no local api-v3 in the
+    # container); otherwise the local api-v3, which on the Mac reads a logical replica of production's RDS (so it is
+    # production's data plus replication lag).
+    if settings.rds_openstates_api_base:
+        source, base, key = "rds", settings.rds_openstates_api_base, settings.rds_openstates_api_key
+    else:
+        source, base, key = "local", settings.local_openstates_api_base, settings.local_openstates_api_key
+    count = await local_openstates_client.count_current_people(code, api_base=base, api_key=key)
+    logger.info("openstates_scrape: people count read", jurisdiction=jurisdiction, count=count, source=source, base=base)
     if count is None:
         return (
             f"cannot read the legislator count for {code.upper()} from api-v3, so the first scrape is refused rather than "
@@ -1852,6 +1868,7 @@ async def run_single_scrape_job(
     jurisdiction: str,
     config: dict | None = None,
     skip_people_check: bool = False,
+    people_checked: bool = False,
 ) -> dict[str, Any]:
     """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint.
 
@@ -1862,9 +1879,11 @@ async def run_single_scrape_job(
     """
     openstates_root = _get_root(config)
     token = _SKIP_PEOPLE_CHECK.set(bool(skip_people_check))  # SYNC-147: the manual trigger's explicit, logged override
+    token_checked = _PEOPLE_ALREADY_CHECKED.set(bool(people_checked))  # the trigger already read the count (one read)
     try:
         return await _run_scrape(jurisdiction, None, openstates_root, config=config)
     finally:
+        _PEOPLE_ALREADY_CHECKED.reset(token_checked)
         _SKIP_PEOPLE_CHECK.reset(token)
 
 
