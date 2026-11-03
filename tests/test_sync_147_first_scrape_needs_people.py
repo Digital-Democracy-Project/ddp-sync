@@ -333,3 +333,16 @@ async def test_a_scheduled_run_with_no_trigger_still_reads_the_count_in_the_funn
     count.assert_awaited_once()
     cloud.assert_not_called()
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_markers_are_cleared_even_when_the_job_raises_so_a_later_scheduled_run_still_checks(cfg):
+    with patch(CLOUD, side_effect=RuntimeError("launch failed")), patch(COUNT, new=AsyncMock(return_value=253)):
+        with pytest.raises(RuntimeError):
+            await scrape.run_single_scrape_job("pa", cfg, skip_people_check=True, people_checked=True)
+    assert scrape._PEOPLE_ALREADY_CHECKED.get() is False and scrape._SKIP_PEOPLE_CHECK.get() is False
+    with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD) as cloud:
+        result = await scrape._run_scrape_impl("pa", None, cfg["openstates_root"], config=cfg)
+    count.assert_awaited_once()
+    cloud.assert_not_called()
+    assert result["success"] is False
