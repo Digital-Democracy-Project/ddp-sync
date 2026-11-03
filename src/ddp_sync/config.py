@@ -503,6 +503,10 @@ class SyncSettings:
     # left in this env var doesn't accidentally start gating dispatch before the freshness
     # infrastructure is even live. Comma-separated 2-letter codes, case-insensitive
     # (normalized to uppercase at parse time).
+    # SYNC-142: this env list is now only the FALLBACK. The dispatch gate reads each state's `enrollment.legbot_replica`
+    # from the shared list (ddp-open-states jurisdictions.yaml) in `authoritative` mode, and this value is ignored there
+    # (with a log line when it differs). It is used when JURISDICTION_MANIFEST_MODE is shadow (the default) or the shared
+    # list cannot be read; leave it unset on a host that should send nothing in that case.
     legbot_rds_replica_jurisdiction_allowlist: frozenset[str] = frozenset()
 
     # SYNC-48: independent enable flag for an automated scraper-completion

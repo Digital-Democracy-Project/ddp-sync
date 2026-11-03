@@ -76,7 +76,8 @@ def test_everything_agreeing_has_no_findings(root):
 def test_an_env_list_the_host_does_not_set_is_not_drift_but_is_named_as_skipped(root):
     f = jdc.collect_findings(AGREEING_CONFIG, _settings(), root)
     assert f["drift"] == [] and f["unverifiable"] == []
-    assert f["skipped"] == ["DDP_OPENSTATES_JURISDICTIONS", "LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST"]
+    # SYNC-142: the LegBot env list is not compared any more (the gate reads the manifest), so it is not named either.
+    assert f["skipped"] == ["DDP_OPENSTATES_JURISDICTIONS"]
 
 
 def test_skipped_env_lists_do_not_change_the_alert_signature_or_cause_an_alert(root):
@@ -91,7 +92,8 @@ def test_an_env_list_that_differs_is_drift_with_both_sides(root):
     f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US", "FL"], ["FL", "US", "NC", "AL"]), root)
     by = {d["source"]: d for d in f["drift"]}
     assert by["env DDP_OPENSTATES_JURISDICTIONS"]["only_in_manifest"] == ["nc"]
-    assert by["env LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST"]["only_in_yaml"] == ["al"]
+    # SYNC-142: a stale LegBot env list on a host is not drift: the gate ignores it when the manifest is readable.
+    assert "env LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST" not in by
 
 
 def test_a_live_yaml_list_that_differs_is_drift(root):

@@ -734,7 +734,7 @@ openstates_scrape:
     repeat_days: 7
 
   # OPEN-330 (OPEN-318 slice 5): daily check that THIS host's jurisdiction lists (the live copy of this file, and its
-  # own DDP_OPENSTATES_JURISDICTIONS / LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST when set) agree with ddp-open-states'
+  # own DDP_OPENSTATES_JURISDICTIONS when set) agree with ddp-open-states'
   # jurisdictions.yaml, and that the manifest on this host can be read and is current enough to check. Alerts through
   # post_alert when the findings change, then every repeat_days. Default off per host: a host sets
   # JURISDICTION_DRIFT_CHECK_ENABLED=true (Mac Studio and the EC2 broker host both should). Manual run:

@@ -353,6 +353,8 @@ cut over 2026-11-02 UTC on both hosts):** the Mac's `.env`; the EC2 broker host'
 (committed there, next to `JURISDICTION_DRIFT_CHECK_ENABLED`, so a pull does not collide with a hand edit). Still
 wired only for the features listed above; the per-feature opt-in lists stay yaml-only on purpose.
 
+**SYNC-142: the LegBot gate reads the shared list.** `session_pipeline_runner._legbot_allowed_codes` answers from each state's `enrollment.legbot_replica` through `enrolled("legbot_replica", <env list>, default_root())`: in `authoritative` mode the shared list decides and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` is ignored (logged once when it differs); in `shadow` mode, or when the shared list cannot be read, the env list is the fallback, and an empty answer sends nothing. The daily drift check no longer compares that env var; it reports `legbot_replica` as unverifiable when the manifest cannot answer it. `legbot_replica` is the one switch a human flips.
+
 **SYNC-146: a new state needs no ddp-sync edit.** In `authoritative` mode three more readers take their answer from the shared
 list through `enrolled(...)`: the scheduler's secondary batch (`scheduler._secondary_jurisdictions`, `scrape_secondary`: tier
 secondary and a status other than paused or probing), the cloud-run ownership gate (`openstates_scrape._cloud_path_owns`, via
@@ -366,7 +368,7 @@ registrations are unchanged by this ticket.
 
 A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
 `post_alert` (source `jurisdiction_drift_check`). It checks the live `sync_schedule.yaml` dict (hand-edited per host),
-the host's own `DDP_OPENSTATES_JURISDICTIONS` and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` (only when the host sets
+the host's own `DDP_OPENSTATES_JURISDICTIONS` (only when the host sets
 them: unset is not drift), and whether the manifest can answer at all: a missing, unreadable, or out-of-date checkout is
 reported as "cannot verify" (the EC2 bind mount is never auto-pulled), because a monitor that cannot see must alert.
 The alert repeats only when the findings change or after `jurisdiction_drift_check.repeat_days` (7). Default off per host

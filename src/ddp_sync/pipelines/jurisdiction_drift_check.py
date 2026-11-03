@@ -7,7 +7,7 @@ the host it runs on:
 
   - every jurisdiction list in the LIVE sync_schedule.yaml (the dict this process loaded, which on a host can be
     hand-edited), via `jurisdiction_enrollment.config_disagreements`;
-  - this host's own `DDP_OPENSTATES_JURISDICTIONS` and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST`, but only when
+  - this host's own `DDP_OPENSTATES_JURISDICTIONS`, but only when
     the host sets them (a host that routes nothing to the replica is not "drift");
   - whether the manifest can answer at all. A monitor that cannot see is an alert condition, not a log line
     (the retired staleness watchdog watched nothing for six weeks): a missing, unreadable or out-of-date
@@ -40,9 +40,14 @@ DEFAULT_REPEAT_DAYS = 7
 # env var name -> (manifest feature, the value in this host's settings)
 _ENV_LISTS = {
     "DDP_OPENSTATES_JURISDICTIONS": ("replica_routing", "ddp_openstates_jurisdictions"),
-    "LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST": ("legbot_replica", "legbot_rds_replica_jurisdiction_allowlist"),
+    # SYNC-142: LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST is no longer compared. The LegBot gate reads the manifest's
+    # `legbot_replica` itself (the env list is only the fallback when the manifest cannot be read), so there is no second
+    # list that can drift.
 }
-_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape_primary", "scrape_secondary")
+# SYNC-142: `legbot_replica` is checked here because the LegBot gate now reads it from the manifest; a manifest that cannot
+# answer it makes the gate fall back to the env list, which must be visible (unverifiable), not silent.
+_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape_primary", "scrape_secondary",
+                     "legbot_replica")
 
 
 def collect_findings(sync_config: dict, settings: Any, root: str) -> dict[str, Any]:
