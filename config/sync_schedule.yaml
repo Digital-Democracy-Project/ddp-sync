@@ -206,6 +206,7 @@ api_health_check:
 #   02:00  FL (all sessions sequential — 12+ hours, starts first)
 #   02:30  WA (~5 hours)
 #   03:00  USA lower → upper (~6 hours; shares slot with Mon Webflow batch, no conflict)
+#   04:00  PA (~7 hours, finishes ~11:00; OPEN-494 -- tier primary in jurisdictions.yaml, same change)
 #   04:00  bill sync [existing]
 #
 #   Sunday additionally:
@@ -662,6 +663,13 @@ openstates_scrape:
         - "119 chamber=lower"
         - "119 chamber=upper"
 
+    # OPEN-494 (Ramon, 2026-11-06): Pennsylvania is nightly, tier primary in ddp-open-states' jurisdictions.yaml. The two
+    # change together (the drift check compares this key set with the manifest's primary tier). The full walk is ~7 h
+    # (first scrape 7 h 9 min, 2026-11-02/03), so it finishes ~11:00 UTC. Not in the secondary list below.
+    pa:
+      enabled: true
+      sync_time_utc: "04:00"   # 1 hour after USA; finishes ~11:00
+
   secondary:
     enabled: true
     sync_day: sunday
@@ -683,12 +691,12 @@ openstates_scrape:
       # first scrape succeed.
       - nc
       # OPEN-478/479/480 (pilot #2, Stage 2): pa, ne, la, the same way. Ramon gave the go on 2026-11-02 and asked for the
-      # first runs by manual trigger at once, all three, not waiting for Sunday. This list also puts all three in the Sunday
-      # 02:00 UTC batch from 11-08, so a host that has it schedules three weekly production scrapes. None of them has run
+      # first runs by manual trigger at once, all three, not waiting for Sunday. This list also puts ne and la in the Sunday
+      # 02:00 UTC batch from 11-08, so a host that has it schedules two weekly production scrapes (pa moved to the nightly
+      # primary lineup above, OPEN-494). None of them has run
       # a full walk before (the bills scrapers do not accept start=, so every run walks every bill); the shared 12 h cloud
       # wait limit applies to each until a measured runtime sets a per-state value (OPEN-476). The cloud path and S3 memory
       # lists above carry the same three. Archive stays off (Stage 4).
-      - pa
       - ne
       - la
 

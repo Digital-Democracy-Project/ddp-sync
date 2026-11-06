@@ -722,6 +722,35 @@ class UpdateScheduler:
             )
             logger.info("openstates_usa_scrape: registered", sync_time=usa_time)
 
+        # OPEN-494: any other state listed under primary (today: pa) is a nightly job of its own at its own
+        # sync_time_utc. fl/wa/usa above keep their dedicated wrappers; this one reuses the single-state run that an
+        # escalated secondary state already uses, so there is no new scrape path. It never reads the secondary list, so a
+        # primary state is not also in the Sunday batch (the manifest tier is the one switch: see _secondary_jurisdictions).
+        for pj, pj_cfg in primary_cfg.items():
+            if pj in ("fl", "wa", "usa") or not isinstance(pj_cfg, dict) or not pj_cfg.get("enabled", False):
+                continue
+            pj_time = pj_cfg.get("sync_time_utc", "04:00")
+            pjh, pjm = map(int, pj_time.split(":"))
+            # A state that was an escalated secondary leaves its old per-state job id behind in a live scheduler.
+            self._remove_job_if_present(f"openstates_secondary_scrape_{pj}")
+
+            async def _primary_wrapper(_j: str = pj):
+                return await run_secondary_scrapes_job(
+                    config, jurisdictions=[_j], flow_status_key=f"openstates_primary_scrape_{_j}"
+                )
+
+            self._add_job_replacing(
+                _primary_wrapper,
+                trigger=CronTrigger(hour=pjh, minute=pjm, timezone=_UTC),
+                id=f"openstates_primary_scrape_{pj}",
+                name=f"OpenStates: {pj} scrape (nightly, primary)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("openstates_primary_scrape: registered", jurisdiction=pj, sync_time=pj_time)
+
         # --- secondary jobs (weekly batch, minus anything escalated to nightly) ---
         sec_cfg = config.get("secondary", {})
         if sec_cfg.get("enabled", True):

@@ -375,6 +375,13 @@ list give the yaml's answer exactly as before. **Rolling a state back off the cl
 `memory_backend_jurisdictions` list is what remembers it afterwards, so add the state to it BEFORE setting `cloud_path` false in
 the shared list (nothing can remember it once the manifest says false). The archive, embedding and search-refresh
 registrations are unchanged by this ticket.
+
+**OPEN-494: a state under `openstates_scrape.primary` other than fl/wa/usa is a nightly job of its own.** `scheduler._register_openstates_scrape_jobs`
+registers `openstates_primary_scrape_<code>` at that entry's `sync_time_utc` (default 04:00) for every extra `primary` entry with
+`enabled: true`, running `run_secondary_scrapes_job(config, jurisdictions=[code], flow_status_key="openstates_primary_scrape_<code>")`
+(the single-state run an escalated secondary state already uses; its run history stays under the secondary flow name). The drift check
+compares the enabled `primary` keys with the manifest's `tier: primary`, so a state moves tier in `jurisdictions.yaml` AND here in one
+change (and leaves `secondary.jurisdictions`, or it is drift). First user: pa, 04:00 UTC. **Do not add a second per-state nightly path.**
 ## Jurisdiction drift check (`pipelines/jurisdiction_drift_check.py`, OPEN-330)
 
 A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
