@@ -1,0 +1,4 @@
+03:17:51 DEBUG openstates.stats: Stat emission is not enabled.
+03:17:55 INFO scrapelib: GET - '<url>
+ne: 1847 bills checked | fetched=1 skipped=3382 archived=1 fetch_errors=0 blocked=0 extract_errors=0 conflicts=0 concurrent_writes=0 s3_verified=1 s3_unverified=0 persist_errors=0
+{"source": "ne", "run_id": "ne-archive-c84bc6ba2ea7", "status": "ok", "state": "ne", "checked": 1847, "fetched": 1, "skipped": 3382, "archived": 1, "fetch_errors": 0, "blocked": 0, "extract_errors": 0, "conflicts": 0, "concurrent_writes": 0, "s3_verified": 1, "s3_unverified": 0, "persist_errors": 0, "duration_s": 12}
