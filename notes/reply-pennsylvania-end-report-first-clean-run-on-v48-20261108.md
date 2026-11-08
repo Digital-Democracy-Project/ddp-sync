@@ -1,0 +1,20 @@
+# Reply (read-only): Pennsylvania's first nightly run on v48 / revision 50 ended clean; end report (OPEN-500, OPEN-494). 2026-11-08, 11:20 UTC
+
+Reply to `3a79efc` item 1 and `ecef62e` item 2 (the end report). Nothing was changed: no retry, relaunch, pause, pull, restart or registration.
+
+**The run:** run `pa-1adcd7a750b2`, task `12d73f4c6b5e403eb554810ba6e7f87f`, **task definition `ddp-scrapers:50`, image v48**, created 04:00:01 UTC, stopped 11:06 UTC, **container exit code 0**. ddp-sync: `collection done, loading into RDS` 10:53:05, `cloud_scrape: done` **11:06:25** (25,584 s = **7 h 06 min**, of which the import was 13 min 20 s).
+
+## Checks (a) to (g)
+- **(a)** no `unexpected keyword argument`; 0 Tracebacks (I read all 51,326 log events, paging the stream).
+- **(b)** `04:00:41 INFO openstates: PA OPEN-500: ignoring start=2026-11-03T04:12:48 and doing a full walk`.
+- **(c) Against the first scrape (5,270 bills / 5,858 vote events / 425,560 person votes):** the scraper saved **5,277 bills and 5,858 vote events** (log: `bill: 5277`, `vote_event: 5858`). **RDS now holds 5,277 bills, 5,858 vote events and 425,560 person votes** for Pennsylvania: bills +7 (7 created since 04:00 UTC, 140 updated), vote events unchanged in number (3,067 updated, 0 created), person votes unchanged. No collapse, small growth in bills, as you said is normal. The harness's `found` is 11,139 (first scrape 11,132, +7).
+- **(d)** the import ran (13 min 20 s) and the harness line is `{"source": "pa", "run_id": "pa-1adcd7a750b2", "mode": "incremental", "status": "ok", "found": 11139, "duration_s": 24322}`. I still cannot read the importer's own `bills_new / bills_updated / bills_noop` summary; the RDS figures above (7 created, 140 bills and 3,067 vote events updated) are what I can see.
+- **(e)** **no `no objects returned from` and no "no changes since cutoff (no-op)"**. The S3 watermark **advanced**: `pa.ts` is now `2026-11-08T10:46:01`, count `11139:incremental` (it was `2026-11-03T05:12:48`, `11132:full`).
+- **(f) Duration:** the scrape took **6:45:19** (task 24,322 s) against the first scrape's about 7 h 9 min. **No 429, 403, captcha, Forbidden, Too Many Requests, retry or timeout** (my text searches matched roll-call numbers in URLs such as `rcNum=429` and `rollcallid=403` only; I checked every match). The only warning in the log other than the insecure-request one is `no session provided, using active sessions: {'2025-2026'}`.
+- **(g) RDS (`ddp-openstates`), 04:00 to 11:10 UTC:** CPU hourly average **6 to 8%**, hourly maximum **9 to 19%** (the 11:00 hour, which holds the import: average **13%, maximum 25%**); during the import window itself 10:53 to 11:07: average 9%, max 24.6%, write IOPS at most 11. **Connections maximum 13 to 14 in every hour.** Nowhere near 80%. **Overlaps with other jobs:** Louisiana's scrape (02:00 to 05:59), **Massachusetts' scrape (started 02:00, still running now, 9 h so far)**, the USA scrape at 03:00 and its second collection at 04:15 (95 s), the USA archive 05:00 to 05:13, the 06:20 drift check and the 10:00 people refresh. Nothing visible on the database from any of it.
+
+## Your extra read: Pennsylvania's `motion_classification` (the v43/v45 "before" was empty 4,873, `passage` 953, `amendment` 32)
+Now, on the same 5,858 vote events: **`{committee-passage}` 3,056**, **`{}` (empty) 1,806**, **`{passage}` 964**, **`{amendment}` 32**. So the motion rules moved 3,056 events to `committee-passage` that were empty before, `passage` went from 953 to 964 (+11), `amendment` is unchanged, and 1,806 remain empty. (An observation only; I have not checked any of them against the rules.)
+
+## Also
+The 6,188 Pennsylvania documents are all still `is_bill_version` true (null 0, false 0) after the run. Massachusetts' task is the only scraper task still running. The next Pennsylvania run is tonight's **11-09 04:00 UTC**, on whichever revision is latest then; I will read its launch the same way. Per your plan, the Pennsylvania switch-on request waits for you to post it.
