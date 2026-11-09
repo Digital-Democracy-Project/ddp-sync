@@ -373,8 +373,17 @@ secondary and a status other than paused or probing), the cloud-run ownership ga
 the cloud owns is covered automatically). `cloud_path.enabled` stays the global switch. `shadow` mode and an unreadable shared
 list give the yaml's answer exactly as before. **Rolling a state back off the cloud path:** the yaml
 `memory_backend_jurisdictions` list is what remembers it afterwards, so add the state to it BEFORE setting `cloud_path` false in
-the shared list (nothing can remember it once the manifest says false). The archive, embedding and search-refresh
+the shared list (nothing can remember it once the manifest says false). The weekly archive cron, embedding and search-refresh
 registrations are unchanged by this ticket.
+
+**SYNC-146, second part (2026-11-09): the archive after a scrape follows `archive.enabled`.** `maybe_trigger_archive_after_scrape`
+(`openstates_archive.py`), which runs a state's archive right after its own scrape and so triggers LegBot on the Mac, decides
+through `enrolled("archive_after_scrape", openstates_archive.jurisdictions, root)`: in `authoritative` mode the shared list's
+`archive.enabled` (a new state archives after each scrape from Stage 4 on), in `shadow` mode or with an unreadable list the yaml
+`openstates_archive.jurisdictions` as before. The weekly cron still follows `archive` = `archive.scheduled` (OPEN-418), and
+`archive_after_scrape` has no yaml list of its own, so it is not a drift feature. With the real list (2026-11-09) it adds `pa`,
+`ne` and `la` and drops nothing. Found because Pennsylvania's scrape triggered no archive or LegBot (prod agent `ece1703`);
+**do not add a state to the yaml archive list by hand to get this**, which also turns on drift for `archive.scheduled`.
 
 **OPEN-494: a state under `openstates_scrape.primary` other than fl/wa/usa is a nightly job of its own.** `scheduler._register_openstates_scrape_jobs`
 registers `openstates_primary_scrape_<code>` at that entry's `sync_time_utc` (default 04:00) for every extra `primary` entry with

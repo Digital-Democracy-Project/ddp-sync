@@ -380,3 +380,77 @@ def test_a_stage_4_state_on_the_ddp_sync_archive_list_is_a_config_disagreement(t
     assert je.config_disagreements(config, str(tmp_path)) == [
         {"feature": "archive", "only_in_yaml": ["nc"], "only_in_manifest": []}
     ]
+
+
+# --- SYNC-146 (2026-11-09): the archive that runs right after a scrape follows archive.enabled -----------
+
+def _new_state_manifest(tmp_path, *, enabled=True):
+    """Pennsylvania's real shape at Stage 4: archive enabled, weekly archive not yet scheduled (OPEN-418)."""
+    manifest = dict(MANIFEST)
+    manifest["pa"] = _entry("primary", status="scraping", cloud_path=True)
+    manifest["pa"]["archive"] = {"enabled": enabled, "scheduled": False}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    return str(tmp_path)
+
+
+def test_archive_after_scrape_follows_enabled_not_scheduled(tmp_path):
+    root = _new_state_manifest(tmp_path)
+    assert "pa" in je.manifest_codes("archive_after_scrape", root)
+    assert "pa" not in je.manifest_codes("archive", root)  # the weekly cron list is unchanged
+
+
+def test_archive_after_scrape_is_not_a_drift_feature(tmp_path):
+    # The yaml archive list matches `scheduled`; a state that is enabled but unscheduled is not drift.
+    root = _new_state_manifest(tmp_path)
+    config = {"openstates_archive": {"jurisdictions": ["al", "fl", "nc", "us"]}}
+    assert [d for d in je.config_disagreements(config, root) if d["feature"] == "archive"] == []
+    assert all(d["feature"] != "archive_after_scrape" for d in je.config_disagreements(config, root))
+
+
+async def _hook(monkeypatch, root, state, yaml_list=("fl", "us")):
+    from unittest.mock import AsyncMock, patch
+
+    monkeypatch.setenv("OPENSTATES_ROOT", root)
+    cfg = {"enabled": True, "jurisdictions": list(yaml_list)}
+    with patch.object(openstates_archive, "_load_archive_config_for_scrape_trigger", return_value=cfg), \
+            patch.object(openstates_archive, "run_single_archive_job", new=AsyncMock(return_value={"success": True})) as run:
+        await openstates_archive.maybe_trigger_archive_after_scrape(state)
+    return run
+
+
+@pytest.mark.asyncio
+async def test_authoritative_new_state_scrape_triggers_its_archive_with_no_yaml_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    run = await _hook(monkeypatch, _new_state_manifest(tmp_path), "pa")
+    run.assert_awaited_once()
+    assert run.await_args.args[0] == "pa"
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_keeps_the_yaml_list(tmp_path, monkeypatch):
+    run = await _hook(monkeypatch, _new_state_manifest(tmp_path), "pa")
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_with_an_unreadable_list_falls_back_to_the_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    empty = str(tmp_path)  # no jurisdictions.yaml here
+    assert (await _hook(monkeypatch, empty, "pa")).await_count == 0
+    assert (await _hook(monkeypatch, empty, "fl")).await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_disabled_in_the_shared_list_is_skipped_even_if_the_yaml_lists_it(tmp_path, monkeypatch):
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    run = await _hook(monkeypatch, _new_state_manifest(tmp_path, enabled=False), "pa", yaml_list=("fl", "pa"))
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_live_state_still_triggers_and_usa_maps_to_us(tmp_path, monkeypatch):
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    root = _new_state_manifest(tmp_path)
+    assert (await _hook(monkeypatch, root, "fl")).await_count == 1
+    run = await _hook(monkeypatch, root, "usa")
+    assert run.await_args.args[0] == "us"
