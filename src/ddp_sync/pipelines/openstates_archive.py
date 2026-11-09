@@ -1001,8 +1001,10 @@ async def maybe_trigger_archive_after_scrape(scrape_jurisdiction: str) -> None:
     """OPEN-291: the scrape-completion-triggers-archive hook, called from _run_scrape()
     on every successful scrape for every jurisdiction it covers (FL, WA, USA, and the
     whole secondary batch) -- one hook, one call site, no per-jurisdiction code. A
-    jurisdiction opts in purely by config: being listed in both its own scrape config
-    and openstates_archive.jurisdictions. Alabama is the standing counter-example --
+    jurisdiction opts in purely by config: being in its own scrape config, and (SYNC-146)
+    in authoritative mode having `archive.enabled: true` in the shared state list
+    (ddp-open-states jurisdictions.yaml), otherwise being listed in
+    openstates_archive.jurisdictions. Alabama is the standing counter-example --
     archived, but not scraped anywhere in ddp-sync, so it never reaches this function
     at all and keeps its existing weekly cron untouched.
 
@@ -1023,7 +1025,12 @@ async def maybe_trigger_archive_after_scrape(scrape_jurisdiction: str) -> None:
 
     if not archive_config.get("enabled", False):
         return
-    if archive_jurisdiction not in archive_config.get("jurisdictions", []):
+    # SYNC-146: in authoritative mode the shared state list decides (archive.enabled), so a new state's scrape triggers its
+    # archive with no ddp-sync edit; shadow mode, or a list that cannot be read, keeps the yaml list exactly as before.
+    listed = enrolled(
+        "archive_after_scrape", archive_config.get("jurisdictions") or [], _scrape_root(archive_config)
+    )
+    if archive_jurisdiction not in (listed or []):
         return
 
     try:

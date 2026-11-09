@@ -41,6 +41,11 @@ _FEATURES = {
     # OPEN-418: the RECURRING archive list is the manifest's archive.scheduled, not archive.enabled (which only means
     # "may be archived", the Stage 4 manual run). A pre-OPEN-418 manifest has no `scheduled`, which reads as "cannot say".
     "archive": (lambda e: e["archive"]["scheduled"], False),
+    # SYNC-146 (2026-11-09): the archive that runs right after a state's own scrape (maybe_trigger_archive_after_scrape,
+    # which then triggers LegBot on the Mac) follows archive.enabled, not `scheduled`: a new state archives after each
+    # scrape from Stage 4 on, while its weekly cron (`scheduled`) stays off until it is live (OPEN-418). No yaml list of
+    # its own, so it is not part of the drift comparison; its fallback is openstates_archive.jurisdictions.
+    "archive_after_scrape": (lambda e: e["archive"]["enabled"], False),
     "embedding": (lambda e: e["enrollment"]["embedding"], False),
     "search_refresh": (lambda e: e["enrollment"]["search_refresh"], False),
     "cloud_path": (lambda e: e["enrollment"]["cloud_path"], True),
