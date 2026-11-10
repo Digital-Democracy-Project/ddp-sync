@@ -387,3 +387,17 @@ async def test_run_archive_only_with_no_token_takes_and_releases_the_lock(redis)
     assert "ddp:pipeline_lock:pa" in held[0][0]
     assert held[0][1]["ddp:pipeline_lock:pa"] == scrape.pipeline_lock_ttl_s("pa", None, {"enabled": True})
     assert "ddp:pipeline_lock:pa" not in redis.data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", ["eval_raises", "not_connected"])
+async def test_a_handoff_redis_cannot_confirm_fails_open_and_runs(client):
+    """pm-review round 3: "cannot answer" (None) is not "lost" (False); the run goes ahead, as acquire does."""
+    fake = FakeRedis(fail_eval=True) if client == "eval_raises" else None
+    statuses = []
+    p = _pipeline_patches(statuses)
+    with patch("ddp_sync.services.redis_store.get_redis_store", return_value=SimpleNamespace(_client=fake)), \
+            p[0] as run, p[1], p[2], p[3], p[4]:
+        result = await scrape.run_state_pipeline("pa", {}, {"enabled": True}, lock_token="handed-off")
+    assert result["success"] is True
+    run.assert_awaited_once()
