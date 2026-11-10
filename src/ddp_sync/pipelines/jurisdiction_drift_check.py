@@ -46,8 +46,9 @@ _ENV_LISTS = {
 }
 # SYNC-142: `legbot_replica` is checked here because the LegBot gate now reads it from the manifest; a manifest that cannot
 # answer it makes the gate fall back to the env list, which must be visible (unverifiable), not silent.
-_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape_primary", "scrape_secondary",
-                     "legbot_replica")
+# SYNC-152: `scrape` (one rule, status not paused or probing) replaces scrape_primary/scrape_secondary: a manifest that cannot
+# answer it leaves this host scheduling no new scrape job, so it must alert as unverifiable.
+_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape", "legbot_replica")
 
 
 def collect_findings(sync_config: dict, settings: Any, root: str) -> dict[str, Any]:

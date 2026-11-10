@@ -7,8 +7,9 @@ day, drifting out of sync. Rather than teaching the archive schedule to understa
 "nightly" and building a separate completion-sequencing mechanism (both real,
 per-jurisdiction-shaped fixes that would need to stay hand-synced with whatever
 dynamic_cadence decides forever), this triggers a jurisdiction's archive job directly
-from its own scrape completion -- one hook, inside `_run_scrape()`, the single function
-every scrape path (FL, WA, USA, the whole secondary batch) already funnels through.
+from its own scrape completion. SYNC-152 moved the call from `_run_scrape()` (once per
+session) to `run_state_pipeline` (once per run, after every session), as `archive_after_scrape`,
+which now returns the outcome (None / True / False) so a failed archive fails the job.
 A jurisdiction opts in purely by being listed in both its own scrape config and
 `openstates_archive.jurisdictions` -- no per-jurisdiction code, ever.
 
@@ -21,10 +22,7 @@ Covers:
   * the usa -> us jurisdiction-code mapping
   * a config-load failure is swallowed, never propagates
   * a run_single_archive_job exception is swallowed, never propagates
-  * `_run_scrape`: a successful scrape invokes the hook with the scrape's own
-    jurisdiction code; a failed scrape does not
-  * a hook-body exception can never propagate out of `_run_scrape` and replace an
-    already-successful scrape job's own result
+  * `_run_scrape` itself no longer archives (the pipeline does, tests/test_sync_152_one_pipeline_per_state.py)
   * the debounce inside `_run_archive_with_hook`: a second archive attempt for the
     same jurisdiction within the window is skipped, not run a second time -- this is
     what makes FL/USA's multi-session scrape loop (which would otherwise trigger this
@@ -43,7 +41,7 @@ from ddp_sync.pipelines.openstates_archive import (
     _acquire_archive_debounce,
     _archive_jurisdiction_code,
     _run_archive_with_hook,
-    maybe_trigger_archive_after_scrape,
+    archive_after_scrape,
 )
 from ddp_sync.pipelines.openstates_scrape import _run_scrape
 
@@ -63,7 +61,7 @@ def test_every_other_jurisdiction_is_unchanged(jurisdiction):
     assert _archive_jurisdiction_code(jurisdiction) == jurisdiction
 
 
-# ── maybe_trigger_archive_after_scrape ──────────────────────────────────────────────
+# ── archive_after_scrape ──────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -74,7 +72,7 @@ async def test_disabled_archive_config_triggers_nothing():
     ), patch(
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
     ) as mock_archive:
-        await maybe_trigger_archive_after_scrape("mi")
+        assert await archive_after_scrape("mi") is None
 
     mock_archive.assert_not_awaited()
 
@@ -91,7 +89,7 @@ async def test_jurisdiction_not_in_archive_list_triggers_nothing():
     ), patch(
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
     ) as mock_archive:
-        await maybe_trigger_archive_after_scrape("al")
+        assert await archive_after_scrape("al") is None
 
     mock_archive.assert_not_awaited()
 
@@ -105,7 +103,7 @@ async def test_jurisdiction_in_list_triggers_the_archive_job():
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
         new=AsyncMock(return_value={"success": True}),
     ) as mock_archive:
-        await maybe_trigger_archive_after_scrape("mi")
+        assert await archive_after_scrape("mi") is True
 
     mock_archive.assert_awaited_once_with("mi", ARCHIVE_CFG)
 
@@ -121,7 +119,7 @@ async def test_usa_scrape_triggers_the_us_archive_job():
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
         new=AsyncMock(return_value={"success": True}),
     ) as mock_archive:
-        await maybe_trigger_archive_after_scrape("usa")
+        assert await archive_after_scrape("usa") is True
 
     mock_archive.assert_awaited_once_with("us", ARCHIVE_CFG)
 
@@ -134,13 +132,13 @@ async def test_config_load_failure_triggers_nothing_and_does_not_raise():
     ), patch(
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
     ) as mock_archive:
-        await maybe_trigger_archive_after_scrape("mi")  # must not raise
+        assert await archive_after_scrape("mi") is None  # must not raise
 
     mock_archive.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_archive_job_exception_is_swallowed():
+async def test_archive_job_exception_is_reported_as_a_failed_archive_not_raised():
     with patch(
         "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
         return_value=ARCHIVE_CFG,
@@ -148,54 +146,47 @@ async def test_archive_job_exception_is_swallowed():
         "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
         new=AsyncMock(side_effect=RuntimeError("fargate blew up")),
     ):
-        await maybe_trigger_archive_after_scrape("mi")  # must not raise
-
-
-# ── _run_scrape: the actual hook call site ──────────────────────────────────────────
+        assert await archive_after_scrape("mi") is False  # must not raise
 
 
 @pytest.mark.asyncio
-async def test_successful_scrape_invokes_the_hook_with_its_own_jurisdiction():
+async def test_a_failed_archive_result_is_reported_as_false():
     with patch(
-        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
-        new=AsyncMock(return_value={"success": True, "jurisdiction": "mi"}),
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.maybe_trigger_archive_after_scrape",
-        new=AsyncMock(),
-    ) as mock_hook:
-        result = await _run_scrape("mi", None, "/fake/root")
-
-    assert result["success"] is True
-    mock_hook.assert_awaited_once_with("mi")
-
-
-@pytest.mark.asyncio
-async def test_failed_scrape_skips_the_hook():
-    with patch(
-        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
-        new=AsyncMock(return_value={"success": False, "jurisdiction": "mi", "error": "boom"}),
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.maybe_trigger_archive_after_scrape",
-        new=AsyncMock(),
-    ) as mock_hook:
-        result = await _run_scrape("mi", None, "/fake/root")
-
-    assert result["success"] is False
-    mock_hook.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_hook_exception_never_replaces_a_successful_scrape_result():
-    with patch(
-        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
-        new=AsyncMock(return_value={"success": True, "jurisdiction": "mi"}),
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.maybe_trigger_archive_after_scrape",
-        new=AsyncMock(side_effect=RuntimeError("archive trigger blew up")),
+        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
+        new=AsyncMock(return_value={"success": False, "error": "exit_code_1"}),
     ):
-        result = await _run_scrape("mi", None, "/fake/root")  # must not raise
+        assert await archive_after_scrape("mi", ARCHIVE_CFG) is False
+
+
+@pytest.mark.asyncio
+async def test_a_passed_archive_config_is_used_instead_of_loading_the_file():
+    with patch(
+        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
+    ) as mock_load, patch(
+        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
+        new=AsyncMock(return_value={"success": True}),
+    ) as mock_archive:
+        assert await archive_after_scrape("mi", ARCHIVE_CFG) is True
+
+    mock_load.assert_not_called()
+    mock_archive.assert_awaited_once_with("mi", ARCHIVE_CFG)
+
+
+# ── _run_scrape no longer archives (SYNC-152: run_state_pipeline archives once, after every session) ──
+
+
+@pytest.mark.asyncio
+async def test_run_scrape_itself_never_archives():
+    with patch(
+        "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
+        new=AsyncMock(return_value={"success": True, "jurisdiction": "mi"}),
+    ), patch(
+        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock()
+    ) as mock_archive:
+        result = await _run_scrape("mi", None, "/fake/root")
 
     assert result["success"] is True
+    mock_archive.assert_not_awaited()
 
 
 # ── debounce ─────────────────────────────────────────────────────────────────────────

@@ -4,10 +4,12 @@ Managed by ddp-sync's APScheduler — replaces the ad-hoc run-all-scrapes.sh
 launchd job that ran everything sequentially and caused Sunday jobs to be
 skipped when Saturday's FL scrape overran into Sunday morning.
 
-Each primary jurisdiction (FL, WA, USA) is an independent APScheduler job so
-a long-running FL scrape does not delay WA or USA. Secondary states (VA, MI,
-MA, UT, AZ) are fanned out concurrently inside a single Sunday job since they
-use independent _data/{state}/ directories and don't conflict.
+SYNC-152: one pipeline per state. WHO is scraped is one manifest rule (`enrolled_scrape_states`: every state in
+ddp-open-states' jurisdictions.yaml whose status is not paused or probing); WHEN is `openstates_scrape.timing` in
+sync_schedule.yaml, per state and optional (`state_timing`). Every scraped state gets its own APScheduler job,
+`openstates_scrape_<state>`, running `run_state_pipeline`: the scrape (all its sessions, in turn), its run history,
+the broker signal, then the archive (which fires LegBot, search refresh and embedding). The manual trigger runs the
+same function. There is no primary/secondary split and no batch job.
 
 run-scrape.sh is invoked with SKIP_PATCHES=1; a dedicated patch_refresh job
 at 01:00 UTC handles apply-local-patches.sh before the 02:00 UTC scrapes.
@@ -194,7 +196,7 @@ WAF_BLOCK_MARKERS = ("consecutive waf blocks detected", "waf block detected")
 # for a WAF block signature classify_failure_reason() cannot otherwise see (see
 # _read_scraper_log_tail's docstring for the full story). Generous relative to the 500-byte
 # stderr tail elsewhere in this module because scraper.log is shared across concurrent
-# jurisdiction runs (secondary states fan out concurrently -- see this module's own docstring),
+# jurisdiction runs (the weekly states start together on Sunday, each its own job),
 # so the line this run actually wrote can sit behind other jurisdictions' output; small enough
 # that reading it after every failed run is still a cheap, bounded file read.
 SCRAPER_LOG_TAIL_BYTES = 8192
@@ -417,11 +419,11 @@ def should_alert_quiet(history: list[dict], window: int) -> bool:
 def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     """Is this jurisdiction opted into ScrapeBot cookie-mint fallback (PLAN-scrapebot.md §3.7)?
 
-    Config-gated per jurisdiction under secondary.scrapebot_fallback in
-    sync_schedule.yaml -- absent/disabled by default, so adding ScrapeBot never
-    changes behavior for a jurisdiction that hasn't explicitly opted in.
+    Config-gated per jurisdiction under openstates_scrape.scrapebot_fallback in
+    sync_schedule.yaml (SYNC-152 moved it out of the retired `secondary` block) -- absent/disabled by default,
+    so adding ScrapeBot never changes behavior for a jurisdiction that hasn't explicitly opted in.
     """
-    fallback_cfg = (config or {}).get("secondary", {}).get("scrapebot_fallback", {})
+    fallback_cfg = (config or {}).get("scrapebot_fallback", {})
     if not fallback_cfg.get("enabled", False):
         return False
     return jurisdiction in fallback_cfg.get("jurisdictions", [])
@@ -444,7 +446,7 @@ def _sweep_import_eligible(jurisdiction: str, config: dict | None) -> bool:
     USA -- PLAN-incremental-scraping.md's own rollout condition.
 
     Config lives under openstates_scrape.sweep_import in sync_schedule.yaml,
-    mirroring secondary.scrapebot_fallback's shape above. Absent/disabled by
+    mirroring scrapebot_fallback's shape above. Absent/disabled by
     default, so a jurisdiction that hasn't opted in is completely unaffected.
     Deliberately NOT a $STATE test in shell (OPEN-124): ddp-sync already resolves
     per-jurisdiction opt-ins from this YAML, and it is what invokes run-scrape.sh,
@@ -474,12 +476,12 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     OPEN-53 established that a blind retry against a WAF worsens a block rather
     than recovering from it: every attempt is more traffic from a client the WAF
     already distrusts. MI is the jurisdiction that actually gets WAF-blocked --
-    it is why secondary.scrapebot_fallback lists exactly ["mi"].
+    it is why scrapebot_fallback lists exactly ["mi"].
 
     Config lives under openstates_scrape.scrape_retry in sync_schedule.yaml
     -- named scrape_retry because that file already has an unrelated top-level
     `retry:` block for OpenStates API call retries. Mirroring
-    secondary.scrapebot_fallback's shape above. Absent/disabled by default, so a
+    scrapebot_fallback's shape above. Absent/disabled by default, so a
     jurisdiction that hasn't opted in is invoked exactly as it is today -- same
     script, same arguments, no wrapper process at all.
 
@@ -517,7 +519,7 @@ def _cloud_path_owns(jurisdiction: str, config: dict | None) -> bool:
     which as of this writing is none; OPEN-190 is what actually moves one.
 
     Checked inside _run_scrape() itself -- the one funnel every launch path already goes
-    through (scheduled jobs, the manual-trigger endpoint via run_single_scrape_job(), and
+    through (scheduled jobs, the manual-trigger endpoint via run_state_pipeline(), and
     retry via run-scrape-retrying.sh, since that wrapper is chosen INSIDE this same
     function) -- rather than at each call site, so "refuses rather than running" is true
     for all of them by construction, not by remembering to add the check everywhere.
@@ -1121,53 +1123,14 @@ async def _run_scrape(
     timeout_s: int | None = None,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Thin wrapper around `_run_scrape_impl`.
+    """One scrape of one jurisdiction (one session, when given): the funnel every scrape goes through.
 
-    SYNC-65: this used to also carry a scrape-completion LegBot-triggering hook
-    (SYNC-50's `_maybe_trigger_legbot_for_scrape` / SYNC-59's
-    `_maybe_trigger_legbot_for_cloud_scrape`, both removed). Both hooks fired
-    before archiving necessarily had, and LegBot's `_resolve_bill_source()` only
-    reads already-archived, already-extracted text with no live-fetch fallback
-    -- triggering off scrape completion routinely lost that race and produced a
-    permanent `no_archived_bill_text` failure. That trigger lives in
-    `openstates_archive.py` (`_maybe_trigger_legbot_for_archive`,
-    `_run_archive_with_hook`), which fires only once the text it depends on is
-    guaranteed to already exist.
-
-    OPEN-291: this wrapper now carries a DIFFERENT hook this docstring's own
-    previous version said it was being kept around for -- on a successful
-    scrape, best-effort triggers that jurisdiction's ARCHIVE job (not LegBot;
-    archiving is the step that produces the text LegBot needs, so this pairing
-    doesn't have the race the removed hooks did). One hook, one call site,
-    covers every caller of `_run_scrape` (FL, WA, USA, the whole secondary
-    batch) uniformly regardless of which internal `_run_scrape_impl` branch
-    (cloud-owned or local subprocess) actually produced the result -- see
-    `maybe_trigger_archive_after_scrape`'s own docstring for the opt-in
-    mechanism (config-driven, not per-jurisdiction code) and the debounce that
-    keeps FL/USA's multi-session loop from firing this once per session.
-
-    SYNC-128: before that, `_maybe_signal_broker_bill_events` tells ddp-broker-py to run
-    its bill-event check for the jurisdiction (opt-in, never raises).
-
-    Wrapped in its own catch-all, mirroring `_run_archive_with_hook`'s own fix
-    for the same pm-review finding: nothing after a successful scrape may
-    change that scrape's own already-successful result.
+    SYNC-152: this used to also run the broker signal (SYNC-128) and the archive (OPEN-291's
+    `maybe_trigger_archive_after_scrape`) after every successful call, so a state scraped in two
+    sessions (the US: both chambers) was archived twice, and the archive's outcome never reached the job.
+    Both moved to `run_state_pipeline`, which runs them once, after all of a state's sessions.
     """
-    result = await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
-    if result.get("success"):
-        # SYNC-128: first, because the archive hook below can run for hours.
-        await _maybe_signal_broker_bill_events(jurisdiction, config)
-        try:
-            from ddp_sync.pipelines.openstates_archive import maybe_trigger_archive_after_scrape
-
-            await maybe_trigger_archive_after_scrape(jurisdiction)
-        except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
-            logger.error(
-                "scrape_triggered_archive_hook_failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
-    return result
+    return await _run_scrape_impl(jurisdiction, session_arg, openstates_root, timeout_s, config)
 
 
 async def _run_scrape_impl(
@@ -1482,7 +1445,7 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
         logger.warning("openstates_scrape: redis write failed", flow=flow_key, error=str(e))
 
 
-# Defaults if sync_schedule.yaml's secondary.escalation block is absent -- deliberately
+# Defaults if sync_schedule.yaml's openstates_scrape.escalation block is absent -- deliberately
 # "most, not all" (3 of 4): a single bad run (AC3) must never escalate, but escalating only on
 # a full 4-for-4 streak would delay detection by an extra week versus catching it at 3.
 DEFAULT_ESCALATION_WINDOW = 4
@@ -1513,7 +1476,7 @@ async def _check_sustained_blocking(
     writers racing to extend the same Redis list. Best-effort throughout: a Redis hiccup here
     must never fail the scrape job itself, same convention as _write_flow_status.
     """
-    escalation_cfg = (config or {}).get("secondary", {}).get("escalation", {})
+    escalation_cfg = (config or {}).get("escalation", {})  # SYNC-152: was under the retired `secondary` block
     window = escalation_cfg.get("window_size", DEFAULT_ESCALATION_WINDOW)
     threshold = escalation_cfg.get("threshold", DEFAULT_ESCALATION_THRESHOLD)
 
@@ -1691,200 +1654,152 @@ async def run_patch_refresh_job(config: dict | None = None) -> dict[str, Any]:
         return {"success": False, "error": str(e), "duration_seconds": duration}
 
 
-async def run_fl_scrapes_job(config: dict | None = None) -> dict[str, Any]:
-    """Run the FL scrape: one run, no session argument, like WA and the secondary batch.
+# ---------------------------------------------------------------------------
+# SYNC-152: one pipeline per state. WHO is scraped is the manifest; WHEN is `timing`.
+# ---------------------------------------------------------------------------
 
-    SYNC-130: the scraper then scrapes every session marked "active" in the scrapers image's
-    scrapers/fl/__init__.py, so a new session needs no edit here. This used to loop over a
-    hand-kept `primary.fl.sessions` list, which left 2027 unscraped.
-    """
-    openstates_root = _get_root(config)
-    start_time = datetime.now(timezone.utc)
+# The rolling run history every state's pipeline writes (ddp:flow_history:openstates_scrape:<state>) and the cadence
+# review reads. Before SYNC-152 only the secondary batch wrote history (under `openstates_secondary_scrapes`), so FL,
+# WA, USA and PA were never reviewed on evidence (FL's review read a key nothing wrote).
+SCRAPE_HISTORY_FLOW = "openstates_scrape"
+# The pre-SYNC-152 key the cadence review falls back to while the new one is still empty. Its lists stop being appended
+# to and expire 30 days after their last write (RedisStore.RUN_HISTORY_TTL), so the fallback ends by itself.
+LEGACY_SCRAPE_HISTORY_FLOW = "openstates_secondary_scrapes"
 
-    result = await _run_scrape("fl", None, openstates_root, SCRAPE_TIMEOUT_S["fl"], config)
-
-    await _write_flow_status("openstates_fl_scrapes", {
-        "flow": "openstates_fl_scrapes",
-        "started_at": start_time.isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if result["success"] else "failed",
-        **result,
-    })
-    return result
+# A scraped state with no `openstates_scrape.timing` entry gets these, overlaid by `openstates_scrape.defaults`.
+# Weekly, Sunday 02:00 UTC: what the retired secondary batch did, so weekly states keep starting together.
+DEFAULT_TIMING: dict[str, Any] = {"floor": "weekly", "day": "sunday", "start_utc": "02:00"}
+_TIMING_FLOORS = ("nightly", "weekly")
 
 
-async def run_wa_scrape_job(config: dict | None = None) -> dict[str, Any]:
-    """Run the WA scrape. Runs in parallel with FL and USA on the event loop."""
-    openstates_root = _get_root(config)
-    start_time = datetime.now(timezone.utc)
+class PipelineFailed(RuntimeError):
+    """Raised by `run_state_pipeline` when any session failed or the archive failed, so APScheduler logs an error
+    instead of "executed successfully". The run's status record has already been written by then."""
 
-    result = await _run_scrape("wa", None, openstates_root, SCRAPE_TIMEOUT_S["wa"], config)
-
-    await _write_flow_status("openstates_wa_scrape", {
-        "flow": "openstates_wa_scrape",
-        "started_at": start_time.isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if result["success"] else "failed",
-        **result,
-    })
-    return result
+    def __init__(self, jurisdiction: str, results: list[dict[str, Any]], archived: bool | None):
+        failed = [r.get("jurisdiction") or r.get("session") or jurisdiction for r in results if not r.get("success")]
+        reason = []
+        if failed:
+            reason.append(f"{len(failed)} of {len(results)} scrape session(s) failed: {failed}")
+        if archived is False:
+            reason.append("the archive failed")
+        super().__init__(f"{jurisdiction}: " + "; ".join(reason or ["failed"]))
+        self.jurisdiction, self.results, self.archived = jurisdiction, results, archived
 
 
-async def run_usa_scrapes_job(config: dict | None = None) -> dict[str, Any]:
-    """Run USA lower then upper sequentially (they share _data/usa/)."""
-    openstates_root = _get_root(config)
-    sessions = (
-        (config or {}).get("primary", {}).get("usa", {})
-        .get("sessions", ["119 chamber=lower", "119 chamber=upper"])
-    )
-    start_time = datetime.now(timezone.utc)
-    t = time.monotonic()
+def enrolled_scrape_states(config: dict | None) -> list[str] | None:
+    """Every state ddp-sync scrapes: the manifest's `scrape` rule (status not paused or probing), spelled the way the
+    scrape side spells it (`usa` for the federal one). The ONE answer the scheduler, the manual trigger, the cadence
+    review and the guard test use; sync_schedule.yaml has no list of its own. None when the manifest cannot be read
+    (logged once by jurisdiction_enrollment); an empty list is a real answer."""
+    return enrolled("scrape", None, _get_root(config))
 
-    logger.info("openstates_usa_scrapes: starting", sessions=sessions)
 
-    results = []
-    for session in sessions:
-        result = await _run_scrape(
-            "usa", f"session={session}", openstates_root, SCRAPE_TIMEOUT_S["usa"], config
-        )
-        results.append(result)
-
-    duration = round(time.monotonic() - t, 1)
-    failed = [r for r in results if not r["success"]]
-
-    log_fn = logger.error if failed else logger.info
-    log_fn(
-        "openstates_usa_scrapes: completed",
-        total=len(results),
-        failed=len(failed),
-        duration_seconds=duration,
-    )
-
-    await _write_flow_status("openstates_usa_scrapes", {
-        "flow": "openstates_usa_scrapes",
-        "started_at": start_time.isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if not failed else "completed_with_errors",
-        "sessions": sessions,
-        "total": len(results),
-        "failed": len(failed),
-        "results": results,
-        "duration_seconds": duration,
-    })
+def state_timing(config: dict | None, jurisdiction: str) -> dict[str, Any]:
+    """WHEN one scraped state runs: built-in defaults, overlaid by `openstates_scrape.defaults`, overlaid by
+    `openstates_scrape.timing.<state>`. Returns floor ("nightly"/"weekly"; a FLOOR that dynamic_cadence may raise and
+    never lowers), day (used only while the effective tempo is weekly), hour and minute (UTC), and sessions (run in turn;
+    empty means one run with no session argument, which scrapes every session the scraper marks active)."""
+    cfg = config or {}
+    merged = {**DEFAULT_TIMING, **(cfg.get("defaults") or {}), **((cfg.get("timing") or {}).get(jurisdiction) or {})}
+    floor = str(merged.get("floor", "weekly")).strip().lower()
+    if floor not in _TIMING_FLOORS:
+        logger.warning("openstates_scrape: unrecognised timing floor, using weekly", jurisdiction=jurisdiction, floor=floor)
+        floor = "weekly"
+    hour, minute = map(int, str(merged["start_utc"]).split(":"))
     return {
-        "success": not failed,
-        "sessions": sessions,
-        "results": results,
-        "failed": len(failed),
-        "duration_seconds": duration,
+        "floor": floor,
+        "day": str(merged.get("day") or "sunday").strip().lower(),
+        "hour": hour,
+        "minute": minute,
+        "sessions": [str(s) for s in (merged.get("sessions") or [])],
     }
 
 
-async def run_secondary_scrapes_job(
-    config: dict | None = None,
-    jurisdictions: list[str] | None = None,
-    flow_status_key: str | None = None,
-) -> dict[str, Any]:
-    """Run secondary states (VA, MI, MA, UT, AZ) concurrently.
-
-    Each jurisdiction uses a distinct _data/{state}/ directory so they don't
-    conflict. asyncio.gather fans them out into separate threads simultaneously,
-    cutting total wall-clock from ~sum(durations) to ~max(durations).
-
-    OPEN-140 added the two optional arguments, and both default to exactly
-    today's behaviour. `jurisdictions` narrows the run to a subset, because a
-    jurisdiction escalated to nightly leaves this weekly batch and gets its own
-    job -- otherwise it would be scraped twice on the batch's day.
-
-    `flow_status_key` renames only the *flow status* Redis key. The rolling
-    per-jurisdiction run HISTORY deliberately keeps the "openstates_secondary_scrapes"
-    flow name in every case: that history is keyed per jurisdiction, it is what
-    the cadence review reads to decide, and splitting it on a cadence change
-    would erase the very evidence that caused the change. The flow status is a
-    single per-flow document, though, so two jobs sharing one key would
-    overwrite each other -- hence the separate name for the split-out jobs.
-    """
-    openstates_root = _get_root(config)
-    if jurisdictions is None:
-        # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant
-        # (which had drifted: no nc).
-        # An explicitly empty list is a real answer, so this tests for None, not falsiness.
-        listed = enrolled("scrape_secondary", ((config or {}).get("secondary") or {}).get("jurisdictions"), openstates_root)
-        jurisdictions = ["va", "mi", "ma", "ut", "az", "nc"] if listed is None else listed
-    start_time = datetime.now(timezone.utc)
-    t = time.monotonic()
-
-    logger.info("openstates_secondary_scrapes: starting", jurisdictions=jurisdictions)
-
-    # session_arg=None is deliberate, not a gap -- do not "fix" this to pass an explicit
-    # session per jurisdiction without re-reading OPEN-24 first. openstates-core's do_scrape()
-    # scrapes every currently-active session when none is given; VA and UT have had two
-    # sessions simultaneously active at once (confirmed live 2026-08-02: VA had 2026S1 + 2027,
-    # UT had 2026 + 2025S2). Passing a single hardcoded/resolved session per jurisdiction
-    # (mirroring fl/usa's own sessions: config, which OPEN-24 originally proposed) would
-    # silently drop whichever second active session doesn't get picked, for exactly those two.
-    results: list[dict[str, Any]] = await asyncio.gather(
-        *[_run_scrape(j, None, openstates_root, config=config) for j in jurisdictions]
-    )
-
-    duration = round(time.monotonic() - t, 1)
-    failed = [r for r in results if not r["success"]]
-
-    log_fn = logger.error if failed else logger.info
-    log_fn(
-        "openstates_secondary_scrapes: completed",
-        jurisdictions=jurisdictions,
-        total=len(results),
-        failed=len(failed),
-        duration_seconds=duration,
-    )
-
-    await _check_sustained_blocking(
-        "openstates_secondary_scrapes", jurisdictions, results, config
-    )
-
-    status_key = flow_status_key or "openstates_secondary_scrapes"
-    await _write_flow_status(status_key, {
-        "flow": status_key,
-        "started_at": start_time.isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if not failed else "completed_with_errors",
-        "jurisdictions": jurisdictions,
-        "total": len(results),
-        "failed": len(failed),
-        "results": list(results),
-        "duration_seconds": duration,
-    })
-    return {
-        "success": not failed,
-        "jurisdictions": jurisdictions,
-        "results": list(results),
-        "failed": len(failed),
-        "duration_seconds": duration,
-    }
+async def _logged(step: str, jurisdiction: str, coro) -> None:
+    """Await one bookkeeping step (history, broker signal, status) and log any exception instead of raising: a Redis or
+    broker hiccup must never stop a successful scrape from being archived, nor hide the run's real outcome."""
+    try:
+        await coro
+    except Exception as e:  # noqa: BLE001 -- bookkeeping never changes the pipeline's outcome
+        logger.error("openstates_pipeline: bookkeeping step failed", step=step, jurisdiction=jurisdiction, error=str(e))
 
 
-async def run_single_scrape_job(
+async def _record_scrape_history(jurisdiction: str, results: list[dict[str, Any]], config: dict | None) -> None:
+    """One history record per session run, under `openstates_scrape:<state>` for every state: the same record (success,
+    WAF classification, filing counts) and the same two checks (sustained WAF blocking, quiet jurisdiction) the
+    secondary batch used to run for its states only."""
+    await _check_sustained_blocking(SCRAPE_HISTORY_FLOW, [jurisdiction] * len(results), results, config)
+
+
+async def run_state_pipeline(
     jurisdiction: str,
-    config: dict | None = None,
+    config: dict | None,
+    archive_config: dict | None = None,
+    *,
     skip_people_check: bool = False,
     people_checked: bool = False,
 ) -> dict[str, Any]:
-    """Run a single arbitrary jurisdiction. Used by the manual trigger endpoint.
+    """Scrape one state, then archive it (which fires LegBot, search refresh and embedding). The ONE path for the
+    scheduler's `openstates_scrape_<state>` job and the manual trigger.
 
-    ScrapeBot pre-seeding (PLAN-scrapebot.md §3.7) happens inside _run_scrape()
-    itself now, keyed off the same config passed through here -- a jurisdiction
-    triggered standalone gets the identical treatment as one triggered as part
-    of the full secondary batch, with no separate call needed at this level.
+    1. every session in `timing.<state>.sessions` in turn (the US: both chambers), each in its own try, so one
+       session's crash does not skip the next; no sessions means one run with no session argument;
+    2. the run history for every session (`_record_scrape_history`);
+    3. once at least one session succeeded: the broker signal (SYNC-128) and ONE archive, after all sessions;
+    4. raises `PipelineFailed` when any session failed or the archive failed. A one-chamber US run still archives
+       what it got (that data is real), but is reported as failed.
+
+    The status record `openstates_scrape_<state>` is written once, in `finally`, after the archive outcome is known.
+    History, broker signal and status are bookkeeping: a failure in any of them is logged and changes nothing.
+    `skip_people_check` / `people_checked` are the manual trigger's SYNC-147 override and "already read" flags.
     """
+    from ddp_sync.pipelines.openstates_archive import archive_after_scrape
+
     openstates_root = _get_root(config)
-    token = _SKIP_PEOPLE_CHECK.set(bool(skip_people_check))  # SYNC-147: the manual trigger's explicit, logged override
-    token_checked = _PEOPLE_ALREADY_CHECKED.set(bool(people_checked))  # the trigger already read the count (one read)
+    started = datetime.now(timezone.utc)
+    t = time.monotonic()
+    results: list[dict[str, Any]] = []
+    archived: bool | None = None
+    outcome = "failed"
+    skip_token = _SKIP_PEOPLE_CHECK.set(bool(skip_people_check))
+    checked_token = _PEOPLE_ALREADY_CHECKED.set(bool(people_checked))
+    logger.info("openstates_pipeline: starting", jurisdiction=jurisdiction)
     try:
-        return await _run_scrape(jurisdiction, None, openstates_root, config=config)
+        for session in state_timing(config, jurisdiction)["sessions"] or [None]:
+            session_arg = f"session={session}" if session else None
+            try:
+                results.append(await _run_scrape(jurisdiction, session_arg, openstates_root, None, config))
+            except Exception as e:  # noqa: BLE001 -- one session's crash must not skip the rest
+                logger.error("openstates_pipeline: scrape raised", jurisdiction=jurisdiction, session=session, error=str(e))
+                label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
+                results.append({"success": False, "error": str(e), "jurisdiction": label, "session": session})
+        await _logged("history", jurisdiction, _record_scrape_history(jurisdiction, results, config))
+        if any(r.get("success") for r in results):
+            await _logged("broker_signal", jurisdiction, _maybe_signal_broker_bill_events(jurisdiction, config))
+            archived = await archive_after_scrape(jurisdiction, archive_config)
+        if not all(r.get("success") for r in results) or archived is False:
+            raise PipelineFailed(jurisdiction, results, archived)
+        outcome = "completed"
+        return {"success": True, "jurisdiction": jurisdiction, "results": results, "archived": archived}
     finally:
-        _PEOPLE_ALREADY_CHECKED.reset(token_checked)
-        _SKIP_PEOPLE_CHECK.reset(token)
+        _PEOPLE_ALREADY_CHECKED.reset(checked_token)
+        _SKIP_PEOPLE_CHECK.reset(skip_token)
+        duration = round(time.monotonic() - t, 1)
+        (logger.info if outcome == "completed" else logger.error)(
+            "openstates_pipeline: done", jurisdiction=jurisdiction, status=outcome, archived=archived,
+            sessions=len(results), failed=sum(1 for r in results if not r.get("success")), duration_seconds=duration,
+        )
+        flow = f"openstates_scrape_{jurisdiction}"
+        await _logged("status", jurisdiction, _write_flow_status(flow, {
+            "flow": flow,
+            "started_at": started.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "status": outcome,
+            "results": results,
+            "archived": archived,
+            "duration_seconds": duration,
+        }))
 
 
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:

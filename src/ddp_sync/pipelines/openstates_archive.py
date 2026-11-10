@@ -53,11 +53,11 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # added here 2026-08-10, exactly the class of bug a single shared constant prevents.
 DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us", "nc"]  # OPEN-328: nc was missing; only a last resort now (jurisdictions.yaml answers first)
 
-# OPEN-291: the scrape side's federal job is "usa" (openstates_scrape.primary.usa in
+# OPEN-291: the scrape side's federal job is "usa" (openstates_scrape.timing.usa in
 # sync_schedule.yaml); the archive side's is "us" (matching OpenStates' own jurisdiction
 # code, see DEFAULT_ARCHIVE_JURISDICTIONS above). Every other jurisdiction uses the same
 # code on both sides. Kept as an explicit map rather than assumed identical strings --
-# maybe_trigger_archive_after_scrape() below is the one place this actually matters.
+# archive_after_scrape() below is the one place this actually matters.
 _SCRAPE_TO_ARCHIVE_JURISDICTION = {"usa": "us"}
 
 # OPEN-291: how long a successful archive run "claims" its jurisdiction before another
@@ -153,9 +153,9 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     Config-gated per jurisdiction under openstates_archive.scrapebot_fallback in
     sync_schedule.yaml -- absent/disabled by default, so adding this never changes
     behavior for a jurisdiction that hasn't explicitly opted in. Same shape as the
-    scrape pipeline's secondary.scrapebot_fallback block (openstates_scrape.py), but
+    scrape pipeline's openstates_scrape.scrapebot_fallback block (openstates_scrape.py), but
     keyed inside this pipeline's own config subtree: run_archive_jobs() receives the
-    openstates_archive: section directly, so there is no "secondary" level here.
+    openstates_archive: section directly.
     """
     fallback_cfg = (config or {}).get("scrapebot_fallback", {})
     if not fallback_cfg.get("enabled", False):
@@ -997,52 +997,42 @@ def _load_archive_config_for_scrape_trigger() -> dict[str, Any]:
     return full_config.get("openstates_archive", {})
 
 
-async def maybe_trigger_archive_after_scrape(scrape_jurisdiction: str) -> None:
-    """OPEN-291: the scrape-completion-triggers-archive hook, called from _run_scrape()
-    on every successful scrape for every jurisdiction it covers (FL, WA, USA, and the
-    whole secondary batch) -- one hook, one call site, no per-jurisdiction code. A
-    jurisdiction opts in purely by config: being in its own scrape config, and (SYNC-146)
-    in authoritative mode having `archive.enabled: true` in the shared state list
-    (ddp-open-states jurisdictions.yaml), otherwise being listed in
-    openstates_archive.jurisdictions. Alabama is the standing counter-example --
-    archived, but not scraped anywhere in ddp-sync, so it never reaches this function
-    at all and keeps its existing weekly cron untouched.
+async def archive_after_scrape(scrape_jurisdiction: str, archive_config: dict | None = None) -> bool | None:
+    """Archive one state right after its scrape (OPEN-291), and say how it went: None when the state is not
+    archived after its scrape (archive disabled, or not enrolled), True when the archive succeeded, False when it
+    failed or raised. Never raises.
 
-    Deliberately does not replace the existing per-jurisdiction weekly archive cron --
-    that stays registered as a floor/backstop, the same "escalate, never remove the
-    fallback" shape dynamic_cadence already uses. _acquire_archive_debounce() is what
-    makes that safe rather than a source of duplicate runs.
+    SYNC-152: called once per run by `run_state_pipeline`, after ALL of a state's sessions (the US used to be
+    archived once per chamber), and its outcome now decides whether the job is reported as failed. It used to be
+    `maybe_trigger_archive_after_scrape`, called inside `_run_scrape` with its result thrown away.
 
-    Never raises -- same log-and-continue contract as every other post-success hook in
-    this file. `_run_scrape()` also wraps its call to this function in its own
-    catch-all (matching `_run_archive_with_hook`'s "wrap the whole block, not just the
-    hook" fix) -- belt and suspenders, not redundant, mirroring
-    `_maybe_trigger_legbot_for_archive`'s own defense-in-depth above: both layers guard
-    independently rather than one relying entirely on the other.
+    Enrollment: in authoritative mode the shared state list decides (`archive.enabled`, SYNC-146), so a new state's
+    scrape triggers its archive with no ddp-sync edit; shadow mode, or a list that cannot be read, keeps the yaml
+    list `openstates_archive.jurisdictions`. `archive_config` is the `openstates_archive` block (the scheduler and
+    the manual trigger pass theirs); None loads it from sync_schedule.yaml.
     """
     archive_jurisdiction = _archive_jurisdiction_code(scrape_jurisdiction)
-    archive_config = _load_archive_config_for_scrape_trigger()
+    if archive_config is None:
+        archive_config = _load_archive_config_for_scrape_trigger()
 
     if not archive_config.get("enabled", False):
-        return
-    # SYNC-146: in authoritative mode the shared state list decides (archive.enabled), so a new state's scrape triggers its
-    # archive with no ddp-sync edit; shadow mode, or a list that cannot be read, keeps the yaml list exactly as before.
+        return None
     listed = enrolled(
         "archive_after_scrape", archive_config.get("jurisdictions") or [], _scrape_root(archive_config)
     )
     if archive_jurisdiction not in (listed or []):
-        return
+        return None
 
     try:
         result = await run_single_archive_job(archive_jurisdiction, archive_config)
-    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+    except Exception as e:  # noqa: BLE001 -- an exception is a failed archive, reported as such
         logger.error(
             "scrape_triggered_archive_failed",
             scrape_jurisdiction=scrape_jurisdiction,
             archive_jurisdiction=archive_jurisdiction,
             error=str(e),
         )
-        return
+        return False
 
     log_fn = logger.info if result.get("success") else logger.warning
     log_fn(
@@ -1051,6 +1041,7 @@ async def maybe_trigger_archive_after_scrape(scrape_jurisdiction: str) -> None:
         archive_jurisdiction=archive_jurisdiction,
         result=result,
     )
+    return bool(result.get("success"))
 
 
 async def _run_archive_with_hook(

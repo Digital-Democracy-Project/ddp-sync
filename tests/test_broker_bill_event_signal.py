@@ -12,8 +12,9 @@ import httpx
 import pytest
 
 from ddp_sync.pipelines.openstates_scrape import (
+    PipelineFailed,
     _maybe_signal_broker_bill_events,
-    _run_scrape,
+    run_state_pipeline,
 )
 from ddp_sync.services import broker_client
 from ddp_sync.services.broker_client import BrokerClientError, request_bill_event_check
@@ -62,38 +63,48 @@ def _scrape(success: bool):
 
 
 def _no_archive_hook():
-    return patch("ddp_sync.pipelines.openstates_archive.maybe_trigger_archive_after_scrape", new=AsyncMock())
+    return patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=True))
 
 
-# ── through _run_scrape ─────────────────────────────────────────────────────────────
+async def _pipeline(config=CFG):
+    """SYNC-152: the signal is sent by run_state_pipeline (once per run), not by _run_scrape (once per session)."""
+    with patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()), patch(
+        "ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()
+    ):
+        return await run_state_pipeline("ut", config)
+
+
+# ── through run_state_pipeline ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_successful_scrape_of_an_enrolled_jurisdiction_sends_one_signal(settings, redis, send):
     with _scrape(True), _no_archive_hook():
-        result = await _run_scrape("ut", None, "/fake/root", config=CFG)
+        result = await _pipeline()
     assert result["success"] is True
     send.assert_awaited_once_with("ut")
 
 
 @pytest.mark.asyncio
 async def test_failed_scrape_sends_nothing(settings, redis, send):
-    with _scrape(False), _no_archive_hook():
-        await _run_scrape("ut", None, "/fake/root", config=CFG)
+    with _scrape(False), _no_archive_hook(), pytest.raises(PipelineFailed):
+        await _pipeline()
     send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_signal_goes_before_the_archive_hook(settings, redis):
+async def test_signal_goes_before_the_archive(settings, redis):
     order = []
+
+    async def _archive(j, cfg):
+        order.append("archive")
+        return True
+
     with _scrape(True), patch(
         "ddp_sync.services.broker_client.request_bill_event_check",
         new=AsyncMock(side_effect=lambda j: order.append("signal")),
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.maybe_trigger_archive_after_scrape",
-        new=AsyncMock(side_effect=lambda j: order.append("archive")),
-    ):
-        await _run_scrape("ut", None, "/fake/root", config=CFG)
+    ), patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=_archive):
+        await _pipeline()
     assert order == ["signal", "archive"]
 
 
@@ -106,9 +117,9 @@ async def test_a_broker_failure_never_changes_the_scrape_result(settings, redis,
     with _scrape(True), _no_archive_hook() as archive, patch(
         "ddp_sync.services.broker_client.request_bill_event_check", new=AsyncMock(side_effect=failure)
     ):
-        result = await _run_scrape("ut", None, "/fake/root", config=CFG)
+        result = await _pipeline()
     assert result["success"] is True
-    archive.assert_awaited_once()  # the archive hook still runs
+    archive.assert_awaited_once()  # the archive still runs
 
 
 # ── the gate ────────────────────────────────────────────────────────────────────────
@@ -129,8 +140,8 @@ async def test_off_by_default_and_unenrolled_jurisdictions_send_nothing(settings
     send.assert_not_awaited()
 
 
-def test_the_checked_in_schedule_ships_it_off_inside_the_block_run_scrape_receives():
-    # every _run_scrape caller passes the openstates_scrape block as `config`
+def test_the_checked_in_schedule_ships_it_off_inside_the_block_the_pipeline_receives():
+    # the scheduler and the manual trigger pass the openstates_scrape block as `config`
     import yaml
 
     from ddp_sync.scheduler import DEFAULT_CONFIG_PATH

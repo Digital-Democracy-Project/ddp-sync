@@ -33,16 +33,21 @@ DEFAULT_CONFIG_PATH = _pkg_config if _pkg_config.exists() else _cwd_config
 
 
 
-def _secondary_jurisdictions(config: dict) -> list[str]:
-    """The secondary batch (SYNC-146). In `authoritative` mode: every state the shared list has at tier `secondary` and
-    a status other than paused or probing, so a new state needs no entry in sync_schedule.yaml; in `shadow` mode, or when
-    the shared list cannot be read, the yaml's own list exactly as before. Same answer the manual trigger and the batch
-    run already use (`enrolled("scrape_secondary", ...)`); the scheduler was the one reader still taking the yaml."""
-    from ddp_sync.pipelines.openstates_scrape import _get_root
-    from ddp_sync.services.jurisdiction_enrollment import enrolled
+# SYNC-152: the scrape job ids of the retired primary/secondary layout. Removed on every registration, BEFORE the
+# per-state jobs are added, so a live scheduler that re-registers (the cadence review) never runs old and new side by side.
+_OLD_SCRAPE_JOB_PREFIXES = (
+    "openstates_secondary_scrape",   # the Sunday batch and the escalated openstates_secondary_scrape_<state> jobs
+    "openstates_primary_scrape_",
+    "openstates_fl_scrape",
+    "openstates_wa_scrape",
+    "openstates_usa_scrape",
+)
+SCRAPE_JOB_PREFIX = "openstates_scrape_"
 
-    listed = enrolled("scrape_secondary", (config.get("secondary") or {}).get("jurisdictions", []), _get_root(config))
-    return [] if listed is None else list(listed)
+_DAY_ABBR = {
+    "monday": "mon", "tuesday": "tue", "wednesday": "wed",
+    "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
+}
 
 
 class UpdateScheduler:
@@ -540,12 +545,13 @@ class UpdateScheduler:
         )
 
     def _register_openstates_scrape_jobs(self, cadences: dict[str, str] | None = None) -> None:
-        """Register independent APScheduler jobs for each OpenStates jurisdiction.
+        """Register one APScheduler job per scraped state, plus the patch refresh and people refresh.
 
-        Replaces the sequential run-all-scrapes.sh launchd job. FL, WA, and
-        USA run as separate daily jobs so a 12-hour FL scrape no longer delays
-        WA or USA. Secondary states fan out concurrently inside their own
-        Sunday job. The patch_refresh job runs at 01:00 UTC before all scrapes.
+        SYNC-152: WHO is scraped is the manifest (`enrolled_scrape_states`: status not paused or
+        probing); WHEN is `openstates_scrape.timing.<state>` (or `defaults`). Each state gets
+        `openstates_scrape_<state>`, running `run_state_pipeline` (scrape, then archive, then LegBot).
+        No primary/secondary split, no batch: the old job ids are removed first. The patch_refresh
+        job runs at 01:00 UTC before all scrapes.
 
         OPEN-140: `cadences` is a per-jurisdiction effective cadence resolved from
         Redis and floored at the YAML value. Passing None -- which is what start()
@@ -555,10 +561,9 @@ class UpdateScheduler:
         Overrides arrive later, by the cadence-review job calling this again.
 
         Calling this repeatedly is the supported way to change cadence without a
-        restart. Every add_job below passes replace_existing=True, and the
-        secondary section removes the job ids its new layout no longer uses, so a
-        jurisdiction that moves between the weekly batch and its own nightly job
-        leaves exactly one cron behind either way.
+        restart. Each state's job keeps its id whatever its tempo, and add_job passes
+        replace_existing=True, so a tempo change replaces that job's trigger in place.
+        A state that leaves the manifest's scrape list loses its job here.
         """
         # None means "startup" -- see the docstring. Captured before defaulting, because
         # only the startup pass schedules the catch-up review; re-registration triggered
@@ -573,10 +578,6 @@ class UpdateScheduler:
         effective: dict[str, str] = {}
         from ddp_sync.pipelines.openstates_scrape import (
             run_patch_refresh_job,
-            run_fl_scrapes_job,
-            run_wa_scrape_job,
-            run_usa_scrapes_job,
-            run_secondary_scrapes_job,
             run_people_refresh_job,
         )
 
@@ -608,10 +609,7 @@ class UpdateScheduler:
             )
             cadences.pop(j)
 
-        day_map = {
-            "monday": "mon", "tuesday": "tue", "wednesday": "wed",
-            "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun",
-        }
+        day_map = _DAY_ABBR
 
         # --- patch refresh ---
         # OPEN-320: env flag ANDs with the shared YAML gate, same pattern as the scrape/archive
@@ -638,211 +636,8 @@ class UpdateScheduler:
                 sync_time=patch_cfg.get("sync_time_utc", "01:00"),
             )
 
-        # --- primary jobs (daily, each with its own sync_time_utc) ---
-        primary_cfg = config.get("primary", {})
-
-        fl_cfg = primary_cfg.get("fl", {})
-        if fl_cfg.get("enabled", True):
-            fl_time = fl_cfg.get("sync_time_utc", "02:00")
-            flh, flm = map(int, fl_time.split(":"))
-            # Optional weekly cadence. FL has no bills to scrape while out of
-            # session (new drafts aren't introduced until ~November), and a
-            # daily FL scrape wipes _data/fl on startup — which collides with
-            # any in-progress historical backfill sharing that dir. Set
-            # sync_day to run weekly; absent → daily (in-session default).
-            fl_day = fl_cfg.get("sync_day")
-            fl_trigger_kwargs = {"hour": flh, "minute": flm, "timezone": _UTC}
-            # OPEN-140: the YAML sync_day is a FLOOR. An escalation may lift FL to
-            # nightly by dropping day_of_week; nothing may push it below weekly.
-            # This is the case the ticket was filed for -- FL's sync_day carries a
-            # "remove once the 2027 session opens" comment that depends on a human
-            # remembering in November.
-            fl_effective = cadences.get("fl", "weekly" if fl_day else "nightly")
-            if fl_day and fl_effective != "nightly":
-                fl_trigger_kwargs["day_of_week"] = day_map.get(fl_day.lower(), "sun")
-
-            async def _fl_wrapper():
-                return await run_fl_scrapes_job(config)
-
-            self._add_job_replacing(
-                _fl_wrapper,
-                trigger=CronTrigger(**fl_trigger_kwargs),
-                id="openstates_fl_scrape",
-                name="OpenStates: FL scrape (all sessions)",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=3600,
-            )
-            logger.info(
-                "openstates_fl_scrape: registered",
-                sync_time=fl_time,
-                sync_day=fl_day or "daily",
-                effective_cadence=fl_effective,
-            )
-            effective["fl"] = fl_effective
-
-        wa_cfg = primary_cfg.get("wa", {})
-        if wa_cfg.get("enabled", True):
-            wa_time = wa_cfg.get("sync_time_utc", "02:30")
-            wah, wam = map(int, wa_time.split(":"))
-
-            async def _wa_wrapper():
-                return await run_wa_scrape_job(config)
-
-            self._add_job_replacing(
-                _wa_wrapper,
-                trigger=CronTrigger(hour=wah, minute=wam, timezone=_UTC),
-                id="openstates_wa_scrape",
-                name="OpenStates: WA scrape",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=3600,
-            )
-            logger.info("openstates_wa_scrape: registered", sync_time=wa_time)
-
-        usa_cfg = primary_cfg.get("usa", {})
-        if usa_cfg.get("enabled", True):
-            usa_time = usa_cfg.get("sync_time_utc", "03:00")
-            usah, usam = map(int, usa_time.split(":"))
-
-            async def _usa_wrapper():
-                return await run_usa_scrapes_job(config)
-
-            self._add_job_replacing(
-                _usa_wrapper,
-                trigger=CronTrigger(hour=usah, minute=usam, timezone=_UTC),
-                id="openstates_usa_scrape",
-                name="OpenStates: USA scrape (lower + upper)",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=3600,
-            )
-            logger.info("openstates_usa_scrape: registered", sync_time=usa_time)
-
-        # OPEN-494: any other state listed under primary (today: pa) is a nightly job of its own at its own
-        # sync_time_utc. fl/wa/usa above keep their dedicated wrappers; this one reuses the single-state run that an
-        # escalated secondary state already uses, so there is no new scrape path. It never reads the secondary list, so a
-        # primary state is not also in the Sunday batch (the manifest tier is the one switch: see _secondary_jurisdictions).
-        for pj, pj_cfg in primary_cfg.items():
-            if pj in ("fl", "wa", "usa") or not isinstance(pj_cfg, dict) or not pj_cfg.get("enabled", False):
-                continue
-            pj_time = pj_cfg.get("sync_time_utc", "04:00")
-            pjh, pjm = map(int, pj_time.split(":"))
-            # A state that was an escalated secondary leaves its old per-state job id behind in a live scheduler.
-            self._remove_job_if_present(f"openstates_secondary_scrape_{pj}")
-
-            async def _primary_wrapper(_j: str = pj):
-                return await run_secondary_scrapes_job(
-                    config, jurisdictions=[_j], flow_status_key=f"openstates_primary_scrape_{_j}"
-                )
-
-            self._add_job_replacing(
-                _primary_wrapper,
-                trigger=CronTrigger(hour=pjh, minute=pjm, timezone=_UTC),
-                id=f"openstates_primary_scrape_{pj}",
-                name=f"OpenStates: {pj} scrape (nightly, primary)",
-                replace_existing=True,
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=3600,
-            )
-            logger.info("openstates_primary_scrape: registered", jurisdiction=pj, sync_time=pj_time)
-
-        # --- secondary jobs (weekly batch, minus anything escalated to nightly) ---
-        sec_cfg = config.get("secondary", {})
-        if sec_cfg.get("enabled", True):
-            sec_day = sec_cfg.get("sync_day", "sunday")
-            sec_time = sec_cfg.get("sync_time_utc", "02:00")
-            sh, sm = map(int, sec_time.split(":"))
-            all_secondary: list[str] = _secondary_jurisdictions(config)
-
-            # OPEN-140: the secondary states do not have one job each -- they share a
-            # single weekly job that fans out over a list. So escalating one to nightly
-            # is not a trigger edit, it is a move: the jurisdiction leaves the batch and
-            # gets a job of its own. Leaving it in the batch as well would scrape it
-            # twice on the batch's day, and each run wipes the other's _data dir.
-            #
-            # The batch keeps its own id and its own weekly day, so a jurisdiction that
-            # is never escalated is registered byte-for-byte as it is today.
-            nightly = [j for j in all_secondary if cadences.get(j) == "nightly"]
-            weekly = [j for j in all_secondary if j not in nightly]
-            for j in all_secondary:
-                effective[j] = "nightly" if j in nightly else "weekly"
-
-            # Drop the per-jurisdiction jobs this layout no longer uses, before adding
-            # the ones it does. Without this a demotion -- or an operator lowering a
-            # floor -- would leave the old nightly cron registered alongside the batch,
-            # which is the stale-job-id hazard scheduler.py already solved once for
-            # legislator_bio_sync and is solving again here for the same reason.
-            for j in all_secondary:
-                if j in nightly:
-                    continue
-                self._remove_job_if_present(f"openstates_secondary_scrape_{j}")
-
-            for j in nightly:
-                async def _single_secondary_wrapper(_j: str = j):
-                    return await run_secondary_scrapes_job(
-                        config,
-                        jurisdictions=[_j],
-                        flow_status_key=f"openstates_secondary_scrape_{_j}",
-                    )
-
-                self._add_job_replacing(
-                    _single_secondary_wrapper,
-                    trigger=CronTrigger(hour=sh, minute=sm, timezone=_UTC),
-                    id=f"openstates_secondary_scrape_{j}",
-                    name=f"OpenStates: {j} scrape (escalated to nightly)",
-                    replace_existing=True,
-                    max_instances=1,
-                    coalesce=True,
-                    misfire_grace_time=3600,
-                )
-                logger.info(
-                    "openstates_secondary_scrape: registered nightly",
-                    jurisdiction=j,
-                    sync_time=sec_time,
-                )
-
-            if weekly:
-                async def _secondary_wrapper(_weekly: list[str] = weekly):
-                    # Pass the narrowed list explicitly rather than letting the job
-                    # re-read config: config still names every secondary jurisdiction,
-                    # including the escalated ones that now run on their own.
-                    return await run_secondary_scrapes_job(config, jurisdictions=_weekly)
-
-                self._add_job_replacing(
-                    _secondary_wrapper,
-                    trigger=CronTrigger(
-                        day_of_week=day_map.get(sec_day.lower(), "sun"),
-                        hour=sh,
-                        minute=sm,
-                        timezone=_UTC,
-                    ),
-                    id="openstates_secondary_scrapes",
-                    name="OpenStates: secondary states",
-                    replace_existing=True,
-                    max_instances=1,
-                    coalesce=True,
-                    misfire_grace_time=3600,
-                )
-                logger.info(
-                    "openstates_secondary_scrapes: registered",
-                    jurisdictions=weekly,
-                    sync_day=sec_day,
-                    sync_time=sec_time,
-                )
-            else:
-                # Every secondary jurisdiction escalated. An empty batch job would fire
-                # weekly and scrape nothing, so remove it rather than register a no-op.
-                self._remove_job_if_present("openstates_secondary_scrapes")
-                logger.info(
-                    "openstates_secondary_scrapes: not registered — every jurisdiction "
-                    "is on its own nightly job",
-                    jurisdictions=nightly,
-                )
+        # --- one pipeline job per scraped state (SYNC-152) ---
+        self._register_state_pipeline_jobs(config, cadences, effective)
 
         # --- people refresh (weekly) ---
         people_cfg = config.get("people_refresh", {})
@@ -885,6 +680,70 @@ class UpdateScheduler:
             self.scheduler.remove_job(job_id)
         except Exception:  # noqa: BLE001 — JobLookupError variant
             pass
+
+    def _job_ids_with_prefix(self, prefixes: tuple[str, ...]) -> list[str]:
+        """Ids of registered jobs (started or still pending) that start with any of `prefixes`."""
+        return [job.id for job in self.scheduler.get_jobs() if job.id.startswith(prefixes)]
+
+    def _register_state_pipeline_jobs(self, config: dict, cadences: dict[str, str], effective: dict[str, str]) -> None:
+        """SYNC-152: `openstates_scrape_<state>` for every state the manifest says we scrape, and nothing else.
+
+        Order matters: the manifest and every state's timing are read first, then the retired layout's ids are
+        removed, then the per-state jobs are added, so old and new never both fire. A manifest that cannot
+        be read leaves the per-state jobs already registered as they are (logged; the daily drift check alerts on
+        an unreadable manifest): dropping every scrape because a file was briefly unreadable would be worse.
+        """
+        from ddp_sync.pipelines.openstates_scrape import enrolled_scrape_states, run_state_pipeline, state_timing
+        from ddp_sync.services.scrape_cadence import resolve_cadence
+
+        states = enrolled_scrape_states(config)
+        if states is None:
+            logger.error("openstates_scrape: the manifest cannot say which states to scrape; leaving the scrape jobs "
+                         "as they are (none are registered at startup)")
+            return
+        # Every state's timing is read before any job is touched: a malformed entry raises here, with the schedule
+        # still whole, rather than half-way through replacing it (pm-review).
+        timings = {j: state_timing(config, j) for j in states}
+
+        for old in self._job_ids_with_prefix(_OLD_SCRAPE_JOB_PREFIXES):
+            self._remove_job_if_present(old)
+
+        wanted = {f"{SCRAPE_JOB_PREFIX}{j}" for j in states}
+        for stale in self._job_ids_with_prefix((SCRAPE_JOB_PREFIX,)):
+            if stale not in wanted:  # a state that left the scrape list (paused, or back to probing)
+                self._remove_job_if_present(stale)
+                logger.info("openstates_scrape: removed the job of a state no longer scraped", job_id=stale)
+
+        archive_config = self._sync_config.get("openstates_archive", {})
+        for j in states:
+            t = timings[j]
+            tempo = resolve_cadence(t["floor"], cadences.get(j))
+            effective[j] = tempo
+            trigger_kwargs: dict[str, Any] = {"hour": t["hour"], "minute": t["minute"], "timezone": _UTC}
+            if tempo == "weekly":
+                trigger_kwargs["day_of_week"] = _DAY_ABBR.get(t["day"], "sun")
+
+            async def _pipeline_wrapper(_j: str = j):
+                return await run_state_pipeline(_j, config, archive_config)
+
+            self._add_job_replacing(
+                _pipeline_wrapper,
+                trigger=CronTrigger(**trigger_kwargs),
+                id=f"{SCRAPE_JOB_PREFIX}{j}",
+                name=f"OpenStates: {j} (scrape, archive, LegBot)",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "openstates_scrape: registered",
+                jurisdiction=j,
+                floor=t["floor"],
+                effective_cadence=tempo,
+                day=t["day"] if tempo == "weekly" else "daily",
+                start_utc=f"{t['hour']:02d}:{t['minute']:02d}",
+            )
 
     def _register_people_pull_job(self) -> None:
         """Daily fast-forward of the people checkout (SYNC-102). Deliberately NOT inside
@@ -1014,7 +873,7 @@ class UpdateScheduler:
             return
 
         # 00:30 UTC: after the previous night's runs have recorded their history and
-        # before the day's first scrape at 01:00 (patch refresh) / 02:00 (FL, secondary),
+        # before the day's first scrape at 01:00 (patch refresh) / 02:00 (the earliest state),
         # so a cadence decided today takes effect today rather than a day late.
         rh, rm = map(int, cadence_cfg.get("review_time_utc", "00:30").split(":"))
 
@@ -1069,8 +928,14 @@ class UpdateScheduler:
         stay in, and refusing to reschedule is strictly better than rescheduling from a
         half-read view of Redis.
         """
+        from ddp_sync.pipelines.openstates_scrape import (
+            LEGACY_SCRAPE_HISTORY_FLOW,
+            SCRAPE_HISTORY_FLOW,
+            enrolled_scrape_states,
+            state_timing,
+        )
         from ddp_sync.services.redis_store import get_redis_store
-        from ddp_sync.services.scrape_cadence import cadence_from_yaml, cadence_review
+        from ddp_sync.services.scrape_cadence import cadence_review
 
         config = self._sync_config.get("openstates_scrape", {})
         cadence_cfg = config.get("dynamic_cadence", {})
@@ -1081,18 +946,15 @@ class UpdateScheduler:
         escalate_window = cadence_cfg.get("escalate_window", 2)
         quiet_window = cadence_cfg.get("quiet_window", 4)
 
-        # Floors, straight from the committed config. Every jurisdiction whose cadence
-        # this can move has to appear here, or resolve_cadence has no floor to floor it at.
-        floors: dict[str, str] = {}
-        fl_cfg = config.get("primary", {}).get("fl", {})
-        if fl_cfg.get("enabled", True):
-            floors["fl"] = cadence_from_yaml(fl_cfg)
-        sec_cfg = config.get("secondary", {})
-        if sec_cfg.get("enabled", True):
-            # The batch's own sync_day is the floor for every jurisdiction in it.
-            sec_floor = cadence_from_yaml(sec_cfg)
-            for j in _secondary_jurisdictions(config):
-                floors[j] = sec_floor
+        # Floors for EVERY scraped state (SYNC-152): who from the manifest, the floor from
+        # `openstates_scrape.timing` / `defaults`. A nightly floor cannot be raised, but it is
+        # still reviewed, so its history is read and demotion advice is logged like any other.
+        states = enrolled_scrape_states(config)
+        if states is None:
+            logger.error("openstates_cadence_review: the manifest cannot say which states are scraped; "
+                         "leaving the current schedule alone")
+            return {"success": False, "error": "manifest unreadable"}
+        floors: dict[str, str] = {j: state_timing(config, j)["floor"] for j in states}
 
         # Read and decide for EVERY jurisdiction before writing anything. pm-review
         # found the ordering that matters: with read-decide-write interleaved per
@@ -1107,14 +969,12 @@ class UpdateScheduler:
 
             for jurisdiction, floor in floors.items():
                 override = await redis_store.get_scrape_cadence(jurisdiction)
-                # History is recorded under the flow that ran the scrape. Escalated
-                # jurisdictions keep writing to the secondary flow's key on purpose --
-                # see run_secondary_scrapes_job -- so one lookup covers both cadences.
-                flow = (
-                    "openstates_fl_scrape" if jurisdiction == "fl"
-                    else "openstates_secondary_scrapes"
-                )
-                history = await redis_store.get_run_history(flow, jurisdiction)
+                # SYNC-152: every state's pipeline writes `openstates_scrape:<state>`, whatever
+                # its tempo. Until a state has a record there, read its pre-SYNC-152 secondary
+                # history instead (that key is no longer written and expires within 30 days).
+                history = await redis_store.get_run_history(SCRAPE_HISTORY_FLOW, jurisdiction)
+                if not history:
+                    history = await redis_store.get_run_history(LEGACY_SCRAPE_HISTORY_FLOW, jurisdiction)
 
                 verdict = cadence_review(
                     jurisdiction=jurisdiction,

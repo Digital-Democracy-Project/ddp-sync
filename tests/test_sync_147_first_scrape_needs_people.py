@@ -30,6 +30,18 @@ def _entry(status):
     return {"name": status, "status": status, "tier": "secondary", "enrollment": {"cloud_path": True}}
 
 
+async def _pipeline(code, cfg, **kwargs):
+    """SYNC-152: the manual trigger runs the state pipeline (run_single_scrape_job is gone). Archive and bookkeeping are
+    faked; a failed run's PipelineFailed is turned back into a result so the people-check assertions read the same."""
+    with patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)), \
+            patch.object(scrape, "_check_sustained_blocking", new=AsyncMock()), \
+            patch.object(scrape, "_write_flow_status", new=AsyncMock()):
+        try:
+            return await scrape.run_state_pipeline(code, cfg, **kwargs)
+        except scrape.PipelineFailed as e:
+            return {"success": False, "results": e.results}
+
+
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     je._cache.clear()
@@ -46,7 +58,6 @@ def cfg(tmp_path):
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
     return {
         "openstates_root": str(tmp_path),
-        "secondary": {"jurisdictions": ["nc", "pa", "ne", "la"]},
         "cloud_path": {"enabled": True, "jurisdictions": ["nc", "pa", "ne", "la", "usa"]},
     }
 
@@ -122,13 +133,13 @@ async def test_a_live_state_launches_even_if_the_count_would_be_zero(cfg):
 async def test_the_manual_override_starts_it_anyway_logs_it_and_does_not_stick(cfg):
     with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD, return_value={"success": True}) as cloud, \
             capture_logs() as logs:
-        await scrape.run_single_scrape_job("pa", cfg, skip_people_check=True)
+        await _pipeline("pa", cfg, skip_people_check=True)
     count.assert_not_awaited()
     cloud.assert_called_once()
     assert any(l["event"] == "openstates_scrape: people check skipped on purpose" for l in logs)
     assert scrape._SKIP_PEOPLE_CHECK.get() is False                     # the override ended with the call
     with patch(COUNT, new=AsyncMock(return_value=0)), patch(CLOUD) as cloud2:
-        result = await scrape.run_single_scrape_job("pa", cfg)          # the next, plain call is checked again
+        result = await _pipeline("pa", cfg)          # the next, plain call is checked again
     cloud2.assert_not_called()
     assert result["success"] is False
 
@@ -142,7 +153,7 @@ def _post(target, cfg, count, query=""):
     app.dependency_overrides[api_key_auth] = lambda: "test-token"
     scheduler = SimpleNamespace(_sync_config={"openstates_scrape": cfg})
     with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), \
-            patch("ddp_sync.pipelines.openstates_scrape.run_single_scrape_job", new=AsyncMock()) as single, \
+            patch("ddp_sync.api.routes.triggers._run_state_pipeline_in_background", new=AsyncMock()) as single, \
             patch(COUNT, new=AsyncMock(return_value=count)):
         resp = TestClient(app).post(f"/trigger/openstates-scrape/{target}{query}")
     return resp, single
@@ -157,20 +168,20 @@ def test_the_trigger_answers_409_with_the_reason_and_does_not_start_the_job(cfg)
 
 def test_the_trigger_starts_a_state_that_has_legislators_exactly_as_before(cfg):
     resp, single = _post("pa", cfg, 253)
-    assert resp.status_code == 200 and resp.json() == {"status": "started", "target": "pa"}
-    single.assert_awaited_once_with("pa", cfg, people_checked=True)   # the job is told: one read, not two
+    assert resp.status_code == 202 and resp.json() == {"status": "started", "target": "pa"}
+    single.assert_awaited_once_with("pa", cfg, {}, people_checked=True)   # the job is told: one read, not two
 
 
 def test_the_trigger_override_starts_it_and_says_so(cfg):
     resp, single = _post("pa", cfg, 0, "?skip_people_check=true")
-    assert resp.status_code == 200 and resp.json()["people_check"] == "skipped on purpose"
-    single.assert_awaited_once_with("pa", cfg, skip_people_check=True)
+    assert resp.status_code == 202 and resp.json()["people_check"] == "skipped on purpose"
+    single.assert_awaited_once_with("pa", cfg, {}, skip_people_check=True)
 
 
 def test_a_live_state_is_triggered_with_no_check(cfg):
     resp, single = _post("nc", cfg, 0)
-    assert resp.status_code == 200
-    single.assert_awaited_once_with("nc", cfg, people_checked=True)
+    assert resp.status_code == 202
+    single.assert_awaited_once_with("nc", cfg, {}, people_checked=True)
 
 
 # --- the count itself: its own short timeout, at most one retry ---------------------------------------------------
@@ -320,7 +331,7 @@ async def test_a_zero_from_the_rds_base_refuses_even_though_the_local_copy_has_p
 @pytest.mark.asyncio
 async def test_a_job_the_trigger_already_checked_does_not_read_the_count_again(cfg):
     with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD, return_value={"success": True}) as cloud:
-        await scrape.run_single_scrape_job("pa", cfg, people_checked=True)
+        await _pipeline("pa", cfg, people_checked=True)
     count.assert_not_awaited()
     cloud.assert_called_once()
     assert scrape._PEOPLE_ALREADY_CHECKED.get() is False          # not sticky
@@ -337,9 +348,9 @@ async def test_a_scheduled_run_with_no_trigger_still_reads_the_count_in_the_funn
 
 @pytest.mark.asyncio
 async def test_the_markers_are_cleared_even_when_the_job_raises_so_a_later_scheduled_run_still_checks(cfg):
-    with patch(CLOUD, side_effect=RuntimeError("launch failed")), patch(COUNT, new=AsyncMock(return_value=253)), \
-            pytest.raises(RuntimeError):
-        await scrape.run_single_scrape_job("pa", cfg, skip_people_check=True, people_checked=True)
+    with patch(CLOUD, side_effect=RuntimeError("launch failed")), patch(COUNT, new=AsyncMock(return_value=253)):
+        result = await _pipeline("pa", cfg, skip_people_check=True, people_checked=True)
+    assert result["success"] is False and "launch failed" in result["results"][0]["error"]
     assert scrape._PEOPLE_ALREADY_CHECKED.get() is False and scrape._SKIP_PEOPLE_CHECK.get() is False
     with patch(COUNT, new=AsyncMock(return_value=0)) as count, patch(CLOUD) as cloud:
         result = await scrape._run_scrape_impl("pa", None, cfg["openstates_root"], config=cfg)

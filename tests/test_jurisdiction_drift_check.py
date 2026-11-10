@@ -41,8 +41,7 @@ AGREEING_CONFIG = {
         "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
     },
     "openstates_scrape": {
-        "primary": {"fl": {"enabled": True}, "usa": {"enabled": True}},
-        "secondary": {"jurisdictions": ["nc"]},
+        "timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}},
         "cloud_path": {"jurisdictions": ["fl", "usa", "nc"]},
     },
 }
@@ -105,9 +104,29 @@ def test_a_live_yaml_list_that_differs_is_drift(root):
     assert [d["feature"] for d in f["drift"]] == ["archive"] and f["drift"][0]["source"] == "sync_schedule.yaml"
 
 
+def test_timing_for_a_state_the_manifest_does_not_scrape_is_drift(root):
+    """SYNC-152: the yaml has no list of scraped states, only timing; timing for a paused state (al) is drift."""
+    import copy
+
+    config = copy.deepcopy(AGREEING_CONFIG)
+    config["openstates_scrape"]["timing"]["al"] = {"floor": "weekly"}
+    f = jdc.collect_findings(config, _settings(), root)
+    assert f["drift"] == [{"feature": "scrape_timing", "only_in_yaml": ["al"], "only_in_manifest": [],
+                           "source": "sync_schedule.yaml"}]
+
+
+def test_a_scraped_state_without_timing_is_not_drift(root):
+    import copy
+
+    config = copy.deepcopy(AGREEING_CONFIG)
+    config["openstates_scrape"]["timing"] = {}
+    assert jdc.collect_findings(config, _settings(), root)["drift"] == []
+
+
 def test_a_missing_manifest_is_unverifiable_not_silent(tmp_path):
     f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US"], ["us"]), str(tmp_path))
     assert f["drift"] == [] and "archive" in f["unverifiable"] and "replica_routing" in f["unverifiable"]
+    assert "scrape" in f["unverifiable"]  # SYNC-152: a host that cannot read who is scraped must alert
 
 
 def test_a_manifest_older_than_the_new_fields_is_unverifiable_for_those_only(tmp_path):

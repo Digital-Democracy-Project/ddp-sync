@@ -1158,61 +1158,60 @@ async def trigger_webflow_job(job_name: str, token: str = Depends(api_key_auth))
 # OpenStates scrape triggers
 # ---------------------------------------------------------------------------
 
-# Targets that map to a named job function.
-_OPENSTATES_JOB_TARGETS = {"patches", "fl", "wa", "usa", "secondary", "people", "people-pull", "fork-check", "drift-check"}
+# Targets that map to a named job function (not a state).
+_OPENSTATES_JOB_TARGETS = {"patches", "people", "people-pull", "fork-check", "drift-check"}
 
 
 def _single_jurisdiction_targets(config: dict) -> set[str]:
-    """SYNC-57: the states that can be scraped on their own are the schedule's own
-    secondary list (sync_schedule.yaml openstates_scrape.secondary.jurisdictions), the
-    same list the Sunday batch runs. It used to be a hardcoded copy here, which missed NC
-    when NC joined the schedule. FL, WA and USA are batch targets above (several sessions
-    or both chambers), so a name that is already a batch target is not repeated here."""
-    from ddp_sync.pipelines.openstates_scrape import _get_root
-    from ddp_sync.services.jurisdiction_enrollment import enrolled
+    """Every state the manifest says we scrape (status not probing or paused). SYNC-152: one rule, the same one the
+    scheduler registers a job for; no tier, no yaml list. This used to read only the secondary list, so a nightly
+    state (Pennsylvania, 2026-11-10) answered 404, and SYNC-57 had already fixed the same reader once."""
+    from ddp_sync.pipelines.openstates_scrape import enrolled_scrape_states
 
-    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
-    names = enrolled("scrape_secondary", (config.get("secondary") or {}).get("jurisdictions") or [], _get_root(config))
-    return {str(j).strip().lower() for j in names or []} - _OPENSTATES_JOB_TARGETS
+    return {str(j).strip().lower() for j in enrolled_scrape_states(config) or []} - _OPENSTATES_JOB_TARGETS
 
 
-@router.post("/trigger/openstates-scrape/{target}")
+async def _run_state_pipeline_in_background(target: str, config: dict, archive_config: dict, **kwargs) -> None:
+    """The manual trigger's background task: the scheduler's own pipeline. Its outcome is the status record
+    `openstates_scrape_<state>` (written by the pipeline) and the log; a failed run is logged here, not raised into
+    the web server after the 202 has gone."""
+    from ddp_sync.pipelines.openstates_scrape import PipelineFailed, run_state_pipeline
+
+    try:
+        await run_state_pipeline(target, config, archive_config, **kwargs)
+    except PipelineFailed as e:
+        logger.error("manual openstates pipeline failed: %s", e)
+    except Exception:  # a background task has no caller left to raise to
+        logger.exception("manual openstates pipeline for %s raised", target)
+
+
+@router.post("/trigger/openstates-scrape/{target}", status_code=202)
 async def trigger_openstates_scrape(
     target: str,
     background_tasks: BackgroundTasks,
     skip_people_check: bool = False,
     token: str = Depends(api_key_auth),
 ):
-    """Trigger an OpenStates scrape job immediately, without waiting for its cron.
+    """Trigger an OpenStates job immediately, without waiting for its cron.
 
-    Returns 202 Accepted immediately; the job runs in the background and logs
-    to ~/Developer/repos/ddp-open-states/logs/scraper.log plus ddp-sync's
-    structured log. Flow status is written to Redis under ddp:flow:openstates_*.
+    Returns 202 Accepted immediately; the job runs in the background. A state's outcome is its status record in
+    Redis (ddp:flow:openstates_scrape_<state>) and ddp-sync's structured log; the answer never says "archived".
 
     Targets:
         patches     — run apply-local-patches.sh (idempotent, ~30s)
-        fl          — FL scrape + import (every session the scrapers image marks active)
-        wa          — WA scrape + import
-        usa         — USA lower then upper sequentially
-        secondary   — VA, MI, MA, UT, AZ concurrently
         people      — git pull people repo + os-people to-database for all states
         people-pull — git pull --ff-only of the people checkout only (SYNC-102)
         fork-check  — how far each DDP fork is behind its upstream (measure and alert only)
         drift-check — compare this host's jurisdiction lists with jurisdictions.yaml (OPEN-330; alerts on drift)
-        <state>     — one state from openstates_scrape.secondary.jurisdictions in
-                      sync_schedule.yaml (va, mi, ma, ut, az, nc today), scraped alone.
-                      SYNC-147: a state that is not live yet and has no legislators in production
+        <state>     — any state the manifest says we scrape (status not paused or probing; `usa` for the US):
+                      the same pipeline as its scheduled job (SYNC-152): scrape every session, then archive,
+                      then LegBot. SYNC-147: a state that is not live yet and has no legislators in production
                       answers 409 (runbook rule 1); `?skip_people_check=true` starts it anyway.
     """
     from ddp_sync.pipelines.openstates_scrape import (
         run_patch_refresh_job,
-        run_fl_scrapes_job,
-        run_wa_scrape_job,
-        run_usa_scrapes_job,
-        run_secondary_scrapes_job,
         run_people_pull_job,
         run_people_refresh_job,
-        run_single_scrape_job,
     )
     from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
     from ddp_sync.pipelines.jurisdiction_drift_check import run_jurisdiction_drift_check
@@ -1220,14 +1219,11 @@ async def trigger_openstates_scrape(
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_scrape", {}) if scheduler else {}
+    archive_config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
 
     if target in _OPENSTATES_JOB_TARGETS:
         job_map = {
             "patches": run_patch_refresh_job,
-            "fl": run_fl_scrapes_job,
-            "wa": run_wa_scrape_job,
-            "usa": run_usa_scrapes_job,
-            "secondary": run_secondary_scrapes_job,
             "people": run_people_refresh_job,
             "people-pull": run_people_pull_job,
             "fork-check": run_fork_upstream_check_job,
@@ -1244,12 +1240,13 @@ async def trigger_openstates_scrape(
         from ddp_sync.pipelines.openstates_scrape import people_check_refusal
 
         if skip_people_check:
-            background_tasks.add_task(run_single_scrape_job, target, config, skip_people_check=True)
+            background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
+                                      skip_people_check=True)
             return {"status": "started", "target": target, "people_check": "skipped on purpose"}
         refusal = await people_check_refusal(target, config)
         if refusal:
             raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
-        background_tasks.add_task(run_single_scrape_job, target, config, people_checked=True)
+        background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config, people_checked=True)
         return {"status": "started", "target": target}
 
     available = sorted(_OPENSTATES_JOB_TARGETS | single_targets)

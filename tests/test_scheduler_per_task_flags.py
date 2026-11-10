@@ -198,10 +198,15 @@ async def test_a_leftover_session_pipeline_batch_block_registers_nothing():
 
 
 @pytest.mark.asyncio
-async def test_patch_refresh_enabled_false_skips_only_the_patch_job():
+async def test_patch_refresh_enabled_false_skips_only_the_patch_job(tmp_path, monkeypatch):
     """OPEN-320: the EC2 host scrapes through Fargate, has no live editable checkouts to
     refresh, and the shared YAML says patch_refresh.enabled: true for every host -- so the
     env flag is the only way to opt that one job out without also dropping the scrapes."""
+    from ddp_sync.services import jurisdiction_enrollment as je
+
+    je._cache.clear()
+    (tmp_path / "jurisdictions.yaml").write_text("wa: {status: live}\n")
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path))  # SYNC-152: who is scraped is the manifest
     sched = _scheduler_with_yaml(
         """
         bill_sync:
@@ -211,10 +216,8 @@ async def test_patch_refresh_enabled_false_skips_only_the_patch_job():
           patch_refresh:
             enabled: true
             sync_time_utc: "01:00"
-          primary:
-            wa:
-              enabled: true
-              sync_time_utc: "02:30"
+          timing:
+            wa: {floor: nightly, start_utc: "02:30"}
         """,
         openstates_patch_refresh_enabled=False,
     )
@@ -222,7 +225,7 @@ async def test_patch_refresh_enabled_false_skips_only_the_patch_job():
     try:
         ids = {j.id for j in sched.scheduler.get_jobs()}
         assert "openstates_patch_refresh" not in ids
-        assert any(job_id.startswith("openstates_wa") for job_id in ids)
+        assert "openstates_scrape_wa" in ids
     finally:
         sched.stop()
 
