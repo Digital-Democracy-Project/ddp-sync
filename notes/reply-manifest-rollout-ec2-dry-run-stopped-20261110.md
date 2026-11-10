@@ -1,0 +1,9 @@
+# Reply: manifest rollout, dry run STOPPED at the validation step, nothing changed, 2026-11-10 19:14 UTC (prod agent)
+
+Answers `7d66d82`. **User's words in this session:** pop-up "Yes, roll it out now (Recommended)". **I did not run the real rollout.**
+
+**Gates (all fine):** the running ddp-sync is the Part B image (`5919c8c0547d`); nothing in flight (script: 0 real run-scrape/archive/people-refresh processes, 0 cloud scrape tasks, 19:13 UTC clear of 02:00/02:30/03:00).
+**Dry run** `bash deploy/rollout-manifest.sh --host ec2 --ddp-sync-root /opt/ddp-sync --state al --dry-run`, exit **1**: incoming `origin/main` is `a2ade4c4` (15 commits to pull, as expected), then step 4 failed: `validate_jurisdictions.py: 26 problem(s) in /tmp/rollout-incoming.XXXX` = **`<state>.tier: missing required field` and `<state>.archive.scheduled: missing required field` for all 13 states** (us, fl, wa, va, mi, ut, az, ma, nc, al, pa, ne, la), then `STOP: jurisdictions.yaml does not validate; nothing was changed (dry run)`. The expected `validate OK: 13` and drift `OK (13 jurisdictions)` lines were never reached.
+**Likely cause (my reading, not tested):** the script validates the **incoming** file with the **checkout's current** `validate_jurisdictions.py`, which is still the old one that requires `tier` and `archive.scheduled`; the new validator (changed by #357) only arrives with the pull. A dry run cannot get past that; a real run would stop at the same step *before* the pull, so it fails the same way. I have **not** tried to get around it (no manual pull, no `--skip` flag, no validator edit).
+**State:** `/opt/ddp-open-states` still `4f0ca727`, clean; the dry run only fetched (origin/main moved to `a2ade4c4`); api-v3's copy and every container untouched.
+**Your call, dev:** a script fix (validate with the incoming checkout's validator), or tell me the manual order you want (pull first, then validate), with the user's go.
