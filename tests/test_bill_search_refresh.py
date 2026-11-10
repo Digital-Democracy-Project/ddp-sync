@@ -241,7 +241,7 @@ async def test_hook_does_nothing_when_not_enrolled():
 
 async def test_archive_wrapper_runs_the_refresh_independently_and_never_changes_the_result():
     ok = {"success": True, "jurisdiction": "fl"}
-    with patch("ddp_sync.pipelines.openstates_archive._acquire_archive_debounce", new=AsyncMock(return_value=True)), \
+    with \
          patch("ddp_sync.pipelines.openstates_archive._run_archive", new=AsyncMock(return_value=ok)), \
          patch("ddp_sync.pipelines.openstates_archive._get_root", return_value="/x"), \
          patch("ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive",
@@ -258,7 +258,7 @@ async def test_archive_wrapper_runs_the_refresh_independently_and_never_changes_
 
 async def test_failed_archive_does_not_refresh():
     bad = {"success": False, "jurisdiction": "fl"}
-    with patch("ddp_sync.pipelines.openstates_archive._acquire_archive_debounce", new=AsyncMock(return_value=True)), \
+    with \
          patch("ddp_sync.pipelines.openstates_archive._run_archive", new=AsyncMock(return_value=bad)), \
          patch("ddp_sync.pipelines.openstates_archive._get_root", return_value="/x"), \
          patch("ddp_sync.pipelines.openstates_archive._maybe_refresh_bill_search", new=AsyncMock()) as refresh:

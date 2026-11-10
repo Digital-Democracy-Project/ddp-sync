@@ -429,7 +429,7 @@ async def test_hook_runs_with_local_api_on_the_mac_and_rds_api_elsewhere():
 
 async def test_archive_wrapper_runs_both_hooks_independently_and_never_changes_the_result():
     ok = {"success": True, "jurisdiction": "fl"}
-    with patch("ddp_sync.pipelines.openstates_archive._acquire_archive_debounce", new=AsyncMock(return_value=True)), \
+    with \
          patch("ddp_sync.pipelines.openstates_archive._run_archive", new=AsyncMock(return_value=ok)), \
          patch("ddp_sync.pipelines.openstates_archive._get_root", return_value="/x"), \
          patch("ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive",
@@ -445,7 +445,7 @@ async def test_archive_wrapper_runs_both_hooks_independently_and_never_changes_t
 
 async def test_failed_archive_triggers_neither_hook():
     bad = {"success": False, "jurisdiction": "fl"}
-    with patch("ddp_sync.pipelines.openstates_archive._acquire_archive_debounce", new=AsyncMock(return_value=True)), \
+    with \
          patch("ddp_sync.pipelines.openstates_archive._run_archive", new=AsyncMock(return_value=bad)), \
          patch("ddp_sync.pipelines.openstates_archive._get_root", return_value="/x"), \
          patch("ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive", new=AsyncMock()) as legbot, \

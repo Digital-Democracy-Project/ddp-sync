@@ -33,7 +33,7 @@ def _entry(status):
 async def _pipeline(code, cfg, **kwargs):
     """SYNC-152: the manual trigger runs the state pipeline (run_single_scrape_job is gone). Archive and bookkeeping are
     faked; a failed run's PipelineFailed is turned back into a result so the people-check assertions read the same."""
-    with patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)), \
+    with patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=None)), \
             patch.object(scrape, "_check_sustained_blocking", new=AsyncMock()), \
             patch.object(scrape, "_write_flow_status", new=AsyncMock()):
         try:
@@ -154,7 +154,8 @@ def _post(target, cfg, count, query=""):
     scheduler = SimpleNamespace(_sync_config={"openstates_scrape": cfg})
     with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), \
             patch("ddp_sync.api.routes.triggers._run_state_pipeline_in_background", new=AsyncMock()) as single, \
-            patch(COUNT, new=AsyncMock(return_value=count)):
+            patch(COUNT, new=AsyncMock(return_value=count)), \
+            patch("ddp_sync.services.redis_store.acquire_state_lock", new=AsyncMock(return_value="tok")):
         resp = TestClient(app).post(f"/trigger/openstates-scrape/{target}{query}")
     return resp, single
 
@@ -169,19 +170,19 @@ def test_the_trigger_answers_409_with_the_reason_and_does_not_start_the_job(cfg)
 def test_the_trigger_starts_a_state_that_has_legislators_exactly_as_before(cfg):
     resp, single = _post("pa", cfg, 253)
     assert resp.status_code == 202 and resp.json() == {"status": "started", "target": "pa"}
-    single.assert_awaited_once_with("pa", cfg, {}, people_checked=True)   # the job is told: one read, not two
+    single.assert_awaited_once_with("pa", cfg, {}, people_checked=True, lock_token="tok")   # one read, not two
 
 
 def test_the_trigger_override_starts_it_and_says_so(cfg):
     resp, single = _post("pa", cfg, 0, "?skip_people_check=true")
     assert resp.status_code == 202 and resp.json()["people_check"] == "skipped on purpose"
-    single.assert_awaited_once_with("pa", cfg, {}, skip_people_check=True)
+    single.assert_awaited_once_with("pa", cfg, {}, skip_people_check=True, lock_token="tok")
 
 
 def test_a_live_state_is_triggered_with_no_check(cfg):
     resp, single = _post("nc", cfg, 0)
     assert resp.status_code == 202
-    single.assert_awaited_once_with("nc", cfg, {}, people_checked=True)
+    single.assert_awaited_once_with("nc", cfg, {}, people_checked=True, lock_token="tok")
 
 
 # --- the count itself: its own short timeout, at most one retry ---------------------------------------------------

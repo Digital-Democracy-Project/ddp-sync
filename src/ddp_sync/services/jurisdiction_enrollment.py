@@ -39,14 +39,10 @@ MANIFEST_FILENAME = "jurisdictions.yaml"
 _UNSCHEDULED_STATUSES = ("paused", "probing")
 
 _FEATURES = {
-    # OPEN-418: the RECURRING archive list is the manifest's archive.scheduled, not archive.enabled (which only means
-    # "may be archived", the Stage 4 manual run). A pre-OPEN-418 manifest has no `scheduled`, which reads as "cannot say".
-    "archive": (lambda e: e["archive"]["scheduled"], False),
-    # SYNC-146 (2026-11-09): the archive that runs right after a state's own scrape (archive_after_scrape,
-    # which then triggers LegBot on the Mac) follows archive.enabled, not `scheduled`: a new state archives after each
-    # scrape from Stage 4 on, while its weekly cron (`scheduled`) stays off until it is live (OPEN-418). No yaml list of
-    # its own, so it is not part of the drift comparison; its fallback is openstates_archive.jurisdictions.
-    "archive_after_scrape": (lambda e: e["archive"]["enabled"], False),
+    # SYNC-153: who is archived is the manifest's archive.enabled, ONE list: a state's archive follows its own scrape
+    # (and the manual archive trigger accepts the same states). There is no recurring archive schedule and no yaml list
+    # any more, so `archive.scheduled` (OPEN-418) is not read and this is not part of the yaml comparison.
+    "archive": (lambda e: e["archive"]["enabled"], False),
     "embedding": (lambda e: e["enrollment"]["embedding"], False),
     "search_refresh": (lambda e: e["enrollment"]["search_refresh"], False),
     "cloud_path": (lambda e: e["enrollment"]["cloud_path"], True),
@@ -179,7 +175,6 @@ def _config_lists(config: dict) -> dict[str, list[str] | None]:
         return None if block is None else [str(c).strip().lower() for c in block]
 
     return {
-        "archive": listed(archive, "jurisdictions"),
         "embedding": listed(archive, "knowledge_base_embedding", "jurisdictions"),
         "search_refresh": listed(archive, "bill_search_refresh", "jurisdictions"),
         "cloud_path": listed(scrape, "cloud_path", "jurisdictions"),

@@ -183,7 +183,7 @@ class _Run:
     def patches(self):
         return (
             patch.object(scrape, "_run_scrape", new=self.run_scrape),
-            patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=self.archive),
+            patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=self.archive),
             patch.object(scrape, "_check_sustained_blocking", new=self.history),
             patch.object(scrape, "_maybe_signal_broker_bill_events", new=self.signal),
             patch.object(scrape, "_write_flow_status", new=self.status),

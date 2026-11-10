@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     from ddp_sync.services.redis_store import get_redis_store
     redis_store = get_redis_store()
     await redis_store.connect()
+    # SYNC-153: no run survives a restart, so no per-state pipeline lock may either.
+    from ddp_sync.services.redis_store import clear_state_locks
+    await clear_state_locks()
 
     # Start scheduler (unconditionally — single worker, no leader election)
     from ddp_sync.scheduler import UpdateScheduler, UpdateSchedulerFactory

@@ -181,7 +181,6 @@ def test_an_unrecognised_mode_is_shadow(root, monkeypatch):
 
 AGREEING_CONFIG = {
     "openstates_archive": {
-        "jurisdictions": ["fl", "us", "nc", "al"],
         "knowledge_base_embedding": {"jurisdictions": ["fl", "us"]},
         "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
     },
@@ -202,7 +201,6 @@ def test_a_config_that_agrees_reports_nothing(root):
 @pytest.mark.parametrize(
     "mutate,feature,only_yaml,only_manifest",
     [
-        (lambda c: c["openstates_archive"]["jurisdictions"].remove("nc"), "archive", [], ["nc"]),
         (lambda c: c["openstates_archive"]["knowledge_base_embedding"]["jurisdictions"].append("nc"), "embedding", ["nc"], []),
         (lambda c: c["openstates_archive"]["bill_search_refresh"]["jurisdictions"].remove("nc"), "search_refresh", [], ["nc"]),
         (lambda c: c["openstates_scrape"]["cloud_path"]["jurisdictions"].remove("nc"), "cloud_path", [], ["nc"]),
@@ -229,7 +227,7 @@ def test_each_list_that_disagrees_is_named(root, mutate, feature, only_yaml, onl
 
 
 def test_log_config_disagreements_logs_every_call_unlike_enrolled(root):
-    config = {"openstates_archive": {"jurisdictions": ["fl"]}}
+    config = {"openstates_archive": {"knowledge_base_embedding": {"jurisdictions": ["fl"]}}}
     with capture_logs() as logs:
         je.log_config_disagreements(config, root)
         je.log_config_disagreements(config, root)
@@ -295,10 +293,6 @@ def test_an_unreadable_manifest_gives_no_scraped_states_rather_than_a_guess(tmp_
     assert openstates_scrape.enrolled_scrape_states({"openstates_root": str(tmp_path)}) is None
 
 
-def test_the_last_resort_archive_default_now_includes_nc():
-    assert "nc" in openstates_archive.DEFAULT_ARCHIVE_JURISDICTIONS
-
-
 def test_the_manual_single_state_targets_are_every_scraped_state(root):
     from ddp_sync.api.routes.triggers import _single_jurisdiction_targets
 
@@ -326,70 +320,30 @@ def test_an_empty_manifest_result_stays_empty_in_authoritative_mode(tmp_path, mo
     assert je.enrolled("archive", ["fl"], str(tmp_path)) == []
 
 
-def test_the_manual_archive_trigger_does_not_fall_back_to_the_default_when_the_list_is_empty(root):
-    from unittest.mock import AsyncMock, MagicMock, patch
+# --- SYNC-153: who is archived is the manifest's archive.enabled, one list -------------------------------------
 
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    from ddp_sync.api.auth import api_key_auth
-    from ddp_sync.api.routes.triggers import router
-
-    app = FastAPI()
-    app.include_router(router)
-    app.dependency_overrides[api_key_auth] = lambda: "t"
-    scheduler = MagicMock()
-    scheduler._sync_config = {"openstates_archive": {"openstates_root": root, "jurisdictions": []}}
-    with patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
-    ) as run:
-        resp = TestClient(app).post("/trigger/openstates-archive/fl")
-    assert resp.status_code == 404  # nothing enrolled; the default list (which contains fl) must not be used
-    run.assert_not_awaited()
-
-
-def test_run_archive_jobs_with_an_empty_list_archives_nothing_rather_than_the_default(root):
-    import asyncio
-    from unittest.mock import AsyncMock, patch
-
-    with patch.object(openstates_archive, "_write_flow_status", new=AsyncMock()), patch.object(
-        openstates_archive, "_run_archive_with_hook", new=AsyncMock(return_value={"success": True})
-    ) as run:
-        asyncio.run(openstates_archive.run_archive_jobs({"openstates_root": root, "jurisdictions": []}))
-    run.assert_not_awaited()
-
-
-# --- OPEN-418: the recurring archive list is the manifest's archive.scheduled -------------------------------
-
-def test_the_archive_feature_reads_scheduled_not_enabled(tmp_path):
-    """A state mid-pilot is `enabled` (may be archived by hand) but not `scheduled` (not on the recurring list)."""
+def test_the_archive_feature_reads_enabled_not_scheduled(tmp_path):
+    """A state mid-pilot (enabled, not scheduled) is archived after its scrape; `scheduled` is not read at all."""
     manifest = {
         "fl": _entry("primary"),
         "nc": dict(_entry("secondary", status="validating"), archive={"enabled": True, "scheduled": False}),
+        "al": dict(_entry("secondary", status="paused"), archive={"enabled": False, "scheduled": True}),
     }
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    assert je.manifest_codes("archive", str(tmp_path)) == ["fl", "nc"]
+
+
+def test_the_archive_feature_works_without_a_scheduled_field(tmp_path):
+    """OPEN-521 will drop `archive.scheduled` from the manifest."""
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump({"fl": dict(_entry("primary"), archive={"enabled": True})}))
     assert je.manifest_codes("archive", str(tmp_path)) == ["fl"]
 
 
-def test_a_manifest_from_before_the_flag_split_cannot_say_what_is_scheduled(tmp_path):
-    old = {"fl": dict(_entry("primary"), archive={"enabled": True})}  # no `scheduled`
-    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(old))
-    with capture_logs() as logs:
-        assert je.manifest_codes("archive", str(tmp_path)) is None
-    assert any(e["event"] == "jurisdiction_manifest_unusable" for e in logs)
-    assert je.enrolled("archive", ["fl"], str(tmp_path)) == ["fl"]  # the yaml's answer stands, in shadow mode
+def test_a_leftover_yaml_archive_list_is_not_compared_any_more(root):
+    assert je.config_disagreements({"openstates_archive": {"jurisdictions": ["zz"]}}, root) == []
 
 
-def test_a_stage_4_state_on_the_ddp_sync_archive_list_is_a_config_disagreement(tmp_path):
-    manifest = {"fl": _entry("primary"), "nc": dict(_entry("secondary", status="validating"), archive={"enabled": True, "scheduled": False})}
-    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
-    config = {"openstates_archive": {"jurisdictions": ["fl", "nc"]}}
-    assert je.config_disagreements(config, str(tmp_path)) == [
-        {"feature": "archive", "only_in_yaml": ["nc"], "only_in_manifest": []}
-    ]
-
-
-# --- SYNC-146 (2026-11-09): the archive that runs right after a scrape follows archive.enabled -----------
+# --- SYNC-146 / SYNC-153: the archive that runs right after a scrape follows archive.enabled ---------------
 
 def _new_state_manifest(tmp_path, *, enabled=True):
     """Pennsylvania's real shape at Stage 4: archive enabled, weekly archive not yet scheduled (OPEN-418)."""
@@ -400,20 +354,6 @@ def _new_state_manifest(tmp_path, *, enabled=True):
     return str(tmp_path)
 
 
-def test_archive_after_scrape_follows_enabled_not_scheduled(tmp_path):
-    root = _new_state_manifest(tmp_path)
-    assert "pa" in je.manifest_codes("archive_after_scrape", root)
-    assert "pa" not in je.manifest_codes("archive", root)  # the weekly cron list is unchanged
-
-
-def test_archive_after_scrape_is_not_a_drift_feature(tmp_path):
-    # The yaml archive list matches `scheduled`; a state that is enabled but unscheduled is not drift.
-    root = _new_state_manifest(tmp_path)
-    config = {"openstates_archive": {"jurisdictions": ["al", "fl", "nc", "us"]}}
-    assert [d for d in je.config_disagreements(config, root) if d["feature"] == "archive"] == []
-    assert all(d["feature"] != "archive_after_scrape" for d in je.config_disagreements(config, root))
-
-
 async def _hook(monkeypatch, root, state, yaml_list=("fl", "us")):
     from unittest.mock import AsyncMock, patch
 
@@ -421,7 +361,7 @@ async def _hook(monkeypatch, root, state, yaml_list=("fl", "us")):
     cfg = {"enabled": True, "jurisdictions": list(yaml_list)}
     with patch.object(openstates_archive, "_load_archive_config_for_scrape_trigger", return_value=cfg), \
             patch.object(openstates_archive, "run_single_archive_job", new=AsyncMock(return_value={"success": True})) as run:
-        await openstates_archive.archive_after_scrape(state)
+        await openstates_archive.archive_with_retry(state)
     return run
 
 
@@ -434,17 +374,19 @@ async def test_authoritative_new_state_scrape_triggers_its_archive_with_no_yaml_
 
 
 @pytest.mark.asyncio
-async def test_shadow_mode_keeps_the_yaml_list(tmp_path, monkeypatch):
+async def test_shadow_mode_also_follows_the_shared_list(tmp_path, monkeypatch):
+    """SYNC-153: there is no yaml list left to keep, so both modes archive what archive.enabled says."""
     run = await _hook(monkeypatch, _new_state_manifest(tmp_path), "pa")
-    run.assert_not_awaited()
+    run.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_authoritative_with_an_unreadable_list_falls_back_to_the_yaml(tmp_path, monkeypatch):
+async def test_an_unreadable_list_archives_nothing(tmp_path, monkeypatch):
+    """SYNC-153: no yaml fallback; the drift check reports `archive` as unverifiable instead."""
     monkeypatch.setenv(je.MODE_ENV, "authoritative")
     empty = str(tmp_path)  # no jurisdictions.yaml here
     assert (await _hook(monkeypatch, empty, "pa")).await_count == 0
-    assert (await _hook(monkeypatch, empty, "fl")).await_count == 1
+    assert (await _hook(monkeypatch, empty, "fl")).await_count == 0
 
 
 @pytest.mark.asyncio

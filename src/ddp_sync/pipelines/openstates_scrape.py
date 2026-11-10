@@ -1687,6 +1687,42 @@ class PipelineFailed(RuntimeError):
         self.jurisdiction, self.results, self.archived = jurisdiction, results, archived
 
 
+class PipelineBusy(RuntimeError):
+    """SYNC-153: raised by `run_state_pipeline` when another run already holds the state's pipeline lock (a manual
+    trigger, or a run still going). The scheduled job logs it as an error and its next start time tries again; nothing is
+    dropped silently, because the run holding the lock archives its own scrape."""
+
+    def __init__(self, jurisdiction: str):
+        super().__init__(f"{jurisdiction}: a run for this state is already in progress (pipeline lock held)")
+        self.jurisdiction = jurisdiction
+
+
+def _wait_s(block: dict | None, jurisdiction: str | None = None) -> int:
+    """A Fargate block's max wait for one state (`max_wait_seconds_by_jurisdiction` over `max_wait_seconds`), as
+    cloud_scrape_trigger._fargate_config resolves it, defaulting to its 12 h."""
+    from ddp_sync.pipelines.cloud_scrape_trigger import _DEFAULT_MAX_WAIT_S
+
+    fargate = ((block or {}).get("cloud_path") or {}).get("fargate") or {}
+    by_state = fargate.get("max_wait_seconds_by_jurisdiction") or {}
+    return int(by_state.get(jurisdiction) or fargate.get("max_wait_seconds") or _DEFAULT_MAX_WAIT_S)
+
+
+def pipeline_lock_ttl_s(jurisdiction: str, config: dict | None, archive_config: dict | None) -> int:
+    """SYNC-153: the state's pipeline lock TTL, the worst case of a whole run: per session, the scrape's Fargate wait
+    plus its RDS load timeout; then 1 + len(ARCHIVE_RETRY_DELAYS_S) archive attempts at the archive's Fargate wait;
+    the retry delays; and 1 h. With today's limits: about 53.5 h for a one-session state, 65.5 h for MA (24 h scrape
+    wait) and 67.5 h for the US (two sessions). Safe only because every lock is cleared when ddp-sync starts."""
+    from ddp_sync.pipelines.cloud_scrape_trigger import _DEFAULT_LOAD_TIMEOUT_S
+    from ddp_sync.pipelines.openstates_archive import ARCHIVE_RETRY_DELAYS_S
+
+    sessions = max(len(state_timing(config, jurisdiction)["sessions"]), 1)
+    fargate = ((config or {}).get("cloud_path") or {}).get("fargate") or {}
+    load = int(fargate.get("load_timeout_seconds") or _DEFAULT_LOAD_TIMEOUT_S)
+    attempts = 1 + len(ARCHIVE_RETRY_DELAYS_S)
+    return (sessions * (_wait_s(config, jurisdiction) + load) + attempts * _wait_s(archive_config)
+            + sum(ARCHIVE_RETRY_DELAYS_S) + 3600)
+
+
 def enrolled_scrape_states(config: dict | None) -> list[str] | None:
     """Every state ddp-sync scrapes: the manifest's `scrape` rule (status not paused or probing), spelled the way the
     scrape side spells it (`usa` for the federal one). The ONE answer the scheduler, the manual trigger, the cadence
@@ -1739,6 +1775,7 @@ async def run_state_pipeline(
     *,
     skip_people_check: bool = False,
     people_checked: bool = False,
+    lock_token: str | None = None,
 ) -> dict[str, Any]:
     """Scrape one state, then archive it (which fires LegBot, search refresh and embedding). The ONE path for the
     scheduler's `openstates_scrape_<state>` job and the manual trigger.
@@ -1753,8 +1790,28 @@ async def run_state_pipeline(
     The status record `openstates_scrape_<state>` is written once, in `finally`, after the archive outcome is known.
     History, broker signal and status are bookkeeping: a failure in any of them is logged and changes nothing.
     `skip_people_check` / `people_checked` are the manual trigger's SYNC-147 override and "already read" flags.
+
+    SYNC-153: the whole run holds the state's pipeline lock (`redis_store.state_lock`); a run that finds it held raises
+    `PipelineBusy` and does nothing else (no status record: the run holding the lock writes its own). A manual trigger
+    took the lock before answering and passes its `lock_token`. The archive is `archive_with_retry` (retries, then an
+    alert); a failed lock release is logged and never replaces the outcome.
     """
-    from ddp_sync.pipelines.openstates_archive import archive_after_scrape
+    from ddp_sync.services.redis_store import state_lock
+
+    ttl = pipeline_lock_ttl_s(jurisdiction, config, archive_config)
+    async with state_lock(jurisdiction, ttl, token=lock_token) as held:
+        if not held:
+            raise PipelineBusy(jurisdiction)
+        return await _run_state_pipeline_locked(
+            jurisdiction, config, archive_config, skip_people_check=skip_people_check, people_checked=people_checked
+        )
+
+
+async def _run_state_pipeline_locked(
+    jurisdiction: str, config: dict | None, archive_config: dict | None, *, skip_people_check: bool, people_checked: bool
+) -> dict[str, Any]:
+    """`run_state_pipeline`'s body, run while the state's lock is held."""
+    from ddp_sync.pipelines.openstates_archive import archive_with_retry
 
     openstates_root = _get_root(config)
     started = datetime.now(timezone.utc)
@@ -1777,7 +1834,7 @@ async def run_state_pipeline(
         await _logged("history", jurisdiction, _record_scrape_history(jurisdiction, results, config))
         if any(r.get("success") for r in results):
             await _logged("broker_signal", jurisdiction, _maybe_signal_broker_bill_events(jurisdiction, config))
-            archived = await archive_after_scrape(jurisdiction, archive_config)
+            archived = await archive_with_retry(jurisdiction, archive_config)
         if not all(r.get("success") for r in results) or archived is False:
             raise PipelineFailed(jurisdiction, results, archived)
         outcome = "completed"

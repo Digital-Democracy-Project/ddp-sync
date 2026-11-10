@@ -9,6 +9,7 @@ Provides:
 """
 
 import json
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import structlog
@@ -744,3 +745,87 @@ def get_redis_store() -> RedisStore:
     if _redis_store is None:
         _redis_store = RedisStore()
     return _redis_store
+
+
+# -- The per-state pipeline lock (SYNC-153) --
+#
+# One run per state at a time, whoever starts it: the scheduled `openstates_scrape_<state>` job, a manual scrape trigger,
+# or a manual archive trigger. APScheduler's max_instances=1 only covers the scheduler; a manual trigger calls the
+# pipeline directly, so the lock lives here. One key per state, spelled the archive way (`usa` -> `us`), so a US scrape and
+# a manual US archive contend for the same lock. Taken with a random token (SET NX EX), released only by its owner (a
+# compare-and-delete script), and every lock is cleared when ddp-sync starts (one scheduler instance runs, so nothing
+# survives a restart), which is what makes the long TTL (the pipeline's worst case) safe.
+#
+# Redis down: the lock fails OPEN (logged), like every other Redis use in this service: a scrape or archive must not stop
+# because the lock store is unavailable. The scheduler's max_instances=1 still stops it starting a state twice.
+
+PIPELINE_LOCK_PREFIX = "ddp:pipeline_lock:"
+# Returned by acquire_state_lock when Redis cannot answer: "go ahead, nothing to release". Falsy, so release skips it.
+NO_LOCK = ""
+_RELEASE_SCRIPT = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+
+
+def state_lock_key(jurisdiction: str) -> str:
+    from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
+
+    return f"{PIPELINE_LOCK_PREFIX}{_archive_jurisdiction_code(str(jurisdiction).strip().lower())}"
+
+
+async def acquire_state_lock(jurisdiction: str, ttl_s: int) -> str | None:
+    """Take the state's lock now. The token when taken, None when another run holds it, NO_LOCK ("") when Redis cannot
+    answer (fail open, logged). The manual triggers call this BEFORE they answer, so a 202 always means the run owns it."""
+    import uuid
+
+    client = get_redis_store()._client
+    if client is None:
+        logger.warning("pipeline_lock_unavailable_proceeding", jurisdiction=jurisdiction, reason="redis not connected")
+        return NO_LOCK
+    token = uuid.uuid4().hex
+    try:
+        ok = await client.set(state_lock_key(jurisdiction), token, nx=True, ex=max(int(ttl_s), 1))
+    except Exception as e:  # noqa: BLE001 -- fail open: a lock-store outage must not stop a scrape or archive
+        logger.warning("pipeline_lock_unavailable_proceeding", jurisdiction=jurisdiction, error=str(e))
+        return NO_LOCK
+    return token if ok else None
+
+
+async def release_state_lock(jurisdiction: str, token: str | None) -> None:
+    """Release the lock if `token` still owns it. Never raises: a failed release is logged (the TTL and the startup
+    clear free the key) and must not replace the run's real outcome."""
+    if not token:
+        return
+    try:
+        client = get_redis_store()._client
+        if client is not None:
+            await client.eval(_RELEASE_SCRIPT, 1, state_lock_key(jurisdiction), token)
+    except Exception as e:  # noqa: BLE001
+        logger.error("pipeline_lock_release_failed", jurisdiction=jurisdiction, error=str(e))
+
+
+@asynccontextmanager
+async def state_lock(jurisdiction: str, ttl_s: int, token: str | None = None):
+    """Hold the state's lock for a block; yields whether this run may go ahead. With `token` the caller already owns it
+    (a manual trigger took it before answering) and this only releases it at the end; without, it tries to take it."""
+    if token is None:
+        token = await acquire_state_lock(jurisdiction, ttl_s)
+    try:
+        yield token is not None
+    finally:
+        await release_state_lock(jurisdiction, token)
+
+
+async def clear_state_locks() -> int:
+    """Delete every pipeline lock. Called once at ddp-sync startup, before the scheduler starts: a lock left by a run
+    that died with the previous process would otherwise block its state until the TTL ran out. Never raises."""
+    client = get_redis_store()._client
+    if client is None:
+        return 0
+    try:
+        keys = [k async for k in client.scan_iter(match=f"{PIPELINE_LOCK_PREFIX}*")]
+        if keys:
+            await client.delete(*keys)
+        logger.info("pipeline_locks_cleared_at_startup", count=len(keys))
+        return len(keys)
+    except Exception as e:  # noqa: BLE001 -- startup must not fail on this
+        logger.error("pipeline_locks_clear_failed", error=str(e))
+        return 0

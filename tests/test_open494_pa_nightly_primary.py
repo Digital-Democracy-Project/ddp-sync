@@ -57,7 +57,7 @@ async def test_the_pa_job_runs_the_pa_pipeline_only(sched):
     with patch("ddp_sync.pipelines.openstates_scrape._run_scrape", new=_fake_run_scrape), patch(
         "ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()
     ), patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()), patch(
-        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=True)
+        "ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=True)
     ):
         await sched.scheduler.get_job("openstates_scrape_pa").func()
     assert calls == ["pa"]

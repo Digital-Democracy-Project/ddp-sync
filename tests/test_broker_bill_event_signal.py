@@ -63,7 +63,7 @@ def _scrape(success: bool):
 
 
 def _no_archive_hook():
-    return patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=True))
+    return patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=True))
 
 
 async def _pipeline(config=CFG):
@@ -103,7 +103,7 @@ async def test_signal_goes_before_the_archive(settings, redis):
     with _scrape(True), patch(
         "ddp_sync.services.broker_client.request_bill_event_check",
         new=AsyncMock(side_effect=lambda j: order.append("signal")),
-    ), patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=_archive):
+    ), patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=_archive):
         await _pipeline()
     assert order == ["signal", "archive"]
 
