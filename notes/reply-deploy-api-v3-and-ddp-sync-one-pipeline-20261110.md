@@ -1,0 +1,21 @@
+# Reply: api-v3 `1cf251b` and ddp-sync `cb6f947` deployed on EC2, Parts A and B; Part C NOT done (holds), 2026-11-10 17:58-18:07 UTC (prod agent)
+
+Answers `6d767ca`. **User's words in this session:** pop-up "Yes, do Parts A and B now (Recommended)" (Part C was not asked and not done).
+
+## Part A: api-v3 (`/opt/ddp-open-states/api-v3`)
+- **Before:** `7b66e66`, clean, image `4b5049bb4814`. **Brought:** `#54` (upstream merge `1970a35`: a certifi bump in `poetry.lock`; the build pulled it), **`#55` (OPEN-519, `bill_types_only`: this host did NOT have it yet)** and `#56` (OPEN-520). Files: `api/bill_types.py`, `bills.py`, `ddp_enrollment.py`, `ddp_search.py`, two test files, `poetry.lock`.
+- Rollback tag `ddp-openstates-api:pre-open520`; `git merge --ff-only 1cf251b`; built and recreated the `api` service only (43 s build, **down about 6 s**, healthz 200 at 17:59:02); new image `dabbd1f7a89b`; the container's `api/bills.py` has `bill_types_only`.
+- **Checks:** `/ddp/enrollment` 200, **no `tier` anywhere**, 13 jurisdictions; `/bills?jurisdiction=pa&per_page=1` 200, 5,277; **`bill_types_only` works: Massachusetts 11,911 without it, 8,779 with it** (your dev number). **Postgres container start time: not applicable**, this host has no Postgres container (the database is RDS); the only other openstates container, Redis, was untouched (up 4 weeks).
+- **Heads-up (a consequence, not a fault):** the broker I deployed today (`ef64fadc`, BROKER-460) already sends `bill_types_only` on the Explore bill list, search, type-ahead and the confirming read. Until now this api-v3 ignored it; **from 17:59 UTC the broker's Massachusetts Explore list drops the 3,132 relabelled non-bill papers** (11,911 to 8,779 via api-v3). I did not check the website's Explore page.
+
+## Part B: ddp-sync (`/opt/ddp-sync`)
+- **G1:** branch `main`, HEAD `a4ac397`, `git status` clean, **`config/` has no local edits** (`git diff config/sync_schedule.yaml` empty). **G2:** nothing in flight (no scrape, archive or LegBot line in 15 min); started 17:59, about 2 h clear of 04:00. **G3 rollback point:** commit `a4ac397`, old image `47cf074da2d2` (tag `ddp-sync:pre-sync152`); log gzipped to `~/ops/log-archive/ddp-sync-pre-sync152-*.gz`. **G4:** `JURISDICTION_MANIFEST_MODE=authoritative`; `OPENSTATES_ROOT=/opt/ddp-open-states`.
+- Also in the diff but not in your note: `infrastructure/docker-compose.prod.yml` (**comment lines only**) and one comment in `config.py`; I read both.
+- `git pull --ff-only` to **`cb6f947`**; `sudo systemctl restart ddp-sync` (the usual unit: `docker compose ... up -d --build`) at 17:59:34; container started 18:00:17Z, **healthy 18:01:21**; image `5919c8c0547d`.
+- **Checks (read-only; no run started):** (1) `/ddp-sync/v1/health` healthy, Redis connected, scheduler running, **17 jobs**, no startup error lines. (2) the yaml has `openstates_scrape.timing` (line 641), `escalation` (666), `scrapebot_fallback` (670), and no `primary:` or `secondary:` keys. (3) `/ddp-sync/v1/schedule`: **exactly one `openstates_scrape_<state>` for each of az fl la ma mi nc ne pa ut va wa usa (12)**, none of the forbidden old job names; next runs: **WA 11-11 02:30, USA 11-11 03:00, PA 11-11 04:00**, and az fl la ma mi nc ne ut va **11-15 (Sunday) 02:00 UTC**; other jobs: `openstates_cadence_review`, `openstates_people_pull`, `jurisdiction_drift_check`, `openstates_people_refresh`, `grantbot_scrape` (12 + 5 = 17; it was 20 jobs before, in the old structure). (4) `POST /ddp-sync/v1/trigger/openstates-scrape/zz` -> **404** `Unknown target 'zz'. Available: az, drift-check, fl, fork-check, la, ma, mi, nc, ne, pa, patches, people, people-pull, usa, ut, va, wa` (`pa`, `ne`, `la` present; `secondary` is gone); I did not trigger a real scrape.
+- **After tonight's Pennsylvania nightly (04:00 UTC 11-11): owed**, read-only: scrape, archive and the LegBot trigger in one job, `openstates_scrape_pa` status, and no `openstates_archive_*` job on its own.
+
+## Part C: NOT done
+The manifest rollout holds for your `go-...` note (and the user's own go). The running ddp-sync is now the Part B image, so the "confirm the running image" condition is met for when it comes.
+
+Rollback: Part A retag `pre-open520` to `:local` and recreate `api`; Part B `git checkout --detach a4ac397`, restart ddp-sync (image tag `pre-sync152`).
