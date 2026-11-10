@@ -21,7 +21,7 @@ The acceptance question is not "does the config parse". It is:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -29,7 +29,7 @@ from ddp_sync.pipelines.openstates_scrape import (
     _cloud_path_owns,
     _memory_backend_enabled,
     _run_scrape,
-    run_single_scrape_job,
+    run_state_pipeline,
 )
 
 
@@ -178,7 +178,7 @@ async def test_run_scrape_is_a_noop_gate_when_config_omitted():
 
 
 @pytest.mark.asyncio
-async def test_run_single_scrape_job_also_routes_to_the_cloud_trigger():
+async def test_the_state_pipeline_also_routes_to_the_cloud_trigger():
     """The manual-trigger endpoint (POST /trigger/openstates-scrape/<state>) funnels
     through _run_scrape() too -- proving OPEN-208's "a manual invocation for a
     jurisdiction owned by the other path never runs the local subprocess" criterion for
@@ -192,8 +192,11 @@ async def test_run_single_scrape_job_also_routes_to_the_cloud_trigger():
             "ddp_sync.pipelines.openstates_scrape.run_cloud_scrape",
             return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0},
         ) as mock_cloud,
+        patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()),
+        patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
     ):
-        result = await run_single_scrape_job("mi", config)
+        result = await run_state_pipeline("mi", config)
 
     mock_run.assert_not_called()
     mock_cloud.assert_called_once()

@@ -59,10 +59,9 @@ questions -- see the ticket for the full rationale):
    /trigger/bill-artifact-generation) keep working.
 
 What this module deliberately does NOT do: wire itself into a real scraper
-job. openstates_scrape.py's own job functions (run_fl_scrapes_job,
-run_secondary_scrapes_job, etc.) don't currently carry a resolved
-session_code per jurisdiction -- run_secondary_scrapes_job's own docstring
-explains why session is passed as None (VA and UT have had two sessions
+job. openstates_scrape.py's job function (run_state_pipeline, SYNC-152) does
+not carry a resolved session_code per jurisdiction -- a state with no
+`sessions` in its timing is scraped with session None (VA and UT have had two sessions
 simultaneously active at once, so there is no single "the session that just
 finished scraping" per jurisdiction to hand this function without first
 solving that separately). Wiring a real completion hook needs that problem

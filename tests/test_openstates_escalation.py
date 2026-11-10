@@ -166,7 +166,7 @@ async def test_check_sustained_blocking_alerts_when_pattern_detected():
             "openstates_secondary_scrapes",
             ["mi"],
             [{"success": False, "failure_reason": "waf_block"}],
-            {"secondary": {"escalation": {"window_size": 4, "threshold": 3}}},
+            {"escalation": {"window_size": 4, "threshold": 3}},
         )
 
     mock_redis.append_run_history.assert_called_once()
@@ -189,7 +189,7 @@ async def test_check_sustained_blocking_does_not_alert_on_single_failure():
             "openstates_secondary_scrapes",
             ["mi"],
             [{"success": False, "failure_reason": "waf_block"}],
-            {"secondary": {"escalation": {"window_size": 4, "threshold": 3}}},
+            {"escalation": {"window_size": 4, "threshold": 3}},
         )
 
     mock_alert.assert_not_called()
@@ -228,5 +228,5 @@ async def test_check_sustained_blocking_never_raises_on_redis_error():
             "openstates_secondary_scrapes",
             ["mi"],
             [{"success": False, "failure_reason": "waf_block"}],
-            {"secondary": {"escalation": {"window_size": 4, "threshold": 3}}},
+            {"escalation": {"window_size": 4, "threshold": 3}},
         )

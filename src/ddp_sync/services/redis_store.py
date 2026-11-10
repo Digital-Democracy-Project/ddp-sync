@@ -691,7 +691,7 @@ class RedisStore:
         """Append one run's outcome to a capped rolling history (Redis List: RPUSH + LTRIM).
 
         Args:
-            flow_name: Flow identifier (e.g. 'openstates_secondary_scrapes')
+            flow_name: Flow identifier (e.g. 'openstates_scrape')
             jurisdiction: Jurisdiction code the record is for (e.g. 'mi')
             record: JSON-serializable outcome, e.g. {"timestamp": ..., "success": bool,
                 "failure_reason": str | None}

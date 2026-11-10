@@ -139,6 +139,17 @@ hook-triggered run, from launching two overlapping archive Fargate tasks for the
 jurisdiction — it fails *open* (proceeds) if Redis is down, deliberately, since this
 feature must never make archiving less reliable than it was before it existed.
 
+**SYNC-152 (2026-11-10): one pipeline per state; no primary/secondary.** WHO is scraped is the
+manifest alone (`enrolled_scrape_states`: status not `paused`/`probing`); `sync_schedule.yaml` holds
+only WHEN (`openstates_scrape.timing.<state>` / `defaults`). Every scraped state has one job,
+`openstates_scrape_<state>`, running `run_state_pipeline`: all sessions, history, broker signal, then
+ONE archive (`archive_after_scrape`, moved out of `_run_scrape`, so the US is archived once, not once
+per chamber). The job raises `PipelineFailed` on a failed session or archive (APScheduler then logs an
+error instead of "executed successfully"). The manual trigger runs the same function for any scraped
+state. **Never add a list of scraped states, a tier, or a per-tier code path back** — every reader
+that took "tier" as "the states we scrape" was wrong for the other half (SYNC-57, then Pennsylvania's
+404 on 2026-11-10). Guard: `tests/test_sync_152_one_pipeline_per_state.py` against the real manifest.
+
 **OPEN-292 (2026-09-15): the SYNC-48 overlap lock is now a renewed lease, not a flat
 TTL.** A real full-session sweep (`limit=5000`, no `bill_candidates` cap) has no natural
 duration bound — MI's own first full run took 31.4 hours (see `PLAN-legbot.md` §34),
@@ -315,7 +326,8 @@ sleepier cadence than its configured floor; a human decides that.
 site had a history of rate-limit/WAF trouble, and letting a self-escalating
 system scrape it more aggressively without a human in the loop was judged too
 risky until that history was reviewed. The exclusion was removed, and the
-mechanism enabled system-wide for FL plus all 6 `secondary` jurisdictions, only
+mechanism enabled system-wide for FL plus all 6 (then) secondary jurisdictions (since SYNC-152:
+every scraped state with a weekly floor), only
 after two separate explicit confirmations from Ramon in the same session (one
 for lifting MI's exclusion specifically, one for enabling the mechanism itself
 beyond MI) — **treat either half of that as requiring its own sign-off if it

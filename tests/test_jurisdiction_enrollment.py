@@ -62,30 +62,36 @@ def test_each_feature_is_read_from_the_manifest(root):
 
 def test_the_federal_jurisdiction_is_usa_on_the_scrape_side_and_us_on_the_archive_side(root):
     assert "usa" in je.manifest_codes("cloud_path", root) and "us" not in je.manifest_codes("cloud_path", root)
-    assert je.manifest_codes("scrape_primary", root) == ["fl", "usa"]
+    assert je.manifest_codes("scrape", root) == ["fl", "nc", "usa"]
     assert "us" in je.manifest_codes("archive", root)
 
 
 def test_a_paused_jurisdiction_is_on_no_scrape_list(root):
-    assert "al" not in je.manifest_codes("scrape_secondary", root)
-    assert je.manifest_codes("scrape_secondary", root) == ["nc"]
+    assert "al" not in je.manifest_codes("scrape", root)
 
 
 @pytest.mark.parametrize("tier", ["primary", "secondary"])
 def test_a_probing_jurisdiction_is_on_no_scrape_list(tmp_path, tier):
-    """OPEN-478/479/480: a state added at Stage 0 has a (required) tier but is on no schedule until Stage 2."""
+    """OPEN-478/479/480: a state added at Stage 0 is on no schedule until Stage 2, whatever its tier says."""
     manifest = {**MANIFEST, "pa": _entry(tier, status="probing", archive=False)}
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
-    assert "pa" not in je.manifest_codes("scrape_primary", str(tmp_path))
-    assert "pa" not in je.manifest_codes("scrape_secondary", str(tmp_path))
+    assert "pa" not in je.manifest_codes("scrape", str(tmp_path))
 
 
 @pytest.mark.parametrize("tier", ["primary", "secondary"])
 @pytest.mark.parametrize("status", ["scraping", "validating", "archived", "live"])
-def test_a_jurisdiction_past_probing_is_on_its_tiers_scrape_list(tmp_path, tier, status):
+def test_a_jurisdiction_past_probing_is_scraped_whatever_its_tier(tmp_path, tier, status):
+    """SYNC-152: one rule, status only. The tier is not read (OPEN-521 will remove it from the manifest)."""
     manifest = {**MANIFEST, "pa": _entry(tier, status=status, archive=False)}
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
-    assert "pa" in je.manifest_codes(f"scrape_{tier}", str(tmp_path))
+    assert "pa" in je.manifest_codes("scrape", str(tmp_path))
+
+
+def test_the_scrape_rule_works_without_a_tier_field(tmp_path):
+    """SYNC-152 must work with today's manifest (tier present) and after OPEN-521 (tier gone)."""
+    manifest = {c: {k: v for k, v in e.items() if k != "tier"} for c, e in MANIFEST.items()}
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
+    assert je.manifest_codes("scrape", str(tmp_path)) == ["fl", "nc", "usa"]
 
 
 # --- never raises; degrades to the yaml ------------------------------------------------------------------
@@ -180,8 +186,7 @@ AGREEING_CONFIG = {
         "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
     },
     "openstates_scrape": {
-        "primary": {"fl": {"enabled": True}, "usa": {"enabled": True}, "wa": {"enabled": False}},
-        "secondary": {"jurisdictions": ["nc"]},
+        "timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}},
         "cloud_path": {"jurisdictions": ["fl", "usa", "nc"]},
     },
 }
@@ -201,8 +206,10 @@ def test_a_config_that_agrees_reports_nothing(root):
         (lambda c: c["openstates_archive"]["knowledge_base_embedding"]["jurisdictions"].append("nc"), "embedding", ["nc"], []),
         (lambda c: c["openstates_archive"]["bill_search_refresh"]["jurisdictions"].remove("nc"), "search_refresh", [], ["nc"]),
         (lambda c: c["openstates_scrape"]["cloud_path"]["jurisdictions"].remove("nc"), "cloud_path", [], ["nc"]),
-        (lambda c: c["openstates_scrape"]["primary"].pop("usa"), "scrape_primary", [], ["usa"]),
-        (lambda c: c["openstates_scrape"]["secondary"]["jurisdictions"].append("al"), "scrape_secondary", ["al"], []),
+        # SYNC-152: timing for a state the manifest does not scrape (al is paused) is drift; a scraped state with no
+        # timing entry (nc) is not.
+        (lambda c: c["openstates_scrape"]["timing"].update(al={"floor": "weekly"}), "scrape_timing", ["al"], []),
+        (lambda c: c["openstates_scrape"]["timing"].pop("usa"), None, None, None),
     ],
 )
 def test_each_list_that_disagrees_is_named(root, mutate, feature, only_yaml, only_manifest):
@@ -210,6 +217,9 @@ def test_each_list_that_disagrees_is_named(root, mutate, feature, only_yaml, onl
 
     config = copy.deepcopy(AGREEING_CONFIG)
     mutate(config)
+    if feature is None:
+        assert je.config_disagreements(config, root) == []
+        return
     assert je.config_disagreements(config, root) == [
         {"feature": feature, "only_in_yaml": only_yaml, "only_in_manifest": only_manifest}
     ]
@@ -273,19 +283,27 @@ def test_the_env_root_override_is_honoured_for_the_manifest_location(root, monke
     assert openstates_archive._knowledge_base_embedding_eligible("us", cfg) is True
 
 
-def test_run_secondary_scrapes_fallback_uses_the_manifest_not_a_stale_constant(root):
-    """The in-code fallback used to be va mi ma ut az (no nc). With no list in the yaml the manifest answers."""
-    assert je.enrolled("scrape_secondary", None, root) == ["nc"]
+def test_the_scraped_states_come_from_the_manifest_alone(root, monkeypatch):
+    """SYNC-152: there is no yaml list and no in-code fallback; shadow and authoritative give the same answer."""
+    cfg = {"openstates_root": root}
+    assert openstates_scrape.enrolled_scrape_states(cfg) == ["fl", "nc", "usa"]
+    monkeypatch.setenv(je.MODE_ENV, "authoritative")
+    assert openstates_scrape.enrolled_scrape_states(cfg) == ["fl", "nc", "usa"]
+
+
+def test_an_unreadable_manifest_gives_no_scraped_states_rather_than_a_guess(tmp_path):
+    assert openstates_scrape.enrolled_scrape_states({"openstates_root": str(tmp_path)}) is None
 
 
 def test_the_last_resort_archive_default_now_includes_nc():
     assert "nc" in openstates_archive.DEFAULT_ARCHIVE_JURISDICTIONS
 
 
-def test_the_manual_single_state_targets_follow_the_schedule(root):
+def test_the_manual_single_state_targets_are_every_scraped_state(root):
     from ddp_sync.api.routes.triggers import _single_jurisdiction_targets
 
-    assert _single_jurisdiction_targets({"openstates_root": root, "secondary": {"jurisdictions": ["nc", "mi", "usa"]}}) == {"nc", "mi"}
+    # SYNC-152: a leftover yaml list is ignored; the manifest's scraped states, usa included, are the targets
+    assert _single_jurisdiction_targets({"openstates_root": root, "secondary": {"jurisdictions": ["mi"]}}) == {"fl", "nc", "usa"}
 
 
 def test_the_shipped_sync_schedule_agrees_with_the_real_manifest_when_a_checkout_is_present():
@@ -338,17 +356,6 @@ def test_run_archive_jobs_with_an_empty_list_archives_nothing_rather_than_the_de
         openstates_archive, "_run_archive_with_hook", new=AsyncMock(return_value={"success": True})
     ) as run:
         asyncio.run(openstates_archive.run_archive_jobs({"openstates_root": root, "jurisdictions": []}))
-    run.assert_not_awaited()
-
-
-def test_run_secondary_scrapes_with_an_empty_list_scrapes_nothing_rather_than_the_default(root):
-    import asyncio
-    from unittest.mock import AsyncMock, patch
-
-    with patch.object(openstates_scrape, "_write_flow_status", new=AsyncMock()), patch.object(
-        openstates_scrape, "_run_scrape", new=AsyncMock()
-    ) as run:
-        asyncio.run(openstates_scrape.run_secondary_scrapes_job({"openstates_root": root, "secondary": {"jurisdictions": []}}))
     run.assert_not_awaited()
 
 
@@ -414,7 +421,7 @@ async def _hook(monkeypatch, root, state, yaml_list=("fl", "us")):
     cfg = {"enabled": True, "jurisdictions": list(yaml_list)}
     with patch.object(openstates_archive, "_load_archive_config_for_scrape_trigger", return_value=cfg), \
             patch.object(openstates_archive, "run_single_archive_job", new=AsyncMock(return_value={"success": True})) as run:
-        await openstates_archive.maybe_trigger_archive_after_scrape(state)
+        await openstates_archive.archive_after_scrape(state)
     return run
 
 

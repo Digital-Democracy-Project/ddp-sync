@@ -192,25 +192,25 @@ api_health_check:
 # OpenStates Scrape Schedule
 # ==========================
 #
-# Replaces the ad-hoc run-all-scrapes.sh launchd job. Each jurisdiction is an
-# independent APScheduler job so a long-running FL scrape (12+ hours) no longer
-# delays WA, USA, or the Sunday secondary-state jobs.
+# SYNC-152 (PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state"): WHO is scraped is
+# ddp-open-states' jurisdictions.yaml, one rule: every state whose status is not paused or probing. This
+# file has no list of scraped states. It says only WHEN, per state and optional (`timing`, else `defaults`).
+# Every scraped state gets its own job, `openstates_scrape_<state>`, which scrapes it (all sessions, in
+# turn), then archives it, then the archive's hooks run (LegBot, search refresh, embedding). The manual
+# trigger, POST /trigger/openstates-scrape/<state>, runs the same pipeline for any scraped state.
 #
-# Cutover: disable the launchd com.ddp.openstates-scraper plist before enabling
-# this block, or both will run simultaneously and conflict.
-#
-# Schedule (UTC) — staggered to avoid simultaneous starts and spread Mac load:
+# Schedule (UTC) as of 2026-11-10 (the scraped states are the manifest's; times are below):
 #
 #   Daily:
 #   01:00  patch refresh (apply-local-patches.sh)
-#   02:00  FL (all sessions sequential — 12+ hours, starts first)
 #   02:30  WA (~5 hours)
-#   03:00  USA lower → upper (~6 hours; shares slot with Mon Webflow batch, no conflict)
-#   04:00  PA (~7 hours, finishes ~11:00; OPEN-494 -- tier primary in jurisdictions.yaml, same change)
+#   03:00  USA lower → upper, then one archive (~6 hours)
+#   04:00  PA (~7 hours, finishes ~11:00; OPEN-494)
 #   04:00  bill sync [existing]
 #
 #   Sunday additionally:
-#   02:00  VA, MI, MA, UT, AZ (concurrent, independent _data/ dirs; alongside FL start)
+#   02:00  FL (weekly floor; dynamic_cadence raises it to nightly) and every scraped state with no
+#          `timing` entry (VA, MI, MA, UT, AZ, NC, NE, LA today), each its own job, started together
 #   06:00  legislator sync [existing]
 #   07:00  bio sync [existing]
 #   10:00  people refresh (USA finishes ~09:00, safe margin)
@@ -243,8 +243,8 @@ openstates_scrape:
   # PLAN-incremental-scraping.md's own rollout condition ("run the VA *or* UT canary first" —
   # singular), before UT and then FL/MA/USA.
   #
-  # Why one and not both: the secondary-states job fans its five jurisdictions out with
-  # asyncio.gather, so VA and UT start simultaneously (confirmed live 2026-08-22 — both at
+  # Why one and not both: VA and UT both run on the Sunday 02:00 default, so they start
+  # simultaneously (confirmed live 2026-08-22 — both at
   # 22:00:00), and run-scrape.sh's import lock is keyed per SCRAPE_KEY so they would NOT
   # serialise. Enabling both would make the very first canary a test of two concurrent
   # sweep-imports against the same Postgres, which conflates "does the sweep work" with "does
@@ -264,7 +264,7 @@ openstates_scrape:
   #
   # Read by _sweep_import_eligible() in pipelines/openstates_scrape.py, which sets
   # SWEEP_IMPORT_ENABLED=1 in run-scrape.sh's environment. Shape mirrors
-  # secondary.scrapebot_fallback below.
+  # scrapebot_fallback below.
   #
   # Rollback: set enabled: false, or empty the list. Note precisely what that does and does
   # not do -- it stops SWEEP_IMPORT_ENABLED being injected into FUTURE runs. It does not revert
@@ -361,7 +361,7 @@ openstates_scrape:
   # this is the line that still keeps MI out. MI must never be retried: OPEN-53 established
   # that a blind retry against a WAF worsens a block rather than recovering from it, because
   # each attempt is more traffic from an already-suspect client. MI is the jurisdiction that
-  # gets WAF-blocked (it is why secondary.scrapebot_fallback below lists exactly ["mi"]).
+  # gets WAF-blocked (it is why scrapebot_fallback below lists exactly ["mi"]).
   #
   # backoff_secs is the wait before each *re*try; the last value repeats if there are more
   # retries than values. So [900, 900] is fixed 15m and [900, 1800, 3600] is growing 15/30/60 --
@@ -375,7 +375,7 @@ openstates_scrape:
   # rather than settled by whoever implemented the mechanism.
   #
   # Read by _retry_eligible() in pipelines/openstates_scrape.py. Shape mirrors
-  # secondary.scrapebot_fallback below.
+  # scrapebot_fallback below.
   #
   # Rollback: set enabled: false, or empty the list. That makes future runs invoke
   # run-scrape.sh directly again. It does not stop an in-flight wrapper -- to stop one that is
@@ -452,8 +452,8 @@ openstates_scrape:
   #
   # nc added alongside the reconciliation: OPEN-231 Stage 6 found NC has never actually run
   # through this path (zero watermark objects in ddp-openstates-scraper-memory for nc, versus
-  # every other cloud jurisdiction having them) -- it was only ever added to `secondary.
-  # jurisdictions` above, which schedules it but doesn't route it through Fargate/RDS. This is
+  # every other cloud jurisdiction having them) -- it was only ever added to the (since retired)
+  # secondary scrape list, which scheduled it but didn't route it through Fargate/RDS. This is
   # what actually starts NC's recurring cloud cycles so Stage 6's soak period can begin for real.
   cloud_path:
     enabled: true
@@ -495,8 +495,9 @@ openstates_scrape:
   # DISABLED for the first cycle, deliberately. The check needs `quiet_window` runs of recorded
   # history before it can say anything at all, and these are weekly jobs, so there is nothing to
   # gain by having it live before the history exists -- and a real risk of it firing on the empty
-  # state. Turn it on once the secondary jurisdictions have a few weeks of `bills_new` in their
-  # history (visible in Redis under ddp:flow_history:openstates_secondary_scrapes:<juris>).
+  # state. Turn it on once the scraped states have a few weeks of `bills_new` in their
+  # history (visible in Redis under ddp:flow_history:openstates_scrape:<juris> since SYNC-152;
+  # before that, openstates_secondary_scrapes:<juris>, for the weekly states only).
   #
   # quiet_window is consecutive MEASURED runs with zero new bills. Runs where the marker was
   # missing or the import report was unparseable are skipped, not counted as zeroes -- "we could
@@ -514,9 +515,9 @@ openstates_scrape:
   # flipping this, confirm the two sides are actually talking to each other: the scrape logs must
   # be free of "no usable filing figures for a successful run" warnings (that warning names the
   # scrape_key and the exact path it looked for, so a mismatch is one `ls` away from settled), and
-  # each of the five secondary jurisdictions needs at least quiet_window recorded runs -- i.e.
+  # each weekly state needs at least quiet_window recorded runs -- i.e.
   # three weeks. Check with:
-  #     redis-cli LRANGE ddp:flow_history:openstates_secondary_scrapes:va 0 -1
+  #     redis-cli LRANGE ddp:flow_history:openstates_scrape:va 0 -1
   # Rollback is this line back to false; it stops alerting and leaves the recorded history intact.
   #
   # WHAT IT WILL AND WILL NOT CATCH, so nobody mistakes it for full coverage:
@@ -575,16 +576,13 @@ openstates_scrape:
   # So a Redis outage cannot leave a jurisdiction unscheduled -- it can only mean the
   # committed cadence stays in force, which is the safe direction.
   #
-  # Escalating a SECONDARY jurisdiction is a move, not a trigger edit. The secondary states
-  # share one weekly job that fans out over a list; an escalated jurisdiction leaves that
-  # list and gets its own nightly job (`openstates_secondary_scrape_<juris>`). Leaving it in
-  # both would scrape it twice on the batch's day, and each run wipes the other's _data dir.
-  # Its run history keeps the `openstates_secondary_scrapes` flow name in both cadences on
-  # purpose -- that history is what the review reads, and splitting it on a cadence change
-  # would erase the evidence that caused the change.
+  # SYNC-152: every scraped state has its own job, `openstates_scrape_<juris>`, whatever its
+  # tempo, so escalating one replaces that job's trigger in place (it loses its weekday). Its
+  # run history is `openstates_scrape:<juris>` for every state and every tempo; the review
+  # covers every scraped state (a nightly floor cannot be raised, only advised on).
   #
-  # review_time_utc sits before the day's first scrape (patch refresh 01:00, FL and secondary
-  # 02:00), so a cadence decided this morning takes effect this morning rather than tomorrow.
+  # review_time_utc sits before the day's first scrape (patch refresh 01:00, the Sunday
+  # states 02:00), so a cadence decided this morning takes effect this morning rather than tomorrow.
   #
   # Where to see the live cadence: GET /schedule reports `openstates_cadence`, plus the jobs
   # themselves. That endpoint is not a nicety -- the floor rule puts the runtime cadence in
@@ -594,11 +592,11 @@ openstates_scrape:
   # one knob here worth checking rather than just setting.
   #   1. Confirm the history exists: each jurisdiction needs at least `escalate_window`
   #      runs carrying a bills_new figure, which on weekly jobs is a couple of weeks.
-  #        redis-cli LRANGE ddp:flow_history:openstates_secondary_scrapes:va 0 -1
+  #        redis-cli LRANGE ddp:flow_history:openstates_scrape:va 0 -1
   #      OPEN-139's filing_activity block above describes the same check in more detail.
   #   2. Note the cadence you expect afterwards, then flip this and read GET /schedule --
   #      `openstates_cadence` reports what actually took effect, and a jurisdiction that
-  #      escalated will have its own `openstates_secondary_scrape_<juris>` job.
+  #      escalated has a `openstates_scrape_<juris>` job with no weekday.
   #   3. A cadence review runs a few minutes after startup as well as at review_time_utc,
   #      so you do not have to wait until tomorrow to see the result.
   # Rollback is this line back to false plus a restart: no review job is registered, so
@@ -607,8 +605,8 @@ openstates_scrape:
   # DEL ddp:scrape_cadence:<juris> clears it for good.
   dynamic_cadence:
     enabled: true  # Ramon's direct decision, 2026-09-14, following the MI exclusion removal
-                   # above. Affects every jurisdiction eligible for review (FL + the whole
-                   # `secondary` batch: va/mi/ma/ut/az/nc), not MI alone -- rollback per the
+                   # above. Affects every scraped state with a weekly floor (SYNC-152: FL and
+                   # every state on `defaults`), not MI alone -- rollback per the
                    # runbook above is this line back to false plus a restart.
     review_time_utc: "00:30"
     startup_review_delay_s: 300   # catch-up review after a restart, before the daily cron
@@ -627,101 +625,56 @@ openstates_scrape:
     enabled: true
     sync_time_utc: "01:00"
 
-  primary:
-    fl:
-      enabled: true  # RE-ENABLED 2026-07-25 — was paused 2026-07-24 for the historical backfill
-      # (2024 then 2023 regular sessions), which collided with this job's shared _data/fl folder.
-      # Both sessions confirmed finished 2026-07-25 (2023 regular at 05:24 EDT, per
-      # ddp-open-states's notes/fl-committee-org-resolution-gaps-20260725 branch) via a manual
-      # run outside this scheduler — the logs/last-run/fl_session_<id>.ts marker this was
-      # originally gated on never appeared (that directory doesn't exist; it's this very job
-      # that would have created it), so re-enabling here is based on that external confirmation,
-      # not the marker.
-      sync_time_utc: "02:00"   # longest job — starts first
-      # Weekly floor while FL is out of session — new draft bills aren't introduced
-      # until ~November, so daily scrapes are wasted work and each one wipes
-      # _data/fl on startup (colliding with historical backfills). Runs Sunday
-      # 02:00 UTC alongside the secondary batch (independent _data/ dirs).
-      # OPEN-140 (dynamic_cadence, enabled 2026-09-14): this is now a FLOOR, not a manual
-      # switch -- no more remembering to flip it in November. Once FL's own filing activity
-      # shows up in its run history, the cadence-review job escalates it to nightly on its
-      # own; this value is only what FL falls back to if that history is missing or Redis
-      # is down.
-      sync_day: sunday
-      # No session list (SYNC-130): like every other state, one run scrapes each session the
-      # scrapers image marks "active": True in scrapers/fl/__init__.py, so a new session is picked
-      # up when the image that activates it is deployed, with no edit here.
-
-    wa:
-      enabled: true
-      sync_time_utc: "02:30"   # 30 min after FL; finishes ~07:30
-
+  # SYNC-152: WHEN each scraped state runs. Timing only, never membership: WHO is scraped is
+  # jurisdictions.yaml (status not paused or probing), so a new state needs no edit here and gets
+  # `defaults`. An entry for a state the manifest does not scrape is drift (the daily drift check
+  # reports it, feature `scrape_timing`). Read by state_timing() in pipelines/openstates_scrape.py.
+  #   floor      nightly | weekly. A FLOOR: dynamic_cadence may raise weekly to nightly, never lower it.
+  #   day        used only while the effective tempo is weekly
+  #   start_utc  "HH:MM"
+  #   sessions   run in turn, one archive after the last; absent = one run, every session the
+  #              scraper marks active (OPEN-24: VA and UT can have two active at once)
+  defaults:
+    floor: weekly
+    day: sunday
+    start_utc: "02:00"   # what the retired Sunday batch did: weekly states start together
+  timing:
+    # FL: weekly floor while out of session; OPEN-140's dynamic_cadence raises it to nightly once
+    # its run history shows new bills. No session list (SYNC-130): one run scrapes every session the
+    # scrapers image marks "active", so a new session needs no edit here.
+    fl: {floor: weekly, day: sunday, start_utc: "02:00"}
+    wa: {floor: nightly, start_utc: "02:30"}
     usa:
-      enabled: true
-      sync_time_utc: "03:00"   # 1 hour after FL; finishes ~09:00
-      sessions:
-        - "119 chamber=lower"
-        - "119 chamber=upper"
+      floor: nightly
+      start_utc: "03:00"
+      sessions: ["119 chamber=lower", "119 chamber=upper"]
+    # OPEN-494 (Ramon, 2026-11-06): nightly. The full walk is ~7 h (first scrape 7 h 9 min,
+    # 2026-11-02/03), so it finishes ~11:00 UTC.
+    pa: {floor: nightly, start_utc: "04:00"}
 
-    # OPEN-494 (Ramon, 2026-11-06): Pennsylvania is nightly, tier primary in ddp-open-states' jurisdictions.yaml. The two
-    # change together (the drift check compares this key set with the manifest's primary tier). The full walk is ~7 h
-    # (first scrape 7 h 9 min, 2026-11-02/03), so it finishes ~11:00 UTC. Not in the secondary list below.
-    pa:
-      enabled: true
-      sync_time_utc: "04:00"   # 1 hour after USA; finishes ~11:00
+  # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
+  # WAF block from MI having been blocked for a month straight -- every weekly failure got
+  # the same per-run alert either way. Checks each jurisdiction's own rolling history of the
+  # last `window_size` runs and fires a separate, distinctly-worded Slack alert if at least
+  # `threshold` of them were WAF-block-classified failures (only MI produces that
+  # classification today; this is jurisdiction-agnostic so any future jurisdiction with the
+  # same failure mode is covered automatically). Deliberately does NOT skip or delay a
+  # scheduled run based on this history -- see OPEN-22's own AC5 scope note: MI already only
+  # runs weekly, so skipping a scheduled attempt has unproven value and would mean less data
+  # on whether the block has actually cleared. SYNC-152 moved this and scrapebot_fallback out
+  # of the retired `secondary` block; they apply to every scraped state.
+  escalation:
+    window_size: 4    # look at each jurisdiction's last N runs
+    threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
 
-  secondary:
-    enabled: true
-    sync_day: sunday
-    sync_time_utc: "02:00"     # concurrent with FL start — independent _data/ dirs
-    jurisdictions:
-      - va
-      - mi
-      - ma
-      - ut
-      - az
-      # OPEN-231 Stage 2 (PLAN-push-button-onboarding.md §5): nc is Phase 1's chosen pilot
-      # candidate (OPEN-230 — probed YELLOW, only blocking gap is a probe-tooling limitation,
-      # not a real scraper defect). Uses the same default 6h SCRAPE_TIMEOUT_S / 4h
-      # ARCHIVE_TIMEOUT_S as va/ut/az below — no nc-specific entry exists yet because no real
-      # run has measured one. This is the FIRST SUPERVISED RUN: merging this line schedules a
-      # real production scrape against the live Postgres, so watch the first Sunday cycle by
-      # hand (per Stage 2/3's human sign-off) rather than assuming it lands cleanly. archive
-      # is intentionally NOT enabled for nc below yet -- that's Stage 4, gated on watching this
-      # first scrape succeed.
-      - nc
-      # OPEN-478/479/480 (pilot #2, Stage 2): pa, ne, la, the same way. Ramon gave the go on 2026-11-02 and asked for the
-      # first runs by manual trigger at once, all three, not waiting for Sunday. This list also puts ne and la in the Sunday
-      # 02:00 UTC batch from 11-08, so a host that has it schedules two weekly production scrapes (pa moved to the nightly
-      # primary lineup above, OPEN-494). None of them has run
-      # a full walk before (the bills scrapers do not accept start=, so every run walks every bill); the shared 12 h cloud
-      # wait limit applies to each until a measured runtime sets a per-state value (OPEN-476). The cloud path and S3 memory
-      # lists above carry the same three. Archive stays off (Stage 4).
-      - ne
-      - la
-
-    # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
-    # WAF block from MI having been blocked for a month straight -- every weekly failure got
-    # the same per-run alert either way. Checks each jurisdiction's own rolling history of the
-    # last `window_size` runs and fires a separate, distinctly-worded Slack alert if at least
-    # `threshold` of them were WAF-block-classified failures (only MI produces that
-    # classification today; this is jurisdiction-agnostic so any future jurisdiction with the
-    # same failure mode is covered automatically). Deliberately does NOT skip or delay a
-    # scheduled run based on this history -- see OPEN-22's own AC5 scope note: MI already only
-    # runs weekly, so skipping a scheduled attempt has unproven value and would mean less data
-    # on whether the block has actually cleared.
-    escalation:
-      window_size: 4    # look at each jurisdiction's last N weekly runs
-      threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
-
-    scrapebot_fallback:
-      enabled: true  # flipped 2026-08-03 after Phase 3 live validation (real mint + concurrency smoke test both passed)
-      jurisdictions: ["mi"]
+  scrapebot_fallback:
+    enabled: true  # flipped 2026-08-03 after Phase 3 live validation (real mint + concurrency smoke test both passed)
+    jurisdictions: ["mi"]
 
   people_refresh:
     enabled: true
     sync_day: sunday
-    sync_time_utc: "10:00"     # after secondary (~06:00) and USA (~09:00) finish
+    sync_time_utc: "10:00"     # after the Sunday states (~06:00) and USA (~09:00) finish
 
   # SYNC-102: daily fast-forward of the people checkout only. Off unless the host sets
   # OPENSTATES_PEOPLE_PULL_ENABLED=true (per-host, like the other flags).
@@ -757,7 +710,7 @@ openstates_scrape:
   # in"). Runs regardless of whether a Michigan scrape is happening right now -- no inbound
   # path, no availability coupling at scrape time. Uses the same ScrapeBot mint path as
   # scrapebot_fallback above; this is a SEPARATE schedule, not a replacement for it -- the
-  # mac's own local pre-seed still runs before each scheduled scrape (secondary.
+  # mac's own local pre-seed still runs before each scheduled scrape (openstates_scrape.
   # scrapebot_fallback), and this job additionally publishes to S3 for a cloud run to read.
   #
   # Monthly, not every 6 hours: ScrapeBot's mint is a real, several-minute CAPTCHA-solving
@@ -932,7 +885,7 @@ openstates_archive:
     al: saturday
     us: sunday
     nc: thursday
-  # Same ScrapeBot cookie pre-seed the scrape jobs get (secondary.scrapebot_fallback above),
+  # Same ScrapeBot cookie pre-seed the scrape jobs get (openstates_scrape.scrapebot_fallback above),
   # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
   # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed
   # left in the cache file. Best-effort — a failed mint logs a warning and the archive run

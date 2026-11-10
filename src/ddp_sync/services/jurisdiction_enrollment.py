@@ -16,7 +16,8 @@ Never raises. The manifest is only as fresh as the ddp-open-states checkout on t
 EC2 broker host that nothing here pulls), so a missing file, an invalid one, or an old one degrades to the
 yaml's answer with a log line, and every disagreement log carries the file's mtime so a stale checkout is
 not mistaken for real drift. The compare logic mirrors check-jurisdiction-drift.py's `project()` in
-ddp-open-states (same six features), which is what CI runs against this repo's main.
+ddp-open-states, which is what CI runs against this repo's main. SYNC-152: who is scraped has no yaml list at
+all any more; `enrolled_scrape_states` (pipelines/openstates_scrape.py) reads the `scrape` feature straight from the manifest.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ _FEATURES = {
     # OPEN-418: the RECURRING archive list is the manifest's archive.scheduled, not archive.enabled (which only means
     # "may be archived", the Stage 4 manual run). A pre-OPEN-418 manifest has no `scheduled`, which reads as "cannot say".
     "archive": (lambda e: e["archive"]["scheduled"], False),
-    # SYNC-146 (2026-11-09): the archive that runs right after a state's own scrape (maybe_trigger_archive_after_scrape,
+    # SYNC-146 (2026-11-09): the archive that runs right after a state's own scrape (archive_after_scrape,
     # which then triggers LegBot on the Mac) follows archive.enabled, not `scheduled`: a new state archives after each
     # scrape from Stage 4 on, while its weekly cron (`scheduled`) stays off until it is live (OPEN-418). No yaml list of
     # its own, so it is not part of the drift comparison; its fallback is openstates_archive.jurisdictions.
@@ -52,11 +53,11 @@ _FEATURES = {
     # OPEN-330: the two env-var lists, spelled "us" like the env values themselves.
     "replica_routing": (lambda e: e["enrollment"]["replica_routing"], False),
     "legbot_replica": (lambda e: e["enrollment"]["legbot_replica"], False),
-    # A paused or probing jurisdiction is on no scrape schedule whatever its (required) tier says: a state added at
-    # Stage 0 joins the list when its status moves to `scraping` (OPEN-478/479/480; mirrors check-jurisdiction-drift.py's
-    # UNSCHEDULED_STATUSES in ddp-open-states).
-    "scrape_primary": (lambda e: e["tier"] == "primary" and e["status"] not in _UNSCHEDULED_STATUSES, True),
-    "scrape_secondary": (lambda e: e["tier"] == "secondary" and e["status"] not in _UNSCHEDULED_STATUSES, True),
+    # SYNC-152: ONE rule for "the states we scrape", read by every reader (the scheduler's per-state pipeline jobs, the
+    # manual trigger, the cadence review, the drift check): status is not paused or probing. A state added at Stage 0 joins
+    # when its status moves to `scraping` (mirrors check-jurisdiction-drift.py's UNSCHEDULED_STATUSES in ddp-open-states).
+    # The manifest's `tier` is not read: WHEN a state is scraped is ddp-sync's `openstates_scrape.timing`, never WHO.
+    "scrape": (lambda e: e["status"] not in _UNSCHEDULED_STATUSES, True),
 }
 
 _lock = threading.Lock()
@@ -177,27 +178,33 @@ def _config_lists(config: dict) -> dict[str, list[str] | None]:
             block = (block or {}).get(k) if isinstance(block, dict) else None
         return None if block is None else [str(c).strip().lower() for c in block]
 
-    primary = scrape.get("primary")
     return {
         "archive": listed(archive, "jurisdictions"),
         "embedding": listed(archive, "knowledge_base_embedding", "jurisdictions"),
         "search_refresh": listed(archive, "bill_search_refresh", "jurisdictions"),
         "cloud_path": listed(scrape, "cloud_path", "jurisdictions"),
-        "scrape_primary": sorted(str(k).lower() for k, v in primary.items() if isinstance(v, dict) and v.get("enabled") is True)
-        if isinstance(primary, dict) else None,
-        "scrape_secondary": listed(scrape, "secondary", "jurisdictions"),
     }
 
 
 def config_disagreements(config: dict, root: str) -> list[dict]:
     """Every feature whose yaml list differs from the manifest's. Empty when they agree or the manifest
-    cannot answer (that case is logged by load_manifest, not counted as drift)."""
+    cannot answer (that case is logged by load_manifest, not counted as drift).
+
+    SYNC-152: the yaml has no list of scraped states, only `openstates_scrape.timing` for some of them. A timing
+    entry for a state the manifest does not scrape is drift (feature `scrape_timing`); a scraped state with no
+    entry is not (it gets `openstates_scrape.defaults`)."""
     out = []
     for feature, have in _config_lists(config).items():
         want = manifest_codes(feature, root)
         if have is None or want is None or set(have) == set(want):
             continue
         out.append({"feature": feature, "only_in_yaml": sorted(set(have) - set(want)), "only_in_manifest": sorted(set(want) - set(have))})
+    timing = ((config.get("openstates_scrape") or {}).get("timing"))
+    scraped = manifest_codes("scrape", root)
+    if isinstance(timing, dict) and scraped is not None:
+        extra = sorted({str(k).strip().lower() for k in timing} - set(scraped))
+        if extra:
+            out.append({"feature": "scrape_timing", "only_in_yaml": extra, "only_in_manifest": []})
     return out
 
 

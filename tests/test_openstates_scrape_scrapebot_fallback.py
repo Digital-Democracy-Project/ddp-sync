@@ -8,7 +8,7 @@ but the detailed WafBlockDetected error only ever reaches scraper.log, so a real
 WAF block always classified as nonzero_exit_other, never waf_block.
 
 _scrapebot_eligible/_maybe_preseed_scrapebot_cookies are opt-in-per-jurisdiction and
-best-effort: a jurisdiction not listed in secondary.scrapebot_fallback.jurisdictions
+best-effort: a jurisdiction not listed in openstates_scrape.scrapebot_fallback.jurisdictions
 (or the feature disabled entirely) must see zero behavior change, and a dispatch
 failure must never propagate up into the scrape job's own result.
 """
@@ -23,17 +23,13 @@ from ddp_sync.pipelines.openstates_scrape import (
     _maybe_preseed_scrapebot_cookies,
     _run_scrape,
     _scrapebot_eligible,
-    run_single_scrape_job,
+    run_state_pipeline,
 )
 from ddp_sync.services.scrapebot_client import ScrapeBotDispatchError
 
 
 def _config(*, enabled=True, jurisdictions=("mi",)):
-    return {
-        "secondary": {
-            "scrapebot_fallback": {"enabled": enabled, "jurisdictions": list(jurisdictions)}
-        }
-    }
+    return {"scrapebot_fallback": {"enabled": enabled, "jurisdictions": list(jurisdictions)}}
 
 
 def test_eligible_true_when_enabled_and_listed():
@@ -157,10 +153,9 @@ async def test_run_scrape_is_a_noop_preseed_when_config_omitted():
 
 
 @pytest.mark.asyncio
-async def test_run_single_scrape_job_preseeds_via_run_scrape():
-    """run_single_scrape_job() (the manual /trigger/openstates-scrape/mi path) used
-    to have no ScrapeBot involvement at all. It gets the pre-seed for free now,
-    via _run_scrape() itself, as long as it passes config through."""
+async def test_the_state_pipeline_preseeds_via_run_scrape():
+    """run_state_pipeline() (the scheduled job and the manual /trigger/openstates-scrape/mi path, SYNC-152)
+    gets the pre-seed via _run_scrape() itself, as long as it passes config through."""
     config = _config()
     with patch(
         "ddp_sync.pipelines.openstates_scrape.scrapebot_client.dispatch_mint_cookies",
@@ -177,8 +172,12 @@ async def test_run_single_scrape_job_preseeds_via_run_scrape():
     ), patch(
         "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
         return_value=(0, b"", b"", False, False),
+    ), patch(
+        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)
+    ), patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()), patch(
+        "ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()
     ):
-        result = await run_single_scrape_job("mi", config)
+        result = await run_state_pipeline("mi", config)
 
     mock_dispatch.assert_awaited_once_with("mi")
     assert result["success"] is True

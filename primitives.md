@@ -288,7 +288,7 @@ Pub/sub channels (hardcoded strings in callers):
 
 ## Broker bill-event signal (`pipelines/openstates_scrape.py`, SYNC-128)
 
-- **`_maybe_signal_broker_bill_events(jurisdiction, config)`** — called from `_run_scrape` on success, before the OPEN-291 archive hook. Gated by `openstates_scrape.broker_bill_event_signal` (`enabled`, `jurisdictions`; default off), maps `usa` to `us` with `openstates_archive._archive_jurisdiction_code`, debounces 15 minutes per jurisdiction (`ddp:broker_bill_event_signal:<code>`, SET NX EX, fails open). Never raises, never retries.
+- **`_maybe_signal_broker_bill_events(jurisdiction, config)`** — called once per run by `run_state_pipeline` when at least one session succeeded, before the archive (SYNC-152; it used to run inside `_run_scrape`, once per session). Gated by `openstates_scrape.broker_bill_event_signal` (`enabled`, `jurisdictions`; default off), maps `usa` to `us` with `openstates_archive._archive_jurisdiction_code`, debounces 15 minutes per jurisdiction (`ddp:broker_bill_event_signal:<code>`, SET NX EX, fails open). Never raises, never retries.
 - **`broker_client.request_bill_event_check(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/openstates-bill-events/check/` `{"jurisdiction": ...}` with the service token (BROKER-300; 202 queued). Raises `BrokerClientError` on an unset base/token, unreachable broker, or any 4xx/5xx (400 unknown jurisdiction, 401 token, 503 queue down).
 
 ## Voatz → Brevo opt-outs (`pipelines/voatz_brevo.py`, SYNC-122)
@@ -331,7 +331,7 @@ goes through) now asks api-v3 for the state's legislator count (`local_openstate
 be read**, but only for a state whose manifest status is `scraping`, `validating` or `archived`. Live, paused, probing and unknown
 states (and an unreadable manifest) are never checked, so the live states cannot change. The manual trigger
 (`POST /trigger/openstates-scrape/<state>`) answers **409** with the reason; `?skip_people_check=true` starts it anyway, on
-purpose (`run_single_scrape_job(..., skip_people_check=True)`, logged, not sticky). Do not write a second people count. It counts CURRENT legislators (a state still onboarding has a session in progress, and its votes need current people to resolve against); the manual trigger checks once for its answer and the funnel checks again before launching, so in the rare case the two reads differ, the refusal is logged and in the flow result, never silent.
+purpose (`run_state_pipeline(..., skip_people_check=True)`, logged, not sticky). Do not write a second people count. It counts CURRENT legislators (a state still onboarding has a session in progress, and its votes need current people to resolve against); the manual trigger checks once for its answer and the funnel checks again before launching, so in the rare case the two reads differ, the refusal is logged and in the flow result, never silent.
 
 ## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
 
@@ -345,11 +345,11 @@ back to the manifest, then to the caller's last-resort constant (`None` means "n
 raises: a missing, invalid or incomplete manifest degrades to the yaml's answer with one log line.
 `log_config_disagreements(config, root)` compares every list at once; the scheduler calls it at start-up, and
 the OPEN-330 daily check reuses it. Features: `archive` (the manifest's `archive.scheduled`, the recurring list; `archive.enabled` is only the shell gate and the Stage 4 manual run, OPEN-418; a manifest from before that split reads as "cannot say" and logs `jurisdiction_manifest_unusable error="missing field 'scheduled'"` at start-up. On 2026-10-27 both the Mac and the EC2-broker host logged it because their ddp-open-states checkouts did not contain OPEN-418's commit `1c69cb57d5` (no `scheduled:` lines; main has 10); both were pulled by 2026-10-28 and the EC2 warning cleared at its restart that night, the Mac's should clear at its next restart (not yet seen); check that first, then the manifest itself), `embedding`, `search_refresh` (spelled `us`) and
-`cloud_path`, `scrape_primary`, `scrape_secondary` (spelled `usa`), mirroring `check-jurisdiction-drift.py`'s
+`cloud_path`, `scrape` (spelled `usa`; SYNC-152 replaced `scrape_primary`/`scrape_secondary`, and it has no yaml list), mirroring `check-jurisdiction-drift.py`'s
 `project()` in ddp-open-states. Wired so far: the embedding and search-refresh hook gates, the manual archive
 trigger and the knowledge-base 404 gates, the manual single-state scrape targets, and the two in-code
 fallbacks. **Not wired (still yaml only, deliberately):** scheduler registration of the scrape/archive jobs,
-`_cloud_path_owns`, `_memory_backend_enabled`, `maybe_trigger_archive_after_scrape`, and the per-feature
+`_cloud_path_owns`, `_memory_backend_enabled`, `archive_after_scrape`, and the per-feature
 opt-in lists (`sweep_import`, `scrape_retry`, `full_walk`, `scrapebot_fallback`), because a wrong answer there
 changes what production scrapes. The manifest is read from the ddp-open-states checkout on each host (a bind
 mount on the EC2 broker host that nothing here pulls).
@@ -367,8 +367,7 @@ wired only for the features listed above; the per-feature opt-in lists stay yaml
 **SYNC-142: the LegBot gate reads the shared list.** `session_pipeline_runner._legbot_allowed_codes` answers from each state's `enrollment.legbot_replica` through `enrolled("legbot_replica", <env list>, default_root())`: in `authoritative` mode the shared list decides and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` is ignored (logged once when it differs); in `shadow` mode, or when the shared list cannot be read, the env list is the fallback, and an empty answer sends nothing. The daily drift check no longer compares that env var; it reports `legbot_replica` as unverifiable when the manifest cannot answer it. `legbot_replica` is the one switch a human flips.
 
 **SYNC-146: a new state needs no ddp-sync edit.** In `authoritative` mode three more readers take their answer from the shared
-list through `enrolled(...)`: the scheduler's secondary batch (`scheduler._secondary_jurisdictions`, `scrape_secondary`: tier
-secondary and a status other than paused or probing), the cloud-run ownership gate (`openstates_scrape._cloud_path_owns`, via
+list through `enrolled(...)`: the scheduler's secondary batch (since SYNC-152: every scraped state, see "One pipeline per state"), the cloud-run ownership gate (`openstates_scrape._cloud_path_owns`, via
 `_cloud_path_jurisdictions`, `cloud_path`: `enrollment.cloud_path`) and the S3 memory floor (`_memory_backend_enabled`: a state
 the cloud owns is covered automatically). `cloud_path.enabled` stays the global switch. `shadow` mode and an unreadable shared
 list give the yaml's answer exactly as before. **Rolling a state back off the cloud path:** the yaml
@@ -376,7 +375,7 @@ list give the yaml's answer exactly as before. **Rolling a state back off the cl
 the shared list (nothing can remember it once the manifest says false). The weekly archive cron, embedding and search-refresh
 registrations are unchanged by this ticket.
 
-**SYNC-146, second part (2026-11-09): the archive after a scrape follows `archive.enabled`.** `maybe_trigger_archive_after_scrape`
+**SYNC-146, second part (2026-11-09): the archive after a scrape follows `archive.enabled`.** `archive_after_scrape` (was `maybe_trigger_archive_after_scrape`)
 (`openstates_archive.py`), which runs a state's archive right after its own scrape and so triggers LegBot on the Mac, decides
 through `enrolled("archive_after_scrape", openstates_archive.jurisdictions, root)`: in `authoritative` mode the shared list's
 `archive.enabled` (a new state archives after each scrape from Stage 4 on), in `shadow` mode or with an unreadable list the yaml
@@ -385,12 +384,37 @@ through `enrolled("archive_after_scrape", openstates_archive.jurisdictions, root
 `ne` and `la` and drops nothing. Found because Pennsylvania's scrape triggered no archive or LegBot (prod agent `ece1703`);
 **do not add a state to the yaml archive list by hand to get this**, which also turns on drift for `archive.scheduled`.
 
-**OPEN-494: a state under `openstates_scrape.primary` other than fl/wa/usa is a nightly job of its own.** `scheduler._register_openstates_scrape_jobs`
-registers `openstates_primary_scrape_<code>` at that entry's `sync_time_utc` (default 04:00) for every extra `primary` entry with
-`enabled: true`, running `run_secondary_scrapes_job(config, jurisdictions=[code], flow_status_key="openstates_primary_scrape_<code>")`
-(the single-state run an escalated secondary state already uses; its run history stays under the secondary flow name). The drift check
-compares the enabled `primary` keys with the manifest's `tier: primary`, so a state moves tier in `jurisdictions.yaml` AND here in one
-change (and leaves `secondary.jurisdictions`, or it is drift). First user: pa, 04:00 UTC. **Do not add a second per-state nightly path.**
+## One pipeline per state (`pipelines/openstates_scrape.py`, SYNC-152)
+
+PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is no primary/secondary split any more.
+
+- **`enrolled_scrape_states(config)`** — WHO is scraped: the manifest's `scrape` feature (status not `paused` or `probing`;
+  `usa` for the federal one). The ONE answer for the scheduler, the manual trigger (`triggers._single_jurisdiction_targets`),
+  the cadence review and the guard test; the manifest's `tier` is never read. `None` when the manifest cannot be read: the
+  scheduler then keeps the jobs it has (none at startup) and the daily drift check alerts (`scrape` unverifiable). **Do not
+  add a yaml list of scraped states, a tier, or an in-code fallback list.**
+- **`state_timing(config, state)`** — WHEN: `openstates_scrape.timing.<state>` over `openstates_scrape.defaults` over the
+  built-in weekly Sunday 02:00 UTC. Fields `floor` (nightly/weekly, a floor dynamic_cadence may raise), `day`, `start_utc`,
+  `sessions` (run in turn; empty = one run with no session argument). Timing for a state that is not scraped is drift
+  (`config_disagreements` feature `scrape_timing`).
+- **`run_state_pipeline(state, config, archive_config, *, skip_people_check, people_checked)`** — the one path for the
+  scheduled job `openstates_scrape_<state>` and `POST /trigger/openstates-scrape/<state>` (202): every session through
+  `_run_scrape` (each in its own try), `_record_scrape_history` (`ddp:flow_history:openstates_scrape:<state>`, the
+  OPEN-22/OPEN-139 record and checks, for every state), the broker signal, then ONE `openstates_archive.archive_after_scrape`
+  (None not archived / True / False). Raises **`PipelineFailed`** when any session failed or the archive failed, so APScheduler
+  logs an error; writes the status record `openstates_scrape_<state>` once, in `finally`. History, signal and status go through
+  `_logged` (a failure is logged, never raised). `_run_scrape` itself no longer archives or signals.
+- **Registration** (`scheduler._register_state_pipeline_jobs`): removes the retired ids first (`openstates_secondary_scrape*`,
+  `openstates_primary_scrape_*`, `openstates_fl_scrape`, `openstates_wa_scrape`, `openstates_usa_scrape`), removes the job of a
+  state no longer scraped, then adds one job per scraped state (`replace_existing`, `max_instances=1`, `coalesce`). A tempo
+  change from the cadence review re-registers the same id without a weekday.
+- **Cadence review** covers every scraped state, reading `openstates_scrape:<state>` and, while that is empty, the retired
+  `openstates_secondary_scrapes:<state>` (no longer written; expires within 30 days).
+- `openstates_scrape.escalation` and `openstates_scrape.scrapebot_fallback` moved out of the retired `secondary` block.
+- **Guard:** `tests/test_sync_152_one_pipeline_per_state.py` reads the real manifest (`OPENSTATES_ROOT`, else this Mac's
+  default checkout) and the real `sync_schedule.yaml`: scraped states == job ids == manual targets, timing only for scraped
+  states, no "primary"/"secondary" left in `openstates_scrape`.
+
 ## Jurisdiction drift check (`pipelines/jurisdiction_drift_check.py`, OPEN-330)
 
 A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
@@ -563,8 +587,8 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions; a host only acts if it also has `KNOWLEDGE_BASE_INDEX_NAME` |
 | `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (the 05:00 archive start) |
 | `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
-| `openstates_scrape.primary.fl` (no `sessions` key) | one run, no session argument | SYNC-130: `run_fl_scrapes_job` runs FL like WA and the secondary batch, so the scraper scrapes every session marked `"active": True` in the scrapers image's `scrapers/fl/__init__.py` (each also needs its House `session_number` there). A new session is picked up when the image that activates it is deployed to Fargate (FL is cloud-owned); nothing here lists sessions. It used to loop over a hand-kept session list, and 2027 went unscraped for months. Two consequences: all active sessions share one incremental marker (`fl`), and FL's scraper skips bills whose last action predates it, so a session activated after its bills were filed gets those bills only on a full run (no marker) or when they move again; and a failing session stops the sessions after it in that run |
-| `openstates_scrape.secondary.jurisdictions` | `[va, mi, ma, ut, az, nc]` in the checked-in file | The Sunday secondary batch, and (SYNC-57) the states `POST /trigger/openstates-scrape/{state}` accepts on their own; `fl`/`wa`/`usa` are batch targets instead |
+| `openstates_scrape.timing.fl` (no `sessions` key) | one run, no session argument | SYNC-130: FL's pipeline runs one scrape with no session argument, like every state without `sessions`, so the scraper scrapes every session marked `"active": True` in the scrapers image's `scrapers/fl/__init__.py` (each also needs its House `session_number` there). A new session is picked up when the image that activates it is deployed to Fargate (FL is cloud-owned); nothing here lists sessions. It used to loop over a hand-kept session list, and 2027 went unscraped for months. Two consequences: all active sessions share one incremental marker (`fl`), and FL's scraper skips bills whose last action predates it, so a session activated after its bills were filed gets those bills only on a full run (no marker) or when they move again; and a failing session stops the sessions after it in that run |
+| `openstates_scrape.defaults` / `.timing.<state>` | weekly, Sunday, `"02:00"` / fl weekly, wa/usa/pa nightly in the checked-in file | SYNC-152: WHEN each scraped state runs (`state_timing`); WHO is the manifest. Replaces `primary` and `secondary.jurisdictions` |
 | `slack_citations.*` | `enabled: true`, `mode: report_only`, `start_date`, `lookback_days: 30`, `thread_lookback_days: 730`, `max_citations_per_run: 200`, `sync_time_utc: "09:00"` | SYNC-127 nightly Slack pull; runs only where the host's `SLACK_CITATIONS_ENABLED=true` (default off) |
 | `docker_cleanup.*` | `enabled: true`, `sync_time_utc: "06:30"` (finishes, timeout included, before the weekly launchd prune's Sunday 08:00), `timeout_seconds: 1800` | SYNC-119 nightly Docker cleanup (ddp-agents `docker-prune.sh`, path `DOCKER_PRUNE_SCRIPT`); runs only where the host's `DOCKER_CLEANUP_ENABLED=true` (default off; the Mac). The script owns every rule, its log and its own alert; the job adds the process-group timeout and a `post_alert` on a non-zero exit |
 | `bill_version_check.max_updates_per_run` | `0` (unlimited) | Cap re-ingestions per run |

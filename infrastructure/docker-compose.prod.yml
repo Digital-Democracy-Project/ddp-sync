@@ -66,7 +66,7 @@ services:
       # OPENSTATES_SCRAPE_ENABLED=true (OPEN-253, 2026-09-03): flipped from the canary-era
       # false above once Ramon moved live scheduled scraping from the Mac host to this one
       # (Mac's own scrape runs stopped the same night). Registers the SIX recurring scheduled
-      # jobs this flag controls (FL, WA, USA, secondary states including MI, people refresh,
+      # jobs this flag controls (one pipeline job per scraped state since SYNC-152, people refresh,
       # patch apply) -- now intentional, not the accidental-enable this comment originally
       # warned about. POST /trigger/openstates-scrape/{target} (api/routes/triggers.py:825)
       # never checks this flag at all -- it's a separate, always-on code path, unaffected
