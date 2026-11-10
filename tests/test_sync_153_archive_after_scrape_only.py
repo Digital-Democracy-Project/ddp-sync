@@ -40,14 +40,17 @@ class FakeRedis:
         self.data[key], self.ttl[key] = value, ex
         return True
 
-    async def eval(self, script, n, key, token):
-        assert "redis.call('get', KEYS[1]) == ARGV[1]" in script  # the compare-and-delete script, not a plain DEL
+    async def eval(self, script, n, key, token, *args):
+        assert "redis.call('get', KEYS[1]) == ARGV[1]" in script  # compare-and-delete / compare-and-expire, never blind
         if self.fail_eval:
             raise ConnectionError("redis went away")
-        if self.data.get(key) == token:
+        if self.data.get(key) != token:
+            return 0
+        if "'expire'" in script:
+            self.ttl[key] = int(args[0])
+        else:
             del self.data[key]
-            return 1
-        return 0
+        return 1
 
     async def scan_iter(self, match):
         prefix = match.rstrip("*")
@@ -314,3 +317,73 @@ def test_a_manual_us_archive_blocks_a_manual_usa_scrape(redis):
 def test_the_committed_yaml_says_the_archive_follows_the_scrape():
     text = DEFAULT_CONFIG_PATH.read_text()
     assert "schedule:" not in textwrap.dedent(text.split("openstates_archive:")[1].split("\nvotebot_eval:")[0])
+
+
+# --- the hand-off from a manual trigger to its run (pm-review round 2) ---------------------------------------------
+
+
+def test_a_manual_trigger_takes_the_lock_with_the_short_handoff_ttl(redis):
+    """If the background run never starts while the process lives on, the lock frees itself in 15 min, not days."""
+    resp, _ = _post_scrape("pa")
+    assert resp.status_code == 202
+    assert redis.ttl["ddp:pipeline_lock:pa"] == redis_store.HANDOFF_TTL_S == 900
+
+
+@pytest.mark.asyncio
+async def test_the_run_extends_a_handed_off_lock_to_the_full_ttl(redis):
+    token = await redis_store.acquire_state_lock("pa", redis_store.HANDOFF_TTL_S)
+    seen = []
+
+    async def _archive(j, cfg):
+        seen.append(redis.ttl["ddp:pipeline_lock:pa"])
+        return True
+
+    statuses = []
+    p = _pipeline_patches(statuses)
+    with p[0], patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=_archive), p[2], p[3], p[4]:
+        await scrape.run_state_pipeline("pa", {}, {"enabled": True}, lock_token=token)
+    assert seen == [scrape.pipeline_lock_ttl_s("pa", {}, {"enabled": True})]
+    assert "ddp:pipeline_lock:pa" not in redis.data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("now_held_by", [None, "another-run"])
+async def test_a_lost_handoff_does_not_run_and_does_not_release_someone_elses_lock(redis, now_held_by):
+    """The token expired (None) or another run took the state since: this run must not go ahead."""
+    if now_held_by:
+        redis.data["ddp:pipeline_lock:pa"] = now_held_by
+    statuses = []
+    p = _pipeline_patches(statuses)
+    with p[0] as run, p[1], p[2], p[3], p[4], pytest.raises(scrape.PipelineBusy):
+        await scrape.run_state_pipeline("pa", {}, {"enabled": True}, lock_token="stale-token")
+    run.assert_not_awaited()
+    assert redis.data.get("ddp:pipeline_lock:pa") == now_held_by
+
+
+@pytest.mark.asyncio
+async def test_a_lost_handoff_skips_a_manual_archive(redis):
+    redis.data["ddp:pipeline_lock:pa"] = "another-run"
+    with patch.object(archive, "run_single_archive_job", new=AsyncMock()) as run, \
+            patch.object(archive, "_write_flow_status", new=AsyncMock()) as status:
+        result = await archive.run_archive_only("pa", {"enabled": True}, lock_token="stale-token")
+    assert result["skipped"] == "busy" and status.await_args.args[1]["status"] == "skipped"
+    run.assert_not_awaited()
+    assert redis.data["ddp:pipeline_lock:pa"] == "another-run"
+
+
+@pytest.mark.asyncio
+async def test_run_archive_only_with_no_token_takes_and_releases_the_lock(redis):
+    """The optional-token path (pipeline_lock_ttl_s with no scrape config) works on its own."""
+    held = []
+
+    async def _one(j, cfg):
+        held.append((dict(redis.data), dict(redis.ttl)))
+        return {"success": True}
+
+    with patch.object(archive, "run_single_archive_job", new=_one), \
+            patch.object(archive, "_write_flow_status", new=AsyncMock()):
+        result = await archive.run_archive_only("pa", {"enabled": True})
+    assert result == {"success": True, "jurisdiction": "pa", "archived": True, "attempts": 1}
+    assert "ddp:pipeline_lock:pa" in held[0][0]
+    assert held[0][1]["ddp:pipeline_lock:pa"] == scrape.pipeline_lock_ttl_s("pa", None, {"enabled": True})
+    assert "ddp:pipeline_lock:pa" not in redis.data

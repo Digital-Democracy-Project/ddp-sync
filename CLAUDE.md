@@ -156,7 +156,8 @@ that took "tier" as "the states we scrape" was wrong for the other half (SYNC-57
 its own pipeline, once, after all its sessions (`archive_with_retry`), or by
 `POST /trigger/openstates-archive/<state>` (`run_archive_only`). WHO is archived is the manifest's
 `archive.enabled`. One Redis lock per state (`ddp:pipeline_lock:<archive code>`, `redis_store.state_lock`)
-covers the whole run, scheduled or manual; the manual triggers take it BEFORE answering (409 when held), and
+covers the whole run, scheduled or manual; the manual triggers take it BEFORE answering (409 when held) with a
+15-minute hand-off TTL that the run extends to the full one when it starts (a run never dispatched frees it), and
 every lock is cleared at startup (`app.lifespan`), which is what makes its long TTL (`pipeline_lock_ttl_s`,
 the run's worst case, ~53-68 h) safe. It fails open when Redis is down. The 30-minute debounce is gone: it
 was claimed before the archive ran and so blocked retries. A failed archive is retried after

@@ -1171,13 +1171,13 @@ def _single_jurisdiction_targets(config: dict) -> set[str]:
     return {str(j).strip().lower() for j in enrolled_scrape_states(config) or []} - _OPENSTATES_JOB_TARGETS
 
 
-async def _take_state_lock(target: str, config: dict, archive_config: dict) -> str:
+async def _take_state_lock(target: str) -> str:
     """SYNC-153: take the state's pipeline lock before answering, so the answer cannot race the run: 409 while it is
     held; otherwise the token goes to the background run, which never takes the lock a second time."""
-    from ddp_sync.pipelines.openstates_scrape import pipeline_lock_ttl_s
-    from ddp_sync.services.redis_store import acquire_state_lock
+    from ddp_sync.services.redis_store import HANDOFF_TTL_S, acquire_state_lock
 
-    token = await acquire_state_lock(target, pipeline_lock_ttl_s(target, config, archive_config))
+    # A short TTL until the background run starts and extends it to the full one (redis_store.HANDOFF_TTL_S).
+    token = await acquire_state_lock(target, HANDOFF_TTL_S)
     if token is None:
         raise HTTPException(status_code=409, detail=f"a run for {target} is in progress (its pipeline lock is held)")
     return token
@@ -1261,7 +1261,7 @@ async def trigger_openstates_scrape(
             refusal = await people_check_refusal(target, config)
             if refusal:
                 raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
-        token = await _take_state_lock(target, config, archive_config)
+        token = await _take_state_lock(target)
         if skip_people_check:
             background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
                                       skip_people_check=True, lock_token=token)
@@ -1308,7 +1308,6 @@ async def trigger_openstates_archive(
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
-    scrape_config = scheduler._sync_config.get("openstates_scrape", {}) if scheduler else {}
     # The manifest's archive.enabled is the ONE list (no yaml list, no default list).
     jurisdictions = set(enrolled("archive", None, _get_root(config)) or [])
     code = _archive_jurisdiction_code(target.strip().lower())
@@ -1317,7 +1316,7 @@ async def trigger_openstates_archive(
             status_code=404,
             detail=f"Unknown target '{target}'. Available: {', '.join(sorted(jurisdictions))}",
         )
-    lock = await _take_state_lock(code, scrape_config, config)
+    lock = await _take_state_lock(code)
     background_tasks.add_task(_run_archive_only_in_background, code, config, lock)
     return {"status": "started", "target": code}
 

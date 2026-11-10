@@ -763,6 +763,11 @@ PIPELINE_LOCK_PREFIX = "ddp:pipeline_lock:"
 # Returned by acquire_state_lock when Redis cannot answer: "go ahead, nothing to release". Falsy, so release skips it.
 NO_LOCK = ""
 _RELEASE_SCRIPT = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+_EXTEND_SCRIPT = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+# A manual trigger takes the lock with this short TTL before it answers; the run it starts extends the lock to the
+# pipeline's full TTL as its first step. If that run never starts (the response or the background task failed while the
+# process lives on), the lock frees itself within 15 minutes instead of blocking the state for days (pm-review round 2).
+HANDOFF_TTL_S = 900
 
 
 def state_lock_key(jurisdiction: str) -> str:
@@ -789,6 +794,19 @@ async def acquire_state_lock(jurisdiction: str, ttl_s: int) -> str | None:
     return token if ok else None
 
 
+async def extend_state_lock(jurisdiction: str, token: str, ttl_s: int) -> bool | None:
+    """Set the lock's TTL to `ttl_s` if `token` still owns it: True when it does, False when it does not (expired or
+    taken by another run), None when Redis cannot answer (the caller fails open, as acquire does)."""
+    client = get_redis_store()._client
+    if client is None:
+        return None
+    try:
+        return bool(await client.eval(_EXTEND_SCRIPT, 1, state_lock_key(jurisdiction), token, max(int(ttl_s), 1)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pipeline_lock_extend_failed_proceeding", jurisdiction=jurisdiction, error=str(e))
+        return None
+
+
 async def release_state_lock(jurisdiction: str, token: str | None) -> None:
     """Release the lock if `token` still owns it. Never raises: a failed release is logged (the TTL and the startup
     clear free the key) and must not replace the run's real outcome."""
@@ -804,10 +822,15 @@ async def release_state_lock(jurisdiction: str, token: str | None) -> None:
 
 @asynccontextmanager
 async def state_lock(jurisdiction: str, ttl_s: int, token: str | None = None):
-    """Hold the state's lock for a block; yields whether this run may go ahead. With `token` the caller already owns it
-    (a manual trigger took it before answering) and this only releases it at the end; without, it tries to take it."""
+    """Hold the state's lock for a block; yields whether this run may go ahead. With `token` the caller took it before
+    (a manual trigger, with HANDOFF_TTL_S): this first confirms the token still owns it and extends it to `ttl_s`; a
+    token that no longer owns it means another run may hold the state, so the block must not run. Without, it takes it."""
     if token is None:
         token = await acquire_state_lock(jurisdiction, ttl_s)
+    elif token and await extend_state_lock(jurisdiction, token, ttl_s) is False:
+        logger.error("pipeline_lock_handoff_lost", jurisdiction=jurisdiction)
+        yield False
+        return
     try:
         yield token is not None
     finally:

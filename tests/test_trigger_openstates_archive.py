@@ -39,11 +39,12 @@ class FakeRedis:
         self.data[key] = value
         return True
 
-    async def eval(self, script, n, key, token):
-        if self.data.get(key) == token:
+    async def eval(self, script, n, key, token, *args):
+        if self.data.get(key) != token:
+            return 0
+        if "'expire'" not in script:
             del self.data[key]
-            return 1
-        return 0
+        return 1
 
 
 @pytest.fixture(autouse=True)

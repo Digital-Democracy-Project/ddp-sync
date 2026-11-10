@@ -394,8 +394,10 @@ weekly cron (see "Archive only after a state's scrape").
   context manager; with a token it only releases), `clear_state_locks()` (called in `app.lifespan` before the scheduler starts).
   Key `ddp:pipeline_lock:<archive code>`, so `usa` and `us` share one. TTL `openstates_scrape.pipeline_lock_ttl_s`: sessions x
   (scrape Fargate wait + load timeout) + attempts x archive Fargate wait + retry delays + 1 h. `run_state_pipeline` raises
-  **`PipelineBusy`** when the lock is held; both manual triggers take the lock before answering (409 when held) and hand the token
-  to the background run. **Do not add a second overlap guard (the 30-minute debounce was removed because it blocked retries) or a
+  **`PipelineBusy`** when the lock is held; both manual triggers take the lock before answering (409 when held), with the short
+  `HANDOFF_TTL_S` (15 min), and hand the token to the background run, whose `state_lock(..., token=)` first confirms the token
+  still owns the lock and extends it to the full TTL (`extend_state_lock`, compare-and-expire). So a run that is never
+  dispatched frees the state within 15 min, and a stale token never runs (`PipelineBusy` / archive `skipped`). **Do not add a second overlap guard (the 30-minute debounce was removed because it blocked retries) or a
   recurring archive job.**
 - Removed: the weekly per-state archive jobs (`openstates_archive_<state>`), `openstates_archive.jurisdictions`/`.schedule`/
   `.sync_time_utc`, `DEFAULT_ARCHIVE_JURISDICTIONS`, `run_archive_jobs`, the `all` archive target, the debounce.
