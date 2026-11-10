@@ -112,7 +112,7 @@ services:
       # LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED=true (2026-09-15): flipped back on with
       # Ramon's explicit direction, alongside deploying PR #157 (OPEN-291) -- the real fix
       # for the MI archiving-lag gap that motivated the 09-14 pause (newly-introduced bills
-      # no longer wait for MI's weekly archive cron; archive now fires right after scrape
+      # no longer wait for MI's weekly archive cron (removed entirely by SYNC-153); archive now fires right after scrape
       # completes). Was off 2026-09-14 -> 2026-09-15 pending that fix; also ran a real
       # one-off full-session MI LegBot dispatch against production (via the Mac's ddp-sync)
       # the same night, separate from this automated path. See notes/ops-handoff for both

@@ -52,6 +52,7 @@ def _post(target, openstates_scrape_config, archive_config=None):
         patch("ddp_sync.api.routes.triggers._run_state_pipeline_in_background", new=AsyncMock()) as pipeline,
         patch("ddp_sync.pipelines.openstates_scrape.people_check_refusal", new=AsyncMock(return_value=None)),
         patch("ddp_sync.pipelines.openstates_scrape.run_patch_refresh_job", new=AsyncMock()) as patches,
+        patch("ddp_sync.services.redis_store.acquire_state_lock", new=AsyncMock(return_value="tok")),
     ):
         resp = TestClient(app).post(f"/trigger/openstates-scrape/{target}")
     return resp, pipeline, patches
@@ -64,7 +65,7 @@ def test_every_scraped_state_is_a_target_and_runs_the_state_pipeline(target):
     resp, pipeline, _ = _post(target, {}, archive)
     assert resp.status_code == 202
     assert resp.json() == {"status": "started", "target": target}
-    pipeline.assert_awaited_once_with(target, {}, archive, people_checked=True)
+    pipeline.assert_awaited_once_with(target, {}, archive, people_checked=True, lock_token="tok")
 
 
 @pytest.mark.parametrize("target", ["al", "zz", "secondary", "us", "mi"])
@@ -88,7 +89,7 @@ def test_pa_is_a_target_with_the_checked_in_schedule():
     openstates_scrape = yaml.safe_load(config_path.read_text())["openstates_scrape"]
     resp, pipeline, _ = _post("pa", openstates_scrape)
     assert resp.status_code == 202
-    pipeline.assert_awaited_once_with("pa", openstates_scrape, {}, people_checked=True)
+    pipeline.assert_awaited_once_with("pa", openstates_scrape, {}, people_checked=True, lock_token="tok")
 
 
 @pytest.mark.asyncio

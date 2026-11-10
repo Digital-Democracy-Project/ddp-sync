@@ -344,12 +344,12 @@ distinct difference, with the manifest file's mtime so a stale checkout is not m
 back to the manifest, then to the caller's last-resort constant (`None` means "neither could answer"). Never
 raises: a missing, invalid or incomplete manifest degrades to the yaml's answer with one log line.
 `log_config_disagreements(config, root)` compares every list at once; the scheduler calls it at start-up, and
-the OPEN-330 daily check reuses it. Features: `archive` (the manifest's `archive.scheduled`, the recurring list; `archive.enabled` is only the shell gate and the Stage 4 manual run, OPEN-418; a manifest from before that split reads as "cannot say" and logs `jurisdiction_manifest_unusable error="missing field 'scheduled'"` at start-up. On 2026-10-27 both the Mac and the EC2-broker host logged it because their ddp-open-states checkouts did not contain OPEN-418's commit `1c69cb57d5` (no `scheduled:` lines; main has 10); both were pulled by 2026-10-28 and the EC2 warning cleared at its restart that night, the Mac's should clear at its next restart (not yet seen); check that first, then the manifest itself), `embedding`, `search_refresh` (spelled `us`) and
+the OPEN-330 daily check reuses it. Features: `archive` (SYNC-153: the manifest's `archive.enabled`, no yaml list; before it, `archive.scheduled`, the recurring list, OPEN-418; a manifest from before that split reads as "cannot say" and logs `jurisdiction_manifest_unusable error="missing field 'scheduled'"` at start-up. On 2026-10-27 both the Mac and the EC2-broker host logged it because their ddp-open-states checkouts did not contain OPEN-418's commit `1c69cb57d5` (no `scheduled:` lines; main has 10); both were pulled by 2026-10-28 and the EC2 warning cleared at its restart that night, the Mac's should clear at its next restart (not yet seen); check that first, then the manifest itself), `embedding`, `search_refresh` (spelled `us`) and
 `cloud_path`, `scrape` (spelled `usa`; SYNC-152 replaced `scrape_primary`/`scrape_secondary`, and it has no yaml list), mirroring `check-jurisdiction-drift.py`'s
 `project()` in ddp-open-states. Wired so far: the embedding and search-refresh hook gates, the manual archive
 trigger and the knowledge-base 404 gates, the manual single-state scrape targets, and the two in-code
 fallbacks. **Not wired (still yaml only, deliberately):** scheduler registration of the scrape/archive jobs,
-`_cloud_path_owns`, `_memory_backend_enabled`, `archive_after_scrape`, and the per-feature
+`_cloud_path_owns`, `_memory_backend_enabled`, and the per-feature
 opt-in lists (`sweep_import`, `scrape_retry`, `full_walk`, `scrapebot_fallback`), because a wrong answer there
 changes what production scrapes. The manifest is read from the ddp-open-states checkout on each host (a bind
 mount on the EC2 broker host that nothing here pulls).
@@ -372,17 +372,35 @@ list through `enrolled(...)`: the scheduler's secondary batch (since SYNC-152: e
 the cloud owns is covered automatically). `cloud_path.enabled` stays the global switch. `shadow` mode and an unreadable shared
 list give the yaml's answer exactly as before. **Rolling a state back off the cloud path:** the yaml
 `memory_backend_jurisdictions` list is what remembers it afterwards, so add the state to it BEFORE setting `cloud_path` false in
-the shared list (nothing can remember it once the manifest says false). The weekly archive cron, embedding and search-refresh
-registrations are unchanged by this ticket.
+the shared list (nothing can remember it once the manifest says false). Embedding and search-refresh registrations are
+unchanged by this ticket.
 
-**SYNC-146, second part (2026-11-09): the archive after a scrape follows `archive.enabled`.** `archive_after_scrape` (was `maybe_trigger_archive_after_scrape`)
-(`openstates_archive.py`), which runs a state's archive right after its own scrape and so triggers LegBot on the Mac, decides
-through `enrolled("archive_after_scrape", openstates_archive.jurisdictions, root)`: in `authoritative` mode the shared list's
-`archive.enabled` (a new state archives after each scrape from Stage 4 on), in `shadow` mode or with an unreadable list the yaml
-`openstates_archive.jurisdictions` as before. The weekly cron still follows `archive` = `archive.scheduled` (OPEN-418), and
-`archive_after_scrape` has no yaml list of its own, so it is not a drift feature. With the real list (2026-11-09) it adds `pa`,
-`ne` and `la` and drops nothing. Found because Pennsylvania's scrape triggered no archive or LegBot (prod agent `ece1703`);
-**do not add a state to the yaml archive list by hand to get this**, which also turns on drift for `archive.scheduled`.
+**SYNC-146, second part (2026-11-09): the archive after a scrape follows `archive.enabled`.** Superseded by SYNC-153: the
+manifest's `archive.enabled` is now the ONE archive list (feature `archive`), with no yaml list, no `archive.scheduled`, and no
+weekly cron (see "Archive only after a state's scrape").
+
+## Archive only after a state's scrape (`pipelines/openstates_archive.py`, `services/redis_store.py`, SYNC-153)
+
+- **`archive_with_retry(state, archive_config)`** — the only scheduled archive: called once by `run_state_pipeline` after all of
+  a state's sessions. None when `openstates_archive.enabled` is false or the manifest's `archive.enabled` is false/unreadable
+  (`enrolled("archive", None, root)`; no yaml list, no fallback); True on success; False after `1 + len(ARCHIVE_RETRY_DELAYS_S)`
+  failed attempts (`(1800, 7200)`; an exception is a failed attempt) and one `post_alert(source="openstates_archive.archive_failure")`.
+  Never raises. Only the archive is retried: its hooks (LegBot, search refresh, embedding) run inside `_run_archive_with_hook`
+  only after a success, each in its own try. Each attempt may also send the existing per-attempt `_alert_archive_failure`.
+- **`run_archive_only(state, archive_config, *, lock_token)`** — the manual archive trigger's run: same retry, under the state's
+  lock, writes `openstates_archive_<state>` (`completed`/`failed`/`skipped`, `attempts`), never the scrape record.
+- **The per-state pipeline lock** (`redis_store`): `acquire_state_lock(state, ttl)` (SET NX EX; token, None when held, `NO_LOCK`
+  "" when Redis cannot answer: fail open), `release_state_lock` (compare-and-delete, never raises), `state_lock(...)` (async
+  context manager; with a token it only releases), `clear_state_locks()` (called in `app.lifespan` before the scheduler starts).
+  Key `ddp:pipeline_lock:<archive code>`, so `usa` and `us` share one. TTL `openstates_scrape.pipeline_lock_ttl_s`: sessions x
+  (scrape Fargate wait + load timeout) + attempts x archive Fargate wait + retry delays + 1 h. `run_state_pipeline` raises
+  **`PipelineBusy`** when the lock is held; both manual triggers take the lock before answering (409 when held), with the short
+  `HANDOFF_TTL_S` (15 min), and hand the token to the background run, whose `state_lock(..., token=)` first confirms the token
+  still owns the lock and extends it to the full TTL (`extend_state_lock`, compare-and-expire). So a run that is never
+  dispatched frees the state within 15 min, and a stale token never runs (`PipelineBusy` / archive `skipped`). **Do not add a second overlap guard (the 30-minute debounce was removed because it blocked retries) or a
+  recurring archive job.**
+- Removed: the weekly per-state archive jobs (`openstates_archive_<state>`), `openstates_archive.jurisdictions`/`.schedule`/
+  `.sync_time_utc`, `DEFAULT_ARCHIVE_JURISDICTIONS`, `run_archive_jobs`, the `all` archive target, the debounce.
 
 ## One pipeline per state (`pipelines/openstates_scrape.py`, SYNC-152)
 
@@ -400,8 +418,8 @@ PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is n
 - **`run_state_pipeline(state, config, archive_config, *, skip_people_check, people_checked)`** — the one path for the
   scheduled job `openstates_scrape_<state>` and `POST /trigger/openstates-scrape/<state>` (202): every session through
   `_run_scrape` (each in its own try), `_record_scrape_history` (`ddp:flow_history:openstates_scrape:<state>`, the
-  OPEN-22/OPEN-139 record and checks, for every state), the broker signal, then ONE `openstates_archive.archive_after_scrape`
-  (None not archived / True / False). Raises **`PipelineFailed`** when any session failed or the archive failed, so APScheduler
+  OPEN-22/OPEN-139 record and checks, for every state), the broker signal, then ONE `openstates_archive.archive_with_retry`
+  (None not archived / True / False; SYNC-153). Raises **`PipelineFailed`** when any session failed or the archive failed, so APScheduler
   logs an error; writes the status record `openstates_scrape_<state>` once, in `finally`. History, signal and status go through
   `_logged` (a failure is logged, never raised). `_run_scrape` itself no longer archives or signals.
 - **Registration** (`scheduler._register_state_pipeline_jobs`): removes the retired ids first (`openstates_secondary_scrape*`,
@@ -585,7 +603,7 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
 | `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions; a host only acts if it also has `KNOWLEDGE_BASE_INDEX_NAME` |
-| `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (the 05:00 archive start) |
+| `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (it was the 05:00 archive start, removed by SYNC-153; left as is until re-measured, plan open question 2) |
 | `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
 | `openstates_scrape.timing.fl` (no `sessions` key) | one run, no session argument | SYNC-130: FL's pipeline runs one scrape with no session argument, like every state without `sessions`, so the scraper scrapes every session marked `"active": True` in the scrapers image's `scrapers/fl/__init__.py` (each also needs its House `session_number` there). A new session is picked up when the image that activates it is deployed to Fargate (FL is cloud-owned); nothing here lists sessions. It used to loop over a hand-kept session list, and 2027 went unscraped for months. Two consequences: all active sessions share one incremental marker (`fl`), and FL's scraper skips bills whose last action predates it, so a session activated after its bills were filed gets those bills only on a full run (no marker) or when they move again; and a failing session stops the sessions after it in that run |
 | `openstates_scrape.defaults` / `.timing.<state>` | weekly, Sunday, `"02:00"` / fl weekly, wa/usa/pa nightly in the checked-in file | SYNC-152: WHEN each scraped state runs (`state_timing`); WHO is the manifest. Replaces `primary` and `secondary.jurisdictions` |

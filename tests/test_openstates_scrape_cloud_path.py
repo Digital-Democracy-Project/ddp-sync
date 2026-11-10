@@ -192,7 +192,7 @@ async def test_the_state_pipeline_also_routes_to_the_cloud_trigger():
             "ddp_sync.pipelines.openstates_scrape.run_cloud_scrape",
             return_value={"success": True, "jurisdiction": "mi", "duration_seconds": 1.0},
         ) as mock_cloud,
-        patch("ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)),
+        patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=None)),
         patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()),
         patch("ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()),
     ):

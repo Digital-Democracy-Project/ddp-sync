@@ -1,5 +1,5 @@
 """Tests for OPEN-192 (reopened): _run_archive_fargate, the real Fargate-launch path for
-cloud_archiver.py, and the use_fargate dispatch in run_archive_jobs()/run_single_archive_job().
+cloud_archiver.py, and the use_fargate dispatch in run_single_archive_job().
 
 cloud_archiver.py itself was built and tested under OPEN-192/238, but nothing in ddp-sync
 ever actually launched it -- the scheduler still called run-archive.sh locally, unconditionally.

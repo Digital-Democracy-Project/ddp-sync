@@ -1171,15 +1171,31 @@ def _single_jurisdiction_targets(config: dict) -> set[str]:
     return {str(j).strip().lower() for j in enrolled_scrape_states(config) or []} - _OPENSTATES_JOB_TARGETS
 
 
+async def _take_state_lock(target: str) -> str:
+    """SYNC-153: take the state's pipeline lock before answering, so the answer cannot race the run: 409 while it is
+    held; otherwise the token goes to the background run, which never takes the lock a second time."""
+    from ddp_sync.services.redis_store import HANDOFF_TTL_S, acquire_state_lock
+
+    # A short TTL until the background run starts and extends it to the full one (redis_store.HANDOFF_TTL_S).
+    token = await acquire_state_lock(target, HANDOFF_TTL_S)
+    if token is None:
+        raise HTTPException(status_code=409, detail=f"a run for {target} is in progress (its pipeline lock is held)")
+    return token
+
+
 async def _run_state_pipeline_in_background(target: str, config: dict, archive_config: dict, **kwargs) -> None:
     """The manual trigger's background task: the scheduler's own pipeline. Its outcome is the status record
     `openstates_scrape_<state>` (written by the pipeline) and the log; a failed run is logged here, not raised into
     the web server after the 202 has gone."""
-    from ddp_sync.pipelines.openstates_scrape import PipelineFailed, run_state_pipeline
+    from ddp_sync.pipelines.openstates_scrape import (
+        PipelineBusy,
+        PipelineFailed,
+        run_state_pipeline,
+    )
 
     try:
         await run_state_pipeline(target, config, archive_config, **kwargs)
-    except PipelineFailed as e:
+    except (PipelineFailed, PipelineBusy) as e:
         logger.error("manual openstates pipeline failed: %s", e)
     except Exception:  # a background task has no caller left to raise to
         logger.exception("manual openstates pipeline for %s raised", target)
@@ -1207,14 +1223,16 @@ async def trigger_openstates_scrape(
                       the same pipeline as its scheduled job (SYNC-152): scrape every session, then archive,
                       then LegBot. SYNC-147: a state that is not live yet and has no legislators in production
                       answers 409 (runbook rule 1); `?skip_people_check=true` starts it anyway.
+                      SYNC-153: the state's pipeline lock is taken BEFORE the answer: 409 while a run for that
+                      state (scheduled, manual scrape or manual archive) holds it; a 202 means this run owns it.
     """
+    from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
+    from ddp_sync.pipelines.jurisdiction_drift_check import run_jurisdiction_drift_check
     from ddp_sync.pipelines.openstates_scrape import (
         run_patch_refresh_job,
         run_people_pull_job,
         run_people_refresh_job,
     )
-    from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
-    from ddp_sync.pipelines.jurisdiction_drift_check import run_jurisdiction_drift_check
     from ddp_sync.scheduler import get_scheduler
 
     scheduler = get_scheduler()
@@ -1239,14 +1257,17 @@ async def trigger_openstates_scrape(
         # it anyway, on purpose; the job logs that.
         from ddp_sync.pipelines.openstates_scrape import people_check_refusal
 
+        if not skip_people_check:
+            refusal = await people_check_refusal(target, config)
+            if refusal:
+                raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
+        token = await _take_state_lock(target)
         if skip_people_check:
             background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
-                                      skip_people_check=True)
+                                      skip_people_check=True, lock_token=token)
             return {"status": "started", "target": target, "people_check": "skipped on purpose"}
-        refusal = await people_check_refusal(target, config)
-        if refusal:
-            raise HTTPException(status_code=409, detail=f"{refusal} Add ?skip_people_check=true to start it anyway (recorded in the log).")
-        background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config, people_checked=True)
+        background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
+                                  people_checked=True, lock_token=token)
         return {"status": "started", "target": target}
 
     available = sorted(_OPENSTATES_JOB_TARGETS | single_targets)
@@ -1256,57 +1277,48 @@ async def trigger_openstates_scrape(
     )
 
 
-@router.post("/trigger/openstates-archive/{target}")
+async def _run_archive_only_in_background(target: str, archive_config: dict, lock_token: str) -> None:
+    """The manual archive trigger's background task: a failed or raising run is logged, never raised into the server."""
+    from ddp_sync.pipelines.openstates_archive import run_archive_only
+
+    try:
+        await run_archive_only(target, archive_config, lock_token=lock_token)
+    except Exception:  # a background task has no caller left to raise to
+        logger.exception("manual openstates archive for %s raised", target)
+
+
+@router.post("/trigger/openstates-archive/{target}", status_code=202)
 async def trigger_openstates_archive(
     target: str,
     background_tasks: BackgroundTasks,
     token: str = Depends(api_key_auth),
 ):
-    """Trigger OpenStates bill-document archiving immediately, without waiting for its cron.
+    """Archive one state now (SYNC-153), with the same retry and alert as the archive after its scrape.
 
-    Split out from the scrape trigger (2026-07-31) — archiving is now fully independent of
-    scraping (see openstates_archive in sync_schedule.yaml), so it gets its own trigger too.
-    Returns 202 Accepted immediately; the job runs in the background and logs to
-    ~/Developer/repos/ddp-open-states/logs/scraper.log plus ddp-sync's structured log. Flow
-    status is written to Redis under ddp:flow:openstates_archive.
-
-    Targets:
-        all                — every jurisdiction in openstates_archive.jurisdictions, concurrently
-        <jurisdiction abbr> — a single jurisdiction from that same list (see sync_schedule.yaml)
+    Accepts any state whose manifest entry has `archive.enabled` (spelled `us` for the US; `usa` is accepted as an
+    alias). Takes the state's pipeline lock BEFORE answering: 409 while a run for that state (a scrape pipeline or
+    another archive) holds it; 202 means this run owns it; 404 for any other target (the old `all` target is gone:
+    a batch of every archive at once would bypass the per-state lock). The outcome is the status record
+    `openstates_archive_<state>` (completed / failed, with the attempt count) and the log, never the HTTP answer.
     """
-    from ddp_sync.pipelines.openstates_archive import (
-        DEFAULT_ARCHIVE_JURISDICTIONS,
-        run_archive_jobs,
-        run_single_archive_job,
-    )
+    from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
+    from ddp_sync.pipelines.openstates_scrape import _get_root
     from ddp_sync.scheduler import get_scheduler
+    from ddp_sync.services.jurisdiction_enrollment import enrolled
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
-    # Read from config rather than a separate hardcoded set here -- a second copy of this
-    # list silently went stale when ma/al/us were added to config 2026-08-10 (this endpoint
-    # kept 404ing on them while the scheduler and run_archive_jobs' own default both knew
-    # about the new jurisdictions already).
-    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
-    from ddp_sync.pipelines.openstates_scrape import _get_root
-    from ddp_sync.services.jurisdiction_enrollment import enrolled
-
-    listed = enrolled("archive", config.get("jurisdictions"), _get_root(config))
-    jurisdictions = set(DEFAULT_ARCHIVE_JURISDICTIONS if listed is None else listed)
-
-    if target == "all":
-        background_tasks.add_task(run_archive_jobs, config)
-        return {"status": "started", "target": target}
-
-    if target in jurisdictions:
-        background_tasks.add_task(run_single_archive_job, target, config)
-        return {"status": "started", "target": target}
-
-    available = sorted(jurisdictions | {"all"})
-    raise HTTPException(
-        status_code=404,
-        detail=f"Unknown target '{target}'. Available: {', '.join(available)}",
-    )
+    # The manifest's archive.enabled is the ONE list (no yaml list, no default list).
+    jurisdictions = set(enrolled("archive", None, _get_root(config)) or [])
+    code = _archive_jurisdiction_code(target.strip().lower())
+    if code not in jurisdictions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown target '{target}'. Available: {', '.join(sorted(jurisdictions))}",
+        )
+    lock = await _take_state_lock(code)
+    background_tasks.add_task(_run_archive_only_in_background, code, config, lock)
+    return {"status": "started", "target": code}
 
 
 @router.post("/trigger/openstates-backfill/{jurisdiction}", status_code=202)

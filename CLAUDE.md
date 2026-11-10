@@ -138,17 +138,31 @@ multi-session-per-run shape, or the still-registered weekly cron landing close t
 hook-triggered run, from launching two overlapping archive Fargate tasks for the same
 jurisdiction — it fails *open* (proceeds) if Redis is down, deliberately, since this
 feature must never make archiving less reliable than it was before it existed.
+**SYNC-153 (2026-11-10) removed both the weekly cron and that debounce:** see below.
 
 **SYNC-152 (2026-11-10): one pipeline per state; no primary/secondary.** WHO is scraped is the
 manifest alone (`enrolled_scrape_states`: status not `paused`/`probing`); `sync_schedule.yaml` holds
 only WHEN (`openstates_scrape.timing.<state>` / `defaults`). Every scraped state has one job,
 `openstates_scrape_<state>`, running `run_state_pipeline`: all sessions, history, broker signal, then
-ONE archive (`archive_after_scrape`, moved out of `_run_scrape`, so the US is archived once, not once
+ONE archive (`archive_with_retry` since SYNC-153; moved out of `_run_scrape`, so the US is archived once, not once
 per chamber). The job raises `PipelineFailed` on a failed session or archive (APScheduler then logs an
 error instead of "executed successfully"). The manual trigger runs the same function for any scraped
 state. **Never add a list of scraped states, a tier, or a per-tier code path back** — every reader
 that took "tier" as "the states we scrape" was wrong for the other half (SYNC-57, then Pennsylvania's
 404 on 2026-11-10). Guard: `tests/test_sync_152_one_pipeline_per_state.py` against the real manifest.
+
+**SYNC-153 (2026-11-10): archive only after a state's scrape.** No archive job is registered on a schedule
+(the weekly per-state days are gone, and so is `openstates_archive.jurisdictions`): a state is archived by
+its own pipeline, once, after all its sessions (`archive_with_retry`), or by
+`POST /trigger/openstates-archive/<state>` (`run_archive_only`). WHO is archived is the manifest's
+`archive.enabled`. One Redis lock per state (`ddp:pipeline_lock:<archive code>`, `redis_store.state_lock`)
+covers the whole run, scheduled or manual; the manual triggers take it BEFORE answering (409 when held) with a
+15-minute hand-off TTL that the run extends to the full one when it starts (a run never dispatched frees it), and
+every lock is cleared at startup (`app.lifespan`), which is what makes its long TTL (`pipeline_lock_ttl_s`,
+the run's worst case, ~53-68 h) safe. It fails open when Redis is down. The 30-minute debounce is gone: it
+was claimed before the archive ran and so blocked retries. A failed archive is retried after
+`ARCHIVE_RETRY_DELAYS_S` (30 min, 2 h), then alerted. **Do not add an archive cron or a second overlap
+guard back.**
 
 **OPEN-292 (2026-09-15): the SYNC-48 overlap lock is now a renewed lease, not a flat
 TTL.** A real full-session sweep (`limit=5000`, no `bill_candidates` cap) has no natural

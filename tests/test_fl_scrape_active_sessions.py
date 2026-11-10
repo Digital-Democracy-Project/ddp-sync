@@ -26,7 +26,7 @@ def test_the_checked_in_schedule_lists_no_fl_sessions(config):
 
 def _bookkeeping():
     return patch.object(openstates_scrape, "_check_sustained_blocking", new=AsyncMock()), patch(
-        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)
+        "ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=None)
     )
 
 

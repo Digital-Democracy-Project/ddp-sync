@@ -173,7 +173,7 @@ async def test_the_state_pipeline_preseeds_via_run_scrape():
         "ddp_sync.pipelines.openstates_scrape._run_with_group_kill",
         return_value=(0, b"", b"", False, False),
     ), patch(
-        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock(return_value=None)
+        "ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock(return_value=None)
     ), patch("ddp_sync.pipelines.openstates_scrape._check_sustained_blocking", new=AsyncMock()), patch(
         "ddp_sync.pipelines.openstates_scrape._write_flow_status", new=AsyncMock()
     ):

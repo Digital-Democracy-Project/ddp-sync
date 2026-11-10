@@ -36,7 +36,6 @@ MANIFEST = {
 
 AGREEING_CONFIG = {
     "openstates_archive": {
-        "jurisdictions": ["fl", "us", "nc", "al"],
         "knowledge_base_embedding": {"jurisdictions": ["fl", "us"]},
         "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
     },
@@ -99,9 +98,9 @@ def test_a_live_yaml_list_that_differs_is_drift(root):
     import copy
 
     config = copy.deepcopy(AGREEING_CONFIG)
-    config["openstates_archive"]["jurisdictions"].remove("nc")
+    config["openstates_archive"]["bill_search_refresh"]["jurisdictions"].remove("nc")
     f = jdc.collect_findings(config, _settings(), root)
-    assert [d["feature"] for d in f["drift"]] == ["archive"] and f["drift"][0]["source"] == "sync_schedule.yaml"
+    assert [d["feature"] for d in f["drift"]] == ["search_refresh"] and f["drift"][0]["source"] == "sync_schedule.yaml"
 
 
 def test_timing_for_a_state_the_manifest_does_not_scrape_is_drift(root):

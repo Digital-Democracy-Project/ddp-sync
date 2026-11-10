@@ -1,4 +1,9 @@
-"""Pipeline that runs OpenStates bill-document archiving on its own schedule.
+"""Pipeline that runs OpenStates bill-document archiving.
+
+SYNC-153: a state is archived only right after its own scrape (`archive_with_retry`, called once by
+`run_state_pipeline` after all the state's sessions) or by the manual archive trigger (`run_archive_only`), both under
+the state's pipeline lock, with a bounded retry and an alert. There is no recurring archive schedule any more (the
+weekly per-state days are gone) and no yaml list: the manifest's `archive.enabled` says who is archived.
 
 Split out of openstates_scrape.py (2026-07-31). Archiving to DDP-HOT used to
 run as the last step inside run-scrape.sh, which meant the incremental cutoff
@@ -11,9 +16,7 @@ WA run was still archiving 1h45m+ after scrape+import had already finished
 cleanly.
 
 run-scrape.sh no longer touches archiving at all (ddp-open-states
-PLAN-open-states.md, incremental-scraping section). This module runs
-run-archive.sh <state> for each ARCHIVE_ENABLED_STATE independently, on its
-own cadence, with no relationship to when/whether a scrape ran. Safe to run
+PLAN-open-states.md, incremental-scraping section). Safe to run
 concurrently with a scrape for the same jurisdiction — os-text-extract's
 natural-key skip check makes an already-archived version a cheap DB check,
 not a re-fetch — or with any other scrape.
@@ -46,33 +49,17 @@ logger = structlog.get_logger()
 
 DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 
-# Same jurisdiction list as ddp-open-states's ARCHIVE_ENABLED_STATES (activate.sh) and
-# openstates_archive.jurisdictions in sync_schedule.yaml. Exported so callers (the manual
-# trigger endpoint, run_archive_jobs' own default) share one definition instead of each
-# hardcoding their own copy -- triggers.py's copy silently went stale when ma/al/us were
-# added here 2026-08-10, exactly the class of bug a single shared constant prevents.
-DEFAULT_ARCHIVE_JURISDICTIONS = ["fl", "ut", "az", "wa", "va", "mi", "ma", "al", "us", "nc"]  # OPEN-328: nc was missing; only a last resort now (jurisdictions.yaml answers first)
-
 # OPEN-291: the scrape side's federal job is "usa" (openstates_scrape.timing.usa in
 # sync_schedule.yaml); the archive side's is "us" (matching OpenStates' own jurisdiction
-# code, see DEFAULT_ARCHIVE_JURISDICTIONS above). Every other jurisdiction uses the same
+# code). Every other jurisdiction uses the same
 # code on both sides. Kept as an explicit map rather than assumed identical strings --
-# archive_after_scrape() below is the one place this actually matters.
+# archive_with_retry() below is the one place this actually matters.
 _SCRAPE_TO_ARCHIVE_JURISDICTION = {"usa": "us"}
 
-# OPEN-291: how long a successful archive run "claims" its jurisdiction before another
-# attempt for the same jurisdiction is treated as a likely duplicate and skipped, not
-# launched. Exists because _run_archive_with_hook has no other overlap protection, and
-# two real callers can now land close together for the same jurisdiction: FL/USA each
-# call _run_scrape() once per session (this ticket's own new hook would otherwise fire
-# once per session, not once per run), and the still-registered weekly archive cron can
-# land on the same jurisdiction shortly after a scrape-triggered run. 30 minutes is
-# comfortably longer than the gap between sequential per-session scrape calls in
-# practice, comfortably shorter than "the next legitimate reason to archive this
-# jurisdiction again." A jurisdiction that never has two archive attempts land this
-# close together never notices this exists.
-_ARCHIVE_TRIGGER_DEBOUNCE_PREFIX = "ddp:archive_trigger_debounce:"
-_ARCHIVE_TRIGGER_DEBOUNCE_TTL_SECONDS = 1800
+# SYNC-153: a state's archive runs only after its own scrape (or a manual archive trigger), under the state's pipeline lock
+# (services/redis_store.state_lock). A failed archive is retried after these delays, then alerted. Plan open question 3
+# proposed two retries, 30 min and 2 h after a failure; built with those values, not yet confirmed by Ramon.
+ARCHIVE_RETRY_DELAYS_S: tuple[int, ...] = (1800, 7200)
 
 # Per-jurisdiction archive timeouts. Downloads + extracts every not-yet-captured
 # document, so these scale with total historical bill count, not just what
@@ -154,7 +141,7 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     sync_schedule.yaml -- absent/disabled by default, so adding this never changes
     behavior for a jurisdiction that hasn't explicitly opted in. Same shape as the
     scrape pipeline's openstates_scrape.scrapebot_fallback block (openstates_scrape.py), but
-    keyed inside this pipeline's own config subtree: run_archive_jobs() receives the
+    keyed inside this pipeline's own config subtree: the archive functions receive the
     openstates_archive: section directly.
     """
     fallback_cfg = (config or {}).get("scrapebot_fallback", {})
@@ -394,7 +381,7 @@ async def _run_archive_fargate(
     ecs_client=None,
 ) -> dict[str, Any]:
     """OPEN-192 (reopened): run cloud_archiver.py for one jurisdiction as a real Fargate task,
-    instead of run-archive.sh locally. Selected by run_archive_jobs()/run_single_archive_job()
+    instead of run-archive.sh locally. Selected by run_single_archive_job()
     when openstates_archive.use_fargate is true; default is false, so enabling this file's own
     import changes no behavior until that flag is flipped.
 
@@ -931,41 +918,6 @@ async def _maybe_refresh_bill_search(jurisdiction: str, config: dict | None) -> 
     )
 
 
-async def _acquire_archive_debounce(jurisdiction: str) -> bool:
-    """OPEN-291: True means this call may proceed, False means skip -- another archive
-    attempt for this jurisdiction already claimed the debounce window and should be
-    treated as the one doing the real work.
-
-    Fails OPEN, not closed: if Redis is unavailable or the SETNX itself errors, this
-    returns True (proceed) rather than blocking archiving on a debounce mechanism that
-    didn't exist before OPEN-291 -- this feature must never make archiving less
-    reliable than it was before it existed. The cost of failing open is at worst the
-    same duplicate-run exposure archiving already had prior to this ticket; the cost of
-    failing closed would be a real archive skipped for a reason that has nothing to do
-    with whether it was actually needed.
-    """
-    try:
-        from ddp_sync.services.redis_store import get_redis_store
-
-        redis_store = get_redis_store()
-        if not redis_store._client:
-            return True
-        acquired = await redis_store._client.set(
-            f"{_ARCHIVE_TRIGGER_DEBOUNCE_PREFIX}{jurisdiction}",
-            "1",
-            nx=True,
-            ex=_ARCHIVE_TRIGGER_DEBOUNCE_TTL_SECONDS,
-        )
-        return bool(acquired)
-    except Exception as e:  # noqa: BLE001 -- a debounce-check failure must never block a real archive
-        logger.warning(
-            "archive_trigger_debounce_check_failed_proceeding",
-            jurisdiction=jurisdiction,
-            error=str(e),
-        )
-        return True
-
-
 def _archive_jurisdiction_code(scrape_jurisdiction: str) -> str:
     """Maps a scrape-side jurisdiction code to the archive side's own code for the same
     real jurisdiction -- see _SCRAPE_TO_ARCHIVE_JURISDICTION's docstring."""
@@ -980,8 +932,7 @@ def _load_archive_config_for_scrape_trigger() -> dict[str, Any]:
     openstates_scrape only -- it has no view into openstates_archive at all, and giving
     it one would mean threading an unrelated config section through every scrape job
     wrapper's signature. Reuses scheduler.py's own DEFAULT_CONFIG_PATH (lazy import --
-    scheduler.py already imports this module lazily too, see its own _register_
-    openstates_archive_jobs, so a module-level import here would cycle) rather than
+    scheduler.py already imports the pipelines lazily too, so a module-level import here would cycle) rather than
     re-deriving the same path resolution a second time.
     """
     try:
@@ -997,51 +948,81 @@ def _load_archive_config_for_scrape_trigger() -> dict[str, Any]:
     return full_config.get("openstates_archive", {})
 
 
-async def archive_after_scrape(scrape_jurisdiction: str, archive_config: dict | None = None) -> bool | None:
-    """Archive one state right after its scrape (OPEN-291), and say how it went: None when the state is not
-    archived after its scrape (archive disabled, or not enrolled), True when the archive succeeded, False when it
-    failed or raised. Never raises.
-
-    SYNC-152: called once per run by `run_state_pipeline`, after ALL of a state's sessions (the US used to be
-    archived once per chamber), and its outcome now decides whether the job is reported as failed. It used to be
-    `maybe_trigger_archive_after_scrape`, called inside `_run_scrape` with its result thrown away.
-
-    Enrollment: in authoritative mode the shared state list decides (`archive.enabled`, SYNC-146), so a new state's
-    scrape triggers its archive with no ddp-sync edit; shadow mode, or a list that cannot be read, keeps the yaml
-    list `openstates_archive.jurisdictions`. `archive_config` is the `openstates_archive` block (the scheduler and
-    the manual trigger pass theirs); None loads it from sync_schedule.yaml.
-    """
-    archive_jurisdiction = _archive_jurisdiction_code(scrape_jurisdiction)
+async def _archive_with_retry(jurisdiction: str, archive_config: dict | None) -> tuple[bool | None, int]:
+    """`archive_with_retry`'s work, plus the number of attempts made (the manual archive's status record shows it)."""
+    j = _archive_jurisdiction_code(jurisdiction)
     if archive_config is None:
         archive_config = _load_archive_config_for_scrape_trigger()
-
     if not archive_config.get("enabled", False):
-        return None
-    listed = enrolled(
-        "archive_after_scrape", archive_config.get("jurisdictions") or [], _scrape_root(archive_config)
-    )
-    if archive_jurisdiction not in (listed or []):
-        return None
-
+        return None, 0
+    # SYNC-153: the manifest's archive.enabled is the ONE list; there is no yaml list and no fallback.
+    if j not in (enrolled("archive", None, _scrape_root(archive_config)) or []):
+        return None, 0
+    attempt = 0
+    for attempt, delay in enumerate((0, *ARCHIVE_RETRY_DELAYS_S), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            result = await run_single_archive_job(j, archive_config)  # Fargate (or local), then LegBot/search/embedding
+        except Exception as e:  # noqa: BLE001 -- an exception is a failed attempt, not the end of the retries
+            result = {"success": False, "error": str(e)}
+        if result.get("success"):
+            logger.info("archive_after_scrape_succeeded", jurisdiction=j, attempt=attempt)
+            return True, attempt
+        logger.warning("archive_attempt_failed", jurisdiction=j, attempt=attempt, error=result.get("error"))
     try:
-        result = await run_single_archive_job(archive_jurisdiction, archive_config)
-    except Exception as e:  # noqa: BLE001 -- an exception is a failed archive, reported as such
-        logger.error(
-            "scrape_triggered_archive_failed",
-            scrape_jurisdiction=scrape_jurisdiction,
-            archive_jurisdiction=archive_jurisdiction,
-            error=str(e),
+        await asyncio.to_thread(
+            post_alert,
+            f":red_circle: *OpenStates archive failed: {j}* — {attempt} attempts (retried after "
+            f"{', '.join(f'{d // 60} min' for d in ARCHIVE_RETRY_DELAYS_S)}); its LegBot, search refresh and embedding "
+            f"did not run. Check the ddp-sync log.",
+            source="openstates_archive.archive_failure",
         )
-        return False
+    except Exception as e:  # noqa: BLE001 -- the alert must not hide the outcome
+        logger.error("archive_failure_alert_failed", jurisdiction=j, error=str(e))
+    return False, attempt
 
-    log_fn = logger.info if result.get("success") else logger.warning
-    log_fn(
-        "scrape_triggered_archive_result",
-        scrape_jurisdiction=scrape_jurisdiction,
-        archive_jurisdiction=archive_jurisdiction,
-        result=result,
-    )
-    return bool(result.get("success"))
+
+async def archive_with_retry(jurisdiction: str, archive_config: dict | None = None) -> bool | None:
+    """Archive one state (SYNC-153): None when it is not archived (archive disabled, or the manifest's
+    `archive.enabled` is false or unreadable), True on success, False after 1 + len(ARCHIVE_RETRY_DELAYS_S) failed
+    attempts and an alert. Never raises; an exception from one attempt counts as a failed attempt.
+
+    Only a failed ARCHIVE is retried: the hooks (LegBot, search refresh, embedding) run inside `_run_archive_with_hook`
+    only after a successful archive, each in its own try, and never change its result. A repeated archive skips the
+    documents it already saved. The caller holds the state's pipeline lock (`run_state_pipeline`, or
+    `run_archive_only`), which is what stops two archives of one state overlapping; the old 30-minute debounce is gone.
+    The waits happen inside the caller's job (worst case 2.5 h), which the lock's TTL covers.
+    `archive_config` is the `openstates_archive` block; None loads it from sync_schedule.yaml.
+    """
+    return (await _archive_with_retry(jurisdiction, archive_config))[0]
+
+
+async def run_archive_only(jurisdiction: str, archive_config: dict, *, lock_token: str | None = None) -> dict[str, Any]:
+    """The manual archive trigger's run (SYNC-153): archive one state under its pipeline lock, with the same retry, and
+    write its own status record, `openstates_archive_<state>` (completed / failed / skipped, plus the attempt count),
+    never the scrape's. The trigger took the lock before answering and passes its token; without one this takes it."""
+    from ddp_sync.pipelines.openstates_scrape import pipeline_lock_ttl_s
+    from ddp_sync.services.redis_store import state_lock
+
+    j = _archive_jurisdiction_code(jurisdiction)
+    started = datetime.now(timezone.utc)
+    archived, attempts, status = None, 0, "failed"
+    try:
+        async with state_lock(j, pipeline_lock_ttl_s(j, None, archive_config), token=lock_token) as held:
+            if not held:
+                status = "skipped"
+                logger.warning("manual_archive_skipped_state_busy", jurisdiction=j)
+                return {"success": False, "jurisdiction": j, "skipped": "busy"}
+            archived, attempts = await _archive_with_retry(j, archive_config)
+            status = "completed" if archived else "failed" if archived is False else "skipped"
+            return {"success": archived is not False, "jurisdiction": j, "archived": archived, "attempts": attempts}
+    finally:
+        await _write_flow_status(f"openstates_archive_{j}", {
+            "flow": f"openstates_archive_{j}", "started_at": started.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(), "status": status,
+            "archived": archived, "attempts": attempts,
+        })
 
 
 async def _run_archive_with_hook(
@@ -1052,13 +1033,8 @@ async def _run_archive_with_hook(
     """Thin wrapper adding the archive-completion LegBot hook (SYNC-65) and the independent
     bill-search refresh (SYNC-87) and knowledge-base embedding (SYNC-83) hooks uniformly over both
     archive branches (local run-archive.sh and Fargate cloud_archiver.py)
-    -- neither run_archive_jobs() nor run_single_archive_job() needs its own copy.
-
-    OPEN-291: also the debounce choke point for the new scrape-completion-triggers-
-    archive hook -- checked here, not just at that hook's own call site, so it also
-    covers the still-registered weekly cron landing close to a hook-triggered run,
-    not only FL/USA's multi-session case. Returns success-but-skipped rather than
-    running a second time.
+    -- run_single_archive_job() needs no copy of its own. (SYNC-153 removed the OPEN-291 debounce that
+    used to be claimed here: the state's pipeline lock, held by the caller, is what stops overlap now.)
 
     `archive_started_at` is captured here, before the archive itself runs, as a
     real wall-clock floor for `resolve_touched_sessions`' own `since` filter --
@@ -1072,13 +1048,6 @@ async def _run_archive_with_hook(
     archive may change that archive's result," not "nothing we currently believe
     can raise."
     """
-    if not await _acquire_archive_debounce(jurisdiction):
-        logger.info(
-            "archive_debounced_skipping_duplicate_run",
-            jurisdiction=jurisdiction,
-        )
-        return {"success": True, "jurisdiction": jurisdiction, "skipped": "debounced"}
-
     archive_started_at = datetime.now(timezone.utc)
     if (config or {}).get("use_fargate", False):
         result = await _run_archive_fargate(jurisdiction, config=config)
@@ -1114,75 +1083,10 @@ async def _run_archive_with_hook(
     return result
 
 
-async def run_archive_jobs(config: dict | None = None) -> dict[str, Any]:
-    """Archive every jurisdiction in ARCHIVE_ENABLED_STATES concurrently.
-
-    Independent of the scrape schedule entirely — each jurisdiction's own
-    natural-key skip check makes this safe to run at any cadence, on any
-    subset of jurisdictions, without coordinating with when that
-    jurisdiction's own scrape last ran.
-
-    OPEN-192 (reopened): `use_fargate: true` in config switches the whole batch to
-    _run_archive_fargate instead of the local run-archive.sh wrapper -- one flag for the
-    entire batch, not per-jurisdiction, since a mixed batch would need its own reasoning
-    about which jurisdictions are safe to run where, and nothing here needs that yet.
-    """
-    # OPEN-328: a yaml with no list falls back to jurisdictions.yaml, then to the last-resort constant. An
-    # explicitly EMPTY list is a real answer (nothing enrolled), not "absent", so test for None, not falsiness.
-    listed = enrolled("archive", (config or {}).get("jurisdictions"), _scrape_root(config))
-    jurisdictions: list[str] = DEFAULT_ARCHIVE_JURISDICTIONS if listed is None else listed
-    start_time = datetime.now(timezone.utc)
-    t = time.monotonic()
-
-    logger.info("openstates_archive: starting batch", jurisdictions=jurisdictions)
-
-    openstates_root = None if (config or {}).get("use_fargate", False) else _get_root(config)
-    results: list[dict[str, Any]] = await asyncio.gather(
-        *[
-            _run_archive_with_hook(j, openstates_root, config=config)
-            for j in jurisdictions
-        ]
-    )
-
-    duration = round(time.monotonic() - t, 1)
-    failed = [r for r in results if not r["success"]]
-
-    log_fn = logger.error if failed else logger.info
-    log_fn(
-        "openstates_archive: batch completed",
-        jurisdictions=jurisdictions,
-        total=len(results),
-        failed=len(failed),
-        duration_seconds=duration,
-    )
-
-    await _write_flow_status("openstates_archive", {
-        "flow": "openstates_archive",
-        "started_at": start_time.isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-        "status": "completed" if not failed else "completed_with_errors",
-        "jurisdictions": jurisdictions,
-        "total": len(results),
-        "failed": len(failed),
-        "results": list(results),
-        "duration_seconds": duration,
-    })
-    return {
-        "success": not failed,
-        "jurisdictions": jurisdictions,
-        "results": list(results),
-        "failed": len(failed),
-        "duration_seconds": duration,
-    }
-
-
 async def run_single_archive_job(
     jurisdiction: str,
     config: dict | None = None,
 ) -> dict[str, Any]:
-    """Archive a single arbitrary jurisdiction. Used by the manual trigger endpoint.
-
-    Same `use_fargate` dispatch (and same archive-completion LegBot hook) as
-    run_archive_jobs() -- see _run_archive_with_hook's docstring.
-    """
+    """One archive attempt for one jurisdiction (`use_fargate` dispatch, then the archive-completion hooks; see
+    _run_archive_with_hook). `archive_with_retry` calls it once per attempt."""
     return await _run_archive_with_hook(jurisdiction, config=config)

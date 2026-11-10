@@ -1,34 +1,10 @@
-"""Unit tests for OPEN-291's scrape-completion-triggers-archive hook.
+"""The archive that follows a state's scrape (OPEN-291; SYNC-152 moved it into run_state_pipeline; SYNC-153 made it the
+ONLY scheduled archive, with a retry, under the state's pipeline lock, and removed the 30-minute debounce).
 
-OPEN-140 made scrape cadence dynamic (weekly -> nightly) but archive scheduling stayed
-a completely separate, static per-jurisdiction weekday map with no connection to it --
-so a jurisdiction escalated to nightly scraping kept its archive job on its old fixed
-day, drifting out of sync. Rather than teaching the archive schedule to understand
-"nightly" and building a separate completion-sequencing mechanism (both real,
-per-jurisdiction-shaped fixes that would need to stay hand-synced with whatever
-dynamic_cadence decides forever), this triggers a jurisdiction's archive job directly
-from its own scrape completion. SYNC-152 moved the call from `_run_scrape()` (once per
-session) to `run_state_pipeline` (once per run, after every session), as `archive_after_scrape`,
-which now returns the outcome (None / True / False) so a failed archive fails the job.
-A jurisdiction opts in purely by being listed in both its own scrape config and
-`openstates_archive.jurisdictions` -- no per-jurisdiction code, ever.
-
-Covers:
-  * the enabled gate -- archive config disabled means zero calls
-  * a jurisdiction not in openstates_archive.jurisdictions is skipped (this is what
-    covers Alabama: archived, but not scraped anywhere in ddp-sync, so it never
-    reaches this function to begin with -- but the same gate would apply to any
-    scraped jurisdiction not opted into archiving)
-  * the usa -> us jurisdiction-code mapping
-  * a config-load failure is swallowed, never propagates
-  * a run_single_archive_job exception is swallowed, never propagates
-  * `_run_scrape` itself no longer archives (the pipeline does, tests/test_sync_152_one_pipeline_per_state.py)
-  * the debounce inside `_run_archive_with_hook`: a second archive attempt for the
-    same jurisdiction within the window is skipped, not run a second time -- this is
-    what makes FL/USA's multi-session scrape loop (which would otherwise trigger this
-    hook once per session) safe, and what protects against the still-registered
-    weekly cron landing close to a hook-triggered run
-  * the debounce fails OPEN when Redis is unavailable, never blocks a real archive
+Covers here: the usa -> us code mapping, the gates of `archive_with_retry` (archive disabled; the manifest's
+`archive.enabled` is the one list, no yaml list, no fallback), `_run_scrape` itself never archiving, and that with the
+debounce gone two archives in a row both run. The retry, the alert and the lock are in
+tests/test_sync_153_archive_after_scrape_only.py. A tiny manifest in a temp dir stands in for ddp-open-states.
 """
 
 from __future__ import annotations
@@ -36,17 +12,30 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from ddp_sync.pipelines.openstates_archive import (
-    _acquire_archive_debounce,
     _archive_jurisdiction_code,
     _run_archive_with_hook,
-    archive_after_scrape,
+    archive_with_retry,
 )
 from ddp_sync.pipelines.openstates_scrape import _run_scrape
+from ddp_sync.services import jurisdiction_enrollment as je
+
+ARCHIVE_CFG = {"enabled": True}
 
 
-ARCHIVE_CFG = {"enabled": True, "jurisdictions": ["mi", "us"]}
+@pytest.fixture(autouse=True)
+def manifest(tmp_path, monkeypatch):
+    je._cache.clear()
+    je._logged.clear()
+    (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump({
+        "mi": {"status": "live", "archive": {"enabled": True}},
+        "us": {"status": "live", "archive": {"enabled": True}},
+        "al": {"status": "paused", "archive": {"enabled": False}},
+    }))
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path))
+    return tmp_path
 
 
 # ── _archive_jurisdiction_code ──────────────────────────────────────────────────────
@@ -61,115 +50,57 @@ def test_every_other_jurisdiction_is_unchanged(jurisdiction):
     assert _archive_jurisdiction_code(jurisdiction) == jurisdiction
 
 
-# ── archive_after_scrape ──────────────────────────────────────────────
+# ── archive_with_retry's gates ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_disabled_archive_config_triggers_nothing():
-    with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value={"enabled": False, "jurisdictions": ["mi"]},
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
-    ) as mock_archive:
-        assert await archive_after_scrape("mi") is None
-
-    mock_archive.assert_not_awaited()
+async def test_disabled_archive_config_archives_nothing():
+    with patch("ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()) as run:
+        assert await archive_with_retry("mi", {"enabled": False}) is None
+    run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_jurisdiction_not_in_archive_list_triggers_nothing():
-    """Covers Alabama's real shape: archived elsewhere on its own schedule, but not
-    scraped by ddp-sync at all -- this is the same gate that would apply to any
-    scraped-but-not-archived jurisdiction, Alabama just never reaches this function
-    to begin with since it's absent from every scrape config too."""
-    with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value={"enabled": True, "jurisdictions": ["mi", "us"]},
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
-    ) as mock_archive:
-        assert await archive_after_scrape("al") is None
-
-    mock_archive.assert_not_awaited()
+async def test_a_state_whose_manifest_archive_is_off_is_not_archived_whatever_a_yaml_list_says():
+    with patch("ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()) as run:
+        assert await archive_with_retry("al", {"enabled": True, "jurisdictions": ["al"]}) is None
+    run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_jurisdiction_in_list_triggers_the_archive_job():
-    with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value=ARCHIVE_CFG,
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
-        new=AsyncMock(return_value={"success": True}),
-    ) as mock_archive:
-        assert await archive_after_scrape("mi") is True
-
-    mock_archive.assert_awaited_once_with("mi", ARCHIVE_CFG)
+async def test_an_unreadable_manifest_archives_nothing_rather_than_guessing(manifest, monkeypatch):
+    monkeypatch.setenv("OPENSTATES_ROOT", str(manifest / "nowhere"))
+    with patch("ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()) as run:
+        assert await archive_with_retry("mi", ARCHIVE_CFG) is None
+    run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_usa_scrape_triggers_the_us_archive_job():
-    """The one real naming wrinkle: scrape's federal jurisdiction is "usa", archive's
-    is "us" -- the trigger must use the archive-side name, not the scrape-side one."""
+async def test_an_enrolled_state_is_archived():
     with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value=ARCHIVE_CFG,
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
-        new=AsyncMock(return_value={"success": True}),
-    ) as mock_archive:
-        assert await archive_after_scrape("usa") is True
-
-    mock_archive.assert_awaited_once_with("us", ARCHIVE_CFG)
+        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock(return_value={"success": True})
+    ) as run:
+        assert await archive_with_retry("mi", ARCHIVE_CFG) is True
+    run.assert_awaited_once_with("mi", ARCHIVE_CFG)
 
 
 @pytest.mark.asyncio
-async def test_config_load_failure_triggers_nothing_and_does_not_raise():
+async def test_usa_scrape_archives_us():
     with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value={},  # the loader's own documented failure return
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()
-    ) as mock_archive:
-        assert await archive_after_scrape("mi") is None  # must not raise
-
-    mock_archive.assert_not_awaited()
+        "ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock(return_value={"success": True})
+    ) as run:
+        assert await archive_with_retry("usa", ARCHIVE_CFG) is True
+    run.assert_awaited_once_with("us", ARCHIVE_CFG)
 
 
 @pytest.mark.asyncio
-async def test_archive_job_exception_is_reported_as_a_failed_archive_not_raised():
+async def test_no_config_loads_the_file():
     with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-        return_value=ARCHIVE_CFG,
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
-        new=AsyncMock(side_effect=RuntimeError("fargate blew up")),
-    ):
-        assert await archive_after_scrape("mi") is False  # must not raise
-
-
-@pytest.mark.asyncio
-async def test_a_failed_archive_result_is_reported_as_false():
-    with patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
-        new=AsyncMock(return_value={"success": False, "error": "exit_code_1"}),
-    ):
-        assert await archive_after_scrape("mi", ARCHIVE_CFG) is False
-
-
-@pytest.mark.asyncio
-async def test_a_passed_archive_config_is_used_instead_of_loading_the_file():
-    with patch(
-        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger",
-    ) as mock_load, patch(
-        "ddp_sync.pipelines.openstates_archive.run_single_archive_job",
-        new=AsyncMock(return_value={"success": True}),
-    ) as mock_archive:
-        assert await archive_after_scrape("mi", ARCHIVE_CFG) is True
-
-    mock_load.assert_not_called()
-    mock_archive.assert_awaited_once_with("mi", ARCHIVE_CFG)
+        "ddp_sync.pipelines.openstates_archive._load_archive_config_for_scrape_trigger", return_value={}
+    ) as load, patch("ddp_sync.pipelines.openstates_archive.run_single_archive_job", new=AsyncMock()) as run:
+        assert await archive_with_retry("mi") is None  # the loader's failure return ({}) means "disabled"
+    load.assert_called_once()
+    run.assert_not_awaited()
 
 
 # ── _run_scrape no longer archives (SYNC-152: run_state_pipeline archives once, after every session) ──
@@ -180,117 +111,29 @@ async def test_run_scrape_itself_never_archives():
     with patch(
         "ddp_sync.pipelines.openstates_scrape._run_scrape_impl",
         new=AsyncMock(return_value={"success": True, "jurisdiction": "mi"}),
-    ), patch(
-        "ddp_sync.pipelines.openstates_archive.archive_after_scrape", new=AsyncMock()
-    ) as mock_archive:
+    ), patch("ddp_sync.pipelines.openstates_archive.archive_with_retry", new=AsyncMock()) as mock_archive:
         result = await _run_scrape("mi", None, "/fake/root")
 
     assert result["success"] is True
     mock_archive.assert_not_awaited()
 
 
-# ── debounce ─────────────────────────────────────────────────────────────────────────
-
-
-class _FakeRedisClient:
-    """Mirrors the real redis.asyncio client's `SET key val NX EX ttl` contract just
-    enough for these tests: the first caller for a given key gets True (acquired);
-    every later caller for the same key gets None (already claimed) until it expires --
-    TTL expiry itself isn't simulated, these tests only need "claimed vs not"."""
-
-    def __init__(self):
-        self._claimed: set[str] = set()
-
-    async def set(self, key, value, nx=False, ex=None):
-        if nx and key in self._claimed:
-            return None
-        self._claimed.add(key)
-        return True
-
-
-def _patch_redis(client):
-    return patch(
-        "ddp_sync.services.redis_store.get_redis_store",
-        return_value=type("_Store", (), {"_client": client})(),
-    )
+# ── no debounce (SYNC-153): the state's lock is what stops overlap, so a retry is never skipped ──
 
 
 @pytest.mark.asyncio
-async def test_first_archive_attempt_for_a_jurisdiction_acquires_the_debounce():
-    with _patch_redis(_FakeRedisClient()):
-        assert await _acquire_archive_debounce("mi") is True
-
-
-@pytest.mark.asyncio
-async def test_second_archive_attempt_within_the_window_is_skipped():
-    client = _FakeRedisClient()
-    with _patch_redis(client):
-        assert await _acquire_archive_debounce("mi") is True
-        assert await _acquire_archive_debounce("mi") is False
-
-
-@pytest.mark.asyncio
-async def test_debounce_is_per_jurisdiction_not_global():
-    client = _FakeRedisClient()
-    with _patch_redis(client):
-        assert await _acquire_archive_debounce("mi") is True
-        assert await _acquire_archive_debounce("us") is True
-
-
-@pytest.mark.asyncio
-async def test_debounce_fails_open_when_redis_unavailable():
-    """No live Redis connection (the real state in a bare unit-test process, and a
-    real possibility in production) must never block a real archive -- this feature
-    didn't exist before OPEN-291, and archiving must never become LESS reliable
-    than it was without it."""
-    with _patch_redis(type("_Store", (), {"_client": None})()):
-        assert await _acquire_archive_debounce("mi") is True
-
-
-@pytest.mark.asyncio
-async def test_debounce_fails_open_when_the_redis_call_itself_raises():
-    class _BrokenClient:
-        async def set(self, *a, **k):
-            raise RuntimeError("connection reset")
-
-    with _patch_redis(_BrokenClient()):
-        assert await _acquire_archive_debounce("mi") is True
-
-
-@pytest.mark.asyncio
-async def test_run_archive_with_hook_skips_a_debounced_duplicate():
-    """The actual integration point: a second _run_archive_with_hook call for the
-    same jurisdiction inside the debounce window is skipped cleanly -- success,
-    not an error, and the underlying archive branches are never invoked a second
-    time."""
-    client = _FakeRedisClient()
-    with _patch_redis(client), patch(
+async def test_two_archives_in_a_row_both_run():
+    with patch(
         "ddp_sync.pipelines.openstates_archive._run_archive",
         new=AsyncMock(return_value={"success": True, "jurisdiction": "mi"}),
     ) as mock_run_archive, patch(
-        "ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive",
-        new=AsyncMock(),
+        "ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive", new=AsyncMock(),
+    ), patch("ddp_sync.pipelines.openstates_archive._maybe_refresh_bill_search", new=AsyncMock()), patch(
+        "ddp_sync.pipelines.openstates_archive._maybe_embed_knowledge_base", new=AsyncMock()
     ):
         first = await _run_archive_with_hook("mi", "/fake/root", config={})
         second = await _run_archive_with_hook("mi", "/fake/root", config={})
 
-    assert first["success"] is True
-    assert first.get("skipped") is None
-    assert second == {"success": True, "jurisdiction": "mi", "skipped": "debounced"}
-    mock_run_archive.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_run_archive_with_hook_is_not_debounced_across_different_jurisdictions():
-    client = _FakeRedisClient()
-    with _patch_redis(client), patch(
-        "ddp_sync.pipelines.openstates_archive._run_archive",
-        new=AsyncMock(return_value={"success": True}),
-    ) as mock_run_archive, patch(
-        "ddp_sync.pipelines.openstates_archive._maybe_trigger_legbot_for_archive",
-        new=AsyncMock(),
-    ):
-        await _run_archive_with_hook("mi", "/fake/root", config={})
-        await _run_archive_with_hook("us", "/fake/root", config={})
-
+    assert first["success"] is True and second["success"] is True
+    assert "skipped" not in second
     assert mock_run_archive.await_count == 2

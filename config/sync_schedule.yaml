@@ -730,32 +730,17 @@ openstates_scrape:
     day_of_month: 1
     sync_time_utc: "08:00"
 
-# Split out from openstates_scrape (2026-07-31) — bill-document archiving to DDP-HOT used to
-# run as the last step of each scrape job, gating that job's incremental-cutoff marker write on
-# the archive step finishing too. A run whose archive step ran long or died left the cutoff
-# stuck, making the next run slower and more likely to also miss its own archive window —
-# observed live: a WA run still archiving 1h45m+ after scrape+import had already finished
-# cleanly. Fully independent: each jurisdiction below archives on its own schedule, with no
-# relationship to when/whether that jurisdiction's own scrape last ran.
-# Same jurisdiction list as ddp-open-states's ARCHIVE_ENABLED_STATES (activate.sh) — keep in
-# sync if that list ever changes.
-#
-# Changed 2026-08-10: each jurisdiction now runs once a week, on its own day, instead of every
-# jurisdiction running concurrently every day. `us` alone has ~83k never-archived documents —
-# two orders of magnitude more than any state jurisdiction — so a daily all-jurisdictions run
-# let federal's fetch+extract volume dominate shared CPU/network/DDP-HOT I/O and starve the
-# smaller jurisdictions' own runs. `us` gets a day entirely to itself; fl+ut and wa+va share a
-# day since both pairs are already ~fully archived and do almost no work once caught up.
+# Bill-document archiving to DDP-HOT (then the archive's hooks: LegBot, search refresh, embedding).
+# SYNC-153 (PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state"): a state is archived
+# ONLY right after its own scrape, inside its openstates_scrape_<state> pipeline job, or by
+# POST /trigger/openstates-archive/<state>; both hold the state's pipeline lock and retry a failed
+# archive twice (30 min, then 2 h; ARCHIVE_RETRY_DELAYS_S) before an alert. WHO is archived is the
+# manifest's archive.enabled. The weekly per-state archive days, the `jurisdictions` list and the
+# 30-minute debounce are gone. Alabama (paused, never scraped) was archived every Saturday by that
+# cron and now is not, until it is scraped again (plan open question 1, Ramon's to answer).
 openstates_archive:
-  # OPEN-291: `enabled` and `jurisdictions` below are also read by
-  # maybe_trigger_archive_after_scrape() (openstates_archive.py), the hook inside
-  # _run_scrape() that fires a jurisdiction's archive job right after its own scrape
-  # completes -- not just by the weekly cron `schedule` map further down. A
-  # jurisdiction opts into that hook purely by appearing here (and in its own scrape
-  # config) -- no separate flag, no per-jurisdiction code. The weekly `schedule` below
-  # stays registered regardless, as a floor/backstop; a debounce inside
-  # _run_archive_with_hook is what keeps that from producing a duplicate run when it
-  # lands close to a hook-triggered one.
+  # The global switch for the archive after a scrape and the manual archive trigger
+  # (archive_with_retry in openstates_archive.py).
   enabled: true
   use_fargate: true   # OPEN-192: Ramon's deliberate cutover decision (2026-09-09) -- archiving
                       # now runs cloud_archiver.py as a real Fargate task, reading from RDS
@@ -839,7 +824,9 @@ openstates_archive:
     delete_orphans: false
     # SYNC-90: the staged backfill (POST /trigger/knowledge-base-backfill/{jurisdiction}) walks the
     # jurisdictions above, whether or not `enabled` is true (a backfill is an explicit, manual run).
-    # It pauses through this UTC window so it stays out of the 05:00 UTC archive start.
+    # It pauses through this UTC window so it stays out of the 05:00 UTC archive start. SYNC-153 removed that
+    # start (archives now follow each scrape); the window is left as it is until it is re-measured (plan open
+    # question 2).
     backfill:
       blackout_start_utc: "04:45"
       blackout_end_utc: "07:00"
@@ -856,35 +843,6 @@ openstates_archive:
     enabled: true
     jurisdictions: [us, fl, mi, az, va, wa, ut, nc]
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
-  sync_time_utc: "05:00"   # shared time-of-day for every jurisdiction below; well clear of the
-                           # 01:00-03:00 scrape-job start times, though overlap with a live
-                           # scrape is safe by design (natural-key skip check)
-  jurisdictions:
-    - fl
-    - ut
-    - az
-    - wa
-    - va
-    - mi
-    - ma
-    - al
-    - us
-    # OPEN-231 Stage 6: NC's one-time catch-up run (6192/6192 archived, Stage 4's gate) already
-    # cleared its backlog, so its weekly runs going forward should be as light as fl/ut's --
-    # paired with mi on thursday rather than given a dedicated day. Arbitrary choice of day
-    # beyond "pick an already-light one" -- change freely if a different day fits ops better.
-    - nc
-  schedule:
-    fl: monday
-    ut: monday
-    az: tuesday
-    wa: wednesday
-    va: wednesday
-    mi: thursday
-    ma: friday
-    al: saturday
-    us: sunday
-    nc: thursday
   # Same ScrapeBot cookie pre-seed the scrape jobs get (openstates_scrape.scrapebot_fallback above),
   # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
   # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed

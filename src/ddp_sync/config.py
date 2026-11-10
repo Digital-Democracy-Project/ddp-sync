@@ -179,6 +179,7 @@ class SyncSettings:
     votebot_eval_enabled: bool = True
     api_health_check_enabled: bool = True
     openstates_scrape_enabled: bool = True
+    # SYNC-153: gated only the weekly archive cron, which is gone; nothing reads it now (kept so a host's env does not break).
     openstates_archive_enabled: bool = True
     # OPEN-320: apply-local-patches.sh refreshes the Mac's live editable openstates checkouts; a
     # host that scrapes through baked-in Fargate images has none, so opts out here.
