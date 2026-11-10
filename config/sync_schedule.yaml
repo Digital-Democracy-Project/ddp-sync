@@ -457,8 +457,8 @@ openstates_scrape:
   # what actually starts NC's recurring cloud cycles so Stage 6's soak period can begin for real.
   cloud_path:
     enabled: true
-    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la"]
-    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la"]
+    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la", "al"]  # OPEN-523: Alabama resumes (manifest cloud_path true)
+    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la", "al"]
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
