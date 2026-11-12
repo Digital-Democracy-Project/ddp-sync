@@ -60,7 +60,6 @@ KEY_MAP = {
     "pinecone_environment": "PINECONE_ENVIRONMENT",
     "pinecone_index_name": "PINECONE_INDEX_NAME",
     "pinecone_namespace": "PINECONE_NAMESPACE",
-    "openstates_api_key": "OPENSTATES_API_KEY",
     "congress_api_key": "CONGRESS_API_KEY",
     "brevo_api_key": "BREVO_API_KEY",
     "brevo_rate_limit_rph": "BREVO_RATE_LIMIT_RPH",

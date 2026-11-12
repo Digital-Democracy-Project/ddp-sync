@@ -5,10 +5,9 @@
 check only runs on ddp-open-states PRs, and the two env-var lists are not in git at all. This job compares, on
 the host it runs on:
 
-  - every jurisdiction list in the LIVE sync_schedule.yaml (the dict this process loaded, which on a host can be
-    hand-edited), via `jurisdiction_enrollment.config_disagreements`;
-  - this host's own `DDP_OPENSTATES_JURISDICTIONS`, but only when
-    the host sets them (a host that routes nothing to the replica is not "drift");
+  - the LIVE sync_schedule.yaml (the dict this process loaded, which on a host can be hand-edited), via
+    `jurisdiction_enrollment.config_disagreements`: since SYNC-157 it holds no per-state list (the manifest is read
+    directly), so only `openstates_scrape.timing` can disagree;
   - whether the manifest can answer at all. A monitor that cannot see is an alert condition, not a log line
     (the retired staleness watchdog watched nothing for six weeks): a missing, unreadable or out-of-date
     checkout (the EC2 bind mount is never auto-pulled) is reported as "unverifiable".
@@ -37,41 +36,26 @@ logger = structlog.get_logger()
 FLOW_KEY = "jurisdiction_drift_check"
 DEFAULT_REPEAT_DAYS = 7
 
-# env var name -> (manifest feature, the value in this host's settings)
-_ENV_LISTS = {
-    "DDP_OPENSTATES_JURISDICTIONS": ("replica_routing", "ddp_openstates_jurisdictions"),
-    # SYNC-142: LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST is no longer compared. The LegBot gate reads the manifest's
-    # `legbot_replica` itself (the env list is only the fallback when the manifest cannot be read), so there is no second
-    # list that can drift.
-}
+# SYNC-157: no env list is compared any more. DDP_OPENSTATES_JURISDICTIONS and LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST
+# are deleted (config.REMOVED_ENV warns when a host still sets one); every reader takes the manifest.
 # SYNC-142: `legbot_replica` is checked here because the LegBot gate now reads it from the manifest; a manifest that cannot
 # answer it makes the gate fall back to the env list, which must be visible (unverifiable), not silent.
 # SYNC-152: `scrape` (one rule, status not paused or probing) replaces scrape_primary/scrape_secondary: a manifest that cannot
 # answer it leaves this host scheduling no new scrape job, so it must alert as unverifiable.
-_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape", "legbot_replica")
+# SYNC-157: the per-state behaviour fields too. A manifest older than SYNC-157 answers None for them, and every reader then
+# treats the state as not enrolled (MI loses its ScrapeBot fallback, MA its retry and its longer Fargate wait), so it must
+# alert as unverifiable rather than run quietly with the safe-but-wrong answer.
+_CHECKED_FEATURES = ("archive", "embedding", "search_refresh", "cloud_path", "scrape", "legbot_replica", "sweep_import",
+                     "full_walk", "scrape_retry", "cadence_escalation", "scrapebot_fallback", "broker_bill_event_signal")
 
 
 def collect_findings(sync_config: dict, settings: Any, root: str) -> dict[str, Any]:
     """Everything wrong right now, as plain data: {"drift": [...], "unverifiable": [...], "skipped": [...]}.
-    `skipped` names the env lists this host does not set (unset and an empty value are the same thing to the
-    settings layer, so a list accidentally cleared reads as "not set"). It is reported in the status and the log
-    so the gap is visible, but it is not a finding and does not alert."""
+    `skipped` is always empty since SYNC-157 (no env list is compared); the key stays for the status record's shape.
+    """
     drift = [dict(d, source="sync_schedule.yaml") for d in je.config_disagreements(sync_config, root)]
     unverifiable = [f for f in _CHECKED_FEATURES if je.manifest_codes(f, root) is None]
-    skipped = []
-    for name, (feature, attr) in _ENV_LISTS.items():
-        have = {str(c).strip().lower() for c in (getattr(settings, attr, None) or []) if str(c).strip()}
-        if not have:
-            skipped.append(name)  # this host does not set it: nothing to compare
-            continue
-        want = je.manifest_codes(feature, root)
-        if want is None:
-            unverifiable.append(feature)
-            continue
-        if have != set(want):
-            drift.append({"feature": feature, "source": f"env {name}", "only_in_yaml": sorted(have - set(want)),
-                          "only_in_manifest": sorted(set(want) - have)})
-    return {"drift": drift, "unverifiable": sorted(set(unverifiable)), "skipped": skipped}
+    return {"drift": drift, "unverifiable": sorted(set(unverifiable)), "skipped": []}
 
 
 def _signature(findings: dict[str, Any]) -> str:

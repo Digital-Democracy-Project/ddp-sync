@@ -14,8 +14,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ddp_sync.pipelines.openstates_scrape import _run_scrape, _sweep_import_eligible
+from tests import sync157_manifest
 
-CANARY_CFG = {"sweep_import": {"enabled": True, "jurisdictions": ["va"]}}
+# SYNC-157: the yaml keeps the switch; WHO is the manifest's scrape.sweep_import (va only, for these tests).
+CANARY_CFG = {"sweep_import": {"enabled": True}}
+
+
+@pytest.fixture(autouse=True)
+def manifest(tmp_path, monkeypatch):
+    sync157_manifest.use(tmp_path, monkeypatch, **sync157_manifest.only("scrape", "sweep_import", ["va"]))
 
 
 # --- the gate itself -------------------------------------------------------------------
@@ -33,7 +40,7 @@ def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
 
 def test_disabled_flag_overrides_the_list():
     """The documented rollback: flip enabled: false and the list stops mattering."""
-    cfg = {"sweep_import": {"enabled": False, "jurisdictions": ["va"]}}
+    cfg = {"sweep_import": {"enabled": False}}
     assert _sweep_import_eligible("va", cfg) is False
 
 
@@ -43,7 +50,7 @@ def test_disabled_flag_overrides_the_list():
         None,
         {},
         {"sweep_import": {}},
-        {"sweep_import": {"enabled": True}},  # enabled but no list
+        {"sweep_import": {"enabled": False}},
     ],
 )
 def test_absent_or_incomplete_config_is_off(cfg):
@@ -116,4 +123,5 @@ def test_shipped_yaml_enables_exactly_the_reviewed_jurisdictions():
     sweep = cfg["openstates_scrape"]["sweep_import"]
 
     assert sweep["enabled"] is True
-    assert sweep["jurisdictions"] == ["va", "mi", "fl", "ma"]
+    assert "jurisdictions" not in sweep  # SYNC-157: WHO is the manifest
+    assert sorted(c for c, e in sync157_manifest.MANIFEST.items() if e["scrape"]["sweep_import"]) == ["fl", "ma", "mi", "va"]

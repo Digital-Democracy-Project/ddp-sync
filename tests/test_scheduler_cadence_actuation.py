@@ -47,7 +47,6 @@ _YAML = """
         review_time_utc: "00:30"
         escalate_window: 2
         quiet_window: 4
-        jurisdictions_excluded: ["mi"]
 
       patch_refresh:
         enabled: false
@@ -75,8 +74,9 @@ def _manifest_root(tmp_path, monkeypatch):
     je._cache.clear()
     je._logged.clear()
     monkeypatch.delenv("OPENSTATES_ROOT", raising=False)
-    manifest = {j: {"status": "live", "tier": "secondary"} for j in _STATES}
-    manifest["al"] = {"status": "paused", "tier": "secondary"}
+    # SYNC-157: who may never be escalated is the manifest's scrape.cadence_escalation (false for mi in these tests)
+    manifest = {j: {"status": "live", "scrape": {"cadence_escalation": j != "mi"}} for j in _STATES}
+    manifest["al"] = {"status": "paused", "scrape": {"cadence_escalation": True}}
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(manifest))
     _ROOT = str(tmp_path)
     yield

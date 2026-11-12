@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = "https://v3.openstates.org"
+BASE_URL = os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002")  # SYNC-157: our own api-v3, never the public one
 SAMPLE_OCD_ID = None  # populated from initial /people fetch
 
 
@@ -36,9 +36,9 @@ async def get(token: str, path: str, params: list[tuple]) -> dict:
 
 
 async def main() -> None:
-    token = os.getenv("OPENSTATES_API_KEY")
+    token = os.getenv("LOCAL_OPENSTATES_API_KEY")
     if not token:
-        raise SystemExit("OPENSTATES_API_KEY not set")
+        raise SystemExit("LOCAL_OPENSTATES_API_KEY not set")
 
     print("=== Probe 1: /people?jurisdiction=fl with include=roles ===")
     try:

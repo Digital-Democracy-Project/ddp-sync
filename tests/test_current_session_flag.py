@@ -110,8 +110,7 @@ def _client_returning(data):
 
 
 def _settings():
-    return SyncSettings(openstates_api_key="k", openstates_api_base="https://v3.openstates.org",
-                        local_openstates_api_base="http://localhost:8002", local_openstates_api_key="l")
+    return SyncSettings(local_openstates_api_base="http://localhost:8002", local_openstates_api_key="l")
 
 
 def _source():

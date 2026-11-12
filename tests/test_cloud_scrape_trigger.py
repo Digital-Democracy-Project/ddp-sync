@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from ddp_sync.pipelines import cloud_scrape_trigger as cst
+from tests import sync157_manifest
 
 
 class FakeRedisClient:
@@ -767,10 +768,24 @@ async def test_reconciliation_tasks_are_retained_and_survive_without_external_re
 # --- OPEN-476: a per-state wait limit, so MA can run longer without loosening the other states ---
 
 
+_WAIT = {}
+
+
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: a state's own Fargate ceiling is the manifest's scrape.fargate_max_wait_s; `_with_overrides` writes it.
+    Until a test calls it, no state has one (everyone gets the shared ceiling)."""
+    _WAIT.update(tmp=tmp_path, mp=monkeypatch)
+    sync157_manifest.use(tmp_path, monkeypatch, **{f"{c}.scrape.fargate_max_wait_s": None for c in sync157_manifest.MANIFEST})
+    yield
+    _WAIT.clear()
+
+
 def _with_overrides(by_state, **fargate):
-    config = _fargate_config(max_wait_seconds=43200, **fargate)
-    config["cloud_path"]["fargate"]["max_wait_seconds_by_jurisdiction"] = by_state
-    return config
+    changes = {f"{c}.scrape.fargate_max_wait_s": None for c in sync157_manifest.MANIFEST}
+    changes.update({f"{('us' if c == 'usa' else c)}.scrape.fargate_max_wait_s": v for c, v in by_state.items()})
+    sync157_manifest.use(_WAIT["tmp"], _WAIT["mp"], **changes)
+    return _fargate_config(max_wait_seconds=43200, **fargate)
 
 
 def test_per_state_wait_overrides_only_the_named_state():
@@ -808,18 +823,11 @@ def test_per_state_wait_is_used_by_run_cloud_scrape_and_persisted_for_resume():
     assert persisted == [86400, 43200]
 
 
-@pytest.mark.parametrize("bad", [0, -5, 1.5, "86400", True, None])
-def test_per_state_wait_rejects_values_that_are_not_positive_whole_seconds(bad):
-    with pytest.raises(ValueError, match="max_wait_seconds_by_jurisdiction"):
-        cst._fargate_config(_with_overrides({"ma": bad}), "ma")
-
-
-@pytest.mark.parametrize("bad", [["ma"], [], None, False, 0, ""])
-def test_per_state_wait_must_be_a_mapping(bad):
-    """A blank `max_wait_seconds_by_jurisdiction:` in YAML loads as None. It must fail loudly,
-    not quietly put MA back on the shared 12 h (pm-review, round 1)."""
-    with pytest.raises(ValueError, match="must be a mapping"):
-        cst._fargate_config(_with_overrides(bad), "ma")
+@pytest.mark.parametrize("bad", [0, -5, 1.5, "86400", True])
+def test_a_per_state_wait_that_is_not_positive_whole_seconds_is_ignored(bad):
+    """The ddp-open-states validator refuses such a value; if one reached a host anyway, ddp-sync keeps the shared
+    ceiling (with a warning) rather than waiting 0 s or crashing the scrape."""
+    assert cst._fargate_config(_with_overrides({"ma": bad}), "ma")["max_wait_seconds"] == 43200
 
 
 def test_absent_per_state_wait_is_fine():
@@ -860,6 +868,7 @@ def test_real_schedule_gives_ma_24_hours_and_leaves_every_other_state_at_12():
 
     path = pathlib.Path(cst.__file__).resolve().parents[3] / "config" / "sync_schedule.yaml"
     scrape_block = yaml.safe_load(path.read_text())["openstates_scrape"]
+    sync157_manifest.use(_WAIT["tmp"], _WAIT["mp"])  # SYNC-157: the real manifest values (ma: 86400, everyone else null)
     assert cst._fargate_config(scrape_block, "ma")["max_wait_seconds"] == 24 * 3600
     for state in ("fl", "wa", "usa", "va", "mi", "ut", "az", "nc"):
         assert cst._fargate_config(scrape_block, state)["max_wait_seconds"] == 12 * 3600, state

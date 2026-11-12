@@ -23,8 +23,15 @@ from ddp_sync.pipelines.openstates_archive import (
     _maybe_refresh_bill_search,
     _run_archive_with_hook,
 )
+from tests import sync157_manifest
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: WHO is enrolled is the manifest (its real values unless a test changes them)."""
+    sync157_manifest.use(tmp_path, monkeypatch)
 
 
 def _resp(body, status=200):
@@ -194,15 +201,16 @@ async def test_call_ceiling_stops_a_runaway_loop():
 # --- hook gate and wiring -------------------------------------------------------------------------
 
 
-async def test_eligibility_is_yaml_policy_default_off():
+async def test_eligibility_is_the_manifest_behind_the_yaml_switch(tmp_path, monkeypatch):
+    sync157_manifest.use(tmp_path, monkeypatch, **sync157_manifest.only("enrollment", "search_refresh", ["fl", "us"]))
     assert not _bill_search_refresh_eligible("fl", None)
-    assert not _bill_search_refresh_eligible("fl", {"bill_search_refresh": {"enabled": False, "jurisdictions": ["fl"]}})
-    cfg = {"bill_search_refresh": {"enabled": True, "jurisdictions": ["FL", "us"]}}
+    assert not _bill_search_refresh_eligible("fl", {"bill_search_refresh": {"enabled": False}})
+    cfg = {"bill_search_refresh": {"enabled": True, "jurisdictions": ["va"]}}  # a leftover list enrolls nobody (SYNC-157)
     assert _bill_search_refresh_eligible("fl", cfg) and _bill_search_refresh_eligible("US", cfg)
     assert not _bill_search_refresh_eligible("va", cfg)
 
 
-_CFG = {"bill_search_refresh": {"enabled": True, "jurisdictions": ["fl"]}}
+_CFG = {"bill_search_refresh": {"enabled": True}}
 
 
 async def test_hook_always_uses_the_rds_api_even_where_a_local_api_exists():
@@ -235,7 +243,7 @@ async def test_hook_does_nothing_when_not_enrolled():
     with patch("ddp_sync.pipelines.openstates_archive.get_settings", return_value=settings), \
          patch("ddp_sync.pipelines.bill_search_refresh.refresh_bill_search", new=AsyncMock()) as run:
         await _maybe_refresh_bill_search("fl", None)
-        await _maybe_refresh_bill_search("va", _CFG)
+        await _maybe_refresh_bill_search("ma", _CFG)  # the manifest does not enroll MA (OPEN-331)
     run.assert_not_awaited()
 
 
@@ -271,4 +279,6 @@ async def test_checked_in_yaml_block_is_on_and_enrolls_the_eight_search_jurisdic
     block = cfg["openstates_archive"]["bill_search_refresh"]
     # On since 2026-10-05; inert on a host without RDS_OPENSTATES_API_BASE and its key (test_..._read_path_not_configured).
     assert block["enabled"] is True
-    assert sorted(block["jurisdictions"]) == sorted(["us", "fl", "mi", "az", "va", "wa", "ut", "nc"])
+    assert "jurisdictions" not in block  # SYNC-157: WHO is the manifest's enrollment.search_refresh
+    enrolled = sorted(c for c, e in sync157_manifest.MANIFEST.items() if e["enrollment"]["search_refresh"])
+    assert enrolled == sorted(["us", "fl", "mi", "az", "va", "wa", "ut", "nc"])

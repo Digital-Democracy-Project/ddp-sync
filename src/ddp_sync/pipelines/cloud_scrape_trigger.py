@@ -155,28 +155,31 @@ def _fargate_config(config: dict | None, jurisdiction: str | None = None) -> dic
     if missing:
         raise ValueError(f"cloud_path.fargate is missing required config: {', '.join(missing)}")
 
-    # OPEN-476: `max_wait_seconds` is one value for every state, but states need different
-    # ceilings (MA's full walk ran 10.35 h on 10-25 and was heading for ~13.8 h on 11-01 when the
-    # shared 12 h cut it off and nothing loaded). `max_wait_seconds_by_jurisdiction` overrides it
-    # for the named states only, so raising one state's ceiling does not loosen the guard on the
-    # rest. Validated even when no jurisdiction is asked for, so a bad value fails loudly at the
-    # first call instead of only when that one state happens to run.
-    by_state = cfg.get("max_wait_seconds_by_jurisdiction", {})  # absent is fine; blank (null) is not
-    if not isinstance(by_state, dict):
-        raise ValueError(  # noqa: TRY004
-            "cloud_path.fargate.max_wait_seconds_by_jurisdiction must be a mapping, "
-            f"got {type(by_state).__name__}"
-        )
-    for state, seconds in by_state.items():
-        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
-            raise ValueError(
-                f"cloud_path.fargate.max_wait_seconds_by_jurisdiction[{state!r}] must be a "
-                f"positive whole number of seconds, got {seconds!r}"
-            )
-    if jurisdiction is not None and jurisdiction in by_state:
-        # A copy: the caller's config dict is shared across jurisdictions and must not change.
-        return {**cfg, "max_wait_seconds": by_state[jurisdiction]}
+    # OPEN-476: `max_wait_seconds` is one value for every state, but states need different ceilings (MA's full walk
+    # ran 10.35 h on 10-25 and was heading for ~13.8 h on 11-01 when the shared 12 h cut it off). SYNC-157: a state's own
+    # ceiling is the manifest's `scrape.fargate_max_wait_s` (null = the shared one), not a yaml map keyed by state.
+    if jurisdiction is not None:
+        from ddp_sync.pipelines.openstates_scrape import _get_root
+
+        own = state_max_wait_s(jurisdiction, _get_root(config))
+        if own is not None:
+            # A copy: the caller's config dict is shared across jurisdictions and must not change.
+            return {**cfg, "max_wait_seconds": own}
     return cfg
+
+
+def state_max_wait_s(jurisdiction: str, root: str) -> int | None:
+    """The manifest's `scrape.fargate_max_wait_s` for one state (SYNC-157), or None (use the shared ceiling). A value
+    that is not a positive whole number is ignored with a warning (the ddp-open-states validator refuses it anyway)."""
+    from ddp_sync.services.jurisdiction_enrollment import manifest_value
+
+    seconds = manifest_value(jurisdiction, ("scrape", "fargate_max_wait_s"), root)
+    if seconds is None:
+        return None
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        logger.warning("fargate_max_wait_s_invalid_ignored", jurisdiction=jurisdiction, value=seconds)
+        return None
+    return seconds
 
 
 def _stop_orphaned_task(ecs_client, cluster: str, task_arn: str) -> str:

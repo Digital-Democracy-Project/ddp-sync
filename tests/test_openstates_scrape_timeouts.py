@@ -16,7 +16,18 @@ from unittest import mock
 import pytest
 
 import ddp_sync.pipelines.openstates_scrape as os_scrape
-from ddp_sync.pipelines.openstates_scrape import SCRAPE_TIMEOUT_S
+from ddp_sync.pipelines.openstates_scrape import (
+    DEFAULT_SCRAPE_TIMEOUT_S,
+    scrape_timeout_s,
+)
+
+
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: the ceilings are the manifest's scrape/archive.timeout_s (its real values here)."""
+    from tests import sync157_manifest
+
+    sync157_manifest.use(tmp_path, monkeypatch)
 
 # The longest real MA full walk observed in scraper.log, in seconds (341 minutes).
 # Updated by OPEN-155. 341 minutes was the 2026-08-01 walk; the very next full walk, on
@@ -27,13 +38,13 @@ MEASURED_MA_FULL_WALK_S = int(8.21 * 3600)
 
 
 def _ceiling(jurisdiction: str) -> int:
-    return SCRAPE_TIMEOUT_S.get(jurisdiction, SCRAPE_TIMEOUT_S["default"])
+    return scrape_timeout_s(jurisdiction)
 
 
 def test_ma_has_its_own_ceiling_rather_than_the_default():
     # The bug this guards is quiet: MA absent from the dict silently inherits `default`, and
     # nothing in the scrape path would say so.
-    assert "ma" in SCRAPE_TIMEOUT_S
+    assert _ceiling("ma") > DEFAULT_SCRAPE_TIMEOUT_S
 
 
 def test_ma_ceiling_clears_the_measured_full_walk_with_real_headroom():
@@ -53,7 +64,7 @@ def test_ma_ceiling_clears_the_measured_full_walk_with_real_headroom():
 def test_the_old_default_would_not_have_been_enough():
     # Pins the reason this change exists. If someone later deletes MA's entry, this documents
     # what they would be reverting to and why it is not adequate.
-    assert SCRAPE_TIMEOUT_S["default"] < MEASURED_MA_FULL_WALK_S * 1.1
+    assert DEFAULT_SCRAPE_TIMEOUT_S < MEASURED_MA_FULL_WALK_S * 1.1
 
 
 def test_ma_ceiling_is_a_backstop_not_the_primary_guard():
@@ -84,18 +95,18 @@ def test_other_jurisdictions_are_untouched():
     assert _ceiling("fl") == 16 * 3600
     assert _ceiling("wa") == 8 * 3600
     assert _ceiling("usa") == 4 * 3600
-    assert SCRAPE_TIMEOUT_S["default"] == 6 * 3600
+    assert DEFAULT_SCRAPE_TIMEOUT_S == 6 * 3600
 
 
 def test_jurisdictions_without_an_entry_still_get_the_default():
     # The lookup contract itself, since MA's whole problem was inheriting it unnoticed.
-    assert _ceiling("az") == SCRAPE_TIMEOUT_S["default"]
-    assert _ceiling("va") == SCRAPE_TIMEOUT_S["default"]
+    assert _ceiling("az") == DEFAULT_SCRAPE_TIMEOUT_S
+    assert _ceiling("va") == DEFAULT_SCRAPE_TIMEOUT_S
 
 
 # --- the production path, not a copy of the lookup -----------------------------------
 #
-# pm-review's point: every test above reimplements `SCRAPE_TIMEOUT_S.get(j, default)` in this
+# pm-review's point: every test above reads `scrape_timeout_s(j)` in this
 # file, so they would all still pass if the production resolution diverged from it. These two
 # assert on the value actually handed to the process runner.
 
@@ -125,4 +136,4 @@ async def test_an_entry_less_jurisdiction_resolves_to_the_default_at_the_invocat
     with mock.patch.object(os_scrape, "_run_with_group_kill", fake_run):
         await os_scrape._run_scrape("az", None, "/tmp/openstates", None, {})
 
-    assert seen["timeout"] == SCRAPE_TIMEOUT_S["default"]
+    assert seen["timeout"] == DEFAULT_SCRAPE_TIMEOUT_S

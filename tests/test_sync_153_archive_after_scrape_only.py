@@ -149,7 +149,10 @@ def _config():
     ("ma", 1 * (24 + 2) + 3 * 12 + 2.5 + 1),    # MA's 24 h scrape wait (OPEN-476): 65.5 h
     ("pa", 1 * (12 + 2) + 3 * 12 + 2.5 + 1),    # a one-session state: 53.5 h
 ])
-def test_the_lock_ttl_covers_the_worst_case_run(state, hours):
+def test_the_lock_ttl_covers_the_worst_case_run(state, hours, tmp_path, monkeypatch):
+    from tests import sync157_manifest
+
+    sync157_manifest.use(tmp_path, monkeypatch)  # SYNC-157: MA's 24 h wait is the manifest's scrape.fargate_max_wait_s
     scrape_cfg, archive_cfg = _config()
     assert scrape.pipeline_lock_ttl_s(state, scrape_cfg, archive_cfg) == int(hours * H)
 

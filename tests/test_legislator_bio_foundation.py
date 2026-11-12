@@ -48,6 +48,7 @@ from ddp_sync.pipelines.legislator_bio import (
     should_write,
     split_email_field,
 )
+from ddp_sync.config import SyncSettings
 from ddp_sync.services.openstates_people import (
     OpenStatesPeopleClient,
     OpenStatesPerson,
@@ -834,7 +835,7 @@ async def test_openstates_fetch_by_id_retries_on_transient_404():
     from ddp_sync.services.openstates_people import OpenStatesPeopleClient
 
     client = OpenStatesPeopleClient(
-        api_key="test", max_retry_attempts=3,
+        SyncSettings(local_openstates_api_key="test"), max_retry_attempts=3,
     )
 
     # Sequence of responses: 404, 404, 200 (transient case)
@@ -884,7 +885,7 @@ async def test_openstates_fetch_by_id_returns_none_after_persistent_404():
     from ddp_sync.services.openstates_people import OpenStatesPeopleClient
 
     client = OpenStatesPeopleClient(
-        api_key="test", max_retry_attempts=3,
+        SyncSettings(local_openstates_api_key="test"), max_retry_attempts=3,
     )
 
     call_count = [0]

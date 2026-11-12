@@ -13,6 +13,7 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata
 from ddp_sync.ingestion.pipeline import IngestionPipeline
 from ddp_sync.services.jurisdiction_names import source_name
+from ddp_sync.services.openstates_route import api_v3
 from ddp_sync.services.rate_limiter import RateLimitConfig, RateLimiter
 
 logger = structlog.get_logger()
@@ -107,7 +108,6 @@ class LegislatorSyncService:
             config_path: Path to sync_schedule.yaml config file
         """
         self.settings = settings or get_settings()
-        self.api_key = self.settings.openstates_api_key
         self.pipeline = IngestionPipeline(self.settings)
         self.config_path = config_path or DEFAULT_CONFIG_PATH
         self.rate_limit = RateLimitConfig.from_yaml(self.config_path)
@@ -128,39 +128,10 @@ class LegislatorSyncService:
         return source_name(jurisdiction)
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
-        """
-        Choose which OpenStates-compatible backend to hit for this jurisdiction.
-
-        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
-        SYNC-6): jurisdictions listed in settings.ddp_openstates_jurisdictions
-        (the same DDP_OPENSTATES_JURISDICTIONS env var ddp-broker-py reads) are
-        routed to the local OpenStates replica instead of the public
-        v3.openstates.org API (SYNC-8), so the two services never diverge on
-        which jurisdictions are "on the replica".
-
-        Used by every call site that has a jurisdiction in scope
-        (fetch_sponsored_bills, fetch_legislator_votes, and -- as of SYNC-78 --
-        _get_sponsor_name() when its caller passes one through).
-
-        Args:
-            jurisdiction: State code (e.g., 'fl', 'us', 'va')
-
-        Returns:
-            (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
-            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
-            the key is sent as a header on every route, never in the query string (it was logged there).
-        """
-        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
-        if jurisdiction.upper() in replica_jurisdictions:
-            logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
-                jurisdiction=jurisdiction,
-                api_base=self.settings.local_openstates_api_base,
-            )
-            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
-
-        return self.settings.openstates_api_base, self.api_key, False
+        """`(api_base, api_key, True)` of this host's own api-v3 for `jurisdiction` (SYNC-157: never the public
+        OpenStates API; a state the manifest does not serve raises `NoOpenStatesRoute`). See services/openstates_route."""
+        api_base, api_key = api_v3(self.settings, jurisdiction)
+        return api_base, api_key, True
 
     async def _build_bill_mapping(self) -> None:
         """
@@ -265,16 +236,8 @@ class LegislatorSyncService:
         Args:
             person_id: OpenStates person ID (e.g., "ocd-person/6a3fae94-...")
             jurisdiction: Jurisdiction code (e.g., "fl", "us"), if known to
-                the caller. When given and covered by
-                settings.ddp_openstates_jurisdictions, routes to the local
-                OpenStates replica the same way fetch_sponsored_bills/
-                fetch_legislator_votes already do (SYNC-78) -- some
-                legislators (e.g. someone seated after the replica became
-                the source of truth for their jurisdiction) exist in the
-                replica but not yet in the public API, so a public-API-only
-                lookup fails for them even though their data is available.
-                When omitted (unknown to the caller), falls back to the
-                public API base as before.
+                the caller; checked against the manifest. Either way the
+                lookup goes to our own api-v3 (SYNC-157), never the public API.
 
         Returns:
             Family name for sponsor filtering, or None if not found
@@ -288,7 +251,7 @@ class LegislatorSyncService:
         if jurisdiction:
             api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
         else:
-            api_base, api_key, _is_local_replica = self.settings.openstates_api_base, self.api_key, False
+            api_base, api_key = api_v3(self.settings)
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:

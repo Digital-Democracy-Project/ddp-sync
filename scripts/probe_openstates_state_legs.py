@@ -4,7 +4,7 @@ OpenStates so we can plan Phase-2.5 field extraction.
 Usage:
     .venv/bin/python scripts/probe_openstates_state_legs.py
 
-Reads OPENSTATES_API_KEY from .env. Fetches 10 FL state legs (current
+Reads LOCAL_OPENSTATES_API_KEY from .env (our own api-v3, SYNC-157). Fetches 10 FL state legs (current
 members) with full include set, and reports per-field populated/null
 counts plus a structural sample of links[] and current_role.
 """
@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-BASE_URL = "https://v3.openstates.org"
+BASE_URL = os.getenv("LOCAL_OPENSTATES_API_BASE", "http://localhost:8002")  # SYNC-157: our own api-v3, never the public one
 INCLUDES = (
     "other_names", "other_identifiers", "links", "sources", "offices",
 )
@@ -55,9 +55,9 @@ def host_of(url: str | None) -> str:
 
 
 def main() -> None:
-    api_key = os.getenv("OPENSTATES_API_KEY")
+    api_key = os.getenv("LOCAL_OPENSTATES_API_KEY")
     if not api_key:
-        raise SystemExit("OPENSTATES_API_KEY not set")
+        raise SystemExit("LOCAL_OPENSTATES_API_KEY not set")
 
     records = asyncio.run(fetch_sample(api_key, n=10))
     print(f"Fetched {len(records)} FL state legislators\n")

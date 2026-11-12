@@ -90,16 +90,39 @@ from ddp_sync.services.replica_freshness import check_bill_version_freshness
 
 
 def _legbot_allowed_codes(settings) -> set[str]:
-    """The jurisdictions LegBot may be sent bills for from the replica (SYNC-142). The switch is the shared list
-    (ddp-open-states jurisdictions.yaml): a state's `enrollment.legbot_replica` is the ONE setting a human flips, because
-    it depends on the data being good. In `authoritative` mode (every production host) the shared list answers and the
-    old per-host env list `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` is ignored, with a one-line log when the two
-    differ. It is used only as the documented fallback: in `shadow` mode (the default), and when the shared list cannot be
-    read. An EMPTY answer is a real answer and means nothing is dispatched, so an unreadable shared list on a host that
-    sets no env list sends no bill anywhere (the safe default)."""
-    env_list = sorted(str(c).strip().lower() for c in settings.legbot_rds_replica_jurisdiction_allowlist)
-    listed = enrolled("legbot_replica", env_list, default_root())
-    return {str(c).upper() for c in (listed or [])}
+    """The jurisdictions LegBot may be sent bills for from the replica: each state's `enrollment.legbot_replica` in the
+    shared list (ddp-open-states jurisdictions.yaml), the ONE switch a human flips (SYNC-142). SYNC-157 removed the old
+    per-host env list and its fallback: when the shared list cannot be read, nothing is dispatched and an alert says so
+    (once per process). An EMPTY answer is a real answer and also dispatches nothing."""
+    listed = enrolled("legbot_replica", None, default_root())
+    if listed is None:
+        _alert_legbot_list_unreadable()
+        return set()
+    return {str(c).upper() for c in listed}
+
+
+_legbot_list_alerted = False
+
+
+def _alert_legbot_list_unreadable() -> None:
+    global _legbot_list_alerted
+    if _legbot_list_alerted:
+        return
+    _legbot_list_alerted = True
+    logger.error("legbot_replica_list_unreadable_dispatching_nothing", root=default_root())
+    try:
+        from ddp_sync.slack_alerts import post_alert
+
+        post_alert(
+            ":warning: ddp-sync (SYNC-157): the jurisdiction manifest cannot say which states LegBot may read from the "
+            f"replica (`enrollment.legbot_replica`, under {default_root()}), so no bill is being sent to LegBot. "
+            "Pull or fix the ddp-open-states checkout on this host.",
+            source="legbot_replica_gate",
+            dedupe_key="legbot_replica_gate:unreadable",
+        )
+    except Exception as exc:  # noqa: BLE001 - the refusal stands even if the alert fails
+        logger.warning("legbot_replica_alert_failed", error=str(exc))
+
 
 logger = structlog.get_logger()
 

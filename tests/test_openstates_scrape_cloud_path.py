@@ -31,16 +31,25 @@ from ddp_sync.pipelines.openstates_scrape import (
     _run_scrape,
     run_state_pipeline,
 )
+from tests import sync157_manifest
+
+_MANIFEST = {}
 
 
-def _config(*, enabled=True, jurisdictions=("mi",), memory_backend_jurisdictions=()):
-    return {
-        "cloud_path": {
-            "enabled": enabled,
-            "jurisdictions": list(jurisdictions),
-            "memory_backend_jurisdictions": list(memory_backend_jurisdictions),
-        }
-    }
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: who the cloud owns (and so who gets S3 memory) is the manifest's enrollment.cloud_path; `_config`
+    writes it. Until a test calls `_config`, no state is on the cloud path."""
+    _MANIFEST.update(tmp=tmp_path, mp=monkeypatch)
+    sync157_manifest.use(tmp_path, monkeypatch, **sync157_manifest.only("enrollment", "cloud_path", []))
+    yield
+    _MANIFEST.clear()
+
+
+def _config(*, enabled=True, jurisdictions=("mi",)):
+    codes = ["us" if c == "usa" else c for c in jurisdictions]
+    sync157_manifest.use(_MANIFEST["tmp"], _MANIFEST["mp"], **sync157_manifest.only("enrollment", "cloud_path", codes))
+    return {"cloud_path": {"enabled": enabled}}
 
 
 # ── _cloud_path_owns ────────────────────────────────────────────────────────────────────────
@@ -70,22 +79,28 @@ def test_memory_backend_enabled_for_a_currently_cloud_owned_jurisdiction():
     assert _memory_backend_enabled("mi", _config(jurisdictions=("mi",))) is True
 
 
-def test_memory_backend_enabled_for_a_rolled_back_jurisdiction():
-    """THE rollback case: mi is no longer in `jurisdictions` (cloud no longer owns it,
-    so the mac path runs it again), but it IS in `memory_backend_jurisdictions` -- the
-    floor an operator never shrinks. Memory must stay on so this run hydrates from S3
-    instead of silently full-walking."""
-    config = _config(jurisdictions=(), memory_backend_jurisdictions=("mi",))
+def test_memory_backend_follows_the_manifest_even_with_the_cloud_switch_off():
+    """The cloud switch off (the Mac runs mi again) keeps S3 memory while the manifest still says cloud_path, so the
+    run hydrates from S3 instead of silently full-walking."""
+    config = _config(enabled=False, jurisdictions=("mi",))
     assert _cloud_path_owns("mi", config) is False  # mac runs it again
     assert _memory_backend_enabled("mi", config) is True  # but still S3-backed
 
 
+def test_a_state_taken_off_the_cloud_path_has_no_memory_floor_any_more():
+    """SYNC-157 removed the yaml floor list (`memory_backend_jurisdictions`): a state whose manifest cloud_path is false
+    gets no S3 memory, so its first Mac run walks in full (more requests, no data lost). Documented in primitives.md."""
+    config = _config(jurisdictions=())
+    config["cloud_path"]["memory_backend_jurisdictions"] = ["mi"]  # a leftover list is ignored (refused at load)
+    assert _memory_backend_enabled("mi", config) is False
+
+
 def test_memory_backend_disabled_for_a_jurisdiction_never_split():
-    config = _config(jurisdictions=("mi",), memory_backend_jurisdictions=())
+    config = _config(jurisdictions=("mi",))
     assert _memory_backend_enabled("va", config) is False
 
 
-def test_memory_backend_disabled_when_config_missing_entirely():
+def test_memory_backend_disabled_when_no_state_is_on_the_cloud_path():
     assert _memory_backend_enabled("mi", None) is False
     assert _memory_backend_enabled("mi", {}) is False
 
@@ -208,7 +223,8 @@ async def test_the_state_pipeline_also_routes_to_the_cloud_trigger():
 
 @pytest.mark.asyncio
 async def test_run_scrape_sets_memory_backend_env_when_enabled():
-    config = _config(jurisdictions=(), memory_backend_jurisdictions=("mi",))
+    config = _config(enabled=False, jurisdictions=("mi",))  # the Mac runs it, the manifest still says cloud_path
+    config["cloud_path"]["fargate"] = {"memory_bucket": "ddp-openstates-scraper-memory", "memory_prefix": "prod"}
     captured = {}
 
     def fake_run(cmd, env, timeout, *args, **kwargs):

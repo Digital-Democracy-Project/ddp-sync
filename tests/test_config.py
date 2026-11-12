@@ -33,29 +33,27 @@ def test_load_from_env_honors_explicit_session_pipeline_concurrency_override(mon
     assert _load_from_env()["session_pipeline_concurrency"] == 4
 
 
-def test_load_from_env_defaults_replica_freshness_allowlist_to_empty(monkeypatch):
-    """OPEN-276: unset must resolve to an empty frozenset -- trusting no jurisdiction by default,
-    not "everything," matching plan §3.6's own default (skip, don't fall back to trusting
-    unverified data)."""
-    monkeypatch.delenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", raising=False)
-    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset()
+def test_the_legbot_env_list_is_gone_and_a_host_that_still_sets_it_is_warned(monkeypatch, caplog):
+    """SYNC-157: LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST (and the public-API settings) no longer exist; the manifest's
+    enrollment.legbot_replica is the one list. A host that still sets one gets one warning naming it, and the value is
+    ignored (not an error: the release removes them only after the new code runs)."""
+    import logging
 
+    from ddp_sync import config as cfg
 
-def test_load_from_env_parses_replica_freshness_allowlist_normalizing_case_and_whitespace(
-    monkeypatch,
-):
-    monkeypatch.setenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "fl, VA ,ut")
-    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset(
-        {"FL", "VA", "UT"}
-    )
-
-
-def test_load_from_env_replica_freshness_allowlist_ignores_empty_entries(monkeypatch):
-    """A trailing comma or accidental double-comma must not produce a bogus empty-string
-    'jurisdiction' that could never legitimately match anything, but shouldn't be silently
-    counted as a configured entry either."""
-    monkeypatch.setenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "fl,,va,")
-    assert _load_from_env()["legbot_rds_replica_jurisdiction_allowlist"] == frozenset({"FL", "VA"})
+    monkeypatch.setenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "fl,va")
+    monkeypatch.setenv("DDP_OPENSTATES_JURISDICTIONS", "fl")
+    monkeypatch.delenv("OPENSTATES_API_BASE", raising=False)
+    monkeypatch.delenv("OPENSTATES_API_KEY", raising=False)
+    assert "legbot_rds_replica_jurisdiction_allowlist" not in _load_from_env()
+    monkeypatch.setattr(cfg, "_removed_env_warned", False)
+    with caplog.at_level(logging.WARNING, logger="ddp_sync.config"):
+        cfg._warn_removed_env()
+        cfg._warn_removed_env()  # once per process
+    warned = [r.getMessage() for r in caplog.records if "SYNC-157" in r.getMessage()]
+    assert len(warned) == 1
+    assert "LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST" in warned[0] and "DDP_OPENSTATES_JURISDICTIONS" in warned[0]
+    assert "OPENSTATES_API_BASE" not in warned[0]
 
 
 def test_load_from_env_defaults_every_sync51_task_flag_to_true(monkeypatch):

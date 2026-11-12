@@ -23,8 +23,15 @@ from ddp_sync.pipelines.openstates_archive import (
     _maybe_embed_knowledge_base,
     _run_archive_with_hook,
 )
+from tests import sync157_manifest
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: WHO is enrolled is the manifest (its real values unless a test changes them)."""
+    sync157_manifest.use(tmp_path, monkeypatch)
 
 OCD = "0b1c2d3e-0000-0000-0000-000000000001"
 
@@ -380,10 +387,11 @@ async def test_redis_down_embeds_nothing_and_warns():
 # --- hook gates and wiring ---------------------------------------------------------------------
 
 
-async def test_eligibility_is_yaml_policy_default_off():
+async def test_eligibility_is_the_manifest_behind_the_yaml_switch(tmp_path, monkeypatch):
+    sync157_manifest.use(tmp_path, monkeypatch, **sync157_manifest.only("enrollment", "embedding", ["fl", "us"]))
     assert not _knowledge_base_embedding_eligible("fl", None)
-    assert not _knowledge_base_embedding_eligible("fl", {"knowledge_base_embedding": {"enabled": False, "jurisdictions": ["fl"]}})
-    cfg = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["FL", "us"]}}
+    assert not _knowledge_base_embedding_eligible("fl", {"knowledge_base_embedding": {"enabled": False}})
+    cfg = {"knowledge_base_embedding": {"enabled": True, "jurisdictions": ["va"]}}  # a leftover list enrolls nobody
     assert _knowledge_base_embedding_eligible("fl", cfg) and _knowledge_base_embedding_eligible("US", cfg)
     assert not _knowledge_base_embedding_eligible("va", cfg)
 

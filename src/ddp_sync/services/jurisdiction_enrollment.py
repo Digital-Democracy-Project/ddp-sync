@@ -1,23 +1,19 @@
-"""Dual-read of ddp-open-states' jurisdiction manifest (OPEN-318 slice 3, OPEN-328).
+"""The reader of ddp-open-states' jurisdiction manifest (OPEN-318 slice 3, OPEN-328; SYNC-157).
 
-`jurisdictions.yaml` in the ddp-open-states checkout says which jurisdictions are enrolled in which
-feature. ddp-sync's own lists in config/sync_schedule.yaml are still the authority today:
-PLAN-push-button-onboarding.md 4.1 requires ddp-sync to read BOTH and log every disagreement for at
-least one full weekly cycle before the manifest becomes authoritative. This module is that dual-read:
+`jurisdictions.yaml` in the ddp-open-states checkout is the ONE list of which jurisdictions are enrolled in what. SYNC-157
+(2026-11-12) deleted every per-state list ddp-sync kept of its own, so every reader takes its answer from here:
 
-    enrolled(feature, yaml_codes, root)   the answer a consumer uses; logs a disagreement once
-    log_config_disagreements(config, root)  every list at once (startup, and the OPEN-330 daily check)
+    enrolled(feature, None, root)        the codes enrolled in a feature (None: the manifest cannot say)
+    is_enrolled(feature, code, root)     one state (False when the manifest cannot say)
+    manifest_value(code, path, root)     one per-state value (a timeout, a Fargate wait)
+    check_removed_keys(config)           refuses a sync_schedule.yaml that still carries a deleted list
 
-Mode is a per-host env var, `JURISDICTION_MANIFEST_MODE` (SYNC-51 style, never in the shared yaml):
-"shadow" (default) returns the yaml's list and only logs; "authoritative" returns the manifest's. Flipping a
-host is one env change plus a restart, after the soak.
-
-Never raises. The manifest is only as fresh as the ddp-open-states checkout on this host (a bind mount on the
-EC2 broker host that nothing here pulls), so a missing file, an invalid one, or an old one degrades to the
-yaml's answer with a log line, and every disagreement log carries the file's mtime so a stale checkout is
-not mistaken for real drift. The compare logic mirrors check-jurisdiction-drift.py's `project()` in
-ddp-open-states, which is what CI runs against this repo's main. SYNC-152: who is scraped has no yaml list at
-all any more; `enrolled_scrape_states` (pipelines/openstates_scrape.py) reads the `scrape` feature straight from the manifest.
+`enrolled` still accepts a yaml list (the OPEN-328 dual-read), but no caller passes one any more, and
+`JURISDICTION_MANIFEST_MODE` no longer changes any answer. Never raises (except `check_removed_keys`, on purpose). The
+manifest is only as fresh as the ddp-open-states checkout on this host (a bind mount on the EC2 broker host that nothing
+here pulls), so a missing, invalid or old file answers None with a log line, and the daily drift check alerts. The
+feature rules mirror check-jurisdiction-drift.py's `project()` in ddp-open-states. SYNC-152: who is scraped is the `scrape`
+feature (status not paused or probing), read by `enrolled_scrape_states` (pipelines/openstates_scrape.py).
 """
 
 from __future__ import annotations
@@ -54,7 +50,56 @@ _FEATURES = {
     # when its status moves to `scraping` (mirrors check-jurisdiction-drift.py's UNSCHEDULED_STATUSES in ddp-open-states).
     # The manifest's `tier` is not read: WHEN a state is scraped is ddp-sync's `openstates_scrape.timing`, never WHO.
     "scrape": (lambda e: e["status"] not in _UNSCHEDULED_STATUSES, True),
+    # SYNC-157: per-state behaviour that sync_schedule.yaml used to list by state. The yaml keeps only the global switch
+    # (`enabled`) and global numbers (interval_days, max_attempts, backoff_secs); WHO is the manifest. A manifest from
+    # before SYNC-157 lacks these fields and answers None (logged once; the daily drift check alerts "unverifiable"),
+    # which every reader treats as "not enrolled", never as a guess.
+    "sweep_import": (lambda e: e["scrape"]["sweep_import"], True),
+    "full_walk": (lambda e: e["scrape"]["full_walk"], True),
+    "scrape_retry": (lambda e: e["scrape"]["retry"], True),
+    "cadence_escalation": (lambda e: e["scrape"]["cadence_escalation"], True),
+    "scrapebot_fallback": (lambda e: e["waf"]["scrapebot_fallback"], True),  # the scrape spells the federal one "usa"
+    "scrapebot_fallback_archive": (lambda e: e["waf"]["scrapebot_fallback"], False),  # the archive spells it "us"
+    "broker_bill_event_signal": (lambda e: e["enrollment"]["broker_bill_event_signal"], False),
 }
+
+# SYNC-157: sync_schedule.yaml keys that were copies of the manifest (or per-state lists that moved into it). A config
+# that still carries one is refused at load (`check_removed_keys`), so a hand-edited host file cannot silently keep a
+# second list. Path -> where the answer lives now.
+REMOVED_CONFIG_KEYS = {
+    ("active_jurisdictions",): "nothing reads it (the Redis set fills itself from bill syncs)",
+    ("openstates_scrape", "cloud_path", "jurisdictions"): "manifest enrollment.cloud_path",
+    ("openstates_scrape", "cloud_path", "memory_backend_jurisdictions"): "manifest enrollment.cloud_path",
+    ("openstates_scrape", "cloud_path", "fargate", "max_wait_seconds_by_jurisdiction"): "manifest scrape.fargate_max_wait_s",
+    ("openstates_scrape", "broker_bill_event_signal", "jurisdictions"): "manifest enrollment.broker_bill_event_signal",
+    ("openstates_scrape", "sweep_import", "jurisdictions"): "manifest scrape.sweep_import",
+    ("openstates_scrape", "full_walk", "jurisdictions"): "manifest scrape.full_walk",
+    ("openstates_scrape", "scrape_retry", "jurisdictions"): "manifest scrape.retry",
+    ("openstates_scrape", "scrape_retry", "jurisdictions_excluded"): "manifest scrape.retry (the validator refuses retry with a WAF)",
+    ("openstates_scrape", "scrapebot_fallback", "jurisdictions"): "manifest waf.scrapebot_fallback",
+    ("openstates_scrape", "dynamic_cadence", "jurisdictions_excluded"): "manifest scrape.cadence_escalation",
+    ("openstates_archive", "scrapebot_fallback", "jurisdictions"): "manifest waf.scrapebot_fallback",
+    ("openstates_archive", "knowledge_base_embedding", "jurisdictions"): "manifest enrollment.embedding",
+    ("openstates_archive", "bill_search_refresh", "jurisdictions"): "manifest enrollment.search_refresh",
+}
+
+
+class RemovedConfigKey(ValueError):
+    """sync_schedule.yaml still carries a per-state list SYNC-157 moved to the jurisdiction manifest."""
+
+
+def check_removed_keys(config: dict) -> None:
+    """Refuse a sync config that still has a key in REMOVED_CONFIG_KEYS (SYNC-157), naming each one."""
+    found = []
+    for path, now in REMOVED_CONFIG_KEYS.items():
+        block = config
+        for key in path[:-1]:
+            block = block.get(key) if isinstance(block, dict) else None
+        if isinstance(block, dict) and path[-1] in block:
+            found.append(f"{'.'.join(path)} (now: {now})")
+    if found:
+        raise RemovedConfigKey("SYNC-157: sync_schedule.yaml still has per-state lists that moved to the jurisdiction "
+                               "manifest (ddp-open-states jurisdictions.yaml); delete them: " + "; ".join(found))
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, dict | None]] = {}  # path -> (mtime, parsed manifest or None)
@@ -119,6 +164,27 @@ def manifest_codes(feature: str, root: str) -> list[str] | None:
     return sorted("usa" if (uses_usa and c == "us") else c for c in codes)
 
 
+def manifest_value(code: str, path: tuple[str, ...], root: str):
+    """One per-state value from the manifest (e.g. ("scrape", "fargate_max_wait_s")), or None when the manifest, the
+    state or the field is missing (logged once). `usa` is read as `us`."""
+    manifest = load_manifest(root)
+    key = "us" if str(code).strip().lower() == "usa" else str(code).strip().lower()
+    value = (manifest or {}).get(key)
+    for part in path:
+        if not isinstance(value, dict) or part not in value:
+            if manifest is not None and key in manifest:
+                _log_once(("value", root, path), "jurisdiction_manifest_unusable", field=".".join(path),
+                          error="missing field (SYNC-157)")
+            return None
+        value = value[part]
+    return value
+
+
+def is_enrolled(feature: str, code: str, root: str) -> bool:
+    """Is `code` enrolled in `feature`? False when the manifest cannot answer (logged by manifest_codes)."""
+    return str(code).strip().lower() in (manifest_codes(feature, root) or [])
+
+
 # Where a caller with no sync config in hand (the source-name labels) finds the ddp-open-states checkout: the same
 # per-host env var the pipelines read, then their documented default. Mirrors openstates_scrape._get_root.
 _DEFAULT_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
@@ -165,20 +231,9 @@ def enrolled(feature: str, yaml_codes, root: str) -> list[str] | None:
 
 
 def _config_lists(config: dict) -> dict[str, list[str] | None]:
-    """ddp-sync's own list for each feature, straight from the sync_schedule.yaml dict (None when absent)."""
-    archive = config.get("openstates_archive") or {}
-    scrape = config.get("openstates_scrape") or {}
-
-    def listed(block, *keys):
-        for k in keys:
-            block = (block or {}).get(k) if isinstance(block, dict) else None
-        return None if block is None else [str(c).strip().lower() for c in block]
-
-    return {
-        "embedding": listed(archive, "knowledge_base_embedding", "jurisdictions"),
-        "search_refresh": listed(archive, "bill_search_refresh", "jurisdictions"),
-        "cloud_path": listed(scrape, "cloud_path", "jurisdictions"),
-    }
+    """ddp-sync's own per-feature lists. SYNC-157 deleted every one (the manifest is read directly, and
+    `check_removed_keys` refuses a config that still has one), so there is nothing left to compare."""
+    return {}
 
 
 def config_disagreements(config: dict, root: str) -> list[dict]:

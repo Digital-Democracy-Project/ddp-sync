@@ -11,7 +11,7 @@ Usage:
 
 Env vars required:
     WEBFLOW_SCHEDULER_API_KEY   CMS read+write (cms:* scope)
-    OPENSTATES_API_KEY          OpenStates v3 API key
+    (OpenStates reads go to this host's own api-v3, SYNC-157: LOCAL_/RDS_OPENSTATES_API_BASE and _KEY)
 """
 
 from __future__ import annotations
@@ -52,21 +52,15 @@ async def run(*, dry_run: bool, limit: int | None) -> BackfillResult:
 
     settings = get_settings()
 
-    if not settings.openstates_api_key:
-        sys.exit("OPENSTATES_API_KEY not set")
     if not settings.webflow_scheduler_api_key:
         sys.exit("WEBFLOW_SCHEDULER_API_KEY not set")
 
     webflow = WebflowLookupService(settings)
     openstates = OpenStatesPeopleClient(
-        api_key=settings.openstates_api_key,
+        settings,
         rate_limiter=RateLimiter(
             RateLimitConfig(requests_per_minute=30, delay_between_requests_ms=0)
         ),
-        openstates_api_base=settings.openstates_api_base,
-        local_openstates_api_base=settings.local_openstates_api_base,
-        local_openstates_api_key=settings.local_openstates_api_key,
-        ddp_openstates_jurisdictions=settings.ddp_openstates_jurisdictions,
     )
 
     result = BackfillResult()
