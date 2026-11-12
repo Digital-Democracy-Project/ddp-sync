@@ -40,18 +40,13 @@ US:
   congress_number: 119        # 119th Congress (2025-2027)
   session_years: "2025-2027"
 
-# DDP Active Jurisdictions (seed list)
-# New states are auto-tracked when bills are synced via the unified sync API.
-# The canonical set is maintained in Redis (votebot:active_jurisdictions).
-# This list seeds the Redis set and serves as documentation of initial states.
-active_jurisdictions:
-  - FL   # Florida
-  - VA   # Virginia
-  - WA   # Washington
-  - UT   # Utah
-  - AZ   # Arizona
-  - MI   # Michigan
-  - MA   # Massachusetts
+# SYNC-157 (2026-11-12): this file keeps NO list of states. WHO is enrolled in anything (scraped, archived, on the
+# cloud path, embedded, search-refreshed, LegBot, sweep import, full walk, retry, ScrapeBot fallback, cadence
+# escalation, broker bill-event signal, a state's own Fargate wait) is ddp-open-states' jurisdictions.yaml, read
+# directly. Each block below keeps only its global switch (`enabled`) and global numbers. The only per-state map left
+# is `openstates_scrape.timing` (WHEN, never WHO). A per-state list put back here is refused at load
+# (jurisdiction_enrollment.check_removed_keys) and fails tests/test_sync_157_no_state_lists.py.
+# (The old `active_jurisdictions` seed list is gone: nothing read it; the Redis set fills itself from bill syncs.)
 
 # Jurisdiction Overrides
 # Use this section to customize sync behavior for specific states.
@@ -222,12 +217,11 @@ openstates_scrape:
   # SYNC-128: after a successful scrape, POST the jurisdiction to ddp-broker-py's
   # /api/openstates-bill-events/check/ (BROKER-300) so it checks for new bill events now rather
   # than on its own schedule. Read by _maybe_signal_broker_bill_events in openstates_scrape.py.
-  # Codes are the broker's ("us", not "usa"). Off until the broker release with BROKER-300 is
+  # WHO: the manifest's enrollment.broker_bill_event_signal (SYNC-157). Off until the broker release with BROKER-300 is
   # deployed AND the scraping host has a real DDP_BROKER_API_TOKEN (the EC2 broker host's is the
   # placeholder "public-endpoint-no-auth", which the broker answers with 401). Pilot one state first.
   broker_bill_event_signal:
     enabled: false
-    jurisdictions: []
 
   # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
   # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
@@ -287,9 +281,8 @@ openstates_scrape:
   # section: the canary judges them plausible (~56s/~63s final cycle, both inside the 180s
   # wait) but on extrapolated evidence only, and wants one full run to completion first.
   # That is a smaller separate step and does not depend on this.
-  sweep_import:
+  sweep_import:            # WHO: the manifest's scrape.sweep_import (SYNC-157; va, mi, fl, ma on 2026-11-12)
     enabled: true
-    jurisdictions: ["va", "mi", "fl", "ma"]
 
   # OPEN-162: periodic forced FULL walk, the backstop MI's incremental filter was documented as
   # having and did not.
@@ -326,9 +319,8 @@ openstates_scrape:
   # SCRAPE_TIMEOUT_S["mi"] ceiling against that measurement rather than the ~6.5h estimate
   # (this module requires >=1.5x a MEASURED walk for MA, and MI is more variable, not less),
   # then set enabled: true. See OPEN-162.
-  full_walk:
+  full_walk:               # WHO: the manifest's scrape.full_walk (SYNC-157; mi on 2026-11-12)
     enabled: false
-    jurisdictions: ["mi"]
     interval_days: 30
 
   # OPEN-87: bounded retry of a whole scrape run. These are weekly jobs, so a run killed by a
@@ -356,7 +348,7 @@ openstates_scrape:
   # that recovered on a later attempt; and total runtime still inside the ceiling with the
   # backoff included.
   #
-  # jurisdictions_excluded is not redundant with the allowlist, it outlives it. When the
+  # (Before SYNC-157:) jurisdictions_excluded was not redundant with the allowlist, it outlived it. When the
   # rollout finishes and someone widens `jurisdictions` (plausibly to every jurisdiction),
   # this is the line that still keeps MI out. MI must never be retried: OPEN-53 established
   # that a blind retry against a WAF worsens a block rather than recovering from it, because
@@ -383,10 +375,11 @@ openstates_scrape:
   # Named scrape_retry, not retry: this file already has an unrelated TOP-LEVEL `retry:` block
   # (OpenStates API call retries, max_attempts/backoff_seconds). Same word, different thing, and
   # a reader skimming for "retry" should not have to work out which one they landed on.
+  # SYNC-157: WHO is the manifest's scrape.retry (ma on 2026-11-12). The exclusion list is now a manifest rule: the
+  # ddp-open-states validator refuses scrape.retry for a state whose waf.profile is not "none" (OPEN-53), so MI cannot be
+  # enrolled by widening anything.
   scrape_retry:
     enabled: true
-    jurisdictions: ["ma"]             # USA next, after one clean MA cycle (see above)
-    jurisdictions_excluded: ["mi"]    # never retry a WAF-blocked jurisdiction (OPEN-53)
     max_attempts: 3
     backoff_secs: [900, 1800]         # PLACEHOLDER pending the OPEN-87 backoff decision
 
@@ -405,19 +398,9 @@ openstates_scrape:
   # this writing NOTHING is listed here -- OPEN-190 is what actually moves a jurisdiction,
   # this ticket only builds and tests the switch itself.
   #
-  # TWO LISTS, NOT ONE, mirroring dynamic_cadence's own floor-not-default rule below.
-  # `jurisdictions` is who cloud owns RIGHT NOW; rolling back means removing a name from
-  # here (the mac path picks it back up at the next scheduled run -- an in-flight run is
-  # never interrupted, and OPEN-187's shared lock makes that safe even mid-transition).
-  # `memory_backend_jurisdictions` is a FLOOR: who has EVER been split. Add a name here at
-  # the SAME TIME as adding it to `jurisdictions`, and never remove it on rollback -- a
-  # jurisdiction coming back to the mac path has no local watermark at all (the mac never
-  # ran it while cloud owned it), so its first run back needs S3-backed memory (OPEN-181)
-  # to hydrate the real cutoff, not silently fall back to "no local file, full walk".
-  #
-  # Rollback is therefore two separate edits with two separate effects: remove from
-  # `jurisdictions` to stop cloud collecting it (mac resumes); `memory_backend_jurisdictions`
-  # stays as it is, permanently, once a jurisdiction has ever appeared there.
+  # SYNC-157: WHO the cloud owns is the manifest's enrollment.cloud_path, and the S3 memory backend follows it (the old
+  # yaml floor list `memory_backend_jurisdictions` is gone). Rolling a state back to the Mac therefore means: its first
+  # Mac run has no S3 memory unless cloud_path is still true, so expect one full walk (more requests, no data loss).
   #
   # OPEN-193: once `enabled: true` and a jurisdiction is listed, `_run_scrape()` no longer just
   # skips it -- it triggers a real Fargate collection and loads the result into RDS (see
@@ -457,8 +440,7 @@ openstates_scrape:
   # what actually starts NC's recurring cloud cycles so Stage 6's soak period can begin for real.
   cloud_path:
     enabled: true
-    jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la", "al"]  # OPEN-523: Alabama resumes (manifest cloud_path true)
-    memory_backend_jurisdictions: ["fl", "wa", "usa", "va", "mi", "ma", "ut", "az", "nc", "pa", "ne", "la", "al"]
+    # SYNC-157: WHO is the manifest's enrollment.cloud_path (the S3 memory backend follows it); no list here.
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
@@ -470,13 +452,9 @@ openstates_scrape:
       container_name: "scraper" # matches the task definition's container name
       memory_bucket: "ddp-openstates-scraper-memory"
       memory_prefix: "prod"     # matches cloud_collector.py's own MEMORY_PREFIX convention
-      max_wait_seconds: 43200   # 12h backstop for every state not named below
-      # OPEN-476: MA's weekly run walks every bill (OPEN-128 ignores the start date): 10.35 h on
-      # 10-25, and about 13.8 h at 11-01's slower pace (malegislature.gov answered ~33% slower, no
-      # blocking; OPEN-475). The shared 12 h cut it off and nothing loaded. 24 h per Ramon,
-      # 2026-11-01. Only the named states change; OPEN-477 replaces this limit with a stall check.
-      max_wait_seconds_by_jurisdiction:
-        ma: 86400
+      max_wait_seconds: 43200   # 12h backstop for every state whose manifest scrape.fargate_max_wait_s is null
+      # OPEN-476: MA's weekly run walks every bill (10.35 h on 10-25, ~13.8 h on 11-01); 24 h per Ramon, 2026-11-01.
+      # SYNC-157: a state's own ceiling is the manifest's scrape.fargate_max_wait_s (ma: 86400), not a map here.
       load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
                                   # loads were minutes even for multi-thousand-row jurisdictions
 
@@ -566,7 +544,7 @@ openstates_scrape:
   # excluded: empty by default. MI was excluded here from OPEN-53 (more traffic against a WAF
   # worsens a block) until PR #154 (2026-09-14, Ramon's direct decision) made it eligible for
   # escalation like any other jurisdiction. MI's blind-retry exclusion is a separate, still-active
-  # mechanism (scrape_retry.jurisdictions_excluded above) -- unaffected by this one.
+  # mechanism (the manifest validator's retry-with-WAF rule, SYNC-157) -- unaffected by this one.
   #
   # Read by scrape_cadence.py via the cadence-review job.
   # HOW IT TAKES EFFECT, and what "without a restart" actually means here. A daily review
@@ -619,7 +597,7 @@ openstates_scrape:
     # still means the same conservative per-request pacing the resilience profile already
     # enforces (RESILIENCE_PROFILES / mi_waf_get) -- this list only controls whether MI is
     # ELIGIBLE to be escalated, not how aggressively it's scraped once escalated.
-    jurisdictions_excluded: []
+    # SYNC-157: who may be escalated is the manifest's scrape.cadence_escalation (true for every state today).
 
   patch_refresh:
     enabled: true
@@ -667,9 +645,8 @@ openstates_scrape:
     window_size: 4    # look at each jurisdiction's last N runs
     threshold: 3       # escalate once >= this many of the last window_size were WAF-blocked
 
-  scrapebot_fallback:
+  scrapebot_fallback:      # WHO: the manifest's waf.scrapebot_fallback (SYNC-157; mi on 2026-11-12)
     enabled: true  # flipped 2026-08-03 after Phase 3 live validation (real mint + concurrency smoke test both passed)
-    jurisdictions: ["mi"]
 
   people_refresh:
     enabled: true
@@ -694,9 +671,8 @@ openstates_scrape:
     alert_tiers_days: [3, 7, 14]
     repeat_days: 7
 
-  # OPEN-330 (OPEN-318 slice 5): daily check that THIS host's jurisdiction lists (the live copy of this file, and its
-  # own DDP_OPENSTATES_JURISDICTIONS when set) agree with ddp-open-states'
-  # jurisdictions.yaml, and that the manifest on this host can be read and is current enough to check. Alerts through
+  # OPEN-330 (OPEN-318 slice 5): daily check that THIS host's live copy of this file (only its timing map since SYNC-157)
+  # agrees with ddp-open-states' jurisdictions.yaml, and that the manifest on this host can be read and is current enough to check. Alerts through
   # post_alert when the findings change, then every repeat_days. Default off per host: a host sets
   # JURISDICTION_DRIFT_CHECK_ENABLED=true (Mac Studio and the EC2 broker host both should). Manual run:
   # POST /trigger/openstates-scrape/drift-check
@@ -783,8 +759,7 @@ openstates_archive:
     # every ddp-sync host, so the REAL per-host gate is KNOWLEDGE_BASE_INDEX_NAME (set only on the EC2 broker host):
     # on a host without it the hook logs `knowledge_base_embedding_enrolled_but_index_unset` and returns, so the
     # Mac cannot double-embed. Do not set that variable on a second host.
-    enabled: true
-    jurisdictions: [fl, us, va, mi, wa, az, ut]
+    enabled: true            # WHO: the manifest's enrollment.embedding (SYNC-157)
     # SYNC-95: also embed bills the version cache has no record of (a bill nobody changed since it was
     # archived is never "touched", so a new state or a gap would otherwise never be filled). Up to this
     # many bills ATTEMPTED per run per jurisdiction, a random slice when more are missing; embedded bills
@@ -840,17 +815,15 @@ openstates_archive:
     # Enabled on the EC2 broker host since 2026-10-01 (SYNC-87), committed here 2026-10-05 so that host's local edit
     # does not conflict with a pull. A host without RDS_OPENSTATES_API_BASE and RDS_OPENSTATES_API_KEY logs
     # `bill_search_refresh_read_path_not_configured` and skips, so this is inert on the Mac.
-    enabled: true
-    jurisdictions: [us, fl, mi, az, va, wa, ut, nc]
+    enabled: true            # WHO: the manifest's enrollment.search_refresh (SYNC-157)
   openstates_root: "/Users/agentsmith/Developer/repos/ddp-open-states"
   # Same ScrapeBot cookie pre-seed the scrape jobs get (openstates_scrape.scrapebot_fallback above),
   # added 2026-08-08: mint fresh WAF-passing cookies via ScrapeBot before each opted-in
   # jurisdiction's archive run, instead of relying on whatever the last scrape's pre-seed
   # left in the cache file. Best-effort — a failed mint logs a warning and the archive run
   # proceeds with existing/self-warmed cookies.
-  scrapebot_fallback:
+  scrapebot_fallback:        # WHO: the manifest's waf.scrapebot_fallback, as for the scrape (SYNC-157)
     enabled: true
-    jurisdictions: ["mi"]
 
 # VoteBot Eval Cron (plan PLAN-eval-and-cache-hit-logging.md §3)
 # Runs scripts/evaluate_production.py weekly via subprocess into votebot's

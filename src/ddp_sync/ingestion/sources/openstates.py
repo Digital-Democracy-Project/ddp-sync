@@ -12,6 +12,7 @@ from ddp_sync.config import Settings, get_settings
 from ddp_sync.ingestion.metadata import DocumentMetadata, MetadataExtractor
 from ddp_sync.ingestion.pipeline import DocumentSource
 from ddp_sync.services.jurisdiction_names import source_name
+from ddp_sync.services.openstates_route import api_v3
 
 logger = structlog.get_logger()
 
@@ -107,7 +108,6 @@ class OpenStatesSource:
         """
         self.settings = settings or get_settings()
         self.metadata_extractor = metadata_extractor or MetadataExtractor()
-        self.api_key = self.settings.openstates_api_key
         # Cache for legislator lookups (openstates_id -> {name, slug})
         self._legislator_cache: dict[str, dict] = {}
 
@@ -124,61 +124,11 @@ class OpenStatesSource:
         return source_name(jurisdiction)
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
-        """
-        Choose which OpenStates-compatible backend to hit for this jurisdiction.
-
-        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
-        SYNC-6): jurisdictions listed in settings.ddp_openstates_jurisdictions
-        (the same DDP_OPENSTATES_JURISDICTIONS env var ddp-broker-py reads) are
-        routed to the local OpenStates replica instead of the public
-        v3.openstates.org API (SYNC-8), so the two services never diverge on
-        which jurisdictions are "on the replica".
-
-        Only used by call sites that actually have a jurisdiction in scope
-        (fetch_jurisdiction, fetch, fetch_legislators) -- fetch_bill() and
-        fetch_legislator_by_id() look up a single record by opaque OpenStates
-        ID with no jurisdiction available, so they always use the public API
-        base (see their docstrings).
-
-        Args:
-            jurisdiction: State code (e.g., 'fl', 'us', 'va')
-
-        Returns:
-            (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
-            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
-            the key is sent as a header on every route, never in the query string (it was logged there).
-        """
-        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
-        if jurisdiction.upper() in replica_jurisdictions:
-            # SYNC-93: "local" means the Mac Studio's api-v3 on localhost:8002, which exists
-            # only on the Mac. A host with no CAMS access (`cams_api_token` unset -- the same
-            # signal as openstates_archive._mac_capable(), read from this instance's own
-            # settings) is the EC2 broker host, where localhost:8002 is the ddp-sync
-            # container itself and nothing answers; its replica is the RDS-backed api-v3
-            # (rds_openstates_api_base), the same split knowledge_base_embedding.read_target
-            # makes. is_local_replica is False for it; the flag no longer selects anything about auth
-            # (SYNC-68: the key is a header on every route). With no RDS base configured (dev, tests) the
-            # behavior is unchanged.
-            if not self.settings.cams_api_token and self.settings.rds_openstates_api_base:
-                logger.debug(
-                    "Routing jurisdiction to RDS-backed OpenStates api-v3",
-                    jurisdiction=jurisdiction,
-                    api_base=self.settings.rds_openstates_api_base,
-                )
-                return (
-                    self.settings.rds_openstates_api_base,
-                    self.settings.rds_openstates_api_key,
-                    False,
-                )
-            logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
-                jurisdiction=jurisdiction,
-                api_base=self.settings.local_openstates_api_base,
-            )
-            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
-
-        return self.settings.openstates_api_base, self.api_key, False
+        """`(api_base, api_key, True)` of this host's own api-v3 for `jurisdiction` (SYNC-157: never the public
+        OpenStates API; a state the manifest does not serve raises `NoOpenStatesRoute`). See services/openstates_route,
+        which keeps SYNC-93's split (the RDS-backed api-v3 on EC2, the local one on the Mac)."""
+        api_base, api_key = api_v3(self.settings, jurisdiction)
+        return api_base, api_key, True
 
     async def fetch_jurisdiction(
         self,
@@ -449,14 +399,11 @@ class OpenStatesSource:
         # Build legislator mapping for sponsor DDP links
         await self._build_legislator_mapping()
 
-        # Route to the local OpenStates replica when a jurisdiction is given
-        # and it's flipped in settings.ddp_openstates_jurisdictions (SYNC-8).
-        # With no jurisdiction (multi-jurisdiction crawl), there's nothing to
-        # route on, so this always uses the public API.
+        # SYNC-157: always our own api-v3. With no jurisdiction (a crawl) it lists only the states we serve.
         if jurisdiction:
             api_base, api_key, _is_local_replica = self._get_api_base_and_key(jurisdiction)
         else:
-            api_base, api_key, _is_local_replica = self.settings.openstates_api_base, self.api_key, False
+            api_base, api_key = api_v3(self.settings)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             headers = {"X-API-Key": api_key} if api_key else {}  # SYNC-68: a header, never the query string
@@ -548,15 +495,14 @@ class OpenStatesSource:
         Returns:
             DocumentSource or None if not found
         """
-        # Single bill lookup by opaque OpenStates ID -- no jurisdiction is
-        # available here to route to the local replica (SYNC-8), so this
-        # always uses the public API base.
+        # Single bill lookup by opaque OpenStates ID: our own api-v3 (SYNC-157), which holds only the states we serve.
+        api_base, api_key = api_v3(self.settings)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {"X-API-Key": self.api_key}
+            headers = {"X-API-Key": api_key} if api_key else {}
 
             try:
                 response = await client.get(
-                    f"{self.settings.openstates_api_base}/bills/{bill_id}",
+                    f"{api_base}/bills/{bill_id}",
                     headers=headers,
                 )
                 response.raise_for_status()
@@ -692,16 +638,14 @@ class OpenStatesSource:
         Returns:
             DocumentSource or None if not found
         """
-        # Single legislator lookup by opaque OpenStates ID -- no jurisdiction
-        # is available here to route to the local replica (SYNC-8), so this
-        # always uses the public API base.
+        # Single legislator lookup by opaque OpenStates ID: our own api-v3 (SYNC-157).
+        api_base, api_key = api_v3(self.settings)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {
-                "accept": "application/json",
-                "X-API-Key": self.api_key,
-            }
+            headers = {"accept": "application/json"}
+            if api_key:
+                headers["X-API-Key"] = api_key
             # OpenStates v3 API uses query param, not path param
-            url = f"{self.settings.openstates_api_base}/people"
+            url = f"{api_base}/people"
 
             # Include all available data for legislators
             include_params = [

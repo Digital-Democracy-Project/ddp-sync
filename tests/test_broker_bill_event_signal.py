@@ -18,8 +18,15 @@ from ddp_sync.pipelines.openstates_scrape import (
 )
 from ddp_sync.services import broker_client
 from ddp_sync.services.broker_client import BrokerClientError, request_bill_event_check
+from tests import sync157_manifest
 
-CFG = {"broker_bill_event_signal": {"enabled": True, "jurisdictions": ["UT", "us"]}}
+# SYNC-157: the yaml keeps the switch; WHO is the manifest's enrollment.broker_bill_event_signal (ut and us here).
+CFG = {"broker_bill_event_signal": {"enabled": True}}
+
+
+@pytest.fixture(autouse=True)
+def manifest(tmp_path, monkeypatch):
+    sync157_manifest.use(tmp_path, monkeypatch, **sync157_manifest.only("enrollment", "broker_bill_event_signal", ["ut", "us"]))
 SETTINGS = SimpleNamespace(ddp_broker_api_base="https://broker.test", ddp_broker_api_token="tok")
 
 
@@ -131,13 +138,18 @@ async def test_a_broker_failure_never_changes_the_scrape_result(settings, redis,
     [
         None,
         {},
-        {"broker_bill_event_signal": {"enabled": False, "jurisdictions": ["ut"]}},
-        {"broker_bill_event_signal": {"enabled": True, "jurisdictions": ["va"]}},
+        {"broker_bill_event_signal": {"enabled": False}},
     ],
 )
 async def test_off_by_default_and_unenrolled_jurisdictions_send_nothing(settings, redis, send, config):
     await _maybe_signal_broker_bill_events("ut", config)
     send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_state_the_manifest_does_not_enroll_sends_nothing(settings, redis, send):
+    await _maybe_signal_broker_bill_events("va", {"broker_bill_event_signal": {"enabled": True, "jurisdictions": ["va"]}})
+    send.assert_not_awaited()  # SYNC-157: a leftover yaml list enrolls nobody
 
 
 def test_the_checked_in_schedule_ships_it_off_inside_the_block_the_pipeline_receives():
@@ -148,7 +160,7 @@ def test_the_checked_in_schedule_ships_it_off_inside_the_block_the_pipeline_rece
 
     with open(DEFAULT_CONFIG_PATH) as f:
         block = yaml.safe_load(f)["openstates_scrape"]["broker_bill_event_signal"]
-    assert block == {"enabled": False, "jurisdictions": []}
+    assert block == {"enabled": False}  # SYNC-157: no list; WHO is the manifest (nobody today)
 
 
 @pytest.mark.asyncio

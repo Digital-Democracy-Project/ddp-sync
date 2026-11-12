@@ -9,8 +9,9 @@ down. Two things must stay true no matter how the rollout is widened later:
 
   * MI must never be retried. OPEN-53 established that a blind retry against a WAF worsens a
     block rather than recovering from it, so retrying MI is not a wasted attempt, it is an
-    actively harmful one. `jurisdictions_excluded` has to beat `jurisdictions`, including when
-    someone lists MI in both.
+    actively harmful one. SYNC-157: WHO is retried is the manifest's `scrape.retry`, and the
+    ddp-open-states validator refuses `retry: true` for a state with a WAF profile, so MI cannot
+    be enrolled by widening anything (that rule is tested there; here MI's manifest says false).
   * A jurisdiction that has not opted in must be invoked exactly as it is today -- same script,
     same argv, no retry env vars. The opt-out is the absence of a wrapper process, not a
     wrapper told to behave itself.
@@ -23,16 +24,24 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ddp_sync.pipelines.openstates_scrape import _retry_eligible, _run_scrape
+from ddp_sync.services import jurisdiction_enrollment as je
+from tests import sync157_manifest
 
+# SYNC-157: the yaml keeps the switch and the numbers; WHO is the manifest (ma and, for these tests, us).
 ROLLOUT_CFG = {
     "scrape_retry": {
         "enabled": True,
-        "jurisdictions": ["ma", "usa"],
-        "jurisdictions_excluded": ["mi"],
         "max_attempts": 3,
         "backoff_secs": [900, 1800],
     }
 }
+
+
+@pytest.fixture(autouse=True)
+def manifest(tmp_path, monkeypatch):
+    je._cache.clear()
+    je._logged.clear()
+    monkeypatch.setenv("OPENSTATES_ROOT", sync157_manifest.write(tmp_path, **{"us.scrape.retry": True}))
 
 
 # --- the gate itself -------------------------------------------------------------------
@@ -48,19 +57,18 @@ def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
     assert _retry_eligible(jurisdiction, ROLLOUT_CFG) is False
 
 
-def test_exclusion_beats_the_allowlist():
-    """The case this exists for: the rollout finishes, someone widens `jurisdictions` to
-    everything, and MI must still be excluded. A retry against a WAF makes the block worse
-    (OPEN-53), so this is the one entry that must survive a careless widening."""
-    cfg = {
-        "scrape_retry": {
-            "enabled": True,
-            "jurisdictions": ["ma", "usa", "mi", "va", "ut", "fl", "wa", "az"],
-            "jurisdictions_excluded": ["mi"],
-        }
-    }
+def test_a_yaml_list_is_ignored_the_manifest_decides():
+    """SYNC-157: a leftover yaml list does not enroll anyone (the scheduler refuses such a config at load anyway)."""
+    cfg = {"scrape_retry": {"enabled": True, "jurisdictions": ["mi", "va"]}}
     assert _retry_eligible("mi", cfg) is False
+    assert _retry_eligible("va", cfg) is False
     assert _retry_eligible("ma", cfg) is True
+
+
+def test_an_unreadable_manifest_retries_nobody(tmp_path, monkeypatch):
+    je._cache.clear()
+    monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path / "nowhere"))
+    assert _retry_eligible("ma", ROLLOUT_CFG) is False
 
 
 def test_disabled_flag_overrides_the_list():
@@ -75,7 +83,7 @@ def test_disabled_flag_overrides_the_list():
         None,
         {},
         {"scrape_retry": {}},
-        {"scrape_retry": {"enabled": True}},  # enabled but no list
+        {"scrape_retry": {"enabled": False}},
     ],
 )
 def test_absent_or_incomplete_config_is_off(cfg):
@@ -174,7 +182,6 @@ async def test_backoff_and_attempts_come_from_config_not_hardcoded():
     cfg = {
         "scrape_retry": {
             "enabled": True,
-            "jurisdictions": ["ma"],
             "max_attempts": 5,
             "backoff_secs": [1800, 3600, 7200, 7200],
         }
@@ -224,20 +231,18 @@ def _shipped_retry_cfg():
     return cfg["openstates_scrape"]["scrape_retry"]
 
 
-def test_shipped_yaml_enables_exactly_the_staged_rollout():
-    """Guards the actual rollout state, so widening it is a deliberate, reviewed edit. MA only for
-    the first cycle -- USA is held back because its 4h SCRAPE_TIMEOUT_S is the tightest ceiling of
-    any named jurisdiction and cannot reliably fit 3 attempts plus backoff."""
+def test_shipped_yaml_enables_the_switch_and_lists_nobody():
+    """SYNC-157: the shipped yaml keeps the switch and the numbers; WHO (ma) is the manifest's scrape.retry."""
     retry = _shipped_retry_cfg()
     assert retry["enabled"] is True
-    assert retry["jurisdictions"] == ["ma"]
+    assert "jurisdictions" not in retry and "jurisdictions_excluded" not in retry
     assert retry["max_attempts"] == 3
 
 
-def test_shipped_yaml_excludes_mi():
-    """Separate test on purpose. If someone widens the rollout above, this one must still pass,
-    and its failure should read as "you have re-enabled retries for MI" and nothing else."""
-    assert "mi" in _shipped_retry_cfg()["jurisdictions_excluded"]
+def test_the_real_manifest_values_retry_only_ma():
+    """The values copied into the manifest: MA only (USA held back: its 4h ceiling cannot fit 3 attempts)."""
+    assert sorted(c for c, e in sync157_manifest.MANIFEST.items() if e["scrape"]["retry"]) == ["ma"]
+    assert sync157_manifest.MANIFEST["mi"]["scrape"]["retry"] is False
 
 
 def test_shipped_config_is_internally_consistent():

@@ -617,19 +617,8 @@ class LegislatorBioPipeline:
         self.webflow = webflow or WebflowLookupService(self.settings)
         self.congress = congress or CongressLegislatorsSource()
         if openstates is None:
-            api_key = self.settings.openstates_api_key
-            if not api_key:
-                raise ValueError(
-                    "OPENSTATES_API_KEY is required for legislator bio sync"
-                )
-            self.openstates = OpenStatesPeopleClient(
-                api_key,
-                openstates_rate_limiter or RateLimiter(),
-                openstates_api_base=self.settings.openstates_api_base,
-                local_openstates_api_base=self.settings.local_openstates_api_base,
-                local_openstates_api_key=self.settings.local_openstates_api_key,
-                ddp_openstates_jurisdictions=self.settings.ddp_openstates_jurisdictions,
-            )
+            # SYNC-157: our own api-v3 only (no public OpenStates key or base any more)
+            self.openstates = OpenStatesPeopleClient(self.settings, openstates_rate_limiter or RateLimiter())
         else:
             self.openstates = openstates
         # Phase-3 photo upload service. Lazy-initialized on first use

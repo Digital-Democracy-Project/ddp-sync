@@ -830,10 +830,18 @@ async def test_coverage_check_failure_is_isolated_to_that_bill():
 def _patch_freshness_enabled(
     enabled: bool,
     *,
-    allowlist: frozenset[str] = frozenset({"FL"}),
+    allowlist: frozenset[str] | None = frozenset({"FL"}),
     content_check_enabled: bool = True,
 ):
-    return patch(
+    import contextlib
+
+    stack = contextlib.ExitStack()
+    # SYNC-157: which states LegBot may read from the replica is the manifest's enrollment.legbot_replica only (the env
+    # list is deleted); these freshness tests stand in the gate's answer for `allowlist`.
+    if allowlist is not None:  # None: the real gate, reading the (test) manifest
+        stack.enter_context(patch("ddp_sync.pipelines.session_pipeline_runner._legbot_allowed_codes",
+                                  return_value={c.upper() for c in allowlist}))
+    stack.enter_context(patch(
         "ddp_sync.pipelines.session_pipeline_runner.get_settings",
         return_value=SimpleNamespace(
             replica_freshness_check_enabled=enabled,
@@ -843,12 +851,9 @@ def _patch_freshness_enabled(
             # below for content_check_enabled=False.
             replica_freshness_content_check_enabled=content_check_enabled,
             session_pipeline_concurrency=1,
-            # Defaults to allowing "FL" (every existing test candidate's jurisdiction) so these
-            # freshness-check tests exercise the freshness check itself, not the OPEN-276
-            # allowlist gate that now runs ahead of it -- that gate has its own dedicated tests.
-            legbot_rds_replica_jurisdiction_allowlist=allowlist,
         ),
-    )
+    ))
+    return stack
 
 
 def _patch_freshness_check(is_fresh: bool, reason: str = "content_matches"):
@@ -3540,7 +3545,8 @@ def _shared_list(tmp_path, monkeypatch, *, legbot_true=(), mode="authoritative")
 
 
 def _env(*codes):
-    return SimpleNamespace(legbot_rds_replica_jurisdiction_allowlist=frozenset(c.upper() for c in codes))
+    """SYNC-157: the env list is deleted; a host's settings no longer carry one (codes are ignored, kept for readability)."""
+    return SimpleNamespace()
 
 
 NINE_LIVE = ("us", "fl", "wa", "va", "mi", "ut", "az", "ma", "nc")
@@ -3581,40 +3587,29 @@ def test_an_unreadable_shared_list_sends_nothing_when_the_host_sets_no_env_list(
     assert session_pipeline_runner._legbot_allowed_codes(_env()) == set()
 
 
-def test_an_unreadable_shared_list_falls_back_to_the_env_list(tmp_path, monkeypatch):
+def test_an_unreadable_shared_list_sends_nothing_and_alerts_once(tmp_path, monkeypatch):
+    """SYNC-157: no env fallback any more. An unreadable shared list dispatches nothing and says so once."""
     from ddp_sync.services import jurisdiction_enrollment as je
 
     je._cache.clear()
     monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path / "nowhere"))
-    monkeypatch.setenv(je.MODE_ENV, "authoritative")
-    assert session_pipeline_runner._legbot_allowed_codes(_env("fl", "ut")) == {"FL", "UT"}
+    monkeypatch.setattr(session_pipeline_runner, "_legbot_list_alerted", False)
+    with patch("ddp_sync.slack_alerts.post_alert") as post:
+        assert session_pipeline_runner._legbot_allowed_codes(_env("fl", "ut")) == set()
+        assert session_pipeline_runner._legbot_allowed_codes(_env()) == set()
+    assert post.call_count == 1 and "legbot_replica" in post.call_args.args[0]
 
 
-def test_shadow_mode_keeps_the_env_list_exactly_and_logs_a_difference(tmp_path, monkeypatch):
-    from structlog.testing import capture_logs
-
+def test_shadow_mode_no_longer_matters_the_shared_list_decides(tmp_path, monkeypatch):
     _shared_list(tmp_path, monkeypatch, legbot_true=("fl", "us"), mode=None)
-    with capture_logs() as logs:
-        got = session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
-    assert got == {"FL", "WA"}
-    assert any(l["event"] == "jurisdiction_manifest_disagrees" and l["feature"] == "legbot_replica" for l in logs)
-
-
-def test_an_env_list_that_differs_from_the_shared_list_is_logged_once_not_applied(tmp_path, monkeypatch):
-    from structlog.testing import capture_logs
-
-    _shared_list(tmp_path, monkeypatch, legbot_true=("fl",))
-    with capture_logs() as logs:
-        session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
-        session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa"))
-    assert [l["event"] for l in logs].count("jurisdiction_manifest_disagrees") == 1
+    assert session_pipeline_runner._legbot_allowed_codes(_env("fl", "wa")) == {"FL", "US"}
 
 
 @pytest.mark.asyncio
 async def test_a_state_with_legbot_replica_false_is_skipped_with_no_write_through_the_real_gate(tmp_path, monkeypatch):
     """SYNC-142: the same skip as a state off the old list, driven by the shared list, with the env list SET to allow it."""
     _shared_list(tmp_path, monkeypatch, legbot_true=("wa",))   # fl is false in the shared list
-    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=frozenset({"FL"})), patch(
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=None), patch(
         "ddp_sync.pipelines.session_pipeline_runner.check_bill_version_freshness", new=AsyncMock()
     ) as mock_freshness, _patch_coverage(None) as mock_coverage, patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact", new=AsyncMock()
@@ -3630,7 +3625,7 @@ async def test_a_state_with_legbot_replica_false_is_skipped_with_no_write_throug
 @pytest.mark.asyncio
 async def test_a_state_with_legbot_replica_true_proceeds_even_with_no_env_list(tmp_path, monkeypatch):
     _shared_list(tmp_path, monkeypatch, legbot_true=("fl",))
-    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=frozenset()), _patch_freshness_check(
+    with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(True, allowlist=None), _patch_freshness_check(
         True
     ), _patch_coverage(None), _patch_version(), patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",

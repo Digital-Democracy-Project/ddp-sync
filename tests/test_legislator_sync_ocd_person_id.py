@@ -29,8 +29,6 @@ def _patch_async_client(mock_client):
 def _make_service(**settings_overrides) -> LegislatorSyncService:
     settings = SyncSettings(
         openai_api_key="test-openai-key",
-        openstates_api_key="public-key",
-        openstates_api_base="https://v3.openstates.org",
         local_openstates_api_base="http://localhost:8002",
         local_openstates_api_key="local-key",
         **settings_overrides,
@@ -85,7 +83,7 @@ async def test_get_sponsor_name_sends_prefixed_id_given_bare_uuid():
 
 @pytest.mark.asyncio
 async def test_fetch_sponsored_bills_matches_sponsorship_given_bare_uuid():
-    service = _make_service(ddp_openstates_jurisdictions=[])
+    service = _make_service()
     mock_client = AsyncMock()
     mock_client.get.return_value = _mock_response(
         {
@@ -113,7 +111,7 @@ async def test_fetch_sponsored_bills_matches_sponsorship_given_bare_uuid():
 
 @pytest.mark.asyncio
 async def test_fetch_legislator_votes_matches_voter_given_bare_uuid():
-    service = _make_service(ddp_openstates_jurisdictions=[])
+    service = _make_service()
     mock_client = AsyncMock()
 
     bill_list_response = _mock_response(
@@ -184,7 +182,7 @@ async def test_sync_legislator_persists_bare_id_while_matching_via_prefixed_id()
     changing that would alter existing Pinecone document IDs' shape and
     orphan previously-ingested documents, which is explicitly out of scope
     for this fix."""
-    service = _make_service(ddp_openstates_jurisdictions=[])
+    service = _make_service()
     mock_client = AsyncMock()
     mock_client.get.return_value = _mock_response(
         {

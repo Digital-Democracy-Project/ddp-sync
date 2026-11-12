@@ -50,6 +50,20 @@ _DAY_ABBR = {
 }
 
 
+def _cadence_excluded(scrape_config: dict | None) -> set[str]:
+    """Scraped states that must never be escalated to nightly (SYNC-157: the manifest's `scrape.cadence_escalation`
+    false; it was the yaml's `dynamic_cadence.jurisdictions_excluded`). Empty when the manifest cannot say (logged
+    once), which is what the empty yaml list meant: today no state is excluded."""
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.services.jurisdiction_enrollment import manifest_codes
+
+    root = _get_root(scrape_config)
+    scraped, escalating = manifest_codes("scrape", root), manifest_codes("cadence_escalation", root)
+    if scraped is None or escalating is None:
+        return set()
+    return set(scraped) - set(escalating)
+
+
 class UpdateScheduler:
     """
     Scheduler for periodic content updates.
@@ -104,10 +118,15 @@ class UpdateScheduler:
             with open(self.config_path) as f:
                 config = yaml.safe_load(f)
                 logger.info(f"Loaded sync config from {self.config_path}")
-                return config or {}
         except Exception as e:
             logger.error(f"Failed to load sync config: {e}")
             return {}
+        # SYNC-157: outside the try on purpose. A config that still carries a per-state list moved to the manifest is
+        # refused (the scheduler does not start), instead of being read as an empty config.
+        from ddp_sync.services.jurisdiction_enrollment import check_removed_keys
+
+        check_removed_keys(config or {})
+        return config or {}
 
     def _log_manifest_disagreements(self) -> None:
         """OPEN-328: dual-read. Compare every jurisdiction list in sync_schedule.yaml with ddp-open-states'
@@ -598,9 +617,7 @@ class UpdateScheduler:
         # decision to make MI eligible for escalation instead -- the list itself, and this
         # belt-and-suspenders enforcement, stay in place for whichever jurisdiction is
         # actually configured as excluded at any given time.
-        excluded_juris = set(
-            config.get("dynamic_cadence", {}).get("jurisdictions_excluded", [])
-        )
+        excluded_juris = _cadence_excluded(config)  # SYNC-157: the manifest's scrape.cadence_escalation
         for j in [j for j in cadences if j in excluded_juris and cadences[j] == "nightly"]:
             logger.error(
                 "openstates_scrape: refusing to escalate an excluded jurisdiction "
@@ -911,7 +928,7 @@ class UpdateScheduler:
             startup_catch_up=startup,
             escalate_window=cadence_cfg.get("escalate_window", 2),
             quiet_window=cadence_cfg.get("quiet_window", 4),
-            excluded=cadence_cfg.get("jurisdictions_excluded", []),
+            excluded=sorted(_cadence_excluded(config)),
         )
 
     async def _run_cadence_review(self) -> dict[str, Any]:
@@ -942,7 +959,7 @@ class UpdateScheduler:
         if not cadence_cfg.get("enabled", False):
             return {"success": True, "skipped": "disabled"}
 
-        excluded = cadence_cfg.get("jurisdictions_excluded", [])
+        excluded = sorted(_cadence_excluded(config))
         escalate_window = cadence_cfg.get("escalate_window", 2)
         quiet_window = cadence_cfg.get("quiet_window", 4)
 

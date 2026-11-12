@@ -1411,8 +1411,8 @@ async def trigger_knowledge_base_backfill(
     (finished stages are skipped, interrupted ones resume from their checkpoint).
     restart: forget the checkpoint(s) and walk from the start.
 
-    404 for an unknown stage or a jurisdiction not enrolled in `openstates_archive.
-    knowledge_base_embedding.jurisdictions`; 503 when `KNOWLEDGE_BASE_INDEX_NAME` or the read api
+    404 for an unknown stage or a jurisdiction not enrolled in
+    the manifest's `enrollment.embedding` (SYNC-157); 503 when `KNOWLEDGE_BASE_INDEX_NAME` or the read api
     is not configured on this host; 409 when a backfill of this jurisdiction is already running.
     """
     from ddp_sync.config import get_settings, knowledge_base_settings
@@ -1431,16 +1431,14 @@ async def trigger_knowledge_base_backfill(
 
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
-    block = (config.get("knowledge_base_embedding") or {})
     from ddp_sync.pipelines.openstates_scrape import _get_root
     from ddp_sync.services.jurisdiction_enrollment import enrolled as _enrolled
 
-    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
-    enrolled = {str(j).lower() for j in _enrolled("embedding", block.get("jurisdictions", []), _get_root(config))}
+    enrolled = {str(j).lower() for j in (_enrolled("embedding", None, _get_root(config)) or [])}  # SYNC-157: the manifest
     if jurisdiction.lower() not in enrolled:
         raise HTTPException(
             status_code=404,
-            detail=f"'{jurisdiction}' is not enrolled in knowledge_base_embedding.jurisdictions: {sorted(enrolled)}",
+            detail=f"'{jurisdiction}' is not enrolled in the manifest's enrollment.embedding: {sorted(enrolled)}",
         )
 
     settings = get_settings()
@@ -1544,7 +1542,7 @@ async def trigger_knowledge_base_reconcile_plan(
     the log, not in this 202). The real pass is the post-archive hook's, switched on by
     `openstates_archive.knowledge_base_embedding.reconcile.max_bills_per_run`.
 
-    404 for a jurisdiction not enrolled in `knowledge_base_embedding.jurisdictions`; 503 when
+    404 for a jurisdiction not enrolled in the manifest's `enrollment.embedding` (SYNC-157); 503 when
     `KNOWLEDGE_BASE_INDEX_NAME` or the read api is not configured on this host.
 
     `ledger=true` plans the api-v3 ledger reconcile instead (`knowledge_base_embedding.ledger`): the bills
@@ -1563,15 +1561,14 @@ async def trigger_knowledge_base_reconcile_plan(
     from ddp_sync.pipelines.openstates_scrape import _get_root
     from ddp_sync.services.jurisdiction_enrollment import enrolled as _enrolled
 
-    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
     enrolled = {
         str(j).lower()
-        for j in _enrolled("embedding", (config.get("knowledge_base_embedding") or {}).get("jurisdictions", []), _get_root(config))
+        for j in (_enrolled("embedding", None, _get_root(config)) or [])  # SYNC-157: the manifest
     }
     if jurisdiction.lower() not in enrolled:
         raise HTTPException(
             status_code=404,
-            detail=f"'{jurisdiction}' is not enrolled in knowledge_base_embedding.jurisdictions: {sorted(enrolled)}",
+            detail=f"'{jurisdiction}' is not enrolled in the manifest's enrollment.embedding: {sorted(enrolled)}",
         )
     settings = get_settings()
     if not settings.knowledge_base_index_name:

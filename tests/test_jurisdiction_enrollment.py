@@ -179,15 +179,10 @@ def test_an_unrecognised_mode_is_shadow(root, monkeypatch):
 
 # --- the whole-config comparison (startup, and the OPEN-330 daily check) ---------------------------------
 
+# SYNC-157: the config holds no per-state list any more; only `openstates_scrape.timing` can disagree.
 AGREEING_CONFIG = {
-    "openstates_archive": {
-        "knowledge_base_embedding": {"jurisdictions": ["fl", "us"]},
-        "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
-    },
-    "openstates_scrape": {
-        "timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}},
-        "cloud_path": {"jurisdictions": ["fl", "usa", "nc"]},
-    },
+    "openstates_archive": {"knowledge_base_embedding": {"enabled": True}, "bill_search_refresh": {"enabled": True}},
+    "openstates_scrape": {"timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}}, "cloud_path": {"enabled": True}},
 }
 
 
@@ -201,9 +196,6 @@ def test_a_config_that_agrees_reports_nothing(root):
 @pytest.mark.parametrize(
     "mutate,feature,only_yaml,only_manifest",
     [
-        (lambda c: c["openstates_archive"]["knowledge_base_embedding"]["jurisdictions"].append("nc"), "embedding", ["nc"], []),
-        (lambda c: c["openstates_archive"]["bill_search_refresh"]["jurisdictions"].remove("nc"), "search_refresh", [], ["nc"]),
-        (lambda c: c["openstates_scrape"]["cloud_path"]["jurisdictions"].remove("nc"), "cloud_path", [], ["nc"]),
         # SYNC-152: timing for a state the manifest does not scrape (al is paused) is drift; a scraped state with no
         # timing entry (nc) is not.
         (lambda c: c["openstates_scrape"]["timing"].update(al={"floor": "weekly"}), "scrape_timing", ["al"], []),
@@ -227,7 +219,7 @@ def test_each_list_that_disagrees_is_named(root, mutate, feature, only_yaml, onl
 
 
 def test_log_config_disagreements_logs_every_call_unlike_enrolled(root):
-    config = {"openstates_archive": {"knowledge_base_embedding": {"jurisdictions": ["fl"]}}}
+    config = {"openstates_scrape": {"timing": {"al": {"floor": "weekly"}}}}
     with capture_logs() as logs:
         je.log_config_disagreements(config, root)
         je.log_config_disagreements(config, root)
@@ -249,9 +241,10 @@ def _archive_cfg(root, embedding):
     return {"openstates_root": root, "knowledge_base_embedding": {"enabled": True, "jurisdictions": embedding}}
 
 
-def test_the_embedding_hook_gate_is_unchanged_in_shadow_mode(root):
-    assert openstates_archive._knowledge_base_embedding_eligible("nc", _archive_cfg(root, ["fl", "us", "nc"])) is True
-    assert openstates_archive._knowledge_base_embedding_eligible("nc", _archive_cfg(root, ["fl", "us"])) is False
+def test_the_embedding_hook_gate_is_the_manifest_in_shadow_mode_too(root):
+    """SYNC-157: no yaml list to be shadowed; a leftover list is ignored in either mode."""
+    assert openstates_archive._knowledge_base_embedding_eligible("nc", _archive_cfg(root, ["fl", "us", "nc"])) is False
+    assert openstates_archive._knowledge_base_embedding_eligible("us", _archive_cfg(root, ["fl"])) is True
 
 
 def test_the_embedding_hook_gate_follows_the_manifest_in_authoritative_mode(root, monkeypatch):
@@ -269,7 +262,7 @@ def test_a_disabled_embedding_block_stays_off_whatever_the_manifest_says(root, m
 
 def test_the_search_refresh_hook_gate(root, monkeypatch):
     cfg = {"openstates_root": root, "bill_search_refresh": {"enabled": True, "jurisdictions": ["fl"]}}
-    assert openstates_archive._bill_search_refresh_eligible("nc", cfg) is False  # shadow: the yaml's answer
+    assert openstates_archive._bill_search_refresh_eligible("nc", cfg) is True  # SYNC-157: the manifest in shadow mode too
     monkeypatch.setenv(je.MODE_ENV, "authoritative")
     assert openstates_archive._bill_search_refresh_eligible("nc", cfg) is True  # the manifest says nc is on it
 
@@ -403,3 +396,56 @@ async def test_authoritative_live_state_still_triggers_and_usa_maps_to_us(tmp_pa
     assert (await _hook(monkeypatch, root, "fl")).await_count == 1
     run = await _hook(monkeypatch, root, "usa")
     assert run.await_args.args[0] == "us"
+
+
+
+# --- SYNC-157: a config that still carries a per-state list is refused ---------------------------------------------
+
+
+@pytest.mark.parametrize("path", sorted(je.REMOVED_CONFIG_KEYS))
+def test_every_removed_list_is_refused_and_named(path):
+    config: dict = {}
+    node = config
+    for key in path[:-1]:
+        node = node.setdefault(key, {})
+    node[path[-1]] = ["fl"]
+    with pytest.raises(je.RemovedConfigKey, match="SYNC-157") as raised:
+        je.check_removed_keys(config)
+    assert ".".join(path) in str(raised.value)
+
+
+def test_the_shipped_schedule_has_none_of_them():
+    import pathlib
+
+    import yaml as _yaml
+
+    path = pathlib.Path(__file__).resolve().parent.parent / "config" / "sync_schedule.yaml"
+    je.check_removed_keys(_yaml.safe_load(path.read_text()))  # does not raise
+
+
+def test_the_scheduler_refuses_to_start_on_such_a_config(tmp_path):
+    from unittest.mock import MagicMock
+
+    from ddp_sync.scheduler import UpdateScheduler
+
+    path = tmp_path / "sync_schedule.yaml"
+    path.write_text("openstates_scrape:\n  sweep_import:\n    enabled: true\n    jurisdictions: [va]\n")
+    settings = MagicMock()
+    settings.sync_interval_minutes = 30
+    with pytest.raises(je.RemovedConfigKey, match="openstates_scrape.sweep_import.jurisdictions"):
+        UpdateScheduler(settings=settings, config_path=path)
+
+
+def test_manifest_value_reads_one_field_and_spells_usa_as_us(root):
+    import pathlib
+
+    import yaml as _yaml
+
+    path = pathlib.Path(root) / "jurisdictions.yaml"
+    data = _yaml.safe_load(path.read_text())
+    data["us"].setdefault("scrape", {})["fargate_max_wait_s"] = 7
+    path.write_text(_yaml.safe_dump(data))
+    je._cache.clear()
+    assert je.manifest_value("usa", ("scrape", "fargate_max_wait_s"), root) == 7
+    assert je.manifest_value("fl", ("scrape", "fargate_max_wait_s"), root) is None  # field missing: None, logged
+    assert je.manifest_value("zz", ("scrape", "fargate_max_wait_s"), root) is None

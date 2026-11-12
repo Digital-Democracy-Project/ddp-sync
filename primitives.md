@@ -123,7 +123,7 @@ The daily bill sync entry point. **Do not reinvent these methods.**
   - `sync_current_session_bills(bills, heartbeat_callback) -> SyncBatchResult`
   - `backload_all_bills(bills) -> SyncBatchResult` — ignores session filter
   - `sync_bill(openstates_url, webflow_bill_id, bill_title, jurisdiction_name, bill_slug) -> BillSyncResult`
-  - `fetch_bill_from_openstates(jurisdiction, session, bill_id) -> dict | None` — rate-limited, retried; includes all `?include=` params. Routes to the local OpenStates replica (`settings.local_openstates_api_base`/`local_openstates_api_key`) instead of the public API (`settings.openstates_api_base`/`openstates_api_key`) when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` (env `DDP_OPENSTATES_JURISDICTIONS`) — mirrors ddp-broker-py's `OpenStatesService._get_client_for_jurisdiction()`; see `_get_api_base_and_key(jurisdiction)` (SYNC-6)
+  - `fetch_bill_from_openstates(jurisdiction, session, bill_id) -> dict | None` — rate-limited, retried; includes all `?include=` params. Always this host's own api-v3 (`services/openstates_route.api_v3`, SYNC-157); a state the manifest does not serve raises `NoOpenStatesRoute`.
   - `parse_openstates_url(url) -> OpenStatesUrl | None`
   - `resolve_jurisdiction_code(jurisdiction_id, openstates_url) -> str` — JURISDICTION_MAP first, OpenStates URL fallback
   - `is_current_session_async(session_year, session_code, jurisdiction) -> bool` — True when the bill's session matches a session api-v3 flags `is_current` (SYNC-139). No date fallback: api-v3 unreachable or not publishing the flag answers False and logs a warning
@@ -137,7 +137,7 @@ The daily bill sync entry point. **Do not reinvent these methods.**
 
 ## Legislator sync service (`pipelines/legislator_sync.py`)
 
-- **`LegislatorSyncService`** — legislator sponsored-bills + voting-record sync (`legislator-bills`/`legislator-votes` documents). Key methods: `fetch_sponsored_bills(person_id, jurisdiction, ...)`, `fetch_legislator_votes(person_id, jurisdiction, session, ...)`, `sync_legislator(legislator, ...)`, `sync_all_legislators(legislators, ...)`. `_get_sponsor_name(person_id, jurisdiction=None)` (SYNC-78) routes to the local OpenStates replica the same way as the other two methods when `jurisdiction` is passed and covered — `fetch_sponsored_bills` passes its own `jurisdiction` through at the call site; omitted (`None`), it falls back to the public API, same as before SYNC-78. `_ocd_person_id(person_id)` (SYNC-77, module-level function) normalizes the CMS's bare-UUID `openstates_id` to OpenStates' `ocd-person/{uuid}` form — applied at all three OpenStates-facing call sites (`_get_sponsor_name`, `fetch_sponsored_bills`, `fetch_legislator_votes`); document IDs/`legislator_id` metadata elsewhere stay on the bare UUID by convention, this only normalizes the request/comparison boundary. `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` routes to the local OpenStates replica when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8).
+- **`LegislatorSyncService`** — legislator sponsored-bills + voting-record sync (`legislator-bills`/`legislator-votes` documents). Key methods: `fetch_sponsored_bills(person_id, jurisdiction, ...)`, `fetch_legislator_votes(person_id, jurisdiction, session, ...)`, `sync_legislator(legislator, ...)`, `sync_all_legislators(legislators, ...)`. `_get_sponsor_name(person_id, jurisdiction=None)` (SYNC-78) passes the jurisdiction through for the manifest check. Every call goes to this host's own api-v3 (SYNC-157).
 
 ## Bill-topics list (live from the broker, SYNC-134)
 
@@ -260,9 +260,9 @@ Pub/sub channels (hardcoded strings in callers):
   - `fetch_jurisdiction(jurisdiction) -> JurisdictionInfo | None`
   - `fetch(jurisdiction, session, limit) -> AsyncIterator[DocumentSource]` — bill search + detail
   - `fetch_legislators(jurisdiction, limit) -> AsyncIterator[DocumentSource]`
-  - `fetch_bill(bill_id) -> DocumentSource | None` / `fetch_legislator_by_id(person_id) -> DocumentSource | None` — single opaque-ID lookups, always public API (no jurisdiction to route on)
+  - `fetch_bill(bill_id) -> DocumentSource | None` / `fetch_legislator_by_id(person_id) -> DocumentSource | None` — single opaque-ID lookups, on this host's own api-v3 (SYNC-157; never the public API)
   - `fetch_legislators_batch(person_ids) -> AsyncIterator[DocumentSource]`
-  - `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` — routes `fetch_jurisdiction`/`fetch`/`fetch_legislators` to the local OpenStates replica (`settings.local_openstates_api_base`/`local_openstates_api_key`) instead of the public API (`settings.openstates_api_base`/`openstates_api_key`) when `jurisdiction` is in `settings.ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8)
+  - `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` — delegates to `services/openstates_route.api_v3` (SYNC-157), like every other caller's.
 - **`JurisdictionInfo`** — `jurisdiction_id, name, sessions: list[LegislativeSession], latest_bill_update`. Methods: `current_sessions() -> list[LegislativeSession]` (the sessions api-v3 flags `is_current`; two while a special session runs), `flags_published() -> bool`. **The "current / previous session" rule lives in api-v3 (`api/current_session.py`, OPEN-467); ddp-sync only reads the flag. Do not add a second rule or a date comparison here.**
 - **`LegislativeSession`** — `identifier, name, classification, start_date, end_date, is_current, is_previous` (the last two are api-v3's flags; `None` = not sent)
 - **`PDFSource`** — `process_url(url, max_pages) -> DocumentSource | None`
@@ -282,7 +282,7 @@ Pub/sub channels (hardcoded strings in callers):
 
 ## OpenStates People client (`services/openstates_people.py`)
 
-- **`OpenStatesPeopleClient`** — person lookups for bio sync. Methods: `fetch_by_id(openstates_id) -> OpenStatesPerson | None` (single opaque-ID lookup, always public API — no jurisdiction to route on), `iter_jurisdiction(jurisdiction) -> AsyncIterator[OpenStatesPerson]`. Deliberately thin — no `Settings` dependency; takes `openstates_api_base`/`local_openstates_api_base`/`local_openstates_api_key`/`ddp_openstates_jurisdictions` as constructor kwargs instead. `_get_api_base_and_key(jurisdiction) -> tuple[str, str, bool]` routes `iter_jurisdiction` to the local OpenStates replica when `jurisdiction` is in `ddp_openstates_jurisdictions` — mirrors `BillSyncService._get_api_base_and_key()` (SYNC-6/SYNC-8). Callers: `pipelines/legislator_bio.py`'s `BioSyncOrchestrator`, `scripts/backfill_legislator_party.py`.
+- **`OpenStatesPeopleClient(settings, rate_limiter=None, ...)`** — person lookups for bio sync. Methods: `fetch_by_id(openstates_id) -> OpenStatesPerson | None`, `iter_jurisdiction(jurisdiction) -> AsyncIterator[OpenStatesPerson]`. Takes the host's settings since SYNC-157: every call goes to this host's own api-v3 (`openstates_route.api_v3`), never the public API.
 - **`OpenStatesPerson`** — bio data shape
 - **`OpenStatesError`** / **`OpenStatesRateLimitError`** — exception hierarchy
 
@@ -304,23 +304,22 @@ Pub/sub channels (hardcoded strings in callers):
 ## Cloud scrape wait limit (`pipelines/cloud_scrape_trigger.py`, OPEN-476)
 
 How long ddp-sync waits for a Fargate scrape task before it asks ECS to stop it. One shared value,
-`openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus an optional per-state override,
-`max_wait_seconds_by_jurisdiction: {ma: 86400}`, applied by `_fargate_config(config, jurisdiction)` in
-`run_cloud_scrape()`. The overridden value is the one persisted in the in-flight record, so a resumed job
-replays it. **Do not** read `SCRAPE_TIMEOUT_S` for this: that dict is the older Mac-path ceiling and the cloud
-path never used it (MA's 16 h entry there did nothing on Fargate). The archive block has its own separate
-`max_wait_seconds`, which the override does not touch. OPEN-477 replaces the fixed limit with a stall check;
-until then, a state that needs longer gets an entry here rather than a bigger shared value.
+`openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus a state's own ceiling, the manifest's
+`scrape.fargate_max_wait_s` (ma: 86400; SYNC-157 moved it from the yaml map `max_wait_seconds_by_jurisdiction`), read by
+`cloud_scrape_trigger.state_max_wait_s` and applied by `_fargate_config(config, jurisdiction)` in `run_cloud_scrape()`. The
+resolved value is the one persisted in the in-flight record, so a resumed job replays it. **Do not** use the scrape
+timeout for this: that is the Mac-path ceiling (`scrape_timeout_s`) and the cloud path never used it. The archive block has
+its own separate `max_wait_seconds`. OPEN-477 replaces the fixed limit with a stall check.
 
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida
 Legislature", "US Congress"), used by `bill_sync`, `legislator_sync` and the OpenStates source (each keeps a thin
-`_get_source_name` that delegates). It was three identical copies, none with `nc`. The manifest cannot supply the strings
-(its `name` is "North Carolina", and the federal entry reads differently), so the table keeps every name that is already in
-the knowledge base, pinned exactly by `tests/test_jurisdiction_names.py`. **Adding a state needs no line here (SYNC-146):** a
-code not in the table is labelled "<manifest name> Legislature" from the shared list (`jurisdiction_enrollment.manifest_name`);
-only when the manifest cannot be read does it fall back to "<CODE> Legislature".
+`_get_source_name` that delegates). **SYNC-157 deleted its per-state table:** a state is "<manifest name> Legislature" from
+the shared list (`jurisdiction_enrollment.manifest_name`), which gives exactly the knowledge base's existing strings for every
+tracked state (pinned by `tests/test_jurisdiction_names.py`); the federal one stays "US Congress" (the manifest calls it
+"United States (Congress)"). An unreadable manifest gives "<CODE> Legislature"; the embedding is gated on the same manifest,
+so it writes nothing then.
 
 ## First scrape needs legislators (`openstates_scrape.people_check_refusal`, SYNC-147)
 
@@ -332,6 +331,38 @@ be read**, but only for a state whose manifest status is `scraping`, `validating
 states (and an unreadable manifest) are never checked, so the live states cannot change. The manual trigger
 (`POST /trigger/openstates-scrape/<state>`) answers **409** with the reason; `?skip_people_check=true` starts it anyway, on
 purpose (`run_state_pipeline(..., skip_people_check=True)`, logged, not sticky). Do not write a second people count. It counts CURRENT legislators (a state still onboarding has a session in progress, and its votes need current people to resolve against); the manual trigger checks once for its answer and the funnel checks again before launching, so in the rare case the two reads differ, the refusal is logged and in the flow result, never silent.
+
+## SYNC-157: our own api-v3 only, and the manifest is the only list of states (2026-11-12)
+
+Ramon: "one singular list that everybody follows"; "every service must read from the canonical manifest of jurisdictions".
+
+- **One route to OpenStates data: `services/openstates_route.api_v3(settings, jurisdiction=None) -> (base, key)`.** This
+  host's own api-v3: RDS-backed on EC2 (no `cams_api_token`, `rds_openstates_api_base` set), local otherwise (SYNC-93's
+  split). A jurisdiction the manifest does not hold raises `NoOpenStatesRoute` and alerts once (`post_alert`, source
+  `openstates_route`); an empty base, or one on the public host, raises too; an unreadable manifest still uses our api-v3
+  (it can only hold our data), with a log line. Every caller's `_get_api_base_and_key` delegates to it; opaque-id lookups and
+  no-state crawls call it without a state. **Deleted:** `openstates_api_base`, `openstates_api_key`,
+  `ddp_openstates_jurisdictions` (env `OPENSTATES_API_BASE`, `OPENSTATES_API_KEY`, `DDP_OPENSTATES_JURISDICTIONS`).
+- **Every per-state list is the manifest's.** `jurisdiction_enrollment` features (each `None` = "cannot say", which every
+  reader treats as not enrolled): `cloud_path` (the S3 memory backend follows it; no floor list), `embedding`,
+  `search_refresh`, `legbot_replica` (no env fallback), `sweep_import`, `full_walk`, `scrape_retry`, `cadence_escalation`,
+  `scrapebot_fallback` (+ `_archive`, spelled "us"), `broker_bill_event_signal`; values via `manifest_value(code, path, root)`:
+  `scrape.timeout_s` (`openstates_scrape.scrape_timeout_s`), `archive.timeout_s` (`openstates_archive.archive_timeout_s`),
+  `scrape.fargate_max_wait_s` (`cloud_scrape_trigger.state_max_wait_s`). `sync_schedule.yaml` keeps each block's `enabled`
+  switch and its global numbers; the only per-state map is `openstates_scrape.timing`. **Deleted:** `active_jurisdictions`
+  (nothing read it), `SCRAPE_TIMEOUT_S`, `ARCHIVE_TIMEOUT_S`, the display-name table, env `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST`,
+  and the yaml lists in `jurisdiction_enrollment.REMOVED_CONFIG_KEYS`.
+- **Refused, not ignored:** `check_removed_keys(config)` raises `RemovedConfigKey` naming each leftover list; the scheduler
+  calls it outside its load `try`, so a host file that still has one does not start. A host that still SETS a deleted env var
+  gets one start-up warning naming it (`config.REMOVED_ENV`), not an error, because the release removes them only after the
+  new code runs. With the cloud path on and the manifest unreadable, `_run_scrape` refuses (`cloud_path_ownership_unknown`)
+  instead of running the Mac path. The daily drift check reports every new feature as "unverifiable" when the host's
+  manifest predates SYNC-157.
+- **Guards:** `tests/test_sync_157_no_public_openstates.py` (no code names the public host; every caller routes through the
+  one function); `tests/test_sync_157_no_state_lists.py` (the real yaml has no state-keyed list or map outside `timing`; no
+  module-level table of two or more states in src, except `voatz_brevo.STATE_CODES` (all states' names) and
+  `BillSyncService.JURISDICTION_MAP` (Webflow ids, goes with Webflow)). Test helper: `tests/sync157_manifest.py`.
+- `JURISDICTION_MANIFEST_MODE` no longer changes any answer (no yaml list is left to prefer); the variable can stay.
 
 ## Jurisdiction manifest dual-read (`services/jurisdiction_enrollment.py`, OPEN-318 / OPEN-328)
 
@@ -364,14 +395,14 @@ cut over 2026-11-02 UTC on both hosts):** the Mac's `.env`; the EC2 broker host'
 (committed there, next to `JURISDICTION_DRIFT_CHECK_ENABLED`, so a pull does not collide with a hand edit). Still
 wired only for the features listed above; the per-feature opt-in lists stay yaml-only on purpose.
 
-**SYNC-142: the LegBot gate reads the shared list.** `session_pipeline_runner._legbot_allowed_codes` answers from each state's `enrollment.legbot_replica` through `enrolled("legbot_replica", <env list>, default_root())`: in `authoritative` mode the shared list decides and `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` is ignored (logged once when it differs); in `shadow` mode, or when the shared list cannot be read, the env list is the fallback, and an empty answer sends nothing. The daily drift check no longer compares that env var; it reports `legbot_replica` as unverifiable when the manifest cannot answer it. `legbot_replica` is the one switch a human flips.
+**SYNC-142: the LegBot gate reads the shared list.** `session_pipeline_runner._legbot_allowed_codes` answers from each state's `enrollment.legbot_replica` (`enrolled("legbot_replica", None, default_root())`). `legbot_replica` is the one switch a human flips. SYNC-157 deleted the env list `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` and its fallback: an unreadable shared list dispatches nothing and alerts once (`_alert_legbot_list_unreadable`).
 
 **SYNC-146: a new state needs no ddp-sync edit.** In `authoritative` mode three more readers take their answer from the shared
 list through `enrolled(...)`: the scheduler's secondary batch (since SYNC-152: every scraped state, see "One pipeline per state"), the cloud-run ownership gate (`openstates_scrape._cloud_path_owns`, via
 `_cloud_path_jurisdictions`, `cloud_path`: `enrollment.cloud_path`) and the S3 memory floor (`_memory_backend_enabled`: a state
 the cloud owns is covered automatically). `cloud_path.enabled` stays the global switch. `shadow` mode and an unreadable shared
 list give the yaml's answer exactly as before. **Rolling a state back off the cloud path:** the yaml
-`memory_backend_jurisdictions` list is what remembers it afterwards, so add the state to it BEFORE setting `cloud_path` false in
+`memory_backend_jurisdictions` list was what remembered it afterwards (deleted by SYNC-157: the S3 memory now follows the manifest's `cloud_path` only, so a state taken off the cloud path walks in full on its first Mac run); before SYNC-157 one added the state to it BEFORE setting `cloud_path` false in
 the shared list (nothing can remember it once the manifest says false). Embedding and search-refresh registrations are
 unchanged by this ticket.
 
@@ -437,7 +468,7 @@ PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is n
 
 A daily job that compares THIS host's jurisdiction lists with ddp-open-states' `jurisdictions.yaml` and alerts through
 `post_alert` (source `jurisdiction_drift_check`). It checks the live `sync_schedule.yaml` dict (hand-edited per host),
-the host's own `DDP_OPENSTATES_JURISDICTIONS` (only when the host sets
+(before SYNC-157 also the host's own `DDP_OPENSTATES_JURISDICTIONS`, deleted; only when the host set
 them: unset is not drift), and whether the manifest can answer at all: a missing, unreadable, or out-of-date checkout is
 reported as "cannot verify" (the EC2 bind mount is never auto-pulled), because a monitor that cannot see must alert.
 The alert repeats only when the findings change or after `jurisdiction_drift_check.repeat_days` (7). Default off per host
@@ -602,9 +633,9 @@ Key config paths referenced in code (don't hardcode — always read from `self._
 |---|---|---|
 | `bill_sync.webflow_status.enabled` | `true` | Flow 1 on/off |
 | `bill_sync.version_check.enabled` | `true` | Flow 2 (Pinecone) on/off |
-| `openstates_archive.knowledge_base_embedding.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[fl, us, va, mi, wa, az, ut]` | SYNC-83 embedding hook on/off and enrolled jurisdictions; a host only acts if it also has `KNOWLEDGE_BASE_INDEX_NAME` |
+| `openstates_archive.knowledge_base_embedding.enabled` | `false` in code, **`true` in the checked-in file since 2026-10-05**; WHO is the manifest's `enrollment.embedding` (SYNC-157, no yaml list) | SYNC-83 embedding hook on/off and enrolled jurisdictions; a host only acts if it also has `KNOWLEDGE_BASE_INDEX_NAME` |
 | `openstates_archive.knowledge_base_embedding.backfill.blackout_start_utc` / `.blackout_end_utc` | `"04:45"` / `"07:00"` | SYNC-90 backfill pauses inside this UTC window (it was the 05:00 archive start, removed by SYNC-153; left as is until re-measured, plan open question 2) |
-| `openstates_archive.bill_search_refresh.enabled` / `.jurisdictions` | `false` in code, **`true` in the checked-in file since 2026-10-05** / `[us, fl, mi, az, va, wa, ut, nc]` | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
+| `openstates_archive.bill_search_refresh.enabled` | `false` in code, **`true` in the checked-in file since 2026-10-05**; WHO is the manifest's `enrollment.search_refresh` (SYNC-157, no yaml list) | SYNC-87 bill-search refresh hook on/off and enrolled jurisdictions; a host only acts if it also has `RDS_OPENSTATES_API_BASE` and its key |
 | `openstates_scrape.timing.fl` (no `sessions` key) | one run, no session argument | SYNC-130: FL's pipeline runs one scrape with no session argument, like every state without `sessions`, so the scraper scrapes every session marked `"active": True` in the scrapers image's `scrapers/fl/__init__.py` (each also needs its House `session_number` there). A new session is picked up when the image that activates it is deployed to Fargate (FL is cloud-owned); nothing here lists sessions. It used to loop over a hand-kept session list, and 2027 went unscraped for months. Two consequences: all active sessions share one incremental marker (`fl`), and FL's scraper skips bills whose last action predates it, so a session activated after its bills were filed gets those bills only on a full run (no marker) or when they move again; and a failing session stops the sessions after it in that run |
 | `openstates_scrape.defaults` / `.timing.<state>` | weekly, Sunday, `"02:00"` / fl weekly, wa/usa/pa nightly in the checked-in file | SYNC-152: WHEN each scraped state runs (`state_timing`); WHO is the manifest. Replaces `primary` and `secondary.jurisdictions` |
 | `slack_citations.*` | `enabled: true`, `mode: report_only`, `start_date`, `lookback_days: 30`, `thread_lookback_days: 730`, `max_citations_per_run: 200`, `sync_time_utc: "09:00"` | SYNC-127 nightly Slack pull; runs only where the host's `SLACK_CITATIONS_ENABLED=true` (default off) |

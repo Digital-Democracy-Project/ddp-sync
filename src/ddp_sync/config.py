@@ -101,25 +101,10 @@ class SyncSettings:
     knowledge_base_index_name: str = ""
 
     # External APIs
-    openstates_api_key: str = ""
     congress_api_key: str = ""
-    # Public v3.openstates.org API base. Configurable so it matches the
-    # local_openstates_api_base pattern below -- SYNC-6 needs this to be
-    # overridable so BillSyncService.fetch_bill_from_openstates() can be
-    # pointed at a different base in tests without patching a class
-    # constant.
-    openstates_api_base: str = "https://v3.openstates.org"
-    # Jurisdictions to route to the local OpenStates replica instead of the
-    # public API (SYNC-6). Deliberately the *same* env var name
-    # ddp-broker-py's settings.py reads (DDP_OPENSTATES_JURISDICTIONS) so
-    # both services can be pointed at one shared value -- ddp-sync does NOT
-    # hardcode its own default jurisdiction list here, to avoid drifting
-    # from whatever broker is actually routing. Empty by default (unlike
-    # broker's hard-required env var): this is a new var for ddp-sync, and
-    # until ops sets it to match broker's value, falling back to "always
-    # public API" is the same behavior as before this change existed --
-    # safer than refusing to boot.
-    ddp_openstates_jurisdictions: list = field(default_factory=list)
+    # SYNC-157: there is no public OpenStates API base, key or per-host routing list (OPENSTATES_API_BASE,
+    # OPENSTATES_API_KEY, DDP_OPENSTATES_JURISDICTIONS): every OpenStates read goes to this host's own api-v3
+    # (services/openstates_route.api_v3). A host that still sets one gets a warning at start-up (REMOVED_ENV).
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -245,14 +230,14 @@ class SyncSettings:
     # dedicated read against ddp-open-states' own local api-v3 instance
     # (docker-compose.ddp.yml maps its container to host port 8002 on the
     # Mac Studio, same box ddp-sync's LegBot dispatch already runs on — see
-    # cams_base_url above), NOT the same thing as openstates_api_key/the
-    # public v3.openstates.org API bill_sync.py calls by default.
+    # cams_base_url above). Since SYNC-157 it is also every OpenStates read's
+    # base on the Mac (services/openstates_route.api_v3).
     # Originally NOT the site-wide OPENSTATES_API_BASE cutover
     # PLAN-local-openstates-migration.md scopes (Pinecone re-keying,
     # VoteBot, universal ingestion) -- that migration is still out of
     # scope. SYNC-6 (2026-08-11) *does* now reuse this same base/key pair
     # for BillSyncService.fetch_bill_from_openstates(), but only for
-    # jurisdictions listed in ddp_openstates_jurisdictions below -- a
+    # jurisdictions listed in the (now deleted, SYNC-157) routing list -- a
     # narrow, jurisdiction-scoped routing decision mirroring
     # ddp-broker-py's _get_client_for_jurisdiction(), not the universal
     # cutover.
@@ -504,11 +489,8 @@ class SyncSettings:
     # left in this env var doesn't accidentally start gating dispatch before the freshness
     # infrastructure is even live. Comma-separated 2-letter codes, case-insensitive
     # (normalized to uppercase at parse time).
-    # SYNC-142: this env list is now only the FALLBACK. The dispatch gate reads each state's `enrollment.legbot_replica`
-    # from the shared list (ddp-open-states jurisdictions.yaml) in `authoritative` mode, and this value is ignored there
-    # (with a log line when it differs). It is used when JURISDICTION_MANIFEST_MODE is shadow (the default) or the shared
-    # list cannot be read; leave it unset on a host that should send nothing in that case.
-    legbot_rds_replica_jurisdiction_allowlist: frozenset[str] = frozenset()
+    # SYNC-157: the old env list LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST is gone. Which states LegBot may be sent
+    # from the replica is the manifest's `enrollment.legbot_replica` only (session_pipeline_runner._legbot_allowed_codes).
 
     # SYNC-48: independent enable flag for an automated scraper-completion
     # caller of run_legbot_pipeline (pipelines/scraper_triggered_legbot.py).
@@ -685,14 +667,7 @@ def _load_from_env() -> dict:
         "pinecone_index_name": os.getenv("PINECONE_INDEX_NAME", "votebot-large"),
         "pinecone_namespace": os.getenv("PINECONE_NAMESPACE", "default"),
         "knowledge_base_index_name": os.getenv("KNOWLEDGE_BASE_INDEX_NAME", ""),
-        "openstates_api_key": os.getenv("OPENSTATES_API_KEY", ""),
         "congress_api_key": os.getenv("CONGRESS_API_KEY", ""),
-        "openstates_api_base": os.getenv("OPENSTATES_API_BASE", "https://v3.openstates.org"),
-        "ddp_openstates_jurisdictions": [
-            j.strip().upper()
-            for j in os.getenv("DDP_OPENSTATES_JURISDICTIONS", "").split(",")
-            if j.strip()
-        ],
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         "webflow_votebot_api_key": os.getenv("WEBFLOW_VOTEBOT_API_KEY", ""),
         "webflow_scheduler_api_key": os.getenv("WEBFLOW_SCHEDULER_API_KEY", ""),
@@ -782,11 +757,6 @@ def _load_from_env() -> dict:
         "replica_freshness_content_check_enabled": (
             os.getenv("REPLICA_FRESHNESS_CONTENT_CHECK_ENABLED", "true").lower() == "true"
         ),
-        "legbot_rds_replica_jurisdiction_allowlist": frozenset(
-            code.strip().upper()
-            for code in os.getenv("LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST", "").split(",")
-            if code.strip()
-        ),
         "legbot_scrape_completion_trigger_enabled": (
             os.getenv("LEGBOT_SCRAPE_COMPLETION_TRIGGER_ENABLED", "false").lower() == "true"
         ),
@@ -825,6 +795,31 @@ def _load_from_env() -> dict:
     }
 
 
+# SYNC-157: settings that no longer exist. A host that still sets one is warned at start-up (once per process) and the
+# value is ignored: the release removes them from each host after the new code is running (removing them first would
+# make the OLD code send every state to the public API). Not an error, so a deploy never breaks on a stale env.
+REMOVED_ENV = (
+    "OPENSTATES_API_BASE",
+    "OPENSTATES_API_KEY",
+    "DDP_OPENSTATES_JURISDICTIONS",
+    "LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST",
+)
+_removed_env_warned = False
+
+
+def _warn_removed_env() -> None:
+    global _removed_env_warned
+    if _removed_env_warned:
+        return
+    _removed_env_warned = True
+    still_set = [name for name in REMOVED_ENV if os.getenv(name) is not None]
+    if still_set:
+        logger.warning(
+            "SYNC-157: these settings no longer exist and are ignored; remove them from this host: %s",
+            ", ".join(still_set),
+        )
+
+
 @lru_cache
 def get_settings() -> SyncSettings:
     """Load config and return a SyncSettings instance.
@@ -832,6 +827,7 @@ def get_settings() -> SyncSettings:
     Named get_settings() so moved code that calls
     `from ddp_sync.config import get_settings` works with minimal changes.
     """
+    _warn_removed_env()
     raw = _load_from_secrets_manager()
     if raw is None:
         raw = _load_from_env()

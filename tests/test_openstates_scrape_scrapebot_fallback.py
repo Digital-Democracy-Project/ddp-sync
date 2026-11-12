@@ -26,10 +26,23 @@ from ddp_sync.pipelines.openstates_scrape import (
     run_state_pipeline,
 )
 from ddp_sync.services.scrapebot_client import ScrapeBotDispatchError
+from tests import sync157_manifest
+
+_MANIFEST = {}
+
+
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: WHO gets the ScrapeBot fallback is the manifest's waf.scrapebot_fallback; `_config` writes it."""
+    _MANIFEST.update(tmp=tmp_path, mp=monkeypatch)
+    yield
+    _MANIFEST.clear()
 
 
 def _config(*, enabled=True, jurisdictions=("mi",)):
-    return {"scrapebot_fallback": {"enabled": enabled, "jurisdictions": list(jurisdictions)}}
+    codes = ["us" if c == "usa" else c for c in jurisdictions]
+    sync157_manifest.use(_MANIFEST["tmp"], _MANIFEST["mp"], **sync157_manifest.only("waf", "scrapebot_fallback", codes))
+    return {"scrapebot_fallback": {"enabled": enabled}}
 
 
 def test_eligible_true_when_enabled_and_listed():

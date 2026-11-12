@@ -28,13 +28,22 @@ import time
 import pytest
 
 from ddp_sync.pipelines.openstates_scrape import (
-    SCRAPE_TIMEOUT_S,
+    DEFAULT_SCRAPE_TIMEOUT_S,
     _full_walk_eligible,
     _maybe_force_full_walk,
     _record_full_walk,
+    scrape_timeout_s,
 )
+from tests import sync157_manifest
 
-MI_CFG = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": 30}}
+# SYNC-157: the yaml keeps the switch and the interval; WHO is the manifest's scrape.full_walk (mi, and us for one test).
+MI_CFG = {"full_walk": {"enabled": True, "interval_days": 30}}
+
+
+@pytest.fixture(autouse=True)
+def manifest(tmp_path_factory, monkeypatch):
+    sync157_manifest.use(tmp_path_factory.mktemp("manifest"), monkeypatch,
+                         **sync157_manifest.only("scrape", "full_walk", ["mi", "us"]))
 
 
 # --- the gate --------------------------------------------------------------------------
@@ -43,7 +52,7 @@ def test_listed_jurisdiction_is_eligible():
     assert _full_walk_eligible("mi", MI_CFG) == (True, 30)
 
 
-@pytest.mark.parametrize("jurisdiction", ["va", "ut", "fl", "wa", "usa", "ma", "az"])
+@pytest.mark.parametrize("jurisdiction", ["va", "ut", "fl", "wa", "ma", "az"])
 def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
     """A full walk is expensive everywhere and dangerous on a rate-capped site.
     It must never leak to a jurisdiction nobody opted in."""
@@ -52,13 +61,13 @@ def test_unlisted_jurisdictions_are_not_eligible(jurisdiction):
 
 def test_disabled_flag_overrides_the_list():
     """The documented rollback."""
-    cfg = {"full_walk": {"enabled": False, "jurisdictions": ["mi"], "interval_days": 30}}
+    cfg = {"full_walk": {"enabled": False, "interval_days": 30}}
     assert _full_walk_eligible("mi", cfg)[0] is False
 
 
 @pytest.mark.parametrize(
     "cfg",
-    [None, {}, {"full_walk": {}}, {"full_walk": {"enabled": True}}],
+    [None, {}, {"full_walk": {}}, {"full_walk": {"enabled": False}}],
 )
 def test_absent_or_incomplete_config_is_off(cfg):
     """Absent config must be off. Every caller that passes no config at all — which
@@ -163,13 +172,13 @@ def test_a_bad_interval_fails_closed(bad):
     ~3,924 WAF-capped requests on every scrape from a one-character typo. And a
     raising int() would take down the scrape path itself, since that call sits
     outside the filesystem error handler."""
-    cfg = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": bad}}
+    cfg = {"full_walk": {"enabled": True, "interval_days": bad}}
     assert _full_walk_eligible("mi", cfg)[0] is False
 
 
 def test_a_bad_interval_does_not_delete_the_marker(tmp_path):
     """Fail-closed asserted on the filesystem, not just the return value."""
-    cfg = {"full_walk": {"enabled": True, "jurisdictions": ["mi"], "interval_days": 0}}
+    cfg = {"full_walk": {"enabled": True, "interval_days": 0}}
     root = _root_with_marker(tmp_path)
     assert _maybe_force_full_walk("mi", "mi", cfg, root) is False
     assert (tmp_path / "logs" / "last-run" / "mi.ts").exists()
@@ -189,7 +198,7 @@ def test_a_session_label_targets_the_right_marker(tmp_path):
     """scrape_key_for() turns `usa session=119` into `usa_session_119`. If this
     cleared the bare `usa.ts` instead, it would force a walk of a run nobody
     configured and leave the real one untouched."""
-    cfg = {"full_walk": {"enabled": True, "jurisdictions": ["usa"], "interval_days": 30}}
+    cfg = {"full_walk": {"enabled": True, "interval_days": 30}}
     last_run = tmp_path / "logs" / "last-run"
     last_run.mkdir(parents=True)
     (last_run / "usa_session_119.ts").write_text("x")
@@ -222,8 +231,8 @@ def test_mi_has_a_ceiling_that_fits_a_full_walk():
     alerting never run — and openstates-core has already wiped the data directory.
     The entire walk's work would be discarded silently. MA hit exactly this trap
     before it got its own entry."""
-    assert SCRAPE_TIMEOUT_S["mi"] > SCRAPE_TIMEOUT_S["default"]
-    assert SCRAPE_TIMEOUT_S["mi"] >= int(6.5 * 3600 * 1.4), "needs real headroom over ~6.5h"
+    assert scrape_timeout_s("mi") > DEFAULT_SCRAPE_TIMEOUT_S
+    assert scrape_timeout_s("mi") >= int(6.5 * 3600 * 1.4), "needs real headroom over ~6.5h"
 
 
 # ── OPEN-162 round 2: a failed forced walk must give the watermark back ────────

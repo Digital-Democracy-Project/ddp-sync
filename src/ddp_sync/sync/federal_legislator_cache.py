@@ -6,15 +6,8 @@ but we can pre-fetch all US Congress members and cache their IDs for lookup.
 The cache maps voter_name strings (as they appear in vote records) to person IDs.
 For example: "Alsobrooks (D-MD)" -> "ocd-person/abc123..."
 
-SYNC-8 (2026-08-12) routes refresh()'s /people fetch to the local OpenStates
-replica instead of the public v3.openstates.org API when "US" is listed in
-settings.ddp_openstates_jurisdictions -- mirrors
-BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py, SYNC-6) and
-the equivalent helpers added the same day to OpenStatesSource,
-LegislatorSyncService, and OpenStatesPeopleClient. This cache only ever
-queries jurisdiction "us", so unlike the other three files there's a single
-routing decision per refresh() call, not one per call site -- see
-_get_api_base_and_key().
+SYNC-157: refresh()'s /people fetch goes to this host's own api-v3 (services/openstates_route), never the
+public OpenStates API.
 """
 
 import json
@@ -25,6 +18,7 @@ import httpx
 import structlog
 
 from ddp_sync.config import Settings, get_settings
+from ddp_sync.services.openstates_route import api_v3
 
 logger = structlog.get_logger()
 
@@ -185,35 +179,10 @@ class FederalLegislatorCache:
         return self._cache.get(person_id)
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
-        """
-        Choose which OpenStates-compatible backend to hit for this jurisdiction.
-
-        Mirrors BillSyncService._get_api_base_and_key() (pipelines/bill_sync.py,
-        SYNC-6) and the equivalent helpers added to OpenStatesSource,
-        LegislatorSyncService, and OpenStatesPeopleClient (SYNC-8):
-        jurisdictions listed in settings.ddp_openstates_jurisdictions are
-        routed to the local OpenStates replica instead of the public
-        v3.openstates.org API. This cache only ever fetches jurisdiction "us"
-        (US Congress), so the routing decision is effectively a single
-        boolean, but the helper is kept in the same shape as the other three
-        files for consistency.
-
-        Returns:
-            (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
-            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
-            the key is sent as a header on every route, never in the query string (it was logged there).
-        """
-        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
-        if jurisdiction.upper() in replica_jurisdictions:
-            logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
-                jurisdiction=jurisdiction,
-                api_base=self.settings.local_openstates_api_base,
-            )
-            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
-
-        return self.settings.openstates_api_base, self.settings.openstates_api_key, False
+        """`(api_base, api_key, True)` of this host's own api-v3 (SYNC-157: never the public OpenStates API).
+        This cache only fetches "us". See services/openstates_route."""
+        api_base, api_key = api_v3(self.settings, jurisdiction)
+        return api_base, api_key, True
 
     async def refresh(self) -> dict:
         """
@@ -224,19 +193,10 @@ class FederalLegislatorCache:
         """
         logger.info("Refreshing federal legislator cache from OpenStates")
 
-        # Always jurisdiction "us" -- resolve once (SYNC-8). The api_key
-        # check below matches whichever backend was resolved (public vs
-        # local replica), not unconditionally the public
-        # OPENSTATES_API_KEY -- routing "US" to the replica shouldn't be
-        # blocked by a missing public key it will never use.
+        # Always jurisdiction "us" -- resolved once, to our own api-v3 (SYNC-157).
         api_base, api_key, is_local_replica = self._get_api_base_and_key("us")
         if not api_key:
-            error = (
-                "Local OpenStates replica API key not configured"
-                if is_local_replica
-                else "OpenStates API key not configured"
-            )
-            return {"success": False, "error": error}
+            return {"success": False, "error": "this host's api-v3 key is not configured"}
 
         legislators: dict[str, dict] = {}
         stats = {"senate": 0, "house": 0, "errors": []}
@@ -301,10 +261,7 @@ class FederalLegislatorCache:
     ) -> dict[str, dict]:
         """Fetch all members of a chamber from OpenStates.
 
-        Routes to the local OpenStates replica instead of the public API when
-        "US" is listed in settings.ddp_openstates_jurisdictions (SYNC-8) --
-        see _get_api_base_and_key(), resolved once by the caller (refresh())
-        since this cache only ever queries jurisdiction "us".
+        Our own api-v3 (SYNC-157), resolved once by the caller (refresh()).
         """
         legislators = {}
         page = 1

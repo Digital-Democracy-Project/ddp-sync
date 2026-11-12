@@ -40,9 +40,10 @@ from unittest.mock import patch
 import pytest
 
 from ddp_sync.pipelines.openstates_archive import (
-    ARCHIVE_TIMEOUT_S,
+    DEFAULT_ARCHIVE_TIMEOUT_S,
     _alert_archive_failure,
     _run_archive,
+    archive_timeout_s,
 )
 
 
@@ -133,6 +134,13 @@ async def test_subprocess_start_failure_alerts():
     assert result["success"] is False
     mock_alert.assert_called_once()
 
+@pytest.fixture(autouse=True)
+def _manifest(tmp_path, monkeypatch):
+    """SYNC-157: the ceilings are the manifest's scrape/archive.timeout_s (its real values here)."""
+    from tests import sync157_manifest
+
+    sync157_manifest.use(tmp_path, monkeypatch)
+
 
 def test_alert_archive_failure_never_raises_when_slack_returns_non_ok():
     with (
@@ -201,20 +209,19 @@ def test_alert_archive_failure_includes_jurisdiction_in_the_message():
 def test_mi_has_its_own_ceiling_rather_than_the_default():
     # MI silently inheriting `default` (4h) is the bug: ~8k docs at ~10s/doc via
     # os-text-extract is 20h+, so a healthy run gets killed partway through every day.
-    assert "mi" in ARCHIVE_TIMEOUT_S
-    assert ARCHIVE_TIMEOUT_S["mi"] > ARCHIVE_TIMEOUT_S["default"]
+    assert archive_timeout_s("mi") > DEFAULT_ARCHIVE_TIMEOUT_S
 
 
 def test_mi_ceiling_clears_the_measured_backlog():
     measured_backlog_seconds = 8000 * 10  # ~8k docs at ~10s/doc
-    assert ARCHIVE_TIMEOUT_S["mi"] >= measured_backlog_seconds
+    assert archive_timeout_s("mi") >= measured_backlog_seconds
 
 
 def test_other_archive_ceilings_are_untouched():
-    assert ARCHIVE_TIMEOUT_S["fl"] == 16 * 3600
-    assert ARCHIVE_TIMEOUT_S["wa"] == 8 * 3600
-    assert ARCHIVE_TIMEOUT_S["us"] == 24 * 3600
-    assert ARCHIVE_TIMEOUT_S["default"] == 4 * 3600
+    assert archive_timeout_s("fl") == 16 * 3600
+    assert archive_timeout_s("wa") == 8 * 3600
+    assert archive_timeout_s("us") == 24 * 3600
+    assert DEFAULT_ARCHIVE_TIMEOUT_S == 4 * 3600
 
 
 @pytest.mark.asyncio
@@ -231,7 +238,7 @@ async def test_mi_resolves_to_its_own_ceiling_at_the_invocation_path():
     ):
         await _run_archive("mi", "/fake/root")
 
-    assert seen["timeout"] == ARCHIVE_TIMEOUT_S["mi"]
+    assert seen["timeout"] == archive_timeout_s("mi")
 
 
 # --- evidence bar: a real subprocess, a real timeout, a real kill -------------------

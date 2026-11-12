@@ -40,7 +40,7 @@ import structlog
 from ddp_sync.config import SyncSettings, get_settings
 from ddp_sync.pipelines.openstates_scrape import _get_root as _scrape_root
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
-from ddp_sync.services.jurisdiction_enrollment import enrolled
+from ddp_sync.services.jurisdiction_enrollment import enrolled, is_enrolled
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
 from ddp_sync.slack_alerts import post_alert
@@ -76,13 +76,17 @@ ARCHIVE_RETRY_DELAYS_S: tuple[int, ...] = (1800, 7200)
 # comparable cold-backfill shape, mi gets the same runway rather than a
 # number sized to one measurement that the next run then exceeds (the same
 # trap openstates_scrape.py's SCRAPE_TIMEOUT_S comment describes for MA).
-ARCHIVE_TIMEOUT_S: dict[str, int] = {
-    "fl": 16 * 3600,
-    "wa": 8 * 3600,
-    "mi": 24 * 3600,
-    "us": 24 * 3600,
-    "default": 4 * 3600,
-}
+# SYNC-157: a state's own ceiling is the manifest's `archive.timeout_s` (fl 16h, wa 8h, mi 24h -- SYNC-2 --, us 24h on
+# 2026-11-12); this module's copy (ARCHIVE_TIMEOUT_S) is deleted. A state the manifest cannot answer for gets the default.
+DEFAULT_ARCHIVE_TIMEOUT_S = 4 * 3600
+
+
+def archive_timeout_s(jurisdiction: str, config: dict | None = None) -> int:
+    """The wall-clock ceiling of one archive run: the manifest's `archive.timeout_s`, else DEFAULT_ARCHIVE_TIMEOUT_S."""
+    from ddp_sync.services.jurisdiction_enrollment import manifest_value
+
+    value = manifest_value(jurisdiction, ("archive", "timeout_s"), _scrape_root(config))
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else DEFAULT_ARCHIVE_TIMEOUT_S
 
 
 def _get_root(config: dict | None) -> str:
@@ -147,7 +151,8 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     fallback_cfg = (config or {}).get("scrapebot_fallback", {})
     if not fallback_cfg.get("enabled", False):
         return False
-    return jurisdiction in fallback_cfg.get("jurisdictions", [])
+    # SYNC-157: WHO is the manifest's waf.scrapebot_fallback (the same field the scrape reads)
+    return is_enrolled("scrapebot_fallback_archive", jurisdiction, _scrape_root(config))
 
 
 async def _maybe_preseed_scrapebot_cookies(
@@ -226,7 +231,7 @@ async def _run_archive(
     script = os.path.join(openstates_root, "run-archive.sh")
     cmd = ["/bin/bash", script, jurisdiction]
 
-    timeout = timeout_s or ARCHIVE_TIMEOUT_S.get(jurisdiction, ARCHIVE_TIMEOUT_S["default"])
+    timeout = timeout_s or archive_timeout_s(jurisdiction, config)
 
     logger.info("openstates_archive: starting", jurisdiction=jurisdiction, timeout_s=timeout)
 
@@ -772,8 +777,8 @@ def _knowledge_base_embedding_eligible(jurisdiction: str, config: dict | None) -
     block = (config or {}).get("knowledge_base_embedding") or {}
     if not block.get("enabled", False):
         return False
-    # OPEN-328: dual-read with jurisdictions.yaml (shadow mode returns the yaml's list).
-    return jurisdiction.lower() in enrolled("embedding", block.get("jurisdictions", []), _scrape_root(config))
+    # SYNC-157: WHO is the manifest's enrollment.embedding; the yaml keeps only the global switch.
+    return jurisdiction.lower() in (enrolled("embedding", None, _scrape_root(config)) or [])
 
 
 def _reconcile_max_bills(config: dict | None) -> int:
@@ -893,7 +898,8 @@ def _bill_search_refresh_eligible(jurisdiction: str, config: dict | None) -> boo
     block = (config or {}).get("bill_search_refresh") or {}
     if not block.get("enabled", False):
         return False
-    return jurisdiction.lower() in enrolled("search_refresh", block.get("jurisdictions", []), _scrape_root(config))
+    # SYNC-157: WHO is the manifest's enrollment.search_refresh; the yaml keeps only the global switch.
+    return jurisdiction.lower() in (enrolled("search_refresh", None, _scrape_root(config)) or [])
 
 
 async def _maybe_refresh_bill_search(jurisdiction: str, config: dict | None) -> None:

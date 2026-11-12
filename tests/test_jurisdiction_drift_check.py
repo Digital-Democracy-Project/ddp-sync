@@ -23,7 +23,12 @@ def _entry(tier="secondary", status="live", archive=True, embedding=False, searc
     return {
         "tier": tier, "status": status, "archive": {"enabled": archive, "scheduled": archive},
         "enrollment": {"embedding": embedding, "search_refresh": search_refresh, "cloud_path": cloud_path,
-                       "replica_routing": replica_routing, "legbot_replica": legbot_replica},
+                       "replica_routing": replica_routing, "legbot_replica": legbot_replica,
+                       "broker_bill_event_signal": False},
+        # SYNC-157: the per-state behaviour ddp-sync reads from here
+        "scrape": {"sweep_import": False, "full_walk": False, "retry": False, "cadence_escalation": True,
+                   "fargate_max_wait_s": None},
+        "waf": {"profile": "none", "scrapebot_fallback": False},
     }
 
 
@@ -34,16 +39,16 @@ MANIFEST = {
     "al": _entry("secondary", status="paused", replica_routing=False, legbot_replica=False),
 }
 
+# SYNC-157: the config holds no per-state list; only `openstates_scrape.timing` can disagree with the manifest.
 AGREEING_CONFIG = {
-    "openstates_archive": {
-        "knowledge_base_embedding": {"jurisdictions": ["fl", "us"]},
-        "bill_search_refresh": {"jurisdictions": ["us", "fl", "nc"]},
-    },
-    "openstates_scrape": {
-        "timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}},
-        "cloud_path": {"jurisdictions": ["fl", "usa", "nc"]},
-    },
+    "openstates_archive": {"knowledge_base_embedding": {"enabled": True}, "bill_search_refresh": {"enabled": True}},
+    "openstates_scrape": {"timing": {"fl": {"floor": "weekly"}, "usa": {"floor": "nightly"}}, "cloud_path": {"enabled": True}},
 }
+# timing for a paused state (al) is drift; a second extra name (zz, unknown) is a different finding
+DRIFT_CONFIG = {**AGREEING_CONFIG, "openstates_scrape": {**AGREEING_CONFIG["openstates_scrape"],
+                "timing": {**AGREEING_CONFIG["openstates_scrape"]["timing"], "al": {"floor": "weekly"}}}}
+DRIFT_CONFIG_2 = {**AGREEING_CONFIG, "openstates_scrape": {**AGREEING_CONFIG["openstates_scrape"],
+                  "timing": {**AGREEING_CONFIG["openstates_scrape"]["timing"], "al": {}, "zz": {}}}}
 
 
 @pytest.fixture(autouse=True)
@@ -60,47 +65,23 @@ def root(tmp_path):
     return str(tmp_path)
 
 
-def _settings(routing=(), legbot=()):
-    return SimpleNamespace(ddp_openstates_jurisdictions=list(routing), legbot_rds_replica_jurisdiction_allowlist=frozenset(legbot))
+def _settings(*_ignored):
+    """SYNC-157: no env list is compared any more; a host's settings are not read by the check."""
+    return SimpleNamespace()
 
 
 # --- collect_findings -----------------------------------------------------------------------------------
 
 def test_everything_agreeing_has_no_findings(root):
-    f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US", "FL", "NC"], ["fl", "us", "nc"]), root)
+    f = jdc.collect_findings(AGREEING_CONFIG, _settings(), root)
     assert f == {"drift": [], "unverifiable": [], "skipped": []}
 
 
-def test_an_env_list_the_host_does_not_set_is_not_drift_but_is_named_as_skipped(root):
-    f = jdc.collect_findings(AGREEING_CONFIG, _settings(), root)
-    assert f["drift"] == [] and f["unverifiable"] == []
-    # SYNC-142: the LegBot env list is not compared any more (the gate reads the manifest), so it is not named either.
-    assert f["skipped"] == ["DDP_OPENSTATES_JURISDICTIONS"]
-
-
-def test_skipped_env_lists_do_not_change_the_alert_signature_or_cause_an_alert(root):
-    result, post, _ = _run(root, AGREEING_CONFIG, _settings())
-    assert not post.called and result["findings"]["skipped"]
-    a = jdc._signature({"drift": [], "unverifiable": [], "skipped": []})
-    b = jdc._signature({"drift": [], "unverifiable": [], "skipped": ["X"]})
-    assert a == b
-
-
-def test_an_env_list_that_differs_is_drift_with_both_sides(root):
-    f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US", "FL"], ["FL", "US", "NC", "AL"]), root)
-    by = {d["source"]: d for d in f["drift"]}
-    assert by["env DDP_OPENSTATES_JURISDICTIONS"]["only_in_manifest"] == ["nc"]
-    # SYNC-142: a stale LegBot env list on a host is not drift: the gate ignores it when the manifest is readable.
-    assert "env LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST" not in by
-
-
-def test_a_live_yaml_list_that_differs_is_drift(root):
-    import copy
-
-    config = copy.deepcopy(AGREEING_CONFIG)
-    config["openstates_archive"]["bill_search_refresh"]["jurisdictions"].remove("nc")
-    f = jdc.collect_findings(config, _settings(), root)
-    assert [d["feature"] for d in f["drift"]] == ["search_refresh"] and f["drift"][0]["source"] == "sync_schedule.yaml"
+def test_no_env_list_is_compared_any_more(root, monkeypatch):
+    """SYNC-157: DDP_OPENSTATES_JURISDICTIONS and the LegBot env list are deleted; a stale one on a host is not read."""
+    monkeypatch.setenv("DDP_OPENSTATES_JURISDICTIONS", "US")
+    f = jdc.collect_findings(AGREEING_CONFIG, SimpleNamespace(ddp_openstates_jurisdictions=["US"]), root)
+    assert f == {"drift": [], "unverifiable": [], "skipped": []}
 
 
 def test_timing_for_a_state_the_manifest_does_not_scrape_is_drift(root):
@@ -123,17 +104,23 @@ def test_a_scraped_state_without_timing_is_not_drift(root):
 
 
 def test_a_missing_manifest_is_unverifiable_not_silent(tmp_path):
-    f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US"], ["us"]), str(tmp_path))
-    assert f["drift"] == [] and "archive" in f["unverifiable"] and "replica_routing" in f["unverifiable"]
+    f = jdc.collect_findings(AGREEING_CONFIG, _settings(), str(tmp_path))
+    assert f["drift"] == [] and "archive" in f["unverifiable"] and "sweep_import" in f["unverifiable"]
     assert "scrape" in f["unverifiable"]  # SYNC-152: a host that cannot read who is scraped must alert
 
 
-def test_a_manifest_older_than_the_new_fields_is_unverifiable_for_those_only(tmp_path):
-    old = {c: {k: v for k, v in e.items() if k != "enrollment"} | {"enrollment": {
-        k: v for k, v in e["enrollment"].items() if k not in ("replica_routing", "legbot_replica")}} for c, e in MANIFEST.items()}
+def test_a_manifest_older_than_sync_157_is_unverifiable_for_its_fields_only(tmp_path):
+    """A host whose ddp-open-states checkout predates SYNC-157 must alert: every reader would treat its states as not
+    enrolled (MI without its ScrapeBot fallback, MA without its retry)."""
+    old = {}
+    for c, e in MANIFEST.items():
+        old[c] = {k: v for k, v in e.items() if k not in ("scrape", "waf")}
+        old[c]["enrollment"] = {k: v for k, v in e["enrollment"].items() if k != "broker_bill_event_signal"}
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(old))
-    f = jdc.collect_findings(AGREEING_CONFIG, _settings(["US", "FL", "NC"], ["fl"]), str(tmp_path))
-    assert f["unverifiable"] == ["legbot_replica", "replica_routing"] and f["drift"] == []
+    f = jdc.collect_findings(AGREEING_CONFIG, _settings(), str(tmp_path))
+    assert f["unverifiable"] == sorted(["broker_bill_event_signal", "cadence_escalation", "full_walk", "scrape_retry",
+                                        "scrapebot_fallback", "sweep_import"])
+    assert f["drift"] == []
 
 
 # --- the job: alerting, de-duplication, never raises ----------------------------------------------------
@@ -165,38 +152,38 @@ def test_no_findings_means_no_alert_and_an_ok_status(root):
 
 
 def test_drift_alerts_once_with_the_lists_named(root):
-    result, post, written = _run(root, AGREEING_CONFIG, _settings(["US"], []))
+    result, post, written = _run(root, DRIFT_CONFIG, _settings())
     assert result["status"] == "drift"
     post.assert_called_once()
     text = post.call_args.args[0]
-    assert "DDP_OPENSTATES_JURISDICTIONS" in text and "fl" in text and "nc" in text
+    assert "scrape_timing" in text and "al" in text
     assert post.call_args.kwargs["source"] == "jurisdiction_drift_check"
     assert written["jurisdiction_drift_check"]["last_alert_at"]
 
 
 def test_the_same_finding_does_not_alert_again_before_repeat_days(root):
-    first, _, _ = _run(root, AGREEING_CONFIG, _settings(["US"]))
-    result, post, _ = _run(root, AGREEING_CONFIG, _settings(["US"]), previous=first)
+    first, _, _ = _run(root, DRIFT_CONFIG, _settings())
+    result, post, _ = _run(root, DRIFT_CONFIG, _settings(), previous=first)
     assert not post.called and result["status"] == "drift"
 
 
 def test_a_changed_finding_alerts_again_immediately(root):
-    first, _, _ = _run(root, AGREEING_CONFIG, _settings(["US"]))
-    _, post, _ = _run(root, AGREEING_CONFIG, _settings(["US", "FL"]), previous=first)
+    first, _, _ = _run(root, DRIFT_CONFIG, _settings())
+    _, post, _ = _run(root, DRIFT_CONFIG_2, _settings(), previous=first)
     assert post.called
 
 
 def test_the_same_finding_alerts_again_after_repeat_days(root):
-    first, _, _ = _run(root, AGREEING_CONFIG, _settings(["US"]))
+    first, _, _ = _run(root, DRIFT_CONFIG, _settings())
     first["last_alert_at"] = "2020-01-01T00:00:00+00:00"
-    _, post, _ = _run(root, AGREEING_CONFIG, _settings(["US"]), previous=first)
+    _, post, _ = _run(root, DRIFT_CONFIG, _settings(), previous=first)
     assert post.called
 
 
 def test_a_failed_alert_post_is_retried_next_run_not_recorded_as_sent(root):
-    result, post, written = _run(root, AGREEING_CONFIG, _settings(["US"]), alert=False)
+    result, post, written = _run(root, DRIFT_CONFIG, _settings(), alert=False)
     assert post.called and written["jurisdiction_drift_check"]["last_alert_at"] is None
-    _, post2, _ = _run(root, AGREEING_CONFIG, _settings(["US"]), previous=written["jurisdiction_drift_check"])
+    _, post2, _ = _run(root, DRIFT_CONFIG, _settings(), previous=written["jurisdiction_drift_check"])
     assert post2.called
 
 
@@ -206,7 +193,7 @@ def test_an_unreadable_manifest_alerts_as_unverifiable(tmp_path):
 
 
 def test_recovery_clears_the_signature(root):
-    first, _, _ = _run(root, AGREEING_CONFIG, _settings(["US"]))
+    first, _, _ = _run(root, DRIFT_CONFIG, _settings())
     result, post, _ = _run(root, AGREEING_CONFIG, _settings(), previous=first)
     assert result["status"] == "ok" and result["signature"] == "" and not post.called
 

@@ -16,6 +16,7 @@ from ddp_sync.ingestion.pipeline import DocumentSource, IngestionPipeline
 from ddp_sync.ingestion.sources.openstates import JurisdictionInfo, OpenStatesSource
 from ddp_sync.services.jurisdiction_names import source_name
 from ddp_sync.services.legislative_calendar import StateLegislativeCalendar
+from ddp_sync.services.openstates_route import api_v3
 from ddp_sync.services.rate_limiter import RateLimitConfig, RateLimiter
 
 logger = structlog.get_logger()
@@ -92,7 +93,6 @@ class BillSyncService:
             config_path: Path to sync_schedule.yaml config file
         """
         self.settings = settings or get_settings()
-        self.api_key = self.settings.openstates_api_key
         self.calendar = StateLegislativeCalendar()
         self.pipeline = IngestionPipeline(self.settings)
         self.config_path = config_path or DEFAULT_CONFIG_PATH
@@ -305,35 +305,10 @@ class BillSyncService:
         await self.rate_limiter.apply()
 
     def _get_api_base_and_key(self, jurisdiction: str) -> tuple[str, str, bool]:
-        """
-        Choose which OpenStates-compatible backend to hit for this jurisdiction.
-
-        Mirrors ddp-broker-py's OpenStatesService._get_client_for_jurisdiction():
-        jurisdictions listed in settings.ddp_openstates_jurisdictions (the same
-        DDP_OPENSTATES_JURISDICTIONS env var broker reads) are routed to the
-        local OpenStates replica instead of the public v3.openstates.org API,
-        so the two services never diverge on which jurisdictions are "on the
-        replica" vs "on the public API".
-
-        Args:
-            jurisdiction: State code (e.g., 'fl', 'us', 'va')
-
-        Returns:
-            (api_base, api_key, is_local_replica) tuple. is_local_replica is
-            True when the jurisdiction is served by a DDP api-v3 instance (the Mac's local one or the
-            RDS-backed one) rather than the public API. It no longer selects an auth style: since SYNC-68
-            the key is sent as a header on every route, never in the query string (it was logged there).
-        """
-        replica_jurisdictions = {j.upper() for j in self.settings.ddp_openstates_jurisdictions}
-        if jurisdiction.upper() in replica_jurisdictions:
-            logger.debug(
-                "Routing jurisdiction to local OpenStates replica",
-                jurisdiction=jurisdiction,
-                api_base=self.settings.local_openstates_api_base,
-            )
-            return self.settings.local_openstates_api_base, self.settings.local_openstates_api_key, True
-
-        return self.settings.openstates_api_base, self.api_key, False
+        """`(api_base, api_key, True)` of this host's own api-v3 for `jurisdiction` (SYNC-157: never the public
+        OpenStates API; a state the manifest does not serve raises `NoOpenStatesRoute`). See services/openstates_route."""
+        api_base, api_key = api_v3(self.settings, jurisdiction)
+        return api_base, api_key, True
 
     async def fetch_bill_from_openstates(
         self,
@@ -344,9 +319,7 @@ class BillSyncService:
         """
         Fetch bill details from OpenStates API with retry logic.
 
-        Routes to the local OpenStates replica instead of the public API for
-        jurisdictions listed in settings.ddp_openstates_jurisdictions (SYNC-6) --
-        see _get_api_base_and_key().
+        Always our own api-v3 (SYNC-157) -- see _get_api_base_and_key().
 
         Args:
             jurisdiction: State code (e.g., 'fl', 'wa')

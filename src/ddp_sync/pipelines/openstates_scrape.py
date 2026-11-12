@@ -75,22 +75,16 @@ DEFAULT_OPENSTATES_ROOT = "/Users/agentsmith/Developer/repos/ddp-open-states"
 # If MA ever genuinely approaches 16h of *productive* work, the answer is still not a bigger
 # number: ma/bills.py's scrape() already takes a `scrape_chunk_number` (1-12) built to split
 # this walk into shorter runs.
-SCRAPE_TIMEOUT_S: dict[str, int] = {
-    "fl": 16 * 3600,
-    "ma": 16 * 3600,
-    # OPEN-162: MI needs its own ceiling because it now gets a periodic FULL walk, and a full
-    # walk is a completely different shape from its weekly incremental. ~3,924 bills against a
-    # hard 10 requests/minute WAF cap is ~6.5h; the 6h default would have killed it just short
-    # of finishing -- and a timeout kill is not an ordinary failure here. subprocess.run(timeout)
-    # kills run-scrape.sh from outside its own process, so its cleanup, marker writes and
-    # on_failure() alerting never run, and openstates-core has already wiped the data directory
-    # at scrape start. The whole walk's work would be discarded, silently, which is exactly the
-    # trap MA hit before it got its own entry.
-    "mi": 10 * 3600,
-    "wa": 8 * 3600,
-    "usa": 4 * 3600,
-    "default": 6 * 3600,
-}
+# SYNC-157: a state's own ceiling is the manifest's `scrape.timeout_s` (fl 16h, ma 16h, mi 10h -- OPEN-162: its periodic
+# full walk is ~6.5h at MI's 10 requests/minute WAF cap --, wa 8h, us 4h on 2026-11-12); this module kept a copy of it
+# (SCRAPE_TIMEOUT_S), which is deleted. A state the manifest cannot answer for gets the default below.
+DEFAULT_SCRAPE_TIMEOUT_S = 6 * 3600
+
+
+def scrape_timeout_s(jurisdiction: str, config: dict | None = None) -> int:
+    """The wall-clock ceiling of one scrape run: the manifest's `scrape.timeout_s`, else DEFAULT_SCRAPE_TIMEOUT_S."""
+    value = enrollment.manifest_value(jurisdiction, ("scrape", "timeout_s"), _get_root(config))
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else DEFAULT_SCRAPE_TIMEOUT_S
 
 
 def _get_root(config: dict | None) -> str:
@@ -426,7 +420,8 @@ def _scrapebot_eligible(jurisdiction: str, config: dict | None) -> bool:
     fallback_cfg = (config or {}).get("scrapebot_fallback", {})
     if not fallback_cfg.get("enabled", False):
         return False
-    return jurisdiction in fallback_cfg.get("jurisdictions", [])
+    # SYNC-157: WHO is the manifest's waf.scrapebot_fallback; the yaml keeps only the global switch
+    return enrollment.is_enrolled("scrapebot_fallback", jurisdiction, _get_root(config))
 
 
 def _sweep_import_eligible(jurisdiction: str, config: dict | None) -> bool:
@@ -455,7 +450,8 @@ def _sweep_import_eligible(jurisdiction: str, config: dict | None) -> bool:
     sweep_cfg = (config or {}).get("sweep_import", {})
     if not sweep_cfg.get("enabled", False):
         return False
-    return jurisdiction in sweep_cfg.get("jurisdictions", [])
+    # SYNC-157: WHO is the manifest's scrape.sweep_import; the yaml keeps only the global switch
+    return enrollment.is_enrolled("sweep_import", jurisdiction, _get_root(config))
 
 
 def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
@@ -494,9 +490,9 @@ def _retry_eligible(jurisdiction: str, config: dict | None) -> bool:
     retry_cfg = (config or {}).get("scrape_retry", {})
     if not retry_cfg.get("enabled", False):
         return False
-    if jurisdiction in retry_cfg.get("jurisdictions_excluded", []):
-        return False
-    return jurisdiction in retry_cfg.get("jurisdictions", [])
+    # SYNC-157: WHO is the manifest's scrape.retry. The old exclusion list (mi) is now a manifest rule: the
+    # ddp-open-states validator refuses scrape.retry on a state with a WAF profile (OPEN-53), so MI cannot be enrolled.
+    return enrollment.is_enrolled("scrape_retry", jurisdiction, _get_root(config))
 
 
 def _cloud_path_owns(jurisdiction: str, config: dict | None) -> bool:
@@ -541,7 +537,7 @@ def _cloud_path_jurisdictions(cloud_cfg: dict, config: dict | None) -> list[str]
     list cannot be read, it is the yaml's own list exactly as before. `enabled` above stays the global switch."""
     # Pass the yaml's list as it is, [] when the key is missing: shadow mode then gives exactly the answer this code gave
     # before SYNC-146 (see `enrolled`'s docstring on the hook gates).
-    listed = enrolled("cloud_path", cloud_cfg.get("jurisdictions", []), _get_root(config))
+    listed = enrolled("cloud_path", None, _get_root(config))  # SYNC-157: the manifest only, no yaml list
     return [] if listed is None else listed
 
 
@@ -570,9 +566,9 @@ def _memory_backend_enabled(jurisdiction: str, config: dict | None) -> bool:
     (nothing can remember that for you once the manifest says false).
     """
     cloud_cfg = (config or {}).get("cloud_path", {})
-    if jurisdiction in _cloud_path_jurisdictions(cloud_cfg, config):
-        return True
-    return jurisdiction in cloud_cfg.get("memory_backend_jurisdictions", [])
+    # SYNC-157: the yaml floor list is gone; the manifest's enrollment.cloud_path is the one answer. Rolling a state back
+    # to the Mac now means leaving cloud_path true until its first Mac run has hydrated (see primitives.md).
+    return jurisdiction in _cloud_path_jurisdictions(cloud_cfg, config)
 
 
 def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, int]:
@@ -595,7 +591,7 @@ def _full_walk_eligible(jurisdiction: str, config: dict | None) -> tuple[bool, i
     cfg = (config or {}).get("full_walk", {})
     if not cfg.get("enabled", False):
         return False, 0
-    if jurisdiction not in cfg.get("jurisdictions", []):
+    if not enrollment.is_enrolled("full_walk", jurisdiction, _get_root(config)):  # SYNC-157: the manifest's scrape.full_walk
         return False, 0
 
     # Fail closed on a bad interval rather than trusting the YAML (pm-review round 1).
@@ -1014,7 +1010,8 @@ async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | Non
     """SYNC-128: after a successful scrape, ask ddp-broker-py (BROKER-300) to run its bill-event
     check for this jurisdiction now instead of waiting for its own schedule.
 
-    Enrollment is `openstates_scrape.broker_bill_event_signal` in sync_schedule.yaml (default off).
+    Switch: `openstates_scrape.broker_bill_event_signal.enabled`; WHO: the manifest's
+    `enrollment.broker_bill_event_signal` (SYNC-157).
     Best effort: never raises, never retries; a failure is a WARNING and the broker's own schedule
     still picks the changes up later. The debounce fails open (a duplicate signal is harmless).
     """
@@ -1025,7 +1022,7 @@ async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | Non
         from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
 
         code = _archive_jurisdiction_code(jurisdiction).lower()
-        if code not in {str(j).lower() for j in block.get("jurisdictions", [])}:
+        if not enrollment.is_enrolled("broker_bill_event_signal", code, _get_root(config)):  # SYNC-157: the manifest
             return
 
         from ddp_sync.config import get_settings
@@ -1166,6 +1163,13 @@ async def _run_scrape_impl(
     # real mint against MI's WAF) for a jurisdiction this mac is not supposed to touch at
     # all. Every caller of _run_scrape() funnels through here, so this one check covers
     # scheduled jobs, the manual-trigger endpoint, and retry alike.
+    if ((config or {}).get("cloud_path") or {}).get("enabled", False) and enrolled("cloud_path", None, _get_root(config)) is None:
+        # SYNC-157: who the cloud owns is the manifest alone (no yaml list to fall back to). When it cannot be read,
+        # running the Mac's run-scrape.sh could scrape a state Fargate also collects, so refuse instead (the daily drift
+        # check alerts "cloud_path unverifiable").
+        logger.error("openstates_scrape: refusing -- the manifest cannot say whether the cloud path owns this state "
+                     "(SYNC-157)", jurisdiction=jurisdiction)
+        return {"success": False, "error": "cloud_path_ownership_unknown", "duration_seconds": 0.0}
     if _cloud_path_owns(jurisdiction, config):
         # OPEN-193: this used to be a bare skip -- every cloud-owned run before this was a
         # human running `aws ecs run-task` and `cloud_loader.py` by hand (the OPEN-191
@@ -1274,7 +1278,7 @@ async def _run_scrape_impl(
     # having the wrapper read the ceiling, or scheduling per-attempt instead of per-invocation
     # are all real options; picking one is an operator decision on OPEN-87, not something to
     # settle by quietly inventing a budget here.
-    timeout = timeout_s or SCRAPE_TIMEOUT_S.get(jurisdiction, SCRAPE_TIMEOUT_S["default"])
+    timeout = timeout_s or scrape_timeout_s(jurisdiction, config)
     label = f"{jurisdiction} {session_arg}" if session_arg else jurisdiction
 
     logger.info(
@@ -1703,8 +1707,10 @@ def _wait_s(block: dict | None, jurisdiction: str | None = None) -> int:
     from ddp_sync.pipelines.cloud_scrape_trigger import _DEFAULT_MAX_WAIT_S
 
     fargate = ((block or {}).get("cloud_path") or {}).get("fargate") or {}
-    by_state = fargate.get("max_wait_seconds_by_jurisdiction") or {}
-    return int(by_state.get(jurisdiction) or fargate.get("max_wait_seconds") or _DEFAULT_MAX_WAIT_S)
+    from ddp_sync.pipelines.cloud_scrape_trigger import state_max_wait_s
+
+    own = state_max_wait_s(jurisdiction, _get_root(block)) if jurisdiction else None  # SYNC-157: the manifest
+    return int(own or fargate.get("max_wait_seconds") or _DEFAULT_MAX_WAIT_S)
 
 
 def pipeline_lock_ttl_s(jurisdiction: str, config: dict | None, archive_config: dict | None) -> int:

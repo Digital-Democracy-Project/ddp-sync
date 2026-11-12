@@ -99,13 +99,12 @@ separate RDS-facing api-v3 instance. Two gates sit in `session_pipeline_runner.p
   at all.
   **SYNC-142 (2026-11-03): the switch is now the shared list.** The gate reads each state's
   `enrollment.legbot_replica` from ddp-open-states' `jurisdictions.yaml` (the ONE setting a human flips for
-  LegBot, because it depends on the data being good); in `authoritative` mode the env list is ignored (a log line when
-  it differs) and is only the fallback in `shadow` mode or when the shared list cannot be read. An empty answer
-  sends nothing.
+  LegBot, because it depends on the data being good). **SYNC-157 (2026-11-12) deleted the env list and its
+  fallback:** an unreadable shared list sends nothing and alerts once; an empty answer sends nothing.
 
 **As of 2026-09-13, both are live in production**, not just built: real logical replication
 from production RDS is up (OPEN-271/272/273/274 all Done, independently verified), and
-`LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST` covers 9 of the 10 tracked jurisdictions
+the LegBot allowlist (then `LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST`, now the manifest's `legbot_replica`) covered 9 of the 10 tracked jurisdictions
 (`mi,ut,fl,va,wa,us,ma,az,nc` — only `al` excluded, since it never migrated to the RDS/cloud
 path at all). If asked to make a cloud-owned jurisdiction trigger LegBot end-to-end and it's
 not already working: **check `PLAN-rds-local-postgres-replication.md` and this epic's own
@@ -215,19 +214,25 @@ confirm or refute. If a similar "concurrency looks wrong" question comes up agai
 these two log lines first before re-deriving evidence from CAMS's own logs the way SYNC-79
 originally had to.
 
-## legislator_sync's RDS-replica routing (SYNC-6/7/8/75/76/77/78) has an unresolved gap (SYNC-80)
+## ddp-sync reads only our own api-v3 and only the manifest's states (SYNC-157, 2026-11-12)
 
-`legislator_sync.py`, `bill_sync.py`, `openstates_people.py`, and a few other ingestion
-call sites each have their own `_get_api_base_and_key(jurisdiction)` helper (SYNC-6/8's
-pattern, catalogued per call site in `primitives.md`) that routes to the DDP-tracked RDS
-replica (`local_openstates_api_base`/`local_openstates_api_key`) instead of the public
-OpenStates API when `jurisdiction` is in `settings.ddp_openstates_jurisdictions`. This
-whole effort is epic **SYNC-7** ("Production switchover to ddp-open-states replica") — if
-you're touching any OpenStates-fetching code path, check whether it already has (or
-should have) this same routing before assuming the public API is the only option, and
-file any new ticket in this lineage under that epic with the `local-openstates-migration`
-label rather than leaving it unparented (SYNC-75/76/77/78/80 all originally shipped
-without one — an oversight fixed retroactively 2026-09-27, not a deliberate choice).
+Every OpenStates read goes to this host's own api-v3 through ONE function, `services/openstates_route.api_v3(settings,
+jurisdiction)`: the RDS-backed api-v3 on EC2 (no `cams_api_token`, `RDS_OPENSTATES_API_BASE` set), the local one on the
+Mac. There is no public base (`OPENSTATES_API_BASE`), no public key (`OPENSTATES_API_KEY`) and no routing list
+(`DDP_OPENSTATES_JURISDICTIONS`): before this, any state missing from that per-host list fell through to
+v3.openstates.org (on 2026-11-12 EC2's list lacked pa, ne and la). A state not in ddp-open-states' `jurisdictions.yaml`
+raises `NoOpenStatesRoute` and alerts once; an empty base raises too. The callers' `_get_api_base_and_key` methods
+(bill_sync, legislator_sync, the OpenStates source, the people client, the federal cache) all delegate to it, and the
+opaque-id lookups (`/bills/{id}`, `/people?id=`) and no-state crawls go to our api-v3 as well. **Never add a public base,
+a key for it or a routing list back**: `tests/test_sync_157_no_public_openstates.py` fails if any code names the public
+host. Every per-state list ddp-sync kept (in `sync_schedule.yaml`, env vars or code tables) is read from the manifest
+instead (see primitives.md, "SYNC-157"), and `tests/test_sync_157_no_state_lists.py` guards against one coming back.
+
+### Historical: legislator_sync's RDS-replica routing (SYNC-6/7/8/75/76/77/78) and its gap (SYNC-80)
+
+Before SYNC-157 each of those call sites had its own `_get_api_base_and_key(jurisdiction)` that routed a state to the
+replica only when it was in `settings.ddp_openstates_jurisdictions`, else to the public API (epic **SYNC-7**). File any
+new ticket in this lineage under that epic with the `local-openstates-migration` label.
 
 Three real, independent bugs in this specific lineage were found and fixed 2026-09-26/27:
 **SYNC-76** (federal Congress members routed by home state instead of `us`, causing

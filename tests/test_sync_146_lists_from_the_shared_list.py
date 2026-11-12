@@ -87,15 +87,14 @@ def test_cloud_path_ownership_and_the_s3_memory_floor_follow_the_shared_list(roo
     assert _cloud_path_owns("al", cfg) is False                # manifest: cloud_path false
 
 
-def test_a_state_the_manifest_takes_off_the_cloud_path_stops_being_owned_but_keeps_a_listed_memory_floor(root, tmp_path):
+def test_a_state_the_manifest_takes_off_the_cloud_path_stops_being_owned_and_loses_its_memory(root, tmp_path):
+    """SYNC-157: the yaml floor list is gone, so the manifest's cloud_path is the one answer for both."""
     data = dict(MANIFEST, pa=_entry(status="scraping", cloud_path=False))
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(data))
     je._cache.clear()
-    cfg = _config(root, cloud=["pa"], memory=[])
-    assert _cloud_path_owns("pa", cfg) is False                # the manifest wins in authoritative mode
-    assert _memory_backend_enabled("pa", cfg) is False         # nothing remembers it unless it was listed first
-    cfg_listed = _config(root, cloud=["pa"], memory=["pa"])
-    assert _memory_backend_enabled("pa", cfg_listed) is True   # the rollback rule: the yaml list is the memory
+    cfg = _config(root, cloud=["pa"], memory=["pa"])           # leftover yaml lists are ignored
+    assert _cloud_path_owns("pa", cfg) is False
+    assert _memory_backend_enabled("pa", cfg) is False
 
 
 def test_the_federal_state_is_usa_on_the_cloud_side(root):
@@ -118,23 +117,33 @@ def test_the_nine_live_states_get_exactly_the_answers_the_yaml_gave(root):
 # --- fallbacks: shadow mode and an unreadable shared list keep today's behaviour ------------------------------
 
 
-def test_shadow_mode_is_the_yaml_exactly_for_the_gates_that_still_have_a_yaml_list(root, monkeypatch):
+def test_shadow_mode_no_longer_matters_the_manifest_decides(root, monkeypatch):
+    """SYNC-157: there is no yaml list to be shadowed; both modes give the manifest's answer."""
     monkeypatch.delenv(je.MODE_ENV)
     cfg = _config(root)
-    assert {"pa", "ne", "la"} <= set(enrolled_scrape_states(cfg))  # SYNC-152: no yaml list to fall back to
-    assert _cloud_path_owns("pa", cfg) is False
+    assert {"pa", "ne", "la"} <= set(enrolled_scrape_states(cfg))
+    assert _cloud_path_owns("pa", cfg) is True
+    assert _memory_backend_enabled("pa", cfg) is True
+
+
+def test_an_unreadable_shared_list_owns_nothing_and_guesses_nothing(tmp_path):
+    cfg = _config(str(tmp_path / "nowhere"), memory=["pa"])
+    assert enrolled_scrape_states(cfg) is None   # SYNC-152: "cannot say", never a guessed list
+    assert _cloud_path_owns("mi", cfg) is False   # SYNC-157: no yaml list to fall back to
     assert _memory_backend_enabled("pa", cfg) is False
 
 
-def test_an_unreadable_shared_list_falls_back_to_the_yaml(tmp_path):
+@pytest.mark.asyncio
+async def test_an_unreadable_shared_list_refuses_the_scrape_instead_of_running_the_mac_path(tmp_path):
+    """SYNC-157: with the cloud path on and no manifest, nobody can say which path owns the state, so neither runs."""
+    from unittest.mock import patch
+
+    from ddp_sync.pipelines.openstates_scrape import _run_scrape
+
     cfg = _config(str(tmp_path / "nowhere"))
-    assert enrolled_scrape_states(cfg) is None   # SYNC-152: "cannot say", never a guessed list
-    assert _cloud_path_owns("mi", cfg) is True
-    assert _cloud_path_owns("pa", cfg) is False
-
-
-def test_the_memory_floor_with_an_unreadable_shared_list_is_the_yaml_exactly(tmp_path):
-    cfg = _config(str(tmp_path / "nowhere"), memory=["pa"])
-    assert _memory_backend_enabled("mi", cfg) is True      # on the yaml cloud list
-    assert _memory_backend_enabled("pa", cfg) is True      # on the yaml memory floor
-    assert _memory_backend_enabled("ne", cfg) is False     # on neither: the manifest cannot add it when unreadable
+    with patch("ddp_sync.pipelines.openstates_scrape._run_with_group_kill") as mac, \
+         patch("ddp_sync.pipelines.openstates_scrape.run_cloud_scrape") as cloud:
+        result = await _run_scrape("mi", None, str(tmp_path), config=cfg)
+    assert result["success"] is False and result["error"] == "cloud_path_ownership_unknown"
+    mac.assert_not_called()
+    cloud.assert_not_called()
