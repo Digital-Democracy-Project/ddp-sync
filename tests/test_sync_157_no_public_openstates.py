@@ -84,9 +84,10 @@ def test_a_host_with_no_api_of_its_own_is_refused_not_sent_to_the_public_api(ale
     assert alerts.call_count == 1
 
 
-def test_a_base_pointing_at_the_public_host_is_refused(alerts):
+@pytest.mark.parametrize("base", ["https://v3.openstates.org", "https://V3.OpenStates.ORG/", "HTTPS://V3.OPENSTATES.ORG"])
+def test_a_base_pointing_at_the_public_host_is_refused_in_any_casing(alerts, base):
     with pytest.raises(NoOpenStatesRoute, match="v3.openstates.org"):
-        api_v3(SyncSettings(cams_api_token="x", local_openstates_api_base="https://v3.openstates.org"), "fl")
+        api_v3(SyncSettings(cams_api_token="x", local_openstates_api_base=base), "fl")
 
 
 def test_an_unreadable_manifest_still_uses_our_own_api(tmp_path, monkeypatch):

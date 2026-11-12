@@ -74,7 +74,7 @@ def api_v3(settings, jurisdiction: str | None = None) -> tuple[str, str]:
     `NoOpenStatesRoute` (and alerts once) for a state the manifest does not serve, or when this host has no api-v3
     configured. Never returns the public API."""
     base, key = _host_api_v3(settings)
-    if not base or PUBLIC_HOST in base:
+    if not base or PUBLIC_HOST in base.lower():  # any casing of the public host is refused (pm-review)
         problem = ("this host has no api-v3 of its own configured (RDS_OPENSTATES_API_BASE on EC2, "
                    "LOCAL_OPENSTATES_API_BASE on the Mac)" if not base else f"the api-v3 base points at {PUBLIC_HOST}")
         _alert_once(f"no-base:{base}", f"{problem}; refusing the OpenStates call instead of using the public API")
