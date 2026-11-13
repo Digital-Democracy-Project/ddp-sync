@@ -4,10 +4,11 @@
 # host end up managed the same way.
 #
 # OPEN-248: cloud_loader.py's import step shells out to `os-update` (openstates-core's CLI),
-# which needs its own Python 3.9 + openstates-core/openstates-scrapers environment -- a
-# completely different, older toolchain than ddp-sync's own Python 3.11 app. This used to be
+# which needs its own Python 3.13 + openstates-core/openstates-scrapers environment -- a
+# separate toolchain from ddp-sync's own Python 3.11 app (3.9 until OPEN-515, 2026-11-13, when
+# upstream OpenStates and ddp-open-states' requirements-openstates.txt moved to 3.13). This used to be
 # satisfied by bind-mounting the EC2 host's own /opt/ddp-open-states venv into this container,
-# but that venv's own python3.9 binary is a symlink to the HOST's system interpreter, which
+# but that venv's own python binary is a symlink to the HOST's system interpreter, which
 # doesn't exist inside this image at all -- found live 2026-09-02, "FileNotFoundError:
 # os-update", plus a real risk of a glibc/shared-library mismatch even if the binary itself
 # were bind-mounted directly. The whole point of Docker is that the image carries its own
@@ -20,7 +21,7 @@
 # using a DIFFERENT Debian release for builder vs. final would silently reproduce this exact
 # bug one layer down.
 
-FROM python:3.9-slim-bookworm AS openstates-builder
+FROM python:3.13-slim-bookworm AS openstates-builder
 
 # git: clones the two forks below. build-essential/libxml2-dev/libxslt-dev/libssl-dev: in case
 # a package in requirements-openstates.txt (lxml, cryptography) has no prebuilt wheel for this
@@ -45,18 +46,18 @@ RUN python3 -m venv /opt/venv-openstates \
     && /opt/venv-openstates/bin/pip install --no-cache-dir --no-deps -r requirements-openstates.txt
 
 # venv's own bin/python3 is an ABSOLUTE symlink to the generic /usr/local/bin/python3 -- fine
-# within this builder stage alone, where that name unambiguously means python3.9. Confirmed
+# within this builder stage alone, where that name unambiguously means python3.13. Confirmed
 # live: copied as-is into the final (python:3.11-slim-bookworm) stage, it silently resolves
 # through THAT image's own pre-existing /usr/local/bin/python3 -> python3.11 instead (the
 # generic name is already claimed there) -- worse than a clean crash, os-update partially
 # starts under the wrong Python entirely, then fails with "No module named 'openstates'"
-# since 3.11 doesn't share 3.9's site-packages. Repointing these three symlinks at the
-# unambiguous, version-specific /usr/local/bin/python3.9 (also copied into the final stage
+# since 3.11 doesn't share the toolchain's site-packages (found when the toolchain was 3.9).
+# Repointing these three symlinks at the unambiguous, version-specific /usr/local/bin/python3.13 (also copied into the final stage
 # below, at that exact same path) makes the venv correct regardless of whatever OTHER Python
 # install coexists alongside it.
-RUN rm -f /opt/venv-openstates/bin/python3 /opt/venv-openstates/bin/python3.9 /opt/venv-openstates/bin/python \
-    && ln -s /usr/local/bin/python3.9 /opt/venv-openstates/bin/python3.9 \
-    && ln -s python3.9 /opt/venv-openstates/bin/python3 \
+RUN rm -f /opt/venv-openstates/bin/python3 /opt/venv-openstates/bin/python3.13 /opt/venv-openstates/bin/python \
+    && ln -s /usr/local/bin/python3.13 /opt/venv-openstates/bin/python3.13 \
+    && ln -s python3.13 /opt/venv-openstates/bin/python3 \
     && ln -s python3 /opt/venv-openstates/bin/python
 
 # Cloned via a BuildKit secret (a GitHub PAT) so the credential is never written into an image
@@ -131,16 +132,16 @@ RUN mkdir -p /app && chown -R python:python /app
 # which copies its equivalent /opt/venv the same way, before its own USER switch, with no
 # extra chown needed (a standard venv/pip install is world-readable+executable by default).
 #
-# The venv alone is not enough: its own bin/python3.9 is a symlink back to whatever created
-# it (the builder stage's SYSTEM python3.9), which does not exist anywhere in this final
+# The venv alone is not enough: its own bin/python3.13 is a symlink back to whatever created
+# it (the builder stage's SYSTEM python3.13), which does not exist anywhere in this final
 # image at all -- confirmed live: without also bringing that system install over, the
 # symlink silently resolved to THIS image's own python3.11 instead (worse than a clean
 # crash -- it partially started, then failed with "No module named 'openstates'", since
-# 3.11 doesn't share 3.9's site-packages). These three paths are additive, not overwrites --
-# python3.9-named files/dirs never collide with this image's own python3.11-named ones.
-COPY --from=openstates-builder /usr/local/bin/python3.9 /usr/local/bin/python3.9
-COPY --from=openstates-builder /usr/local/lib/python3.9 /usr/local/lib/python3.9
-COPY --from=openstates-builder /usr/local/lib/libpython3.9.so.1.0 /usr/local/lib/libpython3.9.so.1.0
+# 3.11 doesn't share the toolchain's site-packages). These three paths are additive, not
+# overwrites -- python3.13-named files/dirs never collide with this image's own python3.11-named ones.
+COPY --from=openstates-builder /usr/local/bin/python3.13 /usr/local/bin/python3.13
+COPY --from=openstates-builder /usr/local/lib/python3.13 /usr/local/lib/python3.13
+COPY --from=openstates-builder /usr/local/lib/libpython3.13.so.1.0 /usr/local/lib/libpython3.13.so.1.0
 COPY --from=openstates-builder /opt/venv-openstates /opt/venv-openstates
 COPY --from=openstates-builder /opt/openstates-core /opt/openstates-core
 COPY --from=openstates-builder /opt/openstates-scrapers /opt/openstates-scrapers
