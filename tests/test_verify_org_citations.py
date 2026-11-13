@@ -427,7 +427,7 @@ async def test_a_second_background_run_waits_for_the_first(store):
 
 
 def _step_settings(mode="act", content=False):
-    return SimpleNamespace(organization_resolution_mode=mode, organization_content_enabled=content)
+    return SimpleNamespace(organization_resolution_mode=mode, person_resolution_mode="off", organization_content_enabled=content)
 
 
 async def _run_with_steps(*, mode="act", content=False, stored=None, resolve=None, about=None):

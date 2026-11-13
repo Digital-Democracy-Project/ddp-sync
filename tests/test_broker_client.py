@@ -24,6 +24,9 @@ from ddp_sync.services.broker_client import (
     write_bill_organization_research_run,
     write_bill_version,
     get_organization_resolution_shortlist,
+    get_person_resolution_shortlist,
+    report_person_resolution_answer,
+    request_person_resolution_act,
     report_organization_resolution_answer,
     request_organization_resolution_act,
 )
@@ -1603,6 +1606,36 @@ async def test_organization_resolution_error_status_raises():
     ):
         with pytest.raises(BrokerClientError):
             await get_organization_resolution_shortlist(position_id=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call, path, payload",
+    [
+        (lambda: get_person_resolution_shortlist(organization_id=10888), "shortlist/", {"organization_id": 10888}),
+        (lambda: report_person_resolution_answer(
+            attempt_id=9, model="claude:x", resolver_prompt_rev="1", choice="rep:1214", reason="FL Senate 17"),
+         "attempts/9/answer/", {"model": "claude:x", "prompt_version": "1", "choice": "rep:1214", "reason": "FL Senate 17"}),
+        (lambda: request_person_resolution_act(attempt_id=9), "attempts/9/act/", {}),
+    ],
+)
+async def test_person_resolution_calls_post_to_the_person_resolution_routes(call, path, payload):
+    """SYNC-150 / BROKER-441: the same three calls as the organization resolution, on the person routes."""
+    mock_client = AsyncMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"ok": True}
+    mock_client.post = AsyncMock(return_value=response)
+
+    with patch("ddp_sync.services.broker_client.get_settings", return_value=_FakeSettings()), _patch_async_client(
+        mock_client
+    ):
+        assert await call() == {"ok": True}
+
+    request = mock_client.post.await_args
+    assert request.args[0] == f"http://localhost:8080/api/person-resolution/{path}"
+    assert request.kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert request.kwargs["json"] == payload
 
 
 # --- SYNC-115: which coverage entries count as "already present" -------------

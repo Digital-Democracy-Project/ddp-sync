@@ -500,3 +500,17 @@ def test_organization_resolution_mode_is_off_unless_a_known_value_is_set(monkeyp
     else:
         monkeypatch.setenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", value)
     assert _load_from_env()["organization_resolution_mode"] == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(None, "off"), ("suggest", "suggest"), (" ACT ", "act"), ("off", "off"), ("on", "off"), ("", "off")],
+)
+def test_person_resolution_mode_is_off_unless_a_known_value_is_set(monkeypatch, value, expected):
+    """SYNC-150: its own switch (people have their own gate), and a typo falls back to off, never to act."""
+    monkeypatch.setenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", "act")
+    if value is None:
+        monkeypatch.delenv("LEGBOT_PERSON_RESOLUTION_MODE", raising=False)
+    else:
+        monkeypatch.setenv("LEGBOT_PERSON_RESOLUTION_MODE", value)
+    assert _load_from_env()["person_resolution_mode"] == expected

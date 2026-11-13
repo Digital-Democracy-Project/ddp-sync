@@ -282,7 +282,7 @@ async def test_truncates_to_cap_and_logs():
     ]
     with patch(
         "ddp_sync.pipelines.bill_organization_position_research.get_settings",
-        return_value=SimpleNamespace(org_research_max_organizations=test_cap, organization_resolution_mode="off", organization_content_enabled=False),
+        return_value=SimpleNamespace(org_research_max_organizations=test_cap, organization_resolution_mode="off", person_resolution_mode="off", organization_content_enabled=False),
     ), patch(
         "ddp_sync.pipelines.bill_organization_position_research.dispatch_bill_question",
         new=AsyncMock(return_value=_find_result(many_positions)),
@@ -660,7 +660,7 @@ async def _run(positions, writes, *, enabled=True, about=None, content_write=Non
     )
     with patch(
         f"{_P}.get_settings",
-        return_value=SimpleNamespace(org_research_max_organizations=500, organization_resolution_mode="off", organization_content_enabled=enabled),
+        return_value=SimpleNamespace(org_research_max_organizations=500, organization_resolution_mode="off", person_resolution_mode="off", organization_content_enabled=enabled),
     ), patch(f"{_P}.dispatch_bill_question", new=AsyncMock(return_value=_find_result(positions))), patch(
         f"{_P}.dispatch_bill_position_verification", new=AsyncMock(return_value=_verify_result())
     ), patch(f"{_P}.write_bill_organization_position", new=AsyncMock(side_effect=writes)), patch(
@@ -834,7 +834,7 @@ async def _run_resolve(
     with patch(
         f"{_P}.get_settings",
         return_value=SimpleNamespace(
-            org_research_max_organizations=500, organization_resolution_mode=mode,
+            org_research_max_organizations=500, organization_resolution_mode=mode, person_resolution_mode="off",
             organization_content_enabled=about_enabled,
         ),
     ), patch(

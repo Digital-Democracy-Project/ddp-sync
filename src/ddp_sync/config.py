@@ -404,6 +404,12 @@ class SyncSettings:
     # endpoints (BROKER-191) exist; the rollout turns on suggest first.
     organization_resolution_mode: str = "off"
 
+    # SYNC-150: the person resolver (BROKER-441 / AGENTS-220). A newly created stub organization that the broker's
+    # candidate check says looks like a person goes to the person resolver instead of the organization one. Same
+    # values as organization_resolution_mode, kept separate because people have their own evaluation gate before
+    # act (scripts/person_resolution_gate.py) and the broker its own `PERSON_RESOLUTION_ACT_ENABLED`. `off`: nothing.
+    person_resolution_mode: str = "off"
+
     # How many bills run_legbot_pipeline (session_pipeline_runner.py)
     # processes concurrently, instead of one at a time. Bounded, not
     # unbounded -- _process_bill() also fires several non-MLX HTTP calls per
@@ -747,6 +753,11 @@ def _load_from_env() -> dict:
         ),
         "organization_resolution_mode": (
             mode if (mode := os.getenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", "off").strip().lower())
+            in ("off", "suggest", "act")
+            else "off"
+        ),
+        "person_resolution_mode": (
+            mode if (mode := os.getenv("LEGBOT_PERSON_RESOLUTION_MODE", "off").strip().lower())
             in ("off", "suggest", "act")
             else "off"
         ),

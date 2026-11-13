@@ -35,8 +35,11 @@ from ddp_sync.pipelines.bill_artifact_generation import _resolve_bill_source
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     get_organization_resolution_shortlist,
+    get_person_resolution_shortlist,
     report_organization_resolution_answer,
+    report_person_resolution_answer,
     request_organization_resolution_act,
+    request_person_resolution_act,
     write_bill_organization_position,
     write_bill_organization_research_run,
     write_organization_content,
@@ -47,6 +50,7 @@ from ddp_sync.services.legbot_client import (
     dispatch_bill_question,
     dispatch_describe_organization,
     dispatch_resolve_organization,
+    dispatch_resolve_person,
 )
 
 logger = structlog.get_logger()
@@ -394,6 +398,136 @@ async def resolve_organization_for_position(
     return out
 
 
+async def resolve_person_for_organization(
+    *,
+    organization_id: int,
+    mode: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """The person resolver for one new stub organization (SYNC-150; broker BROKER-441, LegBot AGENTS-220).
+
+    `resolve_organization_for_position` one level up, same shape: the broker decides whether the record looks like a
+    person and, if so, opens an attempt and returns the record and a shortlist of legislators; LegBot `resolve_person`
+    chooses one or answers null; the answer is reported once; only in `act` mode and for a non-null answer the broker
+    is asked to link (it re-checks everything and may refuse). This never links anything itself, every failure leaves
+    the stub as it is, and it never raises for a broker or LegBot failure.
+
+    Returns {"organization_id", "attempt_id", "outcome", "choice", "reason"}; outcome is one of "not_eligible" (the
+    broker did not offer the record, `reason` says why: usually it does not look like a person), "no_candidates",
+    "null_answer", "suggested", "acted", "act_refused", "shortlist_failed", "dispatch_failed", "report_failed",
+    "act_failed". `choice` is the candidate id the model chose (reported), else None.
+    """
+    out = {"organization_id": organization_id, "attempt_id": None, "outcome": None, "choice": None, "reason": ""}
+    broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
+
+    async def _report(choice, reason, model=None, resolver_prompt_rev=None) -> bool:
+        try:
+            await report_person_resolution_answer(
+                attempt_id=out["attempt_id"], model=model, resolver_prompt_rev=resolver_prompt_rev,
+                choice=choice, reason=reason, **broker,
+            )
+        except BrokerClientError as exc:
+            logger.warning(
+                "Broker rejected the person resolution answer -- stub left as is",
+                organization_id=organization_id, attempt_id=out["attempt_id"], error=str(exc),
+            )
+            out["outcome"] = "report_failed"
+            return False
+        return True
+
+    try:
+        shortlist = await get_person_resolution_shortlist(organization_id=organization_id, **broker)
+        attempt_id = shortlist.get("attempt_id")
+    except Exception as exc:  # noqa: BLE001 -- any failure here: no attempt we know of, so the organization step runs
+        logger.warning("Person shortlist failed -- stub left as is", organization_id=organization_id, error=str(exc))
+        out["outcome"] = "shortlist_failed"
+        return out
+
+    out["attempt_id"] = attempt_id
+    if out["attempt_id"] is None:
+        out["outcome"], out["reason"] = "not_eligible", str(shortlist.get("reason") or "")
+        return out
+
+    candidates = shortlist.get("candidates") or []
+    if not candidates:
+        if await _report(None, "no candidates"):
+            out["outcome"] = "no_candidates"
+        return out
+
+    try:
+        result = await dispatch_resolve_person(shortlist.get("input") or {}, candidates)
+    except LegBotDispatchError as exc:
+        # Not reported: LegBot gave no answer (it fails the task rather than invent one), so the attempt stays open.
+        logger.warning(
+            "resolve_person dispatch failed -- stub left as is",
+            organization_id=organization_id, attempt_id=out["attempt_id"], error=str(exc),
+        )
+        out["outcome"] = "dispatch_failed"
+        return out
+
+    answer = result["answer"]
+    choice = answer.get("choice")
+    reason = str(answer.get("reason") or "")
+    if choice is not None and not (isinstance(choice, str) and choice in {c.get("id") for c in candidates}):
+        reason = f"invalid choice {choice!r} (not in the shortlist); {reason}"
+        choice = None
+    if not await _report(
+        choice, reason, model=answer.get("model") or result.get("backend"),
+        resolver_prompt_rev=answer.get("prompt_version"),
+    ):
+        return out
+
+    out["choice"], out["reason"] = choice, reason
+    if choice is None:
+        out["outcome"] = "null_answer"
+        return out
+    if mode != "act":
+        out["outcome"] = "suggested"
+        return out
+
+    try:
+        acted = await request_person_resolution_act(attempt_id=out["attempt_id"], **broker)
+    except BrokerClientError as exc:
+        logger.warning(
+            "Broker failed the person resolution act request -- stub left as is",
+            organization_id=organization_id, attempt_id=out["attempt_id"], error=str(exc),
+        )
+        out["outcome"] = "act_failed"
+        return out
+    if acted.get("acted"):
+        out["outcome"] = "acted"
+    else:
+        logger.info(
+            "Broker declined the person resolution act request",
+            organization_id=organization_id, attempt_id=out["attempt_id"], reason=acted.get("reason"),
+        )
+        out["outcome"] = "act_refused"
+    return out
+
+
+# The person step's outcomes that mean the record was routed to the person resolver (the broker offered it as a
+# person), so it is never also sent to the organization resolver. "not_eligible" and "shortlist_failed" fall through
+# to the organization step, as before SYNC-150.
+_ROUTED_TO_PERSON = {
+    "no_candidates", "null_answer", "suggested", "acted", "act_refused", "dispatch_failed", "report_failed", "act_failed",
+    "failed",
+}
+
+
+async def _resolve_person_safely(organization_id: int, mode: str, broker: dict) -> dict:
+    """An unexpected error after the shortlist (a person attempt may be open) is "failed": the record stays with the
+    person path and is not sent to the organization resolver. A failure of the shortlist itself is "shortlist_failed"
+    inside `resolve_person_for_organization`, and the organization step runs."""
+    try:
+        return await resolve_person_for_organization(organization_id=organization_id, mode=mode, **broker)
+    except Exception as exc:  # the step must never block or fail position publication
+        logger.warning(
+            "person resolution raised -- stub left as is", organization_id=organization_id, error=str(exc), exc_info=True,
+        )
+        return {"organization_id": organization_id, "attempt_id": None, "outcome": "failed", "choice": None, "reason": ""}
+
+
 # SYNC-107: the broker Organization fields LegBot's describe_organization answer fills. LegBot's answer
 # keys are the broker's own field names (AGENTS-104), so nothing is renamed; its `sources` list is not a
 # broker field and is ignored.
@@ -490,6 +624,10 @@ async def resolve_and_describe_organizations(
     moved). `citations` maps a written position id to its (citation_url, citation_excerpt), the
     evidence the matcher is shown; a result whose position id is not in it is not resolved.
 
+    0. SYNC-150, the person step (`person_resolution_mode`, off by default): a newly created, confirmed stub is first
+       offered to the broker's person check; one the broker takes as a person goes to the person resolver
+       (`resolve_person_for_organization`) and NOT to the organization resolver, and gets no About text when the model
+       named a legislator (it is a person, not an organization). One the broker does not take continues below.
     1. SYNC-97, the resolve step (`organization_resolution_mode`, off by default): for a newly created,
        confirmed position, the broker shortlists existing organizations (only a stub is eligible),
        LegBot chooses or answers null, and in `act` mode the broker may move the position. Before the
@@ -502,14 +640,30 @@ async def resolve_and_describe_organizations(
     """
     settings = get_settings()
     mode = settings.organization_resolution_mode
-    if mode != "off":
+    person_mode = settings.person_resolution_mode
+    broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
+    if mode != "off" or person_mode != "off":
         for result in results:
             if (
                 result.get("outcome") != "written"
                 or result.get("result") != "created"
                 or result.get("verification_verdict") != "confirmed"
-                or result.get("position_id") not in citations
             ):
+                continue
+            if person_mode != "off" and result.get("organization_id") is not None:
+                person = await _resolve_person_safely(result["organization_id"], person_mode, broker)
+                result["person_resolution"] = person
+                logger.info(
+                    "person_resolution_attempt",
+                    bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=person_mode,
+                    org_name=result["org_name"], **person,
+                )
+                if person["outcome"] in _ROUTED_TO_PERSON:
+                    if person["choice"] is not None:
+                        # The model named a legislator: no "about this organization" text for a person.
+                        result["organization_needs_content"] = False
+                    continue
+            if mode == "off" or result.get("position_id") not in citations:
                 continue
             citation_url, citation_excerpt = citations[result["position_id"]]
             try:
@@ -541,6 +695,12 @@ async def resolve_and_describe_organizations(
                 # The position now belongs to a reviewed organization: no About text for the stub.
                 result["organization_id"] = resolution["organization_id"]
                 result["organization_needs_content"] = False
+        if any("person_resolution" in r for r in results):
+            logger.info(
+                "person_resolution_summary",
+                bill_openstates_id=bill_openstates_id, invocation_id=invocation_id, mode=person_mode,
+                outcomes=dict(Counter(r["person_resolution"]["outcome"] for r in results if "person_resolution" in r)),
+            )
         if any("resolution" in r for r in results):
             logger.info(
                 "organization_resolution_summary",

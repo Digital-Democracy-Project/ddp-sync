@@ -17,6 +17,7 @@ from ddp_sync.services.legbot_client import (
     dispatch_bill_position_verification,
     dispatch_describe_organization,
     dispatch_resolve_organization,
+    dispatch_resolve_person,
     dispatch_bill_question,
 )
 
@@ -1069,6 +1070,33 @@ async def test_resolve_organization_sends_the_name_the_citation_and_the_candidat
         "candidates": candidates,
         "question_type": "resolve_organization",
         "caller": "ddp_sync",
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_person_sends_the_brokers_record_and_shortlist_unchanged(tmp_path):
+    """SYNC-150 / AGENTS-220: the broker's shortlist `input` and `candidates` go to LegBot as they came."""
+    task_id = "person123"
+    artifacts_dir = tmp_path / "artifacts"
+    (artifacts_dir / task_id).mkdir(parents=True)
+    answer = {"choice": "rep:1214", "reason": "FL Senate 17", "model": "claude:x", "prompt_version": "1"}
+    (artifacts_dir / task_id / "task_result.json").write_text(json.dumps({"answer": answer, "backend": "claude"}))
+    record = {"name": "Sen. Carlos Guillermo Smith", "org_type": "Public official", "description": "", "website": "",
+              "signals": ["title"], "state_hint": ["FL"]}
+    candidates = [{"id": "rep:1214", "name": "Carlos Smith", "jurisdiction": "FL", "chamber": "upper", "district": "17"}]
+
+    mock_client = _mock_client(statuses=["queued", "completed"], task_id=task_id)
+    with patch(
+        "ddp_sync.services.legbot_client.get_settings",
+        return_value=_FakeSettings(cams_artifacts_dir=str(artifacts_dir)),
+    ), _patch_async_client(mock_client), patch(
+        "ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock
+    ):
+        result = await dispatch_resolve_person(record, candidates)
+
+    assert result == {"answer": answer, "backend": "claude"}
+    assert mock_client.post.await_args.kwargs["json"]["payload"] == {
+        "organization": record, "candidates": candidates, "question_type": "resolve_person", "caller": "ddp_sync",
     }
 
 
