@@ -1,0 +1,1093 @@
+{
+ "frozen": "2026-11-13",
+ "source": "dev broker (copy of production data): common.person_resolution._record_input and _shortlist read without opening an attempt; 'search' cases are the same search for a hand-cleaned name; 'synthetic' records are made up around real search results",
+ "verdicts_source": "provisional",
+ "labels": "Ramon: the five BROKER-441 cases and the 2026-11-13 list (11055, 11115, 11060 link; 16147 null; a member's office links to its member). The synthetic cases' labels are the builder's: change verdicts_source to reviewed once Ramon has read them.",
+ "cases": [
+  {
+   "case_id": "broker-10888",
+   "shortlist_source": "broker",
+   "organization_id": 10888,
+   "organization": {
+    "name": "Sen. Carlos Guillermo Smith",
+    "org_type": "Public official (Florida State Senator)",
+    "description": "Carlos Guillermo Smith is a Democratic member of the Florida State Senate representing District 17 (elected 2024) and a former member of the Florida House (2016–2022). He is a progressive leader and civil rights advocate who made history as Florida’s first openly LGBTQ+ Latino legislator. His stated mission is to represent Central Florida by advancing equity, protecting civil and LGBTQ+ rights, strengthening public education, expanding access to health care, reducing gun violence, and promoting affordable housing and economic opportunity.",
+    "website": "https://www.flsenate.gov/Senators/S17"
+   },
+   "candidates": [
+    {
+     "id": "rep:1214",
+     "broker_id": 1214,
+     "openstates_id": "df1d6ab6-b2cd-4a6f-b7cc-aa5a63d8011f",
+     "name": "Carlos Smith",
+     "jurisdiction": "FL",
+     "chamber": "upper",
+     "district": "17",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "carlos-smith-1214",
+     "url": "/legislators/carlos-smith-1214"
+    }
+   ],
+   "expected": "rep:1214"
+  },
+  {
+   "case_id": "broker-10799",
+   "shortlist_source": "broker",
+   "organization_id": 10799,
+   "organization": {
+    "name": "Rep. Anna V. Eskamani",
+    "org_type": "Public official (state legislator)",
+    "description": "Anna V. Eskamani is a Democratic member of the Florida House of Representatives from central Orange County (elected 2018; representing District 42 since 2022). Born and raised in Orlando to immigrant parents, she is the first Iranian‑American elected to the Florida Legislature and is known as a progressive policy advocate and constituent services leader focused on consumer relief and community programs.",
+    "website": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4672"
+   },
+   "candidates": [
+    {
+     "id": "rep:1094",
+     "broker_id": 1094,
+     "openstates_id": "1f8e10ad-0047-4854-b696-38e15fda7afa",
+     "name": "Anna Eskamani",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "42",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "anna-eskamani-1094",
+     "url": "/legislators/anna-eskamani-1094"
+    }
+   ],
+   "expected": "rep:1094"
+  },
+  {
+   "case_id": "broker-11055",
+   "shortlist_source": "broker",
+   "organization_id": 11055,
+   "organization": {
+    "name": "Rep. Eskamani",
+    "org_type": "Elected public official (State legislator)",
+    "description": "Anna V. Eskamani is a Democratic member of the Florida House of Representatives, first elected in 2018 and representing central Orange County. A daughter of Iranian immigrant parents and a longtime nonprofit professional, she is a progressive lawmaker known for advocacy on health care access, public education, environmental protection, housing affordability, workers' economic security, LGBTQ equality, and funding for arts and cultural programs.",
+    "website": "https://annaforflorida.com/"
+   },
+   "candidates": [
+    {
+     "id": "rep:1094",
+     "broker_id": 1094,
+     "openstates_id": "1f8e10ad-0047-4854-b696-38e15fda7afa",
+     "name": "Anna Eskamani",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "42",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "anna-eskamani-1094",
+     "url": "/legislators/anna-eskamani-1094"
+    }
+   ],
+   "expected": "rep:1094"
+  },
+  {
+   "case_id": "broker-11068",
+   "shortlist_source": "broker",
+   "organization_id": 11068,
+   "organization": {
+    "name": "Rep. Rita Harris",
+    "org_type": "Elected official (state legislator)",
+    "description": "Jennifer \\\"Rita\\\" Harris is the Democratic State Representative for Florida House District 44 (Orlando). First elected in 2022 and re-elected in 2024, she focuses on constituent-driven priorities including affordable housing, tenant rights, reproductive health access, education equity and language access, climate resilience, and community public health initiatives.",
+    "website": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4877&LegislativeTermId=91"
+   },
+   "candidates": [
+    {
+     "id": "rep:1184",
+     "broker_id": 1184,
+     "openstates_id": "ca476441-7c7a-4f21-ba55-207c21a7d51d",
+     "name": "Rita Harris",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "44",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "rita-harris-1184",
+     "url": "/legislators/rita-harris-1184"
+    },
+    {
+     "id": "os:f1ddabf1-c991-4736-9259-445de23aa58b",
+     "broker_id": null,
+     "openstates_id": "f1ddabf1-c991-4736-9259-445de23aa58b",
+     "name": "Shawn Harrison",
+     "jurisdiction": "FL",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "shawn-harrison",
+     "url": "/legislators/f1ddabf1-c991-4736-9259-445de23aa58b/shawn-harrison"
+    }
+   ],
+   "expected": "rep:1184"
+  },
+  {
+   "case_id": "broker-11115",
+   "shortlist_source": "broker",
+   "organization_id": 11115,
+   "organization": {
+    "name": "FL State Representative Rita Harris",
+    "org_type": "Public office / State legislator (Florida House Representative)",
+    "description": "Jennifer “Rita” Harris is a Democratic member of the Florida House of Representatives representing District 44 (Orlando area). First elected in 2022, Harris is a community activist and former volunteer with reproductive health advocacy who positions herself as an affordable-housing and environment-focused legislator working on constituent services, economic opportunity, and neighborhood-level issues.",
+    "website": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4877&LegislativeTermId=91"
+   },
+   "candidates": [],
+   "expected": "rep:1184"
+  },
+  {
+   "case_id": "broker-11060",
+   "shortlist_source": "broker",
+   "organization_id": 11060,
+   "organization": {
+    "name": "Sen. Joe Gruters",
+    "org_type": "Elected official and political leader (Florida State Senator; former state party chair; national party officer)",
+    "description": "Joe Gruters is a Republican politician and businessman who serves as a Florida state senator representing parts of Sarasota and Manatee counties and who has held senior party leadership roles. A longtime GOP organizer and former chair of the Republican Party of Florida, Gruters advances conservative policy priorities at the state and national level, emphasizing election integrity, stricter immigration enforcement, pro-business regulation, and law-and-order measures.",
+    "website": "https://www.flsenate.gov/Senators/s22?pref=full"
+   },
+   "candidates": [
+    {
+     "id": "rep:1232",
+     "broker_id": 1232,
+     "openstates_id": "24b4458a-bc61-42f8-805a-6bc43edf6acb",
+     "name": "Joe Gruters",
+     "jurisdiction": "FL",
+     "chamber": "upper",
+     "district": "22",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "joe-gruters-1232",
+     "url": "/legislators/joe-gruters-1232"
+    }
+   ],
+   "expected": "rep:1232"
+  },
+  {
+   "case_id": "broker-14005",
+   "shortlist_source": "broker",
+   "organization_id": 14005,
+   "organization": {
+    "name": "Office of Rep. Thomas Massie",
+    "org_type": "Federal elected official office",
+    "description": "The official congressional office of U.S. Representative Thomas Massie, who represents Kentucky’s 4th Congressional District in the U.S. House of Representatives. The office assists constituents, handles district services, and communicates the congressman’s legislative work and public positions.",
+    "website": "https://massie.house.gov/"
+   },
+   "candidates": [],
+   "expected": "rep:940"
+  },
+  {
+   "case_id": "broker-14934",
+   "shortlist_source": "broker",
+   "organization_id": 14934,
+   "organization": {
+    "name": "Office of U.S. Representative Jefferson Van Drew (NJ-02)",
+    "org_type": "Federal elected official office",
+    "description": "The Office of U.S. Representative Jefferson Van Drew serves New Jersey’s 2nd Congressional District in the U.S. House of Representatives. It provides constituent services, federal agency assistance, and legislative representation for South Jersey residents.",
+    "website": "https://vandrew.house.gov/"
+   },
+   "candidates": [],
+   "expected": "rep:716"
+  },
+  {
+   "case_id": "broker-14999",
+   "shortlist_source": "broker",
+   "organization_id": 14999,
+   "organization": {
+    "name": "Office of U.S. Representative David G. Valadao",
+    "org_type": "Congressional office of a federal elected official",
+    "description": "Office of U.S. Representative David G. Valadao is the official congressional office serving California’s 22nd Congressional District. The office assists constituents with federal agency casework, legislative concerns, meeting and event requests, and general communication with the Representative.",
+    "website": "https://valadao.house.gov"
+   },
+   "candidates": [],
+   "expected": "rep:634"
+  },
+  {
+   "case_id": "broker-13996",
+   "shortlist_source": "broker",
+   "organization_id": 13996,
+   "organization": {
+    "name": "Council Member Anil Pesaramelli (Erie, Colorado)",
+    "org_type": "Municipal elected official",
+    "description": "Anil Pesaramelli is an elected member of the Erie, Colorado Town Council representing District 1. The Town Council serves as the legislative and governing body for the Town of Erie, setting local policy, adopting ordinances and resolutions, and overseeing town government.",
+    "website": "https://www.erieco.gov/318/Town-Council"
+   },
+   "candidates": [],
+   "expected": null
+  },
+  {
+   "case_id": "broker-10301",
+   "shortlist_source": "broker",
+   "organization_id": 10301,
+   "organization": {
+    "name": "Dietitian Mukherjee",
+    "org_type": "Individual health professional (dietitian / nutritionist)",
+    "description": "An individual nutrition professional named Mukherjee who practices as a dietitian and provides clinical and community nutrition services, patient counseling, and public commentary on food and health topics; may engage with schools, healthcare providers, and public health programs to apply evidence-based nutrition guidance.",
+    "website": "https://dietitianmo.wordpress.com/"
+   },
+   "candidates": [],
+   "expected": null
+  },
+  {
+   "case_id": "broker-16147",
+   "shortlist_source": "broker",
+   "organization_id": 16147,
+   "organization": {
+    "name": "TBI Warrior Foundation",
+    "org_type": "501(c)(3) nonprofit public charity providing individual and family services",
+    "description": "TBI Warrior Foundation is a Texas-based nonprofit that works to improve the quality of life of veterans, civilians and children living with brain injuries, as well as their family caregivers. Its programs provide rehabilitation and vocational counseling, assistance accessing medical care and assistive devices, caregiver support and respite, and help obtaining educational or workplace accommodations. It also undertakes disability-focused disaster-response and community-education activities.",
+    "website": "https://www.tbiwarriorfoundation.org/"
+   },
+   "candidates": [],
+   "expected": null
+  },
+  {
+   "case_id": "search-11115",
+   "shortlist_source": "search",
+   "organization_id": 11115,
+   "organization": {
+    "name": "FL State Representative Rita Harris",
+    "org_type": "Public office / State legislator (Florida House Representative)",
+    "description": "Jennifer “Rita” Harris is a Democratic member of the Florida House of Representatives representing District 44 (Orlando area). First elected in 2022, Harris is a community activist and former volunteer with reproductive health advocacy who positions herself as an affordable-housing and environment-focused legislator working on constituent services, economic opportunity, and neighborhood-level issues.",
+    "website": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4877&LegislativeTermId=91"
+   },
+   "candidates": [
+    {
+     "id": "rep:1184",
+     "broker_id": 1184,
+     "openstates_id": "ca476441-7c7a-4f21-ba55-207c21a7d51d",
+     "name": "Rita Harris",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "44",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "rita-harris-1184",
+     "url": "/legislators/rita-harris-1184"
+    },
+    {
+     "id": "os:f1ddabf1-c991-4736-9259-445de23aa58b",
+     "broker_id": null,
+     "openstates_id": "f1ddabf1-c991-4736-9259-445de23aa58b",
+     "name": "Shawn Harrison",
+     "jurisdiction": "FL",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "shawn-harrison",
+     "url": "/legislators/f1ddabf1-c991-4736-9259-445de23aa58b/shawn-harrison"
+    }
+   ],
+   "expected": "rep:1184"
+  },
+  {
+   "case_id": "search-14005",
+   "shortlist_source": "search",
+   "organization_id": 14005,
+   "organization": {
+    "name": "Office of Rep. Thomas Massie",
+    "org_type": "Federal elected official office",
+    "description": "The official congressional office of U.S. Representative Thomas Massie, who represents Kentucky’s 4th Congressional District in the U.S. House of Representatives. The office assists constituents, handles district services, and communicates the congressman’s legislative work and public positions.",
+    "website": "https://massie.house.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:940",
+     "broker_id": 940,
+     "openstates_id": "7d1234be-d22a-5374-8022-59a795f0f3f4",
+     "name": "Thomas Massie",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "KY-4",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "thomas-massie-940",
+     "url": "/legislators/thomas-massie-940"
+    },
+    {
+     "id": "rep:1291",
+     "broker_id": 1291,
+     "openstates_id": "d3e64eee-6a6f-45e4-b47a-bf22e8279670",
+     "name": "Brianna Thomas",
+     "jurisdiction": "WA",
+     "chamber": "lower",
+     "district": "34",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "brianna-thomas-1291",
+     "url": "/legislators/brianna-thomas-1291"
+    },
+    {
+     "id": "rep:1497",
+     "broker_id": 1497,
+     "openstates_id": "b6db5cc9-d9d3-4cbd-9532-6126a47c2ab3",
+     "name": "Josh Thomas",
+     "jurisdiction": "VA",
+     "chamber": "lower",
+     "district": "21",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "josh-thomas-1497",
+     "url": "/legislators/josh-thomas-1497"
+    },
+    {
+     "id": "rep:1699",
+     "broker_id": 1699,
+     "openstates_id": "c96aa62f-6a2c-4d37-9074-2c25875c639b",
+     "name": "Thomas Albert",
+     "jurisdiction": "MI",
+     "chamber": "upper",
+     "district": "18",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "thomas-albert-1699",
+     "url": "/legislators/thomas-albert-1699"
+    },
+    {
+     "id": "rep:1244",
+     "broker_id": 1244,
+     "openstates_id": "04066eef-919c-4dc9-a655-ebc5e185f0c7",
+     "name": "Tom Leek",
+     "jurisdiction": "FL",
+     "chamber": "upper",
+     "district": "7",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "tom-leek-1244",
+     "url": "/legislators/tom-leek-1244"
+    },
+    {
+     "id": "os:af3afb45-9d94-4437-9b86-196c3011ccb5",
+     "broker_id": null,
+     "openstates_id": "af3afb45-9d94-4437-9b86-196c3011ccb5",
+     "name": "Thomas M. McGee",
+     "jurisdiction": "MA",
+     "chamber": null,
+     "district": null,
+     "party": "Democratic",
+     "in_office": null,
+     "left_office": null,
+     "slug": "thomas-m-mcgee",
+     "url": "/legislators/af3afb45-9d94-4437-9b86-196c3011ccb5/thomas-m-mcgee"
+    },
+    {
+     "id": "os:ca2aefac-9eaa-4873-8334-24ac92f047c0",
+     "broker_id": null,
+     "openstates_id": "ca2aefac-9eaa-4873-8334-24ac92f047c0",
+     "name": "Thomas M. Petrolati",
+     "jurisdiction": "MA",
+     "chamber": null,
+     "district": null,
+     "party": "Democratic",
+     "in_office": null,
+     "left_office": null,
+     "slug": "thomas-m-petrolati",
+     "url": "/legislators/ca2aefac-9eaa-4873-8334-24ac92f047c0/thomas-m-petrolati"
+    },
+    {
+     "id": "os:ebfdda03-c083-4a13-b3a4-f87f6e24adac",
+     "broker_id": null,
+     "openstates_id": "ebfdda03-c083-4a13-b3a4-f87f6e24adac",
+     "name": "Thomas Moakley",
+     "jurisdiction": "MA",
+     "chamber": "lower",
+     "district": "Barnstable, Dukes and Nantucket",
+     "party": "Democratic",
+     "in_office": null,
+     "left_office": null,
+     "slug": "thomas-moakley",
+     "url": "/legislators/ebfdda03-c083-4a13-b3a4-f87f6e24adac/thomas-moakley"
+    }
+   ],
+   "expected": "rep:940"
+  },
+  {
+   "case_id": "search-14934",
+   "shortlist_source": "search",
+   "organization_id": 14934,
+   "organization": {
+    "name": "Office of U.S. Representative Jefferson Van Drew (NJ-02)",
+    "org_type": "Federal elected official office",
+    "description": "The Office of U.S. Representative Jefferson Van Drew serves New Jersey’s 2nd Congressional District in the U.S. House of Representatives. It provides constituent services, federal agency assistance, and legislative representation for South Jersey residents.",
+    "website": "https://vandrew.house.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:716",
+     "broker_id": 716,
+     "openstates_id": "a7706596-7110-5866-935b-b44668b92af1",
+     "name": "Jeff Van Drew",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NJ-2",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "jeff-van-drew-716",
+     "url": "/legislators/jeff-van-drew-716"
+    },
+    {
+     "id": "rep:717",
+     "broker_id": 717,
+     "openstates_id": "ae48c8d2-6f51-4bae-b6d1-b41130d20995",
+     "name": "Jefferson Shreve",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "IN-6",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "jefferson-shreve-717",
+     "url": "/legislators/jefferson-shreve-717"
+    },
+    {
+     "id": "rep:1750",
+     "broker_id": 1750,
+     "openstates_id": "1773d5d5-4967-4af5-9880-3106ace372d7",
+     "name": "Jeff Burton",
+     "jurisdiction": "UT",
+     "chamber": "lower",
+     "district": null,
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "jeff-burton-1750",
+     "url": "/legislators/jeff-burton-1750"
+    },
+    {
+     "id": "os:39f80bf5-e4c8-4b0f-9ca6-5f43508a5755",
+     "broker_id": null,
+     "openstates_id": "39f80bf5-e4c8-4b0f-9ca6-5f43508a5755",
+     "name": "Jefferson Moss",
+     "jurisdiction": "UT",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "jefferson-moss",
+     "url": "/legislators/39f80bf5-e4c8-4b0f-9ca6-5f43508a5755/jefferson-moss"
+    },
+    {
+     "id": "os:cbdfdaef-57ee-44d0-aa40-6058561c572c",
+     "broker_id": null,
+     "openstates_id": "cbdfdaef-57ee-44d0-aa40-6058561c572c",
+     "name": "Patrick O. Jefferson",
+     "jurisdiction": "LA",
+     "chamber": null,
+     "district": null,
+     "party": "Democratic",
+     "in_office": null,
+     "left_office": null,
+     "slug": "patrick-o-jefferson",
+     "url": "/legislators/cbdfdaef-57ee-44d0-aa40-6058561c572c/patrick-o-jefferson"
+    }
+   ],
+   "expected": "rep:716"
+  },
+  {
+   "case_id": "search-14999",
+   "shortlist_source": "search",
+   "organization_id": 14999,
+   "organization": {
+    "name": "Office of U.S. Representative David G. Valadao",
+    "org_type": "Congressional office of a federal elected official",
+    "description": "Office of U.S. Representative David G. Valadao is the official congressional office serving California’s 22nd Congressional District. The office assists constituents with federal agency casework, legislative concerns, meeting and event requests, and general communication with the Representative.",
+    "website": "https://valadao.house.gov"
+   },
+   "candidates": [
+    {
+     "id": "rep:634",
+     "broker_id": 634,
+     "openstates_id": "cf552a34-e9e1-5de9-9270-b5b441dd89fe",
+     "name": "David Valadao",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "CA-22",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "david-valadao-634",
+     "url": "/legislators/david-valadao-634"
+    },
+    {
+     "id": "os:2a2df3c1-9ede-46b7-8d73-896b1e317aff",
+     "broker_id": null,
+     "openstates_id": "2a2df3c1-9ede-46b7-8d73-896b1e317aff",
+     "name": "Dave Argall",
+     "jurisdiction": "PA",
+     "chamber": "upper",
+     "district": "29",
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "dave-argall",
+     "url": "/legislators/2a2df3c1-9ede-46b7-8d73-896b1e317aff/dave-argall"
+    },
+    {
+     "id": "os:80905bfc-ccfe-434a-81f1-616fa3b928f0",
+     "broker_id": null,
+     "openstates_id": "80905bfc-ccfe-434a-81f1-616fa3b928f0",
+     "name": "David G Butterfield",
+     "jurisdiction": "UT",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "david-g-butterfield",
+     "url": "/legislators/80905bfc-ccfe-434a-81f1-616fa3b928f0/david-g-butterfield"
+    },
+    {
+     "id": "os:f30c3419-d198-4c97-89ed-271e469ba883",
+     "broker_id": null,
+     "openstates_id": "f30c3419-d198-4c97-89ed-271e469ba883",
+     "name": "Gregg Buxton",
+     "jurisdiction": "UT",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "gregg-buxton",
+     "url": "/legislators/f30c3419-d198-4c97-89ed-271e469ba883/gregg-buxton"
+    }
+   ],
+   "expected": "rep:634"
+  },
+  {
+   "case_id": "search-15931",
+   "shortlist_source": "search",
+   "organization_id": 15931,
+   "organization": {
+    "name": "Office of Rep. Andy Biggs",
+    "org_type": "U.S. congressional office",
+    "description": "The Office of Rep. Andy Biggs is the official congressional office of the Republican U.S. representative for Arizona’s 5th Congressional District. It conducts legislative and representational work, communicates the representative’s policy positions, and provides constituents with assistance involving federal agencies, grants, service-academy nominations, tours, internships and other federal matters.",
+    "website": "https://biggs.house.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:556",
+     "broker_id": 556,
+     "openstates_id": "86b4b077-b73b-579b-bb73-bc5a4a73719a",
+     "name": "Andy Biggs",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "AZ-5",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "andy-biggs-556",
+     "url": "/legislators/andy-biggs-556"
+    },
+    {
+     "id": "rep:555",
+     "broker_id": 555,
+     "openstates_id": "fe2fa2c7-83de-5bf2-b602-6ca9f7fc8a6f",
+     "name": "Andy Barr",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "KY-6",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "andy-barr-555",
+     "url": "/legislators/andy-barr-555"
+    },
+    {
+     "id": "rep:918",
+     "broker_id": 918,
+     "openstates_id": "295e47f2-b86f-4b98-a111-7f05b57427c6",
+     "name": "Sheri Biggs",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "SC-3",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "sheri-biggs-918",
+     "url": "/legislators/sheri-biggs-918"
+    },
+    {
+     "id": "os:2642cfb4-7639-4cf8-8f8e-d45c851b35b2",
+     "broker_id": null,
+     "openstates_id": "2642cfb4-7639-4cf8-8f8e-d45c851b35b2",
+     "name": "Andy Biggs",
+     "jurisdiction": "AZ",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "andy-biggs",
+     "url": "/legislators/2642cfb4-7639-4cf8-8f8e-d45c851b35b2/andy-biggs"
+    },
+    {
+     "id": "os:7c66f731-b19a-4855-af96-0dbd0ff0eb7a",
+     "broker_id": null,
+     "openstates_id": "7c66f731-b19a-4855-af96-0dbd0ff0eb7a",
+     "name": "Andy Billig",
+     "jurisdiction": "WA",
+     "chamber": null,
+     "district": null,
+     "party": "Democratic",
+     "in_office": null,
+     "left_office": null,
+     "slug": "andy-billig",
+     "url": "/legislators/7c66f731-b19a-4855-af96-0dbd0ff0eb7a/andy-billig"
+    },
+    {
+     "id": "rep:557",
+     "broker_id": 557,
+     "openstates_id": "74a68d2f-f563-50d8-80a7-408346b8ba14",
+     "name": "Andy Harris",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "MD-1",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "andy-harris-557",
+     "url": "/legislators/andy-harris-557"
+    },
+    {
+     "id": "rep:558",
+     "broker_id": 558,
+     "openstates_id": "5916e23e-c486-5d60-88c8-56bb65c23763",
+     "name": "Andy Ogles",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "TN-5",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "andy-ogles-558",
+     "url": "/legislators/andy-ogles-558"
+    },
+    {
+     "id": "os:c476ab83-c1f7-44a7-b7c9-4cfa4679bed8",
+     "broker_id": null,
+     "openstates_id": "c476ab83-c1f7-44a7-b7c9-4cfa4679bed8",
+     "name": "Brian Biggs",
+     "jurisdiction": "NC",
+     "chamber": "lower",
+     "district": "70",
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "brian-biggs",
+     "url": "/legislators/c476ab83-c1f7-44a7-b7c9-4cfa4679bed8/brian-biggs"
+    }
+   ],
+   "expected": "rep:556"
+  },
+  {
+   "case_id": "synthetic-caucus",
+   "shortlist_source": "synthetic",
+   "organization_id": null,
+   "organization": {
+    "name": "Congressional Black Caucus",
+    "org_type": "Congressional caucus",
+    "description": "The Congressional Black Caucus is an organization of Black members of the United States Congress.",
+    "website": "https://cbc.house.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:693",
+     "broker_id": 693,
+     "openstates_id": "51b7316e-0885-571b-8a2e-daf54dd906bb",
+     "name": "Hank Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "GA-4",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "hank-johnson-693",
+     "url": "/legislators/hank-johnson-693"
+    },
+    {
+     "id": "rep:761",
+     "broker_id": 761,
+     "openstates_id": "ea06a401-ba19-4028-8986-38e950a657b6",
+     "name": "Julie Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "TX-32",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "julie-johnson-761",
+     "url": "/legislators/julie-johnson-761"
+    }
+   ],
+   "expected": null
+  },
+  {
+   "case_id": "synthetic-surname-no-state",
+   "shortlist_source": "synthetic",
+   "organization_id": null,
+   "organization": {
+    "name": "Rep. Smith",
+    "org_type": "Public official",
+    "description": "Rep. Smith spoke in support of the bill at a committee hearing.",
+    "website": ""
+   },
+   "candidates": [
+    {
+     "id": "rep:542",
+     "broker_id": 542,
+     "openstates_id": "55a28978-7661-5a33-a2be-a505a07e2a8e",
+     "name": "Adam Smith",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "WA-9",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "adam-smith-542",
+     "url": "/legislators/adam-smith-542"
+    },
+    {
+     "id": "rep:544",
+     "broker_id": 544,
+     "openstates_id": "39f36070-b860-5345-a3cc-ea7fdbf7dfb3",
+     "name": "Adrian Smith",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NE-3",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "adrian-smith-544",
+     "url": "/legislators/adrian-smith-544"
+    },
+    {
+     "id": "rep:606",
+     "broker_id": 606,
+     "openstates_id": "84a22f15-cf83-5f0b-a048-a6fc50aa60fe",
+     "name": "Chris Smith",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NJ-4",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "chris-smith-606",
+     "url": "/legislators/chris-smith-606"
+    },
+    {
+     "id": "rep:1214",
+     "broker_id": 1214,
+     "openstates_id": "df1d6ab6-b2cd-4a6f-b7cc-aa5a63d8011f",
+     "name": "Carlos Smith",
+     "jurisdiction": "FL",
+     "chamber": "upper",
+     "district": "17",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "carlos-smith-1214",
+     "url": "/legislators/carlos-smith-1214"
+    },
+    {
+     "id": "rep:996",
+     "broker_id": 996,
+     "openstates_id": "3827ab20-4901-56bc-a6ea-e7c275da9eb9",
+     "name": "Cindy Hyde-Smith",
+     "jurisdiction": "US",
+     "chamber": "upper",
+     "district": "Mississippi",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "cindy-hyde-smith-996",
+     "url": "/legislators/cindy-hyde-smith-996"
+    },
+    {
+     "id": "rep:1114",
+     "broker_id": 1114,
+     "openstates_id": "e4bf077a-8468-49a6-a75c-24ee5076352e",
+     "name": "Dave Smith",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "38",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "dave-smith-1114",
+     "url": "/legislators/dave-smith-1114"
+    },
+    {
+     "id": "rep:712",
+     "broker_id": 712,
+     "openstates_id": "559a5a0c-4b35-56f0-aa59-76c98e6cfb45",
+     "name": "Jason Smith",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "MO-8",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "jason-smith-712",
+     "url": "/legislators/jason-smith-712"
+    },
+    {
+     "id": "rep:1073",
+     "broker_id": 1073,
+     "openstates_id": "f82067c3-a257-54ae-b6bd-ebe5178372e7",
+     "name": "Tina Smith",
+     "jurisdiction": "US",
+     "chamber": "upper",
+     "district": "Minnesota",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "tina-smith-1073",
+     "url": "/legislators/tina-smith-1073"
+    }
+   ],
+   "expected": null
+  },
+  {
+   "case_id": "synthetic-surname-with-state",
+   "shortlist_source": "synthetic",
+   "organization_id": null,
+   "organization": {
+    "name": "Sen. Johnson",
+    "org_type": "Public official (state senator)",
+    "description": "Ruth Johnson is a Republican member of the Michigan Senate representing the 24th district.",
+    "website": "https://www.senate.michigan.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:651",
+     "broker_id": 651,
+     "openstates_id": "1bc146c5-42d6-5bf7-a862-34747a4b8ed7",
+     "name": "Dusty Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "SD-AL",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "dusty-johnson-651",
+     "url": "/legislators/dusty-johnson-651"
+    },
+    {
+     "id": "rep:1103",
+     "broker_id": 1103,
+     "openstates_id": "2aa3b059-b565-413d-9eac-24e34b541c1d",
+     "name": "Chad Johnson",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "22",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "chad-johnson-1103",
+     "url": "/legislators/chad-johnson-1103"
+    },
+    {
+     "id": "rep:693",
+     "broker_id": 693,
+     "openstates_id": "51b7316e-0885-571b-8a2e-daf54dd906bb",
+     "name": "Hank Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "GA-4",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "hank-johnson-693",
+     "url": "/legislators/hank-johnson-693"
+    },
+    {
+     "id": "rep:761",
+     "broker_id": 761,
+     "openstates_id": "ea06a401-ba19-4028-8986-38e950a657b6",
+     "name": "Julie Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "TX-32",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "julie-johnson-761",
+     "url": "/legislators/julie-johnson-761"
+    },
+    {
+     "id": "rep:1756",
+     "broker_id": 1756,
+     "openstates_id": "0c8df9e4-cb46-4dc1-ab5b-6d181efd58e0",
+     "name": "John Johnson",
+     "jurisdiction": "UT",
+     "chamber": "upper",
+     "district": "3",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "john-johnson-1756",
+     "url": "/legislators/john-johnson-1756"
+    },
+    {
+     "id": "rep:831",
+     "broker_id": 831,
+     "openstates_id": "ef2a1e73-edb7-5f53-9f61-da2020fc417d",
+     "name": "Mike Johnson",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "LA-4",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "mike-johnson-831",
+     "url": "/legislators/mike-johnson-831"
+    },
+    {
+     "id": "rep:1058",
+     "broker_id": 1058,
+     "openstates_id": "67d8f8b5-1fad-5132-9da8-3210783163a8",
+     "name": "Ron Johnson",
+     "jurisdiction": "US",
+     "chamber": "upper",
+     "district": "Wisconsin",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "ron-johnson-1058",
+     "url": "/legislators/ron-johnson-1058"
+    },
+    {
+     "id": "rep:1684",
+     "broker_id": 1684,
+     "openstates_id": "8d0d58dd-a718-4f8f-bb7f-c530e039c0c5",
+     "name": "Ruth Johnson",
+     "jurisdiction": "MI",
+     "chamber": "upper",
+     "district": "24",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "ruth-johnson-1684",
+     "url": "/legislators/ruth-johnson-1684"
+    }
+   ],
+   "expected": "rep:1684"
+  },
+  {
+   "case_id": "synthetic-left-office",
+   "shortlist_source": "synthetic",
+   "organization_id": null,
+   "organization": {
+    "name": "Sen. Tom Carper",
+    "org_type": "Public official (U.S. Senator)",
+    "description": "Tom Carper is a sitting U.S. Senator from Delaware who serves on the Environment and Public Works Committee.",
+    "website": "https://www.carper.senate.gov/"
+   },
+   "candidates": [
+    {
+     "id": "rep:940",
+     "broker_id": 940,
+     "openstates_id": "7d1234be-d22a-5374-8022-59a795f0f3f4",
+     "name": "Thomas Massie",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "KY-4",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "thomas-massie-940",
+     "url": "/legislators/thomas-massie-940"
+    },
+    {
+     "id": "rep:1069",
+     "broker_id": 1069,
+     "openstates_id": "3ad2df38-e817-50b9-924d-9dbd4bba94a8",
+     "name": "Thom Tillis",
+     "jurisdiction": "US",
+     "chamber": "upper",
+     "district": "North Carolina",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "thom-tillis-1069",
+     "url": "/legislators/thom-tillis-1069"
+    },
+    {
+     "id": "rep:2021",
+     "broker_id": 2021,
+     "openstates_id": "762f36c5-6766-5708-9066-d1d6340500d3",
+     "name": "Tom Carper",
+     "jurisdiction": "US",
+     "chamber": "upper",
+     "district": null,
+     "party": "Democratic",
+     "in_office": false,
+     "left_office": "2025-01-03",
+     "slug": "tom-carper-2021",
+     "url": "/legislators/tom-carper-2021"
+    },
+    {
+     "id": "rep:948",
+     "broker_id": 948,
+     "openstates_id": "1cbf8801-61cd-5f46-93c1-0d02f110035a",
+     "name": "Tom Kean",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NJ-7",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "tom-kean-948",
+     "url": "/legislators/tom-kean-948"
+    },
+    {
+     "id": "rep:950",
+     "broker_id": 950,
+     "openstates_id": "4182b897-5c2e-5dff-a87c-aa7911e81a3d",
+     "name": "Tom Suozzi",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NY-3",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "tom-suozzi-950",
+     "url": "/legislators/tom-suozzi-950"
+    },
+    {
+     "id": "rep:951",
+     "broker_id": 951,
+     "openstates_id": "5048bd11-acf0-5775-a75f-5f085fc8bc11",
+     "name": "Tom Tiffany",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "WI-7",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "tom-tiffany-951",
+     "url": "/legislators/tom-tiffany-951"
+    }
+   ],
+   "expected": null
+  }
+ ]
+}

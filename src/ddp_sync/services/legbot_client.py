@@ -399,6 +399,34 @@ async def dispatch_resolve_organization(
     )
 
 
+async def dispatch_resolve_person(
+    organization: dict,
+    candidates: list[dict],
+    *,
+    timeout_seconds: float | None = None,
+) -> dict:
+    """Dispatch a resolve_person task to LegBot and return its answer (SYNC-150; the question type is AGENTS-220).
+
+    `organization` and `candidates` are the broker's person shortlist (`input` and `candidates`, BROKER-441), passed
+    through unchanged. LegBot chooses one candidate's string id ("rep:12", "os:<uuid>") or answers null; the answer is
+    {"choice", "reason", "model", "prompt_version", "prompt_hash", "insufficient_information": False}. An id LegBot was
+    not given, or a reply that is not an answer, fails the task rather than coming back as null.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "organization": organization,
+            "candidates": candidates,
+            "question_type": "resolve_person",
+            "caller": "ddp_sync",
+        },
+        question_type="resolve_person",
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _dispatch_and_await(
     payload: dict,
     *,

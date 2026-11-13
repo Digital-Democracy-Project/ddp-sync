@@ -691,8 +691,10 @@ async def _post_organization_resolution(
     what: str,
     broker_api_base: str | None,
     broker_api_token: str | None,
+    route: str = "organization-resolution",
 ) -> dict:
-    """POST one organization-resolution call (SYNC-97 / BROKER-191) and return its JSON body.
+    """POST one organization-resolution call (SYNC-97 / BROKER-191) and return its JSON body. `route` is
+    "person-resolution" for the person resolution (SYNC-150 / BROKER-441), which has the same three calls.
 
     Raises BrokerClientError for a missing base URL, an unreachable broker or any status >= 400, so a
     caller can treat every failure the same way (the resolve step never blocks publication).
@@ -705,7 +707,7 @@ async def _post_organization_resolution(
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
-                f"{resolved_api_base}/api/organization-resolution/{path}",
+                f"{resolved_api_base}/api/{route}/{path}",
                 headers={"Authorization": f"Bearer {resolved_api_token}"},
                 json=payload,
             )
@@ -781,6 +783,77 @@ async def request_organization_resolution_act(
         what="organization resolution act request",
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
+    )
+
+
+async def get_person_resolution_shortlist(
+    *,
+    organization_id: int,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Ask the broker whether an organization record is really a person and, if it is, open a person-resolution
+    attempt and get its shortlist of legislators (SYNC-150 / BROKER-441). The broker's candidate check decides; this
+    side never copies its rules.
+
+    Returns:
+        {"attempt_id": <int> | None, "candidates": [{"id": "rep:<id>" | "os:<uuid>", "name", "jurisdiction",
+        "chamber", "district", "party", "in_office", "left_office", "url", ...}], "input": {"name", "org_type",
+        "description", "website", ...} | None, "reason": <str>}; `attempt_id` is None (and `reason` says why) when the
+        record is not offered, "the record does not look like a person" among them.
+    """
+    return await _post_organization_resolution(
+        "shortlist/",
+        {"organization_id": organization_id},
+        what="person shortlist request",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+        route="person-resolution",
+    )
+
+
+async def report_person_resolution_answer(
+    *,
+    attempt_id: int,
+    model: str | None,
+    resolver_prompt_rev: str | None,
+    choice: str | None,
+    reason: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Report the model's answer to a person-resolution attempt, once (SYNC-150 / BROKER-441; a second answer is a
+    409). `choice` is a candidate's string id or None."""
+    return await _post_organization_resolution(
+        f"attempts/{attempt_id}/answer/",
+        {"model": model, "prompt_version": resolver_prompt_rev, "choice": choice, "reason": reason},
+        what="person resolution answer",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+        route="person-resolution",
+    )
+
+
+async def request_person_resolution_act(
+    *,
+    attempt_id: int,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Ask the broker to link the record to the person its attempt's answer names (SYNC-150 / BROKER-441). The broker
+    re-checks every rule and its own act setting (`PERSON_RESOLUTION_ACT_ENABLED`, off by default); a refusal is a
+    normal 200 answer, {"acted": False, "reason": ...}.
+
+    Returns:
+        {"acted": <bool>, "reason": <str>}.
+    """
+    return await _post_organization_resolution(
+        f"attempts/{attempt_id}/act/",
+        {},
+        what="person resolution act request",
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+        route="person-resolution",
     )
 
 

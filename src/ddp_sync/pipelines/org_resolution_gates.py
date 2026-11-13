@@ -291,17 +291,19 @@ class ShadowGateReport:
     awaiting_review: list[Attempt]
     wrong: list[Attempt]
     non_null_attempts: list[Attempt]
+    min_eligible: int = MIN_ELIGIBLE  # the thresholds this report was scored against (SYNC-150 passes its own)
+    min_non_null: int = MIN_NON_NULL
 
     def render(self) -> str:
         return "\n".join(
             [
                 f"shadow gate: {'PASS' if self.passed else 'FAIL'}",
-                f"  eligible invocations: {self.eligible} (need >= {MIN_ELIGIBLE})",
-                f"  non-null suggestions: {self.non_null} (need >= {MIN_NON_NULL})",
+                f"  eligible invocations: {self.eligible} (need >= {self.min_eligible})",
+                f"  non-null suggestions: {self.non_null} (need >= {self.min_non_null})",
                 f"  awaiting review: {len(self.awaiting_review)} (must be 0)",
                 f"  reviewed wrong: {len(self.wrong)} (must be 0)",
             ]
-            + [f"  - attempt {a.attempt_id}: {a.input_name!r} -> organization {a.choice}" for a in self.non_null_attempts]
+            + [f"  - attempt {a.attempt_id}: {a.input_name!r} -> {a.choice}" for a in self.non_null_attempts]
         )
 
 
@@ -328,4 +330,6 @@ def evaluate_shadow_gate(
         awaiting_review=awaiting,
         wrong=wrong,
         non_null_attempts=non_null,
+        min_eligible=min_eligible,
+        min_non_null=min_non_null,
     )
