@@ -510,6 +510,54 @@ def test_unreadable_log_never_stops_a_run_and_says_so_once():
     assert alerts == ["openstates_scrape.stall_check"]
 
 
+class FlakyLogsClient(FakeLogsClient):
+    """Raises for the first `failures` reads, then answers like FakeLogsClient."""
+
+    def __init__(self, clock, failures, lag_s):
+        super().__init__(clock, lag_s=lag_s)
+        self.failures = failures
+
+    def get_log_events(self, **kwargs):
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append(kwargs)
+            raise RuntimeError("ThrottlingException")
+        return super().get_log_events(**kwargs)
+
+
+def test_unreadable_past_the_alert_time_never_says_still_logging():
+    """pm-review: a run whose log cannot be read past max_wait_seconds gets the cannot-read alert only."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 6 + [_stopped_response(exit_code=0)],
+    )
+    logs = FakeLogsClient(clock, error=RuntimeError("AccessDeniedException"))
+
+    result, alerts, _ = _scrape(ecs, logs, clock, max_wait_seconds=2000)
+
+    assert result["success"] is True
+    assert alerts == ["openstates_scrape.stall_check"]
+
+
+def test_stale_signal_recovering_at_the_alert_time_is_a_stall_only():
+    """pm-review: reads fail until past max_wait_seconds, then recover showing an old last line: the run is stopped
+    as stalled, with no 'still running' alert just before it."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 5,
+    )
+    logs = FlakyLogsClient(clock, failures=3, lag_s=4000)  # 3rd poll (2000 s) fails; 4th (3000 s) reads a line 4000 s old
+
+    result, alerts, failure_alert = _scrape(ecs, logs, clock, max_wait_seconds=2500)
+
+    assert result["success"] is False
+    assert "stall" in ecs.stop_task_calls[0]["reason"]
+    failure_alert.assert_called_once()
+    assert "openstates_scrape.long_run" not in alerts
+
+
 def test_logs_client_that_cannot_be_built_is_an_unreadable_log_not_a_failure():
     clock = FakeClock(step_s=1000)
     ecs = FakeEcsClient(

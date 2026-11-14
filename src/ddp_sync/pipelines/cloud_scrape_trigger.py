@@ -339,8 +339,9 @@ def _wait_for_task_stop(
       newest line in the task's log stream; once no new line has appeared for `stall_seconds` (45 min by default, the
       clock starting when this wait began), the task is stopped and the wait returns a failure (the caller sends the
       one failure alert). A run that keeps logging is never stopped for taking long: at `max_wait_seconds` it gets one
-      "still running" alert and the wait goes on. A failed read never counts as quiet: it is logged, and after
-      `stall_seconds` with no successful read one alert says the stall check cannot see this run.
+      "still running" alert (sent only after a good read shows it is not stalled) and the wait goes on. A failed read
+      never counts as quiet: it is logged, and after `stall_seconds` with no successful read one alert says the stall
+      check cannot see this run.
     """
     container_name = fargate_cfg.get("container_name", "scraper")
     max_wait = fargate_cfg.get("max_wait_seconds", _DEFAULT_MAX_WAIT_S)
@@ -375,16 +376,6 @@ def _wait_for_task_stop(
                 stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
                 return None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
         else:
-            if not long_run_alerted and now >= deadline:
-                long_run_alerted = True
-                hours = (now - started) / 3600
-                logger.warning("cloud_scrape: still running past its alert time", label=name, hours=round(hours, 1))
-                post_alert(
-                    f":hourglass: *OpenStates scrape still running: {name}* -- {hours:.1f} h and still logging, so it "
-                    f"was not stopped (OPEN-477: only a run with no new log line for {stall_s // 60} min is stopped). "
-                    f"If it will never finish, stop ECS task {task_arn} by hand.",
-                    source="openstates_scrape.long_run",
-                )
             try:
                 newest = _newest_log_line_s(task_arn, fargate_cfg, logs_client)
             except Exception as e:  # noqa: BLE001 -- any read failure means "cannot tell", never "quiet"
@@ -412,6 +403,18 @@ def _wait_for_task_stop(
                     return None, (
                         f"stalled: no new log line for {int(quiet)}s (limit {stall_s}s) "
                         f"(task_arn={task_arn}); {stop_detail}"
+                    )
+                # pm-review: only after a good read that shows the run is not stalled, so this alert never calls an
+                # unreadable run "still logging" nor comes just before a stall stop.
+                if not long_run_alerted and now >= deadline:
+                    long_run_alerted = True
+                    hours = (now - started) / 3600
+                    logger.warning("cloud_scrape: still running past its alert time", label=name, hours=round(hours, 1))
+                    post_alert(
+                        f":hourglass: *OpenStates scrape still running: {name}* -- {hours:.1f} h and still logging, so "
+                        f"it was not stopped (OPEN-477: only a run with no new log line for {stall_s // 60} min is "
+                        f"stopped). If it will never finish, stop ECS task {task_arn} by hand.",
+                        source="openstates_scrape.long_run",
                     )
         time.sleep(_POLL_INTERVAL_S)
 
