@@ -452,7 +452,10 @@ openstates_scrape:
       container_name: "scraper" # matches the task definition's container name
       memory_bucket: "ddp-openstates-scraper-memory"
       memory_prefix: "prod"     # matches cloud_collector.py's own MEMORY_PREFIX convention
-      max_wait_seconds: 43200   # 12h backstop for every state whose manifest scrape.fargate_max_wait_s is null
+      max_wait_seconds: 43200   # OPEN-477: NOT a stop any more -- when a run still logging gets one "still running"
+                                # alert (12 h for every state whose manifest scrape.fargate_max_wait_s is null)
+      stall_seconds: 2700       # OPEN-477: stop a run whose task log has had no new line for 45 min (the longest
+                                # healthy gap in two full MA walks was 431 s; OPEN-155's local check is also 45 min)
       # OPEN-476: MA's weekly run walks every bill (10.35 h on 10-25, ~13.8 h on 11-01); 24 h per Ramon, 2026-11-01.
       # SYNC-157: a state's own ceiling is the manifest's scrape.fargate_max_wait_s (ma: 86400), not a map here.
       load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's

@@ -42,12 +42,9 @@ What this deliberately does NOT do, scoped out rather than silently missing (OPE
 acceptance criteria list "load runs next to the database; ddp-sync runs on EC2" and re-
 measured freshness -- not full local-path parity):
 
-  * No stall detection. The local path watches its own scrape output directory's file count
-    for a stuck run (SYNC-3); a Fargate task has no such directory to watch from here. ECS's
-    own task boundary (stopped, with an exit code) is the only signal available. A wedged
-    collector inside the container is bounded by `cloud_collector.py`'s own internal
-    timeouts, not by anything on this side of the boundary -- a real gap if that turns out to
-    be insufficient, but not one to guess a replacement mechanism for here.
+  * (Was: no stall detection. OPEN-477 added it: the scrape wait now ends a run whose CloudWatch
+    log stream has been quiet for `stall_seconds`, and no longer stops a run for taking long --
+    see `_wait_for_task_stop()`.)
   * No same-jurisdiction concurrency lock of this module's own. `cloud_collector.py` already
     acquires OPEN-187's cross-machine `SourceLock`, keyed on the jurisdiction alone, the moment
     it starts -- the OPEN-191 rehearsal confirmed live that a second concurrent launch for the
@@ -91,6 +88,7 @@ import structlog
 
 from ddp_sync.pipelines import inflight_fargate_jobs
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
+from ddp_sync.slack_alerts import post_alert
 
 logger = structlog.get_logger(__name__)
 
@@ -108,6 +106,12 @@ _POLL_INTERVAL_S = 30
 # cover the slowest cold-start run seen in the OPEN-191 rehearsal (MA, ~9.5h) with real margin,
 # same reasoning SCRAPE_TIMEOUT_S in openstates_scrape.py already uses for the mac-side ceiling.
 _DEFAULT_MAX_WAIT_S = 12 * 3600
+
+# OPEN-477: a scrape whose task log has had no new line for this long is stuck, and is stopped. The local
+# path's 45 minutes (OPEN-155, SCRAPE_STALL_SECONDS) is the starting point; the longest quiet gap in two
+# healthy full Massachusetts walks (10-25 and 11-01, read from CloudWatch for OPEN-475) was 431 s (7.2 min),
+# so 45 minutes is over six times the longest healthy gap seen.
+_DEFAULT_STALL_S = 45 * 60
 
 # Default backstop for cloud_loader.py itself (pm-review, round 1: this had no timeout at all).
 # The OPEN-191 rehearsal's loads were minutes, not hours, even against multi-thousand-row
@@ -182,16 +186,16 @@ def state_max_wait_s(jurisdiction: str, root: str) -> int | None:
     return seconds
 
 
-def _stop_orphaned_task(ecs_client, cluster: str, task_arn: str) -> str:
+def _stop_orphaned_task(
+    ecs_client, cluster: str, task_arn: str, reason: str = "ddp-sync: max_wait_seconds exceeded"
+) -> str:
     """Best-effort cleanup for a task this function gave up waiting on (pm-review, round 1:
     the ECS task kept running past max_wait_seconds with nothing on this side ever stopping
     it, which could let a later retry or scheduled run start a second collection for the same
     jurisdiction while the first was still going). Never raises -- a failed stop_task here is
     still better reported as "gave up waiting" than as an exception replacing that message."""
     try:
-        ecs_client.stop_task(
-            cluster=cluster, task=task_arn, reason="ddp-sync: max_wait_seconds exceeded"
-        )
+        ecs_client.stop_task(cluster=cluster, task=task_arn, reason=reason)
         return "task stop requested"
     except Exception as e:  # noqa: BLE001 -- cleanup best-effort, never let this mask the timeout
         return f"stop_task also failed: {e}"
@@ -276,19 +280,77 @@ def _launch_fargate_task(
     return True, tasks[0]["taskArn"], ""
 
 
-def _wait_for_task_stop(task_arn: str, fargate_cfg: dict, ecs_client) -> tuple[int | None, str]:
-    """Poll DescribeTasks until `task_arn` stops, or `max_wait_seconds` runs out.
+def _newest_log_line_s(task_arn: str, fargate_cfg: dict, logs_client) -> float | None:
+    """Wall-clock time (seconds) of the newest line in the task's CloudWatch log stream, or None when the stream
+    exists but holds no line yet. Raises when the stream cannot be read -- including when it does not exist (yet, or
+    because the log group is misconfigured): the caller treats that as "cannot tell", never as "quiet"."""
+    from ddp_sync.pipelines.openstates_backfill import task_log_stream
+
+    log_group, stream_name = task_log_stream(task_arn, fargate_cfg)
+    # startFromHead=False with limit=1 is the stream's last event.
+    resp = logs_client.get_log_events(
+        logGroupName=log_group, logStreamName=stream_name, startFromHead=False, limit=1
+    )
+    events = resp.get("events") or []
+    if not events:
+        return None
+    return max(e.get("timestamp", 0) for e in events) / 1000.0
+
+
+class _UnreadableLogs:
+    """Stands in for a CloudWatch Logs client that could not be built: every read raises, so the stall check reports
+    it cannot read the log (and never stops the run) instead of the run failing over a client constructor."""
+
+    def __init__(self, error: Exception):
+        self._error = error
+
+    def get_log_events(self, **_kwargs):
+        raise self._error
+
+
+def _logs_client():
+    try:
+        return boto3.client("logs")
+    except Exception as e:  # noqa: BLE001 -- see _UnreadableLogs
+        return _UnreadableLogs(e)
+
+
+def _wait_for_task_stop(
+    task_arn: str,
+    fargate_cfg: dict,
+    ecs_client,
+    *,
+    logs_client=None,
+    label: str | None = None,
+) -> tuple[int | None, str]:
+    """Poll DescribeTasks until `task_arn` stops.
 
     Extracted from the old `_run_fargate_collection` (OPEN-251) so it can run against a
     task_arn this process just launched OR one a previous process launched and persisted --
     DescribeTasks doesn't care which. Returns (exit_code, detail); `exit_code=None` covers a
     task that stopped without ever reporting one (killed by ECS itself -- OOM, spot
-    interruption -- or this function's own wait gave up first, in which case it also asked ECS
-    to stop the task -- see `_stop_orphaned_task()`).
+    interruption -- or this function ended the wait, in which case it also asked ECS to stop
+    the task -- see `_stop_orphaned_task()`).
+
+    Two modes:
+
+    * Without `logs_client` (the archive and backfill jobs, unchanged): stop the task once `max_wait_seconds` runs out.
+    * With `logs_client` (the scrape, OPEN-477): a stall check replaces the hard limit. Each poll reads the time of the
+      newest line in the task's log stream; once no new line has appeared for `stall_seconds` (45 min by default, the
+      clock starting when this wait began), the task is stopped and the wait returns a failure (the caller sends the
+      one failure alert). A run that keeps logging is never stopped for taking long: at `max_wait_seconds` it gets one
+      "still running" alert and the wait goes on. A failed read never counts as quiet: it is logged, and after
+      `stall_seconds` with no successful read one alert says the stall check cannot see this run.
     """
     container_name = fargate_cfg.get("container_name", "scraper")
     max_wait = fargate_cfg.get("max_wait_seconds", _DEFAULT_MAX_WAIT_S)
-    deadline = time.monotonic() + max_wait
+    stall_s = fargate_cfg.get("stall_seconds", _DEFAULT_STALL_S)
+    started = time.monotonic()
+    deadline = started + max_wait
+    last_line_at = time.time()  # wall clock: CloudWatch timestamps are wall-clock
+    last_read_ok = started
+    long_run_alerted = unreadable_alerted = False
+    name = label or task_arn
 
     while True:
         desc = ecs_client.describe_tasks(cluster=fargate_cfg["cluster"], tasks=[task_arn])
@@ -306,9 +368,51 @@ def _wait_for_task_stop(task_arn: str, fargate_cfg: dict, ecs_client) -> tuple[i
             # empty for exactly the failures worth diagnosing most.
             reason = (match or {}).get("reason") or task.get("stoppedReason", "")
             return exit_code, reason
-        if time.monotonic() >= deadline:
-            stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
-            return None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
+
+        now = time.monotonic()
+        if logs_client is None:
+            if now >= deadline:
+                stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
+                return None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
+        else:
+            if not long_run_alerted and now >= deadline:
+                long_run_alerted = True
+                hours = (now - started) / 3600
+                logger.warning("cloud_scrape: still running past its alert time", label=name, hours=round(hours, 1))
+                post_alert(
+                    f":hourglass: *OpenStates scrape still running: {name}* -- {hours:.1f} h and still logging, so it "
+                    f"was not stopped (OPEN-477: only a run with no new log line for {stall_s // 60} min is stopped). "
+                    f"If it will never finish, stop ECS task {task_arn} by hand.",
+                    source="openstates_scrape.long_run",
+                )
+            try:
+                newest = _newest_log_line_s(task_arn, fargate_cfg, logs_client)
+            except Exception as e:  # noqa: BLE001 -- any read failure means "cannot tell", never "quiet"
+                logger.warning("cloud_scrape: stall check could not read the task log", label=name, error=str(e))
+                if not unreadable_alerted and now - last_read_ok >= stall_s:
+                    unreadable_alerted = True
+                    post_alert(
+                        f":warning: *OpenStates scrape stall check cannot read the log of {name}* -- no successful "
+                        f"read for {stall_s // 60} min ({e}). The run is NOT stopped; nothing will end it if it "
+                        f"hangs. ECS task {task_arn}.",
+                        source="openstates_scrape.stall_check",
+                    )
+            else:
+                last_read_ok = now
+                if newest is not None:
+                    last_line_at = max(last_line_at, newest)
+                quiet = time.time() - last_line_at
+                if quiet >= stall_s:
+                    stop_detail = _stop_orphaned_task(
+                        ecs_client,
+                        fargate_cfg["cluster"],
+                        task_arn,
+                        reason=f"ddp-sync: no new log line for {int(quiet)}s (stall)",
+                    )
+                    return None, (
+                        f"stalled: no new log line for {int(quiet)}s (limit {stall_s}s) "
+                        f"(task_arn={task_arn}); {stop_detail}"
+                    )
         time.sleep(_POLL_INTERVAL_S)
 
 
@@ -392,6 +496,7 @@ def _finish_after_launch(
     ecs_client,
     subprocess_runner,
     label: str,
+    logs_client=None,
 ) -> dict[str, Any]:
     """Wait for an already-launched ECS task to stop, then load into RDS on success.
 
@@ -413,7 +518,10 @@ def _finish_after_launch(
     )
 
     start = time.monotonic()
-    exit_code, detail = _wait_for_task_stop(task_arn, fargate_cfg, ecs_client)
+    # OPEN-477: the scrape wait always runs in stall-check mode (a logs client is what switches it on).
+    exit_code, detail = _wait_for_task_stop(
+        task_arn, fargate_cfg, ecs_client, logs_client=logs_client or _logs_client(), label=label
+    )
 
     if exit_code != 0:
         duration = round(time.monotonic() - start, 1)
@@ -478,7 +586,7 @@ def _finish_after_launch(
 
 
 def resume_inflight_fargate_job(
-    run_id: str, record: dict[str, Any], *, ecs_client=None, subprocess_runner=None
+    run_id: str, record: dict[str, Any], *, ecs_client=None, subprocess_runner=None, logs_client=None
 ) -> dict[str, Any]:
     """Finish a Fargate job a previous ddp-sync process left in-flight (OPEN-251).
 
@@ -529,6 +637,7 @@ def resume_inflight_fargate_job(
             client,
             subprocess_runner,
             label,
+            logs_client,
         )
     except Exception as e:  # noqa: BLE001 -- see docstring: nothing may escape uncaught here
         duration = round(time.monotonic() - start, 1)
@@ -619,6 +728,7 @@ def run_cloud_scrape(
     *,
     ecs_client=None,
     subprocess_runner=None,
+    logs_client=None,
 ) -> dict[str, Any]:
     """Trigger a Fargate collection and, on success, load it into RDS.
 
@@ -739,6 +849,7 @@ def run_cloud_scrape(
                 client,
                 subprocess_runner,
                 label,
+                logs_client,
             )
         finally:
             inflight_fargate_jobs.clear(run_id)

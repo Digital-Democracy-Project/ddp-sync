@@ -312,15 +312,28 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
-## Cloud scrape wait limit (`pipelines/cloud_scrape_trigger.py`, OPEN-476)
+## Cloud scrape wait: stall check, no hard limit (`pipelines/cloud_scrape_trigger.py`, OPEN-477, OPEN-476)
 
-How long ddp-sync waits for a Fargate scrape task before it asks ECS to stop it. One shared value,
+**OPEN-477:** the scrape wait (`_wait_for_task_stop(..., logs_client=...)`, switched on by `_finish_after_launch`, so a
+fresh run and a resumed one alike) stops a task only when its CloudWatch log stream (`/aws/ecs/ddp-scrapers`,
+`scraper/scraper/<task id>`, named by `openstates_backfill.task_log_stream`, the same stream `_fetch_task_output` reads)
+has had no new line for `cloud_path.fargate.stall_seconds` (default `_DEFAULT_STALL_S`, 45 min; the longest healthy
+gap in two full Massachusetts walks was 431 s). The quiet clock starts when the wait starts. The stop sends the usual
+failure alert once (`stalled: no new log line for ...`). A failed log read never counts as quiet: it is logged, and
+after `stall_seconds` without a good read one `openstates_scrape.stall_check` alert says the run cannot be watched.
+**There is no hard stop for a scrape any more:** the value below is now when a run that is still logging gets one
+`openstates_scrape.long_run` alert ("still running, not stopped"); a human stops it if it will never finish. The
+archive and backfill jobs call `_wait_for_task_stop` without a logs client and keep their hard stop. **Do not** add a
+second watchdog: extend this one. Access: `logs:GetLogEvents` on that group, already used by `_fetch_task_output`.
+
+When a scrape that is still logging gets its "still running" alert (before OPEN-477: when it was stopped). One shared value,
 `openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus a state's own ceiling, the manifest's
 `scrape.fargate_max_wait_s` (ma: 86400; SYNC-157 moved it from the yaml map `max_wait_seconds_by_jurisdiction`), read by
 `cloud_scrape_trigger.state_max_wait_s` and applied by `_fargate_config(config, jurisdiction)` in `run_cloud_scrape()`. The
 resolved value is the one persisted in the in-flight record, so a resumed job replays it. **Do not** use the scrape
 timeout for this: that is the Mac-path ceiling (`scrape_timeout_s`) and the cloud path never used it. The archive block has
-its own separate `max_wait_seconds`. OPEN-477 replaces the fixed limit with a stall check.
+its own separate `max_wait_seconds`, still a hard stop. The SYNC-153 pipeline lock's TTL (`pipeline_lock_ttl_s`) is
+still sized from these numbers (53.5 h or more), so ddp-sync never starts a second run of a state while one is going.
 
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 

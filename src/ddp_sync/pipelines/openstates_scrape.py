@@ -1717,7 +1717,10 @@ def pipeline_lock_ttl_s(jurisdiction: str, config: dict | None, archive_config: 
     """SYNC-153: the state's pipeline lock TTL, the worst case of a whole run: per session, the scrape's Fargate wait
     plus its RDS load timeout; then 1 + len(ARCHIVE_RETRY_DELAYS_S) archive attempts at the archive's Fargate wait;
     the retry delays; and 1 h. With today's limits: about 53.5 h for a one-session state, 65.5 h for MA (24 h scrape
-    wait) and 67.5 h for the US (two sessions). Safe only because every lock is cleared when ddp-sync starts."""
+    wait) and 67.5 h for the US (two sessions). Safe only because every lock is cleared when ddp-sync starts.
+    OPEN-477: the scrape's wait is no longer a stop (only a stall stops it; the wait is when a "still running" alert
+    goes out), so a run still logging could in theory outlive this TTL; that alert fires long before it does, and the
+    scheduler's max_instances=1 still keeps the same state's job from overlapping itself."""
     from ddp_sync.pipelines.cloud_scrape_trigger import _DEFAULT_LOAD_TIMEOUT_S
     from ddp_sync.pipelines.openstates_archive import ARCHIVE_RETRY_DELAYS_S
 

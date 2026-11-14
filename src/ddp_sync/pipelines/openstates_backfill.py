@@ -122,6 +122,16 @@ def _launch_backfill_fargate_task(
     return True, tasks[0]["taskArn"], ""
 
 
+def task_log_stream(task_arn: str, fargate_cfg: dict) -> tuple[str, str]:
+    """(log group, log stream) a task of this cluster writes to: `<prefix>/<container>/<task id>` in
+    `/aws/ecs/ddp-scrapers`. Shared by `_fetch_task_output` and the scrape wait's stall check (OPEN-477)."""
+    log_group = fargate_cfg.get("log_group", _DEFAULT_LOG_GROUP)
+    stream_prefix = fargate_cfg.get("log_stream_prefix", "scraper")
+    container_name = fargate_cfg.get("container_name", "scraper")
+    task_id = task_arn.rsplit("/", 1)[-1]
+    return log_group, f"{stream_prefix}/{container_name}/{task_id}"
+
+
 def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
     """Best-effort fetch of this task's own stdout/stderr from CloudWatch Logs.
 
@@ -148,11 +158,7 @@ def _fetch_task_output(task_arn: str, fargate_cfg: dict, logs_client) -> str:
     Never raises -- a log-fetch failure is real information ("logs unavailable"), not a reason
     to fail a task that otherwise exited 0.
     """
-    log_group = fargate_cfg.get("log_group", _DEFAULT_LOG_GROUP)
-    stream_prefix = fargate_cfg.get("log_stream_prefix", "scraper")
-    container_name = fargate_cfg.get("container_name", "scraper")
-    task_id = task_arn.rsplit("/", 1)[-1]
-    stream_name = f"{stream_prefix}/{container_name}/{task_id}"
+    log_group, stream_name = task_log_stream(task_arn, fargate_cfg)
 
     messages: list[str] = []
     next_token: str | None = None
