@@ -196,6 +196,13 @@ One standalone document per organization into the new index, through the same `K
 
 Singleton: `get_redis_store() -> RedisStore`. All methods no-op gracefully when Redis is down.
 
+- **Reconnect when Redis was not up at startup (SYNC-160): `reconnect_until_available()`**, started as a background task in `app.py`'s lifespan right after `connect()`.
+  * **Why:** on 2026-11-13 the Mac's ddp-sync came up 49 s before its Redis container, stayed without Redis for 1.5 days and refused every scraper-triggered LegBot run (503, `redis_unavailable`), with no alert.
+  * **What it does:** while `_client` is `None` it retries `connect()` every `RECONNECT_INTERVAL_SECONDS` (30). If Redis is still missing after `RECONNECT_ALERT_AFTER_SECONDS` (300) it sends **one** `post_alert` (`source="redis_store.unavailable"`). On connecting it runs `clear_state_locks()` as startup would have, and logs `redis_reconnected`. It returns at once if the startup connect worked.
+  * `connect()` publishes `_client` only after its `ping` succeeds, and closes a failed attempt.
+  * A Redis that drops *after* connecting is not this loop's job: `redis.asyncio` reconnects an existing client on the next command.
+  * **Do not add a second reconnect** in a caller; callers keep checking `_client` (or `is_available`) and refusing as before.
+
 - **`set_bill_version(webflow_id, data)` / `get_bill_version(webflow_id)`** — 90-day TTL. Data shape: `{version_date, version_note, text_url, media_type, chunk_count, last_checked, bill_slug}`. `chunk_count` added 2026-06-06 for surplus chunk deletion.
 - **`set_bill_status(webflow_id, data)` / `get_bill_status(webflow_id)`** — 90-day TTL. Data shape: `{status, status_date, status_chamber, gov_url, last_synced}`.
 - **`set_flow_status(flow_name, data)` / `get_flow_status(flow_name)`** — 7-day TTL. Records run outcomes for `/health` endpoint.
