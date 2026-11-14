@@ -23,7 +23,13 @@ from tests.test_scraper_triggered_legbot import FakeRedisClient
 class _FakeRedisWithScan(FakeRedisClient):
     """The trigger's SET-NX/GET/DELETE/EXPIRE plus the SCAN/DELETE that clear_state_locks uses."""
 
+    def __init__(self):
+        super().__init__()
+        self.seen_published_during_clear: list = []
+
     async def scan_iter(self, match=None):
+        # what any other caller would have seen while the locks were being cleared
+        self.seen_published_during_clear.append(rs_module.get_redis_store()._client)
         prefix = (match or "").rstrip("*")
         for key in list(self.store):
             if key.startswith(prefix):
@@ -56,9 +62,14 @@ def _connect_after(store: RedisStore, failures: int, client) -> AsyncMock:
     """A connect() that fails `failures` times, then publishes `client`."""
     calls = {"n": 0}
 
-    async def connect():
+    async def connect(*, before_publish=None):
         calls["n"] += 1
-        store._client = client if calls["n"] > failures else None
+        if calls["n"] > failures:
+            if before_publish is not None:
+                await before_publish(client)
+            store._client = client
+        else:
+            store._client = None
 
     mock = AsyncMock(side_effect=connect)
     store.connect = mock
@@ -189,3 +200,55 @@ async def test_connect_publishes_a_client_only_after_its_ping_succeeds(store, mo
     await store.connect()
     assert store._client is working
     assert seen_during_ping == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_locks_are_cleared_before_any_caller_can_see_the_new_client(store):
+    """Round-2 review: a run that starts the moment Redis is back must not have its fresh lock wiped by
+    the reconnect's clear, so the clear runs while the client is still unpublished."""
+    client = _FakeRedisWithScan()
+    client.store[f"{PIPELINE_LOCK_PREFIX}pa"] = b"old-run"
+    _connect_after(store, failures=1, client=client)
+
+    await reconnect_until_available(interval=0, alert_after=10_000)
+
+    assert client.seen_published_during_clear == [None]
+    assert f"{PIPELINE_LOCK_PREFIX}pa" not in client.store
+    assert store._client is client
+
+
+@pytest.mark.asyncio
+async def test_failing_to_load_the_alert_does_not_stop_the_retries(store, monkeypatch):
+    """Round-2 review: loading the alert module is inside the guard too."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ddp_sync.slack_alerts", None)  # makes the import raise ImportError
+    client = _FakeRedisWithScan()
+    _connect_after(store, failures=6, client=client)
+
+    await reconnect_until_available(interval=0, alert_after=60, clock=_Clock(step=60))
+
+    assert store._client is client
+
+
+@pytest.mark.asyncio
+async def test_real_connect_runs_before_publish_with_the_client_before_publishing(store, monkeypatch):
+    seen = []
+
+    class _Client:
+        async def ping(self):
+            return True
+
+        async def close(self):
+            pass
+
+    working = _Client()
+    monkeypatch.setattr("redis.asyncio.from_url", lambda *a, **k: working)
+
+    async def before_publish(client):
+        seen.append((client, store._client))
+
+    await store.connect(before_publish=before_publish)
+
+    assert seen == [(working, None)]
+    assert store._client is working

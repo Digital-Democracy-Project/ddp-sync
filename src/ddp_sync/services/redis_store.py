@@ -49,9 +49,11 @@ class RedisStore:
     def is_available(self) -> bool:
         return self._client is not None
 
-    async def connect(self):
+    async def connect(self, *, before_publish=None):
         """Connect to Redis. Called from app.py lifespan startup, and again by
-        `reconnect_until_available` while it is down (SYNC-160)."""
+        `reconnect_until_available` while it is down (SYNC-160). `before_publish`, if given, is awaited
+        with the working client before any caller can see it (the reconnect clears the pipeline locks
+        there, so a run that starts the moment Redis is back cannot have its new lock wiped)."""
         client = None
         try:
             import redis.asyncio as aioredis
@@ -64,6 +66,8 @@ class RedisStore:
             # Verify connectivity before publishing the client: a retry can run while the app is
             # serving, and a caller must never see a client whose ping has not succeeded (SYNC-160).
             await client.ping()
+            if before_publish is not None:
+                await before_publish(client)
             self._client = client
             logger.info("Redis connected", url=settings.redis_url)
         except Exception as e:
@@ -848,10 +852,13 @@ async def state_lock(jurisdiction: str, ttl_s: int, token: str | None = None):
         await release_state_lock(jurisdiction, token)
 
 
-async def clear_state_locks() -> int:
+async def clear_state_locks(client=None) -> int:
     """Delete every pipeline lock. Called once at ddp-sync startup, before the scheduler starts: a lock left by a run
-    that died with the previous process would otherwise block its state until the TTL ran out. Never raises."""
-    client = get_redis_store()._client
+    that died with the previous process would otherwise block its state until the TTL ran out. Never raises.
+    SYNC-160: the reconnect passes the new `client` before publishing it, so the clear runs before any caller
+    can take a lock with it."""
+    if client is None:
+        client = get_redis_store()._client
     if client is None:
         return 0
     try:
@@ -889,16 +896,17 @@ async def reconnect_until_available(
     alerted = False
     while store._client is None:
         await asyncio.sleep(interval)
-        await store.connect()
+        # The locks are cleared with the new client before it is published (`before_publish`), so a run
+        # that starts the moment Redis is back cannot have its fresh lock wiped by this clear.
+        await store.connect(before_publish=lambda client: clear_state_locks(client))
         if store._client is not None:
-            await clear_state_locks()
             logger.info("redis_reconnected", waited_seconds=round(clock() - started))
             return
         if not alerted and clock() - started >= alert_after:
             alerted = True
-            from ddp_sync.slack_alerts import post_alert
-
             try:
+                from ddp_sync.slack_alerts import post_alert
+
                 await asyncio.to_thread(
                     post_alert,
                     "ddp-sync has had no Redis since it started "
@@ -909,5 +917,5 @@ async def reconnect_until_available(
                     source="redis_store.unavailable",
                     dedupe_key="ddp-sync-redis-unavailable",
                 )
-            except Exception as e:  # noqa: BLE001 -- the alert must never stop the retries
+            except Exception as e:  # noqa: BLE001 -- the alert (or loading it) must never stop the retries
                 logger.error("redis_unavailable_alert_failed", error=str(e))
