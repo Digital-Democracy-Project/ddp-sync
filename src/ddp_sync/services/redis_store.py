@@ -8,7 +8,9 @@ Provides:
 - Graceful fallback: all methods no-op when Redis is unavailable
 """
 
+import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -48,17 +50,21 @@ class RedisStore:
         return self._client is not None
 
     async def connect(self):
-        """Connect to Redis. Called from app.py lifespan startup."""
+        """Connect to Redis. Called from app.py lifespan startup, and again by
+        `reconnect_until_available` while it is down (SYNC-160)."""
+        client = None
         try:
             import redis.asyncio as aioredis
 
             settings = get_settings()
-            self._client = aioredis.from_url(
+            client = aioredis.from_url(
                 settings.redis_url,
                 decode_responses=True,
             )
-            # Verify connectivity
-            await self._client.ping()
+            # Verify connectivity before publishing the client: a retry can run while the app is
+            # serving, and a caller must never see a client whose ping has not succeeded (SYNC-160).
+            await client.ping()
+            self._client = client
             logger.info("Redis connected", url=settings.redis_url)
         except Exception as e:
             logger.warning(
@@ -66,6 +72,11 @@ class RedisStore:
                 error=str(e),
             )
             self._client = None
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
 
     async def disconnect(self):
         """Disconnect from Redis. Called from app.py lifespan shutdown."""
@@ -852,3 +863,51 @@ async def clear_state_locks() -> int:
     except Exception as e:  # noqa: BLE001 -- startup must not fail on this
         logger.error("pipeline_locks_clear_failed", error=str(e))
         return 0
+
+
+# SYNC-160: `connect()` used to run once, at startup. On 2026-11-13 the Mac rebooted and ddp-sync came
+# up 49 s before its Redis container; it stayed without Redis for 1.5 days and refused every
+# scraper-triggered LegBot run with 503 (redis_unavailable), and nothing alerted. While Redis is
+# missing, retry every RECONNECT_INTERVAL_SECONDS; send one operator alert if it is still missing
+# after RECONNECT_ALERT_AFTER_SECONDS (a container a minute late is not worth one). Once connected,
+# clear the pipeline locks as startup would have (SYNC-153). A Redis that drops AFTER connecting is
+# not this loop's concern: redis.asyncio reconnects an existing client on the next command.
+RECONNECT_INTERVAL_SECONDS = 30
+RECONNECT_ALERT_AFTER_SECONDS = 300
+
+
+async def reconnect_until_available(
+    *,
+    interval: float = RECONNECT_INTERVAL_SECONDS,
+    alert_after: float = RECONNECT_ALERT_AFTER_SECONDS,
+    clock=time.monotonic,
+) -> None:
+    """Retry `connect()` until Redis answers; returns at once if it already did. Started as a
+    background task from app.py's lifespan. Never raises, apart from cancellation at shutdown."""
+    store = get_redis_store()
+    started = clock()
+    alerted = False
+    while store._client is None:
+        await asyncio.sleep(interval)
+        await store.connect()
+        if store._client is not None:
+            await clear_state_locks()
+            logger.info("redis_reconnected", waited_seconds=round(clock() - started))
+            return
+        if not alerted and clock() - started >= alert_after:
+            alerted = True
+            from ddp_sync.slack_alerts import post_alert
+
+            try:
+                await asyncio.to_thread(
+                    post_alert,
+                    "ddp-sync has had no Redis since it started "
+                    f"({round((clock() - started) / 60)} min). Until it connects, scraper-triggered "
+                    "LegBot runs are refused, and the Slack citation pull and in-flight Fargate "
+                    f"tracking do not run. Retrying every {int(interval)} s; restarting ddp-sync "
+                    "is not needed once Redis is up.",
+                    source="redis_store.unavailable",
+                    dedupe_key="ddp-sync-redis-unavailable",
+                )
+            except Exception as e:  # noqa: BLE001 -- the alert must never stop the retries
+                logger.error("redis_unavailable_alert_failed", error=str(e))
