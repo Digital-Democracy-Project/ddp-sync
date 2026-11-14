@@ -1,6 +1,6 @@
 {
- "frozen": "2026-11-13",
- "source": "dev broker (copy of production data): common.person_resolution._record_input and _shortlist read without opening an attempt; 'search' cases are the same search for a hand-cleaned name; 'synthetic' records are made up around real search results",
+ "frozen": "2026-11-14",
+ "source": "dev broker (copy of production data), 'broker' shortlists refreshed 2026-11-14 with BROKER-497 (office words dropped before a title; a state-hinted search keeps that state's members of Congress): common.person_resolution._record_input and _shortlist read without opening an attempt; 'search' cases are the same search for a hand-cleaned name; 'synthetic' records are made up around real search results",
  "verdicts_source": "provisional",
  "labels": "Ramon: the five BROKER-441 cases and the 2026-11-13 list (11055, 11115, 11060 link; 16147 null; a member's office links to its member). The synthetic cases' labels are the builder's: change verdicts_source to reviewed once Ramon has read them.",
  "cases": [
@@ -140,7 +140,36 @@
     "description": "Jennifer “Rita” Harris is a Democratic member of the Florida House of Representatives representing District 44 (Orlando area). First elected in 2022, Harris is a community activist and former volunteer with reproductive health advocacy who positions herself as an affordable-housing and environment-focused legislator working on constituent services, economic opportunity, and neighborhood-level issues.",
     "website": "https://www.flhouse.gov/Sections/Representatives/details.aspx?MemberId=4877&LegislativeTermId=91"
    },
-   "candidates": [],
+   "candidates": [
+    {
+     "id": "rep:1184",
+     "broker_id": 1184,
+     "openstates_id": "ca476441-7c7a-4f21-ba55-207c21a7d51d",
+     "name": "Rita Harris",
+     "jurisdiction": "FL",
+     "chamber": "lower",
+     "district": "44",
+     "party": "Democratic",
+     "in_office": true,
+     "left_office": null,
+     "slug": "rita-harris-1184",
+     "url": "/legislators/rita-harris-1184"
+    },
+    {
+     "id": "os:f1ddabf1-c991-4736-9259-445de23aa58b",
+     "broker_id": null,
+     "openstates_id": "f1ddabf1-c991-4736-9259-445de23aa58b",
+     "name": "Shawn Harrison",
+     "jurisdiction": "FL",
+     "chamber": null,
+     "district": null,
+     "party": "Republican",
+     "in_office": null,
+     "left_office": null,
+     "slug": "shawn-harrison",
+     "url": "/legislators/f1ddabf1-c991-4736-9259-445de23aa58b/shawn-harrison"
+    }
+   ],
    "expected": "rep:1184"
   },
   {
@@ -181,7 +210,22 @@
     "description": "The official congressional office of U.S. Representative Thomas Massie, who represents Kentucky’s 4th Congressional District in the U.S. House of Representatives. The office assists constituents, handles district services, and communicates the congressman’s legislative work and public positions.",
     "website": "https://massie.house.gov/"
    },
-   "candidates": [],
+   "candidates": [
+    {
+     "id": "rep:940",
+     "broker_id": 940,
+     "openstates_id": "7d1234be-d22a-5374-8022-59a795f0f3f4",
+     "name": "Thomas Massie",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "KY-4",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "thomas-massie-940",
+     "url": "/legislators/thomas-massie-940"
+    }
+   ],
    "expected": "rep:940"
   },
   {
@@ -194,7 +238,22 @@
     "description": "The Office of U.S. Representative Jefferson Van Drew serves New Jersey’s 2nd Congressional District in the U.S. House of Representatives. It provides constituent services, federal agency assistance, and legislative representation for South Jersey residents.",
     "website": "https://vandrew.house.gov/"
    },
-   "candidates": [],
+   "candidates": [
+    {
+     "id": "rep:716",
+     "broker_id": 716,
+     "openstates_id": "a7706596-7110-5866-935b-b44668b92af1",
+     "name": "Jeff Van Drew",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "NJ-2",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "jeff-van-drew-716",
+     "url": "/legislators/jeff-van-drew-716"
+    }
+   ],
    "expected": "rep:716"
   },
   {
@@ -207,7 +266,22 @@
     "description": "Office of U.S. Representative David G. Valadao is the official congressional office serving California’s 22nd Congressional District. The office assists constituents with federal agency casework, legislative concerns, meeting and event requests, and general communication with the Representative.",
     "website": "https://valadao.house.gov"
    },
-   "candidates": [],
+   "candidates": [
+    {
+     "id": "rep:634",
+     "broker_id": 634,
+     "openstates_id": "cf552a34-e9e1-5de9-9270-b5b441dd89fe",
+     "name": "David Valadao",
+     "jurisdiction": "US",
+     "chamber": "lower",
+     "district": "CA-22",
+     "party": "Republican",
+     "in_office": true,
+     "left_office": null,
+     "slug": "david-valadao-634",
+     "url": "/legislators/david-valadao-634"
+    }
+   ],
    "expected": "rep:634"
   },
   {
