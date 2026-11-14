@@ -270,18 +270,21 @@ def test_the_frozen_fixture_holds_the_known_cases_and_every_expected_id_is_in_it
 
 
 @pytest.mark.asyncio
-async def test_even_a_perfect_model_cannot_pass_while_the_broker_returns_empty_shortlists_for_records_that_should_link():
-    """The finding this gate records today (2026-11-13): the broker's shortlist is empty for 11115 and the three
-    "Office of ..." records, so they can only be null, and recall falls short whatever the model does."""
+async def test_a_perfect_model_reaches_every_record_that_should_link_now_that_the_broker_shortlists_them():
+    """BROKER-497 (refreshed 2026-11-14): the broker's shortlist used to be empty for 11115 and the three "Office of ..."
+    records, so no model could link them. With the fixed shortlists every positive case holds its person, so a perfect
+    model misses none and the scored gate passes; the fixture's labels are still provisional, so the run is not a pass."""
     loaded = load_cases()
+    by_id = {c["case_id"]: c for c in loaded["cases"]}
+    for key, rep in {11115: "rep:1184", 14005: "rep:940", 14934: "rep:716", 14999: "rep:634"}.items():
+        assert by_id[f"broker-{key}"]["candidates"][0]["id"] == rep  # the right person comes first
     run = await run_offline(loaded, ask=_oracle(loaded))
     report = run.gate()
 
     assert report.wrong_matches == []
     missed = {r.case_id for r in run.results if r.kind == "positive" and r.answered_org_id is None}
-    assert missed == {"broker-11115", "broker-14005", "broker-14934", "broker-14999"}
-    assert report.recall < 0.80 and not run.passed()
-    assert "should have linked, answered null: " in run.render()
+    assert missed == set()
+    assert report.scored_pass and not run.passed()  # provisional labels
 
 
 @pytest.mark.asyncio
