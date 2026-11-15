@@ -367,6 +367,12 @@ async def dispatch_describe_organization(
     )
 
 
+# ddp-sync's (and the broker's `logo_source`) names for where a candidate came from, as LegBot's judge_logo names them
+# (AGENTS-240, docs/reference/legbot.md); LegBot refuses any other name
+JUDGE_LOGO_KINDS = {"commons": "commons", "img": "labelled_img", "schema_org": "schema_logo",
+                    "apple_touch_icon": "apple_touch_icon", "og_image": "og_image"}
+
+
 async def dispatch_judge_logo(
     image_png: bytes,
     org_name: str,
@@ -379,9 +385,10 @@ async def dispatch_judge_logo(
 
     LegBot looks at one candidate image and says what it sees; it does not decide. The image is sent as a PNG already
     prepared by ddp-sync (an image with see-through parts drawn on mid-grey, so a white logo is visible; tiny images never
-    sent), base64 in `image_png_base64`. `candidate_kind` is where it came from: commons, img, schema_org, apple_touch_icon
-    or og_image. The answer is facts only: {"is_logo", "text_seen", "shows_org", "shows_parent", "names_other_org",
-    "reason"}; the acceptance rule stays in ddp-sync (`pipelines.organization_logo.accept_logo`).
+    sent; at most 768 px a side), base64 in `image_b64` (LegBot refuses a PNG over 1024 px a side or 2 MB).
+    `candidate_kind` is where it came from: commons, img, schema_org, apple_touch_icon or og_image, sent under LegBot's
+    names (`JUDGE_LOGO_KINDS`). The answer is facts only: {"is_logo", "text_seen", "shows_org", "shows_parent",
+    "names_other_org", "reason"}; the acceptance rule stays in ddp-sync (`pipelines.organization_logo.accept_logo`).
 
     Raises:
         LegBotDispatchError: task failed, timed out, or its result couldn't be read from disk.
@@ -390,10 +397,10 @@ async def dispatch_judge_logo(
 
     return await _dispatch_and_await(
         {
-            "image_png_base64": base64.b64encode(image_png).decode("ascii"),
+            "image_b64": base64.b64encode(image_png).decode("ascii"),
             "org_name": org_name,
             "parent_name": parent_name or "",
-            "candidate_kind": candidate_kind,
+            "candidate_kind": JUDGE_LOGO_KINDS[candidate_kind],
             "question_type": "judge_logo",
             "caller": "ddp_sync",
         },

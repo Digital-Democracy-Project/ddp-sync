@@ -3,7 +3,8 @@ one organization's search end to end (fake network, fake broker, recorded judge 
 
 The judge answers below are in AGENTS-240's answer shape ({is_logo, text_seen, shows_org, shows_parent, names_other_org,
 reason}) and mirror the 2026-11-14 test's cases: a wrong picture, a real logo given a mismatched name, a white logo, a
-symbol-only logo, and a chapter whose site shows the parent's logo.
+symbol-only logo (never accepted: Ramon, 2026-11-15, "Strict: need the name"), and a chapter whose site shows the parent's
+logo.
 """
 
 import asyncio
@@ -63,24 +64,22 @@ def fake_dns():
 
 # ---- the acceptance rule ----
 
-@pytest.mark.parametrize("answer,kind,has_parent,expected", [
-    (WRONG_PICTURE, "img", False, (False, False)),
-    (SPONSOR, "img", False, (False, False)),            # a real logo, but another organization's
-    (OWN, "og_image", False, (True, False)),
-    (SYMBOL_ONLY, "img", False, (True, False)),         # declared by the site: allowed (Ramon, 2026-11-15)
-    (SYMBOL_ONLY, "schema_org", False, (True, False)),
-    (SYMBOL_ONLY, "apple_touch_icon", False, (False, False)),  # not declared as the logo: needs the name
-    (SYMBOL_ONLY, "og_image", False, (False, False)),
-    (PARENT_NAME, "img", True, (True, True)),           # a chapter site showing the parent's name
-    (PARENT_NAME, "img", False, (False, False)),        # no parent set: it does not show this organization
+@pytest.mark.parametrize("answer,has_parent,expected", [
+    (WRONG_PICTURE, False, (False, False)),
+    (SPONSOR, False, (False, False)),            # a real logo, but another organization's
+    (OWN, False, (True, False)),
+    (SYMBOL_ONLY, False, (False, False)),        # strict: no name, not accepted (Ramon, 2026-11-15, "Strict: need the name")
+    (SYMBOL_ONLY, True, (False, False)),
+    (PARENT_NAME, True, (True, True)),           # a chapter site showing the parent's name
+    (PARENT_NAME, False, (False, False)),        # no parent set: it does not show this organization
 ])
-def test_accept_logo(answer, kind, has_parent, expected):
-    assert ol.accept_logo(answer, kind=kind, has_parent=has_parent)[:2] == expected
+def test_accept_logo(answer, has_parent, expected):
+    assert ol.accept_logo(answer, has_parent=has_parent)[:2] == expected
 
 
 def test_a_mismatched_name_is_turned_down_even_when_the_picture_is_a_logo():
     mismatched = {**OWN, "shows_org": False, "names_other_org": True, "reason": "shows Sierra Club, not this name"}
-    assert ol.accept_logo(mismatched, kind="img", has_parent=False)[0] is False
+    assert ol.accept_logo(mismatched, has_parent=False)[0] is False
 
 
 # ---- the website's candidates ----
@@ -142,6 +141,50 @@ def test_a_tiny_icon_is_not_judged_and_an_icon_file_is_stored_as_png():
     assert picture.content_type == "image/png" and picture.data[:8] == b"\x89PNG\r\n\x1a\n"
     with pytest.raises(ol.LogoFetchError):
         ol.prepare_picture(b"<html>not a picture</html>")
+
+
+def test_a_large_picture_is_shrunk_for_the_judge_within_legbots_limits():
+    # LegBot's judge_logo refuses a PNG over 1024 px a side or 2,000,000 bytes (AGENTS-240, `_logo_candidate_from_payload`)
+    import random
+
+    noisy = Image.frombytes("RGB", (2000, 2000), random.Random(0).randbytes(2000 * 2000 * 3))  # square noise: the largest judged PNG
+    out = io.BytesIO()
+    noisy.save(out, "PNG")
+    picture = ol.prepare_picture(out.getvalue())
+    judged = Image.open(io.BytesIO(picture.judge_png))
+    assert judged.size == (768, 768)
+    assert len(picture.judge_png) <= 2_000_000
+    assert Image.open(io.BytesIO(picture.data)).size == (1024, 1024)
+
+
+@pytest.mark.asyncio
+async def test_the_judge_payload_is_what_legbots_judge_logo_reads():
+    """The payload as LegBot's `_logo_candidate_from_payload` (ddp-agents, AGENTS-240) checks it: `image_b64` strict
+    base64 of a PNG (signature and IHDR) at most 1024 px a side and 2,000,000 bytes, a non-empty `org_name`, a string
+    `parent_name`, a known `candidate_kind`."""
+    import base64
+
+    from ddp_sync.services import legbot_client
+
+    picture = ol.prepare_picture(png(2400, 900))
+    sent = {}
+
+    async def capture(payload, **kwargs):
+        sent.update(payload)
+        return {}
+    kinds = []
+    with patch.object(legbot_client, "_dispatch_and_await", new=capture):
+        for kind in ("commons", *ol.WEBSITE_KINDS):
+            await legbot_client.dispatch_judge_logo(picture.judge_png, "Sierra Club", parent_name=None, candidate_kind=kind)
+            kinds.append(sent["candidate_kind"])
+    assert kinds == ["commons", "labelled_img", "schema_logo", "apple_touch_icon", "og_image"]
+    assert sent["question_type"] == "judge_logo"
+    image = base64.b64decode(sent["image_b64"], validate=True)
+    assert image.startswith(b"\x89PNG\r\n\x1a\n") and image[12:16] == b"IHDR"
+    width, height = int.from_bytes(image[16:20], "big"), int.from_bytes(image[20:24], "big")
+    assert 0 < width <= 1024 and 0 < height <= 1024 and len(image) <= 2_000_000
+    assert sent["org_name"].strip() and isinstance(sent["parent_name"], str)
+    assert sent["candidate_kind"] in ("commons", "labelled_img", "schema_logo", "apple_touch_icon", "og_image")  # LegBot's names
 
 
 # ---- one organization, end to end ----

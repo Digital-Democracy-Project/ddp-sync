@@ -53,9 +53,8 @@ WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 COMMONS_RENDER_WIDTH = 512
 WEBSITE_KINDS = ("img", "schema_org", "apple_touch_icon", "og_image")
-# a symbol-only image (no words) is accepted only when the site itself declares it as the logo (Ramon, 2026-11-15)
-DECLARED_KINDS = ("img", "schema_org")
 STORED_LONGEST_SIDE = 1024      # px: the stored copy is at most this wide or tall
+JUDGED_LONGEST_SIDE = 768       # px: the PNG the judge sees (LegBot refuses over 1024 px a side or 2 MB; AGENTS-240)
 MAX_JUDGED = 8                   # judge calls per organization: a wall of sponsor logos must not mean 40 model calls
 MAX_PIXELS = 25_000_000          # a small file can unpack into a huge picture: refuse before decoding
 MAX_REDIRECTS = 5
@@ -109,14 +108,14 @@ def site_host(url: str) -> str:
 
 # ---- the acceptance rule (the judge only reports facts; AGENTS-240) ----
 
-def accept_logo(answer: dict, *, kind: str, has_parent: bool) -> tuple[bool, bool, str]:
+def accept_logo(answer: dict, *, has_parent: bool) -> tuple[bool, bool, str]:
     """(accepted, is_parents, why) for one judged candidate.
 
     Never: not a logo, or it names another organization. Accepted as the organization's own when it shows the organization's
     name, initials or emblem; as the parent's when a parent is set and it shows the parent's (a chapter-site logo showing the
-    parent's name counts as "all we have", Ramon 2026-11-15). A symbol-only image (no words seen) is accepted as the
-    organization's own only when the site declares it as its logo (a labelled `<img>` or the schema.org logo); an
-    apple-touch-icon or og:image with no words still needs the name or initials."""
+    parent's name counts as "all we have", Ramon 2026-11-15). Strict: a symbol-only image (no name or initials of the
+    organization or the parent) is never accepted, wherever it came from (Ramon, 2026-11-15 pop-up "Strict: need the name",
+    after AGENTS-240's re-test: allowing symbols added 4 real logos and 4 wrong ones out of 72)."""
     if not answer.get("is_logo"):
         return False, False, "not a logo"
     if answer.get("names_other_org"):
@@ -125,8 +124,6 @@ def accept_logo(answer: dict, *, kind: str, has_parent: bool) -> tuple[bool, boo
         return True, False, "shows the organization"
     if has_parent and answer.get("shows_parent"):
         return True, True, "shows the parent organization"
-    if not str(answer.get("text_seen") or "").strip() and kind in DECLARED_KINDS:
-        return True, False, "symbol-only logo declared by the site"
     return False, False, "does not show the organization"
 
 
@@ -298,8 +295,11 @@ def prepare_picture(data: bytes) -> Picture | None:
     out = io.BytesIO()
     stored_image.save(out, "PNG", optimize=True)
     stored, content_type = out.getvalue(), "image/png"
-    backdrop = Image.new("RGBA", rgba.size, GREY + (255,))
-    backdrop.alpha_composite(rgba)
+    # the judge's copy: at most JUDGED_LONGEST_SIDE (LegBot refuses a larger one), see-through parts drawn on mid-grey
+    judged_image = rgba.copy()
+    judged_image.thumbnail((JUDGED_LONGEST_SIDE, JUDGED_LONGEST_SIDE))
+    backdrop = Image.new("RGBA", judged_image.size, GREY + (255,))
+    backdrop.alpha_composite(judged_image)
     judged = io.BytesIO()
     backdrop.convert("RGB").save(judged, "PNG")
     return Picture(stored, content_type, judged.getvalue(), width, height)
@@ -528,7 +528,7 @@ async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: 
         logger.warning("judge_logo dispatch failed", url=candidate.url, error=str(exc))
         return None
     answer = dispatched.get("answer") or {}
-    accepted, is_parents, why = accept_logo(answer, kind=candidate.kind, has_parent=bool(parent))
+    accepted, is_parents, why = accept_logo(answer, has_parent=bool(parent))
     if not accepted:
         search.rejected.append({"kind": candidate.kind, "url": candidate.url, "why": why,
                                 "text_seen": answer.get("text_seen"), "reason": answer.get("reason")})
