@@ -371,24 +371,223 @@ def test_task_stopped_with_no_matching_container_reports_exit_code_none():
 
 
 def test_max_wait_exceeded_gives_up_without_looping_forever():
-    ecs = FakeEcsClient(
-        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
-        describe_responses=[_running_response()],
-    )
-    with (
-        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
-        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure"),
-    ):
-        result = cst.run_cloud_scrape(
-            "mi", None, "/fake/root", _fargate_config(max_wait_seconds=0), ecs_client=ecs,
-        )
+    """Without a logs client (the archive and backfill jobs) the wait still stops the task at max_wait_seconds.
+    OPEN-477 removed that hard stop from the scrape only; see the stall-check tests below."""
+    ecs = FakeEcsClient(describe_responses=[_running_response()])
+    fargate = _fargate_config(max_wait_seconds=0)["cloud_path"]["fargate"]
 
-    assert result["success"] is False
-    assert result["error"] == "exit_code_none"
+    exit_code, detail = cst._wait_for_task_stop("arn:task/1", fargate, ecs)
+
+    assert exit_code is None
+    assert "gave up waiting" in detail
     assert len(ecs.describe_calls) == 1  # gave up on the very first poll, no real sleep needed
     # pm-review, round 1: a timed-out run must not leave the ECS task running unbounded.
     assert ecs.stop_task_calls == [{"cluster": "ddp-scrapers-prototype", "task": "arn:task/1",
                                      "reason": "ddp-sync: max_wait_seconds exceeded"}]
+
+
+# ── OPEN-477: the scrape wait ends a stalled run, never a slow one ───────────────────────────
+
+
+class FakeClock:
+    """Stands in for the `time` module inside cloud_scrape_trigger: each sleep moves both clocks forward."""
+
+    def __init__(self, step_s=1000.0):
+        self.now = 1_800_000_000.0
+        self.step_s = step_s
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, _s):
+        self.now += self.step_s
+
+
+class FakeLogsClient:
+    """get_log_events returns one event `lag_s` seconds before the clock's now (None: an empty stream), or raises."""
+
+    def __init__(self, clock, lag_s=None, error=None):
+        self.clock, self.lag_s, self.error = clock, lag_s, error
+        self.calls = []
+
+    def get_log_events(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        if self.lag_s is None:
+            return {"events": []}
+        return {"events": [{"timestamp": int((self.clock.now - self.lag_s) * 1000), "message": "x"}]}
+
+
+def _scrape(ecs, logs, clock, **fargate):
+    alerts = []
+    with (
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.time", clock),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.resolve_rds_database_url", return_value=("postgresql://rds/openstates", "")),
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.post_alert", side_effect=lambda text, source: alerts.append(source)),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as failure_alert,
+    ):
+        result = cst.run_cloud_scrape(
+            "ma", None, "/fake/root", _fargate_config(**fargate), ecs_client=ecs, logs_client=logs,
+            subprocess_runner=lambda cmd, env: FakeSubprocessResult(returncode=0),
+        )
+    return result, alerts, failure_alert
+
+
+def test_quiet_run_is_stopped_and_alerts_once():
+    """The last line stays 2701 s behind the clock: quiet 0, 1000, 2000 s (kept), then 2701 s (> 45 min): stopped."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc123"}], "failures": []},
+        describe_responses=[_running_response()] * 4,
+    )
+    logs = FakeLogsClient(clock, lag_s=2701)
+
+    result, alerts, failure_alert = _scrape(ecs, logs, clock)
+
+    assert result["success"] is False
+    assert result["error"] == "exit_code_none"
+    assert len(ecs.describe_calls) == 4
+    assert len(ecs.stop_task_calls) == 1
+    assert "stall" in ecs.stop_task_calls[0]["reason"]
+    failure_alert.assert_called_once()
+    assert "stalled: no new log line for 2701s" in failure_alert.call_args.args[1]
+    assert alerts == []
+    # Reads the task's own stream, newest event first (the stream name the backfill fetch uses too).
+    assert logs.calls[0] == {"logGroupName": "/aws/ecs/ddp-scrapers", "logStreamName": "scraper/scraper/abc123",
+                             "startFromHead": False, "limit": 1}
+
+
+def test_quiet_from_the_start_is_stopped():
+    """A stream with no line at all: the quiet time counts from when the wait began."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 4,
+    )
+    logs = FakeLogsClient(clock, lag_s=None)
+
+    result, _, _ = _scrape(ecs, logs, clock)
+
+    assert result["success"] is False
+    assert len(ecs.describe_calls) == 4  # quiet 0, 1000, 2000 s: kept waiting; 3000 s: stopped
+    assert "stall" in ecs.stop_task_calls[0]["reason"]
+
+
+def test_slow_but_steadily_logging_run_is_not_stopped():
+    """30 hours, a fresh line every poll, past its max_wait_seconds: one 'still running' alert, never a stop."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 108 + [_stopped_response(exit_code=0)],
+    )
+    logs = FakeLogsClient(clock, lag_s=5)
+
+    result, alerts, failure_alert = _scrape(ecs, logs, clock, max_wait_seconds=12 * 3600)
+
+    assert result["success"] is True
+    assert ecs.stop_task_calls == []
+    failure_alert.assert_not_called()
+    assert alerts == ["openstates_scrape.long_run"]
+
+
+def test_unreadable_log_never_stops_a_run_and_says_so_once():
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 10 + [_stopped_response(exit_code=0)],
+    )
+    logs = FakeLogsClient(clock, error=RuntimeError("AccessDeniedException: logs:GetLogEvents"))
+
+    result, alerts, failure_alert = _scrape(ecs, logs, clock)
+
+    assert result["success"] is True
+    assert ecs.stop_task_calls == []
+    failure_alert.assert_not_called()
+    assert alerts == ["openstates_scrape.stall_check"]
+
+
+class FlakyLogsClient(FakeLogsClient):
+    """Raises for the first `failures` reads, then answers like FakeLogsClient."""
+
+    def __init__(self, clock, failures, lag_s):
+        super().__init__(clock, lag_s=lag_s)
+        self.failures = failures
+
+    def get_log_events(self, **kwargs):
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append(kwargs)
+            raise RuntimeError("ThrottlingException")
+        return super().get_log_events(**kwargs)
+
+
+def test_unreadable_past_the_alert_time_never_says_still_logging():
+    """pm-review: a run whose log cannot be read past max_wait_seconds gets the cannot-read alert only."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 6 + [_stopped_response(exit_code=0)],
+    )
+    logs = FakeLogsClient(clock, error=RuntimeError("AccessDeniedException"))
+
+    result, alerts, _ = _scrape(ecs, logs, clock, max_wait_seconds=2000)
+
+    assert result["success"] is True
+    assert alerts == ["openstates_scrape.stall_check"]
+
+
+def test_stale_signal_recovering_at_the_alert_time_is_a_stall_only():
+    """pm-review: reads fail until past max_wait_seconds, then recover showing an old last line: the run is stopped
+    as stalled, with no 'still running' alert just before it."""
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 5,
+    )
+    logs = FlakyLogsClient(clock, failures=3, lag_s=4000)  # 3rd poll (2000 s) fails; 4th (3000 s) reads a line 4000 s old
+
+    result, alerts, failure_alert = _scrape(ecs, logs, clock, max_wait_seconds=2500)
+
+    assert result["success"] is False
+    assert "stall" in ecs.stop_task_calls[0]["reason"]
+    failure_alert.assert_called_once()
+    assert "openstates_scrape.long_run" not in alerts
+
+
+def test_logs_client_that_cannot_be_built_is_an_unreadable_log_not_a_failure():
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(
+        run_task_response={"tasks": [{"taskArn": "arn:task/1"}], "failures": []},
+        describe_responses=[_running_response()] * 4 + [_stopped_response(exit_code=0)],
+    )
+    with patch("ddp_sync.pipelines.cloud_scrape_trigger.boto3.client", side_effect=RuntimeError("no region")):
+        result, alerts, _ = _scrape(ecs, None, clock)
+
+    assert result["success"] is True
+    assert ecs.stop_task_calls == []
+    assert alerts == ["openstates_scrape.stall_check"]
+
+
+def test_resumed_job_also_gets_the_stall_check(monkeypatch):
+    monkeypatch.setattr(cst.inflight_fargate_jobs, "clear", lambda run_id: None)
+    clock = FakeClock(step_s=1000)
+    ecs = FakeEcsClient(describe_responses=[_running_response()] * 4)
+    logs = FakeLogsClient(clock, lag_s=3600)
+    record = {"jurisdiction": "ma", "session_arg": None, "task_arn": "arn:task/9",
+              "fargate_cfg": _fargate_config()["cloud_path"]["fargate"], "openstates_root": "/fake/root"}
+    with (
+        patch("ddp_sync.pipelines.cloud_scrape_trigger.time", clock),
+        patch("ddp_sync.pipelines.openstates_scrape._alert_scrape_failure") as failure_alert,
+    ):
+        result = cst.resume_inflight_fargate_job("ma-1", record, ecs_client=ecs, logs_client=logs)
+
+    assert result["success"] is False
+    assert "stall" in ecs.stop_task_calls[0]["reason"]
+    failure_alert.assert_called_once()
 
 
 def test_describe_tasks_exception_mid_poll_is_caught_and_reported():
@@ -609,7 +808,7 @@ def test_task_arn_recorded_before_the_wait_begins_and_cleared_on_success():
     )
     seen_while_waiting = {}
 
-    def fake_wait(task_arn, fargate_cfg, ecs_client):
+    def fake_wait(task_arn, fargate_cfg, ecs_client, **_kwargs):
         seen_while_waiting["record"] = dict(cst.inflight_fargate_jobs.list_inflight())
         return 0, ""
 
@@ -805,7 +1004,7 @@ def test_per_state_wait_is_used_by_run_cloud_scrape_and_persisted_for_resume():
     )
     waited_with, persisted = [], []
 
-    def fake_wait(task_arn, fargate_cfg, ecs_client):
+    def fake_wait(task_arn, fargate_cfg, ecs_client, **_kwargs):
         waited_with.append(fargate_cfg["max_wait_seconds"])
         return 1, "stopped for the test"  # a failed run: skips the load step
 
@@ -845,7 +1044,7 @@ def test_a_resumed_job_waits_with_the_persisted_per_state_value():
     }
     waited_with = []
 
-    def fake_wait(task_arn, fargate_cfg, ecs_client):
+    def fake_wait(task_arn, fargate_cfg, ecs_client, **_kwargs):
         waited_with.append(fargate_cfg["max_wait_seconds"])
         return 1, "stopped for the test"
 
