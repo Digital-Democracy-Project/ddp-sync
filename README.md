@@ -256,6 +256,13 @@ processed; `limit` is still required and validated, just unused for that purpose
 already dedups its own candidates. **This is the intended way to run a large targeted backfill going forward** —
 not an uncoordinated external script.
 
+**Updated 2026-11-15 (SYNC-165): the session scan lists only real bill types.** It asks api-v3 for
+`bill_types_only` (OPEN-519), the same rule the website's lists use; the list of labels lives only in api-v3's
+`api/bill_types.py`. Massachusetts files reports, orders, communications and study requests under bill numbers,
+none with bill text: measured on the Mac api-v3 on 2026-11-15, Massachusetts 194th drops from 11,932 candidates
+to 8,781 (3,151 fewer), Louisiana 2026 by 2 (its two House study requests), every other live state by 0. A
+caller-supplied `bill_candidates` list is not filtered.
+
 **Updated 2026-08-28 (SYNC-42): `retry_failed` is required, and it reaches `failed` and nothing else.**
 Once a `BillArtifact` was recorded `failed`, no later run ever retried it and there was no option to —
 so a failure caused by a bug, an outage or a since-fixed prompt stayed failed permanently, and the only

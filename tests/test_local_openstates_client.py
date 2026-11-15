@@ -110,6 +110,50 @@ async def test_happy_path_returns_gov_id_session_and_live_url():
 
 
 @pytest.mark.asyncio
+async def test_only_real_bill_types_are_candidates():
+    """SYNC-165: a report or an order is not a candidate; a bill and a resolution are.
+    Which labels are bill types is api-v3's rule (`bill_types_only`, OPEN-519), so the
+    fake api-v3 below applies its own answer (`_is_bill_type`) only when asked, on
+    every page."""
+    bills = [
+        ("H 1", "bill", True),
+        ("H 2", "report", False),
+        ("S 3", "order", False),
+        ("S 4", "resolution", True),
+    ]
+
+    def page(params):
+        rows = [b for b in bills if params.get("bill_types_only") != "true" or b[2]]
+        start = (int(params["page"]) - 1) * 1
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "results": [
+                {"id": f"ocd-bill/{ident}", "identifier": ident, "classification": [label]}
+                for ident, label, _is_bill_type in rows[start:start + 1]
+            ],
+            "pagination": {"max_page": len(rows)},
+        }
+        return response
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=lambda url, params, headers: page(params))
+    with patch(
+        "ddp_sync.services.local_openstates_client.get_settings",
+        return_value=_FakeSettings(),
+    ), patch(
+        "ddp_sync.services.local_openstates_client._API_V3_MAX_PER_PAGE", 1
+    ), _patch_async_client(mock_client), _patch_current_session("194th"):
+        result = await list_current_session_bill_candidates("ma", limit=None)
+
+    assert [c["gov_id"] for c in result] == ["H 1", "S 4"]
+    assert all(
+        call.kwargs["params"]["bill_types_only"] == "true"
+        for call in mock_client.get.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_gov_id_is_the_short_identifier_not_the_uuid_regression():
     """Regression test for the 2026-07-30 live-testing bug: gov_id must
     always fit ConceptStatementSet.gov_id's max_length=20 -- a bare
