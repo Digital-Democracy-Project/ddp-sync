@@ -6,6 +6,7 @@ reason}) and mirror the 2026-11-14 test's cases: a wrong picture, a real logo gi
 symbol-only logo, and a chapter whose site shows the parent's logo.
 """
 
+import asyncio
 import io
 import json
 from types import SimpleNamespace
@@ -128,7 +129,9 @@ def test_a_white_logo_is_shown_to_the_judge_on_grey_and_stored_as_it_is():
     judged = Image.open(io.BytesIO(picture.judge_png)).convert("RGB")
     assert judged.getpixel((0, 0)) == ol.GREY            # see-through corner drawn on grey
     assert judged.getpixel((150, 60)) == (255, 255, 255)  # the white mark stays white, now visible
-    assert picture.data == out.getvalue() and picture.content_type == "image/png"
+    stored = Image.open(io.BytesIO(picture.data))
+    assert picture.content_type == "image/png" and stored.format == "PNG"
+    assert stored.convert("RGBA").getpixel((0, 0))[3] == 0  # the stored copy keeps its see-through parts (no grey)
 
 
 def test_a_tiny_icon_is_not_judged_and_an_icon_file_is_stored_as_png():
@@ -150,10 +153,15 @@ def _state(**overrides):
     return state
 
 
+def real_url(request) -> str:
+    """The address the code meant: requests go to the checked IP address with the real name in `Host` (`_pinned`)."""
+    return f"{request.url.scheme}://{request.headers['host']}{request.url.raw_path.decode()}"
+
+
 def _network(routes):
     """A fake web: {url-prefix: (status, content-type, body)}; Wikidata answers no match unless a route says otherwise."""
     def handler(request):
-        url = str(request.url)
+        url = real_url(request)
         for prefix, (status, content_type, body) in routes.items():
             if url.startswith(prefix):
                 data = body if isinstance(body, bytes) else (json.dumps(body) if not isinstance(body, str) else body).encode()
@@ -376,8 +384,8 @@ async def test_a_page_cannot_send_the_finder_to_a_private_address_directly_or_by
     seen = []
 
     def handler(request):
-        seen.append(str(request.url))
-        url = str(request.url)
+        seen.append(real_url(request))
+        url = real_url(request)
         if url == "https://www.sierraclub.org/redirected.png":
             return httpx.Response(302, headers={"location": "http://intranet.example/logo.png"})
         for prefix, (status, content_type, body) in routes.items():
@@ -427,7 +435,7 @@ async def test_the_step_never_raises_on_a_strange_broker_answer_or_an_unexpected
 @pytest.mark.asyncio
 async def test_a_redirect_to_a_public_picture_is_followed():
     def handler(request):
-        url = str(request.url)
+        url = real_url(request)
         if url == "https://www.sierraclub.org/":
             return httpx.Response(200, headers={"content-type": "text/html"},
                                   content=b'<img class="logo" src="/old-logo.png">')
@@ -444,7 +452,7 @@ async def test_a_redirect_to_a_public_picture_is_followed():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             result = await ol.find_and_store_organization_logo(organization_id=7, org_name="Sierra Club", client=client)
     assert result["outcome"] == "website"
-    assert write.await_args.kwargs["image"] == png()
+    assert Image.open(io.BytesIO(write.await_args.kwargs["image"])).size == (300, 120)
 
 
 @pytest.mark.asyncio
@@ -453,3 +461,81 @@ async def test_the_real_resolver_answers_and_localhost_is_refused():
     assert addresses and all(a.split("%")[0] in ("127.0.0.1", "::1") for a in addresses)
     with patch(f"{_L}._resolve", new=_REAL_RESOLVE), pytest.raises(ol.LogoFetchError):
         await ol._check_public("http://localhost:8000/logo.png")
+
+
+
+# ---- the second review (2026-11-15) ----
+
+@pytest.mark.asyncio
+async def test_the_request_goes_to_the_address_that_was_checked_not_to_a_second_lookup():
+    answers = iter([["93.184.216.34"], ["10.0.0.5"]])  # a name that answers public first, private next
+
+    async def rebinding(host):
+        return next(answers)
+
+    hits = []
+
+    def handler(request):
+        hits.append((request.url.host, request.headers["host"], request.extensions.get("sni_hostname")))
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=png())
+
+    with patch(f"{_L}._resolve", new=rebinding):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await ol._fetch(client, "https://rebind.example/logo.png")
+    assert hits == [("93.184.216.34", "rebind.example", "rebind.example")]
+
+
+@pytest.mark.asyncio
+async def test_a_site_that_trickles_bytes_is_given_up_on_as_a_whole():
+    class Trickle(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x"
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "image/png"}, stream=Trickle())
+
+    with patch(f"{_L}.REQUEST_TIMEOUT_SECONDS", 0.3), pytest.raises(ol.LogoFetchError):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await ol._fetch(client, "https://slow.example/logo.png")
+
+
+@pytest.mark.asyncio
+async def test_the_download_cap_holds_with_and_without_a_declared_size_and_a_bad_header_is_ignored():
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(10):
+                yield b"x" * 50
+
+    def handler(request):
+        path = request.url.path
+        if path == "/undeclared":
+            return httpx.Response(200, stream=Chunks())
+        if path == "/declared":
+            return httpx.Response(200, headers={"content-length": "100000"}, content=b"x")
+        return httpx.Response(200, headers={"content-length": "5, 5"}, content=b"hello")
+
+    with patch(f"{_L}.MAX_DOWNLOAD_BYTES", 100):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for path in ("/undeclared", "/declared"):
+                with pytest.raises(ol.LogoFetchError):
+                    await ol._fetch(client, f"https://big.example{path}")
+            body, _ = await ol._fetch(client, "https://big.example/doubled")
+    assert body == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_a_wall_of_sponsor_logos_is_capped():
+    page = "".join(f'<img class="logo" src="/sponsor-{n}.png">' for n in range(12))
+    routes = {f"https://www.sierraclub.org/sponsor-{n}.png": (200, "image/png", png()) for n in range(12)}
+    routes["https://www.sierraclub.org/"] = (200, "text/html", page)
+    result, _, judge = await _run(_state(), routes, [SPONSOR] * ol.MAX_JUDGED)
+    assert judge.await_count == ol.MAX_JUDGED
+    assert result["skipped"] == {"over_cap": 12 - ol.MAX_JUDGED}
+    assert result["rejected"] == ol.MAX_JUDGED
+
+
+def test_a_lazy_loaded_logo_is_found_behind_its_placeholder():
+    page = '<img class="logo" src="data:image/gif;base64,R0lGOD" data-src="/real-logo.png">'
+    assert [c.url for c in ol.website_candidates(page, "https://x.example/")] == ["https://x.example/real-logo.png"]

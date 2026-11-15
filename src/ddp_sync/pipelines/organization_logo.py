@@ -55,7 +55,8 @@ COMMONS_RENDER_WIDTH = 512
 WEBSITE_KINDS = ("img", "schema_org", "apple_touch_icon", "og_image")
 # a symbol-only image (no words) is accepted only when the site itself declares it as the logo (Ramon, 2026-11-15)
 DECLARED_KINDS = ("img", "schema_org")
-STORABLE_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
+STORED_LONGEST_SIDE = 1024      # px: the stored copy is at most this wide or tall
+MAX_JUDGED = 8                   # judge calls per organization: a wall of sponsor logos must not mean 40 model calls
 MAX_PIXELS = 25_000_000          # a small file can unpack into a huge picture: refuse before decoding
 MAX_REDIRECTS = 5
 
@@ -74,7 +75,7 @@ class Candidate:
 
 @dataclass
 class Picture:
-    data: bytes          # what the broker stores (PNG, JPEG, GIF or WebP)
+    data: bytes          # what the broker stores: re-encoded PNG
     content_type: str
     judge_png: bytes     # what the judge sees (see-through parts on grey)
     width: int
@@ -84,7 +85,8 @@ class Picture:
 @dataclass
 class Search:
     rejected: list[dict] = field(default_factory=list)   # {"kind", "url", "why", "answer"?}
-    skipped: Counter = field(default_factory=Counter)    # small, svg, unreadable
+    skipped: Counter = field(default_factory=Counter)    # small, svg, unreadable, over_cap
+    judged: int = 0
 
 
 # ---- names and hosts ----
@@ -153,7 +155,9 @@ def website_candidates(page_html: str, page_url: str) -> list[Candidate]:
                if getattr(parent, "name", None) in ("a", "div", "span", "figure", "picture")][:2]
         ).lower()
         if "logo" in label:
-            add("img", img.get("src") or img.get("data-src"))
+            src = img.get("src") or ""
+            lazy = img.get("data-src") or img.get("data-lazy-src") or img.get("data-original")
+            add("img", lazy if (not src or src.startswith("data:")) and lazy else src)
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -197,10 +201,12 @@ async def _resolve(host: str) -> list[str]:
     return [info[4][0] for info in infos]
 
 
-async def _check_public(url: str) -> None:
-    """Raise LogoFetchError unless `url` is http(s) and its host resolves only to public internet addresses. The pages and
-    pictures come from organizations' websites and from addresses those pages name, and this runs on the Mac, which reaches
-    private services over WireGuard: loopback, private, link-local (cloud metadata) and reserved addresses are refused."""
+async def _check_public(url: str) -> str:
+    """The public address to connect to for `url`, or LogoFetchError. `url` must be http(s) and its host must resolve only
+    to public internet addresses. The pages and pictures come from organizations' websites and from addresses those pages
+    name, and this runs on the Mac, which reaches private services over WireGuard: loopback, private, link-local (cloud
+    metadata) and reserved addresses are refused. The caller connects to the address returned here, never to a second
+    lookup of the name (a name that answers a public address first and a private one next cannot get through)."""
     parts = urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise LogoFetchError(f"not a web address: {url}")
@@ -210,34 +216,55 @@ async def _check_public(url: str) -> None:
         raise LogoFetchError(f"cannot resolve {parts.hostname}") from exc
     if not addresses or not all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addresses):
         raise LogoFetchError(f"not a public address: {parts.hostname}")
+    return addresses[0].split("%")[0]
+
+
+def _pinned(url: str, address: str) -> tuple[str, dict, dict]:
+    """(url with the checked address in place of the name, headers, extensions): the request goes to `address`, says the
+    real name in `Host`, and TLS checks the certificate against the real name (`sni_hostname`)."""
+    parts = urlparse(url)
+    host = f"[{address}]" if ":" in address else address
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    headers = {"Host": parts.netloc.rsplit("@", 1)[-1]}
+    extensions = {"sni_hostname": parts.hostname} if parts.scheme == "https" else {}
+    return parts._replace(netloc=netloc).geturl(), headers, extensions
 
 
 async def _fetch(client: httpx.AsyncClient, url: str) -> tuple[bytes, str]:
-    """(body, content type) of `url`, at most MAX_DOWNLOAD_BYTES, one request per site at a time, with the timeout. Every
-    address, the first and each redirect's, must be public (`_check_public`); redirects are followed here, at most
-    MAX_REDIRECTS."""
+    """(body, content type) of `url`, at most MAX_DOWNLOAD_BYTES, one request per site at a time. Every address, the first
+    and each redirect's, must be public and is connected to as checked (`_check_public`, `_pinned`); redirects are followed
+    here, at most MAX_REDIRECTS. The whole download, not only each read, must finish within REQUEST_TIMEOUT_SECONDS."""
     for _ in range(MAX_REDIRECTS + 1):
-        await _check_public(url)
+        address = await _check_public(url)
+        target, headers, extensions = _pinned(url, address)
         lock = _site_locks.setdefault(site_host(url), asyncio.Lock())
         async with lock:
             try:
-                async with client.stream("GET", url, follow_redirects=False, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
-                    if resp.is_redirect:
-                        location = resp.headers.get("location")
-                        if not location:
-                            raise LogoFetchError(f"redirect without an address: {url}")
-                        url = urljoin(url, location)
-                        continue
-                    if resp.status_code >= 400:
-                        raise LogoFetchError(f"{resp.status_code} for {url}")
-                    if int(resp.headers.get("content-length") or 0) > MAX_DOWNLOAD_BYTES:
-                        raise LogoFetchError(f"too big: {url}")
-                    body = bytearray()
-                    async for chunk in resp.aiter_bytes():
-                        body += chunk
-                        if len(body) > MAX_DOWNLOAD_BYTES:
+                async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+                    async with client.stream("GET", target, headers=headers, extensions=extensions,
+                                             follow_redirects=False, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+                        if resp.is_redirect:
+                            location = resp.headers.get("location")
+                            if not location:
+                                raise LogoFetchError(f"redirect without an address: {url}")
+                            url = urljoin(url, location)
+                            continue
+                        if resp.status_code >= 400:
+                            raise LogoFetchError(f"{resp.status_code} for {url}")
+                        try:
+                            declared = int(resp.headers.get("content-length") or 0)
+                        except ValueError:  # a malformed or doubled header: the streaming cap below still holds
+                            declared = 0
+                        if declared > MAX_DOWNLOAD_BYTES:
                             raise LogoFetchError(f"too big: {url}")
-                    return bytes(body), resp.headers.get("content-type", "")
+                        body = bytearray()
+                        async for chunk in resp.aiter_bytes():
+                            body += chunk
+                            if len(body) > MAX_DOWNLOAD_BYTES:
+                                raise LogoFetchError(f"too big: {url}")
+                        return bytes(body), resp.headers.get("content-type", "")
+            except TimeoutError as exc:
+                raise LogoFetchError(f"took longer than {REQUEST_TIMEOUT_SECONDS:g} s: {url}") from exc
             except httpx.HTTPError as exc:
                 raise LogoFetchError(f"{type(exc).__name__} for {url}") from exc
     raise LogoFetchError(f"too many redirects: {url}")
@@ -264,12 +291,13 @@ def prepare_picture(data: bytes) -> Picture | None:
     if max(width, height) < MIN_LONGEST_SIDE:
         return None
     rgba = image.convert("RGBA")
-    if image.format in STORABLE_FORMATS:
-        stored, content_type = data, STORABLE_FORMATS[image.format]
-    else:
-        out = io.BytesIO()
-        rgba.save(out, "PNG")
-        stored, content_type = out.getvalue(), "image/png"
+    # what the broker stores is drawn again here, never the site's own bytes (no metadata or appended data kept), as a PNG at
+    # most STORED_LONGEST_SIDE wide or tall (a logo needs no more, and a re-encoded photo stays within the broker's cap)
+    stored_image = rgba.copy()
+    stored_image.thumbnail((STORED_LONGEST_SIDE, STORED_LONGEST_SIDE))
+    out = io.BytesIO()
+    stored_image.save(out, "PNG", optimize=True)
+    stored, content_type = out.getvalue(), "image/png"
     backdrop = Image.new("RGBA", rgba.size, GREY + (255,))
     backdrop.alpha_composite(rgba)
     judged = io.BytesIO()
@@ -470,7 +498,12 @@ async def _search(client: httpx.AsyncClient, state: dict, org_name: str, result:
 
 
 async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: dict | None, search: Search):
-    """(picture, answer, is_parents) when the candidate is accepted, else None (recorded in `search`)."""
+    """(picture, answer, is_parents) when the candidate is accepted, else None (recorded in `search`). At most MAX_JUDGED
+    candidates per organization are tried (fetched, and judged when readable); the rest are counted as `over_cap`."""
+    if search.judged >= MAX_JUDGED:
+        search.skipped["over_cap"] += 1
+        return None
+    search.judged += 1  # counted when tried, so a wall of unreadable images is capped too
     try:
         data, content_type = await _fetch(client, candidate.url)
     except LogoFetchError:
