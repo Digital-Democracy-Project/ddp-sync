@@ -1260,11 +1260,62 @@ async def test_a_pair_whose_documents_are_of_different_media_types_is_skipped():
     """The archiver diffs each media type against its own earlier documents and
     api-v3 returns one document per version, so when the baseline's returned
     document is of another type the true baseline's text is not available."""
+    introduced = _ver("Introduced", media_type="text/xml")
+    # The archiver also kept this version's PDF, the true baseline; api-v3 returned the XML.
+    introduced["links"].append({"url": "https://x/Introduced.pdf", "media_type": "application/pdf"})
     result = await _transitions_for([
-        _ver("Introduced", media_type="text/xml"),
+        introduced,
         _ver("Substitute #1", diff=_DIFF, media_type="application/pdf"),
     ])
     assert result is None
+
+
+# SYNC-164: Massachusetts' chapter law (HTML) has no HTML before it, so core compares it
+# with the bill's PDF (OPEN-223, `_diff_baseline`) and stores that diff.
+
+
+def _ma_bill(*, law_diff=_DIFF):
+    """The shape api-v3 returns for a Massachusetts enacted bill (H 1024, Mac replica
+    2026-11-15): one PDF bill text, then one HTML chapter law."""
+    return [
+        _ver("Bill Text", media_type="application/pdf"),
+        _ver("Chapter Law Text (Enacted)", diff=law_diff, media_type="text/html"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_massachusetts_chapter_law_after_the_bill_pdf_is_not_skipped():
+    assert await _transitions_for(_ma_bill()) == [
+        ("Bill Text", "Chapter Law Text (Enacted)", "text of Bill Text"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_another_states_pdf_to_html_as_core_stores_it_is_skipped():
+    """Core's strict rule gives another state's HTML with no HTML before it no
+    comparison at all, so there is nothing to write. The versions carry no state:
+    the rule follows the stored row, so a stored cross-media diff in any state would
+    be kept (measured 2026-11-15: none exists outside Massachusetts)."""
+    assert await _transitions_for(_ma_bill(law_diff=None)) is None
+
+
+@pytest.mark.asyncio
+async def test_pdf_to_html_is_skipped_when_an_earlier_version_has_html():
+    """Core compared the HTML with that earlier HTML, not with the PDF returned
+    as the old side, so the pair is still refused."""
+    versions = [
+        _ver("Introduced", media_type="text/html", text=False),
+        _ver("Engrossed", diff=_DIFF, media_type="application/pdf"),
+        _ver("Enrolled", diff=_DIFF, media_type="text/html"),
+    ]
+    assert await _transitions_for(versions) is None
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_link_without_a_media_type_could_be_the_baseline():
+    versions = _ma_bill()
+    versions[0]["links"].append({"url": "https://x/unknown-type"})
+    assert await _transitions_for(versions) is None
 
 
 @pytest.mark.asyncio

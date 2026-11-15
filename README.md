@@ -370,6 +370,16 @@ not available. Not fixed here: bills whose versions share a sort key (Utah's "Co
 "Substitute #N" are one, 491 of 1,021 Utah bills), whose lineage order the archiver took from the
 database's unspecified row order.
 
+**Updated 2026-11-15 (SYNC-164): the one mixed-media pair core compares itself is kept.** For
+Massachusetts, openstates-core compares the enacted chapter law (HTML) with the bill's PDF, because the
+law has no HTML before it (OPEN-223, `_diff_baseline` in core's `text_extract.py`). The check above
+skipped all of those. A mixed-media pair is now kept when the newer document has no earlier document that
+could be of its own type (`_no_earlier_document_of_type`): core stores a diff for such a document only
+through that cross-media rule, so the stored diff is core's own comparison with the PDF returned as the
+old side. No list of states is kept here, so the rule follows the stored row: a cross-media diff in any
+other state would be kept too, and core's strict rule never stores one. Measured on the Mac replica, 2026-11-15: 364 stored diffs have
+that shape, all Massachusetts; 354 of those bills now yield a transition (10 have identical text).
+
 **Updated 2026-08-26 (SYNC-37, paired with `ddp-agents`' AGENTS-74):** `_process_bill()` no longer
 **blocks** on organisation research. It launches as an `asyncio` task after `version` is resolved and
 `ensure_bill_exists()` has run — the latest point it can start, since both can still return early —
