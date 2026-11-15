@@ -32,6 +32,10 @@ import structlog
 # than duplicating its archived-text-preferred logic in this module too.
 from ddp_sync.config import get_settings
 from ddp_sync.pipelines.bill_artifact_generation import _resolve_bill_source
+from ddp_sync.pipelines.organization_logo import (
+    find_and_store_organization_logo,
+    summarize,
+)
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     get_organization_resolution_shortlist,
@@ -173,6 +177,7 @@ async def verify_and_store_position(
             "attempted_verdict": None,
             "organization_id": None,
             "organization_needs_content": False,
+            "organization_needs_logo": False,
         }
 
     write_kwargs = dict(
@@ -259,6 +264,7 @@ async def verify_and_store_position(
             "attempted_verdict": attempted_verdict,
             "organization_id": None,
             "organization_needs_content": False,
+            "organization_needs_logo": False,
         }
 
     return {
@@ -271,6 +277,8 @@ async def verify_and_store_position(
         "attempted_verdict": attempted_verdict,
         "organization_id": write_result.get("organization_id"),
         "organization_needs_content": bool(write_result.get("organization_needs_content")),
+        # SYNC-161 / BROKER-502: whether the logo step should look for this organization's logo (False from an older broker)
+        "organization_needs_logo": bool(write_result.get("organization_needs_logo")),
     }
 
 
@@ -635,6 +643,9 @@ async def resolve_and_describe_organizations(
        for the stub.
     2. SYNC-107, the About step (`organization_content_enabled`, off by default): an organization that
        a confirmed position resolved to and that still has no description gets its content once.
+    3. SYNC-161, the logo step (`organization_logo_enabled`, off by default): an organization that a confirmed position
+       resolved to and that the broker says needs a logo (`organization_needs_logo`) gets
+       `find_and_store_organization_logo` once.
 
     Never raises, and never undoes or holds back a written position.
     """
@@ -660,8 +671,9 @@ async def resolve_and_describe_organizations(
                 )
                 if person["outcome"] in _ROUTED_TO_PERSON:
                     if person["choice"] is not None:
-                        # The model named a legislator: no "about this organization" text for a person.
+                        # The model named a legislator: no "about this organization" text, and no logo, for a person.
                         result["organization_needs_content"] = False
+                        result["organization_needs_logo"] = False
                     continue
             if mode == "off" or result.get("position_id") not in citations:
                 continue
@@ -695,6 +707,8 @@ async def resolve_and_describe_organizations(
                 # The position now belongs to a reviewed organization: no About text for the stub.
                 result["organization_id"] = resolution["organization_id"]
                 result["organization_needs_content"] = False
+                # the logo step reads that organization's own state from the broker and decides there
+                result["organization_needs_logo"] = True
         if any("person_resolution" in r for r in results):
             logger.info(
                 "person_resolution_summary",
@@ -734,6 +748,35 @@ async def resolve_and_describe_organizations(
                 invocation_id=invocation_id,
                 asked=len(asked),
                 outcomes=dict(Counter(r["about_content"]["outcome"] for r in results if "about_content" in r)),
+            )
+
+    if settings.organization_logo_enabled:
+        # SYNC-161, step 3: after the About step, which may just have filled in a new stub's website. The broker says which
+        # organizations need a logo (`organization_needs_logo`) and the step re-reads its state before it looks.
+        looked: set[int] = set()
+        for result in results:
+            organization_id = result.get("organization_id")
+            if (
+                result.get("verification_verdict") != "confirmed"
+                or not result.get("organization_needs_logo")
+                or organization_id is None
+                or organization_id in looked
+            ):
+                continue
+            looked.add(organization_id)
+            result["logo"] = await find_and_store_organization_logo(
+                organization_id=organization_id,
+                org_name=result["org_name"],
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        if looked:
+            logger.info(
+                "organization_logo_summary",
+                bill_openstates_id=bill_openstates_id,
+                invocation_id=invocation_id,
+                asked=len(looked),
+                **summarize([r["logo"] for r in results if "logo" in r]),
             )
 
 
