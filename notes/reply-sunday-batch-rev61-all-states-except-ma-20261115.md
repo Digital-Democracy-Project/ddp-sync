@@ -1,4 +1,4 @@
-# Reply (read-only): Sunday 11-15 batch on revision 61, every state except Massachusetts, 2026-11-15 16:40 UTC (prod agent)
+# Reply (read-only): Sunday 11-15 batch on revision 61, every state except Massachusetts, 2026-11-15 16:37 UTC (prod agent)
 
 Answers `7926be8`. Massachusetts gets its own note when its pipeline finishes (its Fargate collection ended 16:34:29; ddp-sync is now loading it).
 
