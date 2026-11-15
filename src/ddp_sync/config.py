@@ -395,6 +395,11 @@ class SyncSettings:
     # type (AGENTS-104); with it off, research runs behave exactly as before.
     organization_content_enabled: bool = False
 
+    # SYNC-161: the logo step after the About step (BROKER-502 stores it, LegBot `judge_logo` AGENTS-240 checks it). A rollout
+    # switch, not an approval step (Ramon, 2026-11-14: no staff approval). Off until the broker's logo routes are deployed and
+    # CAMS is reloaded onto AGENTS-240; with it off, research runs behave exactly as before.
+    organization_logo_enabled: bool = False
+
     # SYNC-97: the resolve step after verify (PLAN-notifications-alert-engine.md 6.7.4). A newly verified
     # position whose organization is a pipeline-created stub is shown to LegBot's resolve_organization
     # with a shortlist of existing organizations. `off`: nothing is asked. `suggest`: the answer is
@@ -750,6 +755,9 @@ def _load_from_env() -> dict:
         ),
         "organization_content_enabled": (
             os.getenv("LEGBOT_ORGANIZATION_CONTENT_ENABLED", "false").lower() == "true"
+        ),
+        "organization_logo_enabled": (
+            os.getenv("LEGBOT_ORGANIZATION_LOGO_ENABLED", "false").lower() == "true"
         ),
         "organization_resolution_mode": (
             mode if (mode := os.getenv("LEGBOT_ORGANIZATION_RESOLUTION_MODE", "off").strip().lower())

@@ -604,6 +604,110 @@ async def write_organization_content(
     return result
 
 
+async def get_organization_logo_state(
+    organization_id: int,
+    *,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """What the logo step reads before it looks (SYNC-161 / BROKER-502, `GET /api/organizations/<pk>/logo/`, service token):
+    {"id", "name", "website", "parent": {"id", "name", "has_logo"} | None, "logo": {...}, "needs_logo"}.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the read or was unreachable.
+    """
+    return await _get_organization_json(
+        f"/api/organizations/{organization_id}/logo/", None, broker_api_base, broker_api_token
+    )
+
+
+async def list_organizations_needing_logo(
+    *,
+    limit: int = 100,
+    older_than_days: int | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """The organizations the logo step should look at next (BROKER-502, `GET /api/organizations/logo-queue/`): never checked
+    first, then the oldest check; with `older_than_days`, also every logo checked longer ago (the refresh).
+    {"count", "results": [<logo state>, ...]}.
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the read or was unreachable.
+    """
+    params = {"limit": limit}
+    if older_than_days is not None:
+        params["older_than_days"] = older_than_days
+    return await _get_organization_json("/api/organizations/logo-queue/", params, broker_api_base, broker_api_token)
+
+
+async def write_organization_logo(
+    *,
+    organization_id: int,
+    action: str,
+    image: bytes | None = None,
+    image_content_type: str = "image/png",
+    fields: dict | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    """Write one result of the logo step (SYNC-161 / BROKER-502, `POST /api/organizations/<pk>/logo/`, service token).
+
+    `action` is `set` (with `image` and `fields` source, source_url, and for Commons license and credit), `parent` (use the
+    parent's logo), `none` (looked, nothing better: the current logo stays) or `clear`. `fields` may carry `is_parents` and
+    `check` (the judge's answer, a dict; sent as JSON text). The broker checks the picture itself (pictures only, its size
+    cap, no SVG) and refuses a logo staff hid (409).
+
+    Returns:
+        The broker's state after the write (the same shape as `get_organization_logo_state`).
+
+    Raises:
+        BrokerClientError: ddp-broker-py rejected the write or was unreachable.
+    """
+    import json as _json
+
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError("DDP_BROKER_API_BASE is not configured — cannot write an organization logo.")
+
+    data = {"action": action}
+    for key, value in (fields or {}).items():
+        if value is None:
+            continue
+        if key == "check":
+            data[key] = _json.dumps(value)
+        elif isinstance(value, bool):
+            data[key] = "true" if value else "false"
+        else:
+            data[key] = str(value)
+    files = None
+    if image is not None:
+        extension = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}.get(
+            image_content_type, "png")
+        files = {"image": (f"logo.{extension}", image, image_content_type)}
+    headers = {"Authorization": f"Bearer {resolved_api_token}"}
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{resolved_api_base}/api/organizations/{organization_id}/logo/",
+                headers=headers, data=data, files=files,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise BrokerClientError(
+            f"ddp-broker-py rejected the organization logo write ({resp.status_code}): {resp.text}"
+        )
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise BrokerClientError("ddp-broker-py returned a non-JSON logo body") from exc
+
+
 async def request_bill_event_check(jurisdiction: str) -> None:
     """Ask ddp-broker-py to run its bill-event check for one jurisdiction now (SYNC-128 / BROKER-300).
 

@@ -75,7 +75,7 @@ async def _run(*, person_mode="suggest", org_mode="suggest", person_shortlist=No
                  "insufficient_information": False}
     with patch(f"{_P}.get_settings", return_value=SimpleNamespace(
         org_research_max_organizations=500, organization_resolution_mode=org_mode, person_resolution_mode=person_mode,
-        organization_content_enabled=about_enabled,
+        organization_content_enabled=about_enabled, organization_logo_enabled=False,
     )), patch(f"{_P}.dispatch_bill_question", new=AsyncMock(return_value={"answer": positions, "backend": "openai"})), patch(
         f"{_P}.dispatch_bill_position_verification",
         new=AsyncMock(return_value={"answer": {"verdict": "confirmed", "insufficient_information": False,
