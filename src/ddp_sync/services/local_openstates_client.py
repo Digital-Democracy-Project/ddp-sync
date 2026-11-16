@@ -487,6 +487,27 @@ def _diff_baseline_index(versions: list[dict], i: int) -> int | None:
     return None
 
 
+def _no_earlier_document_of_type(versions: list[dict], i: int, media_type: str) -> bool:
+    """True when no version before `versions[i]` has a document that could be of
+    `media_type` (SYNC-164). A link with no media type might be one, so it counts.
+
+    openstates-core compares a document with the previous one of its own media type
+    (OPEN-217), and stores no comparison at all when there is none -- except where its
+    `_diff_baseline` allows another type (OPEN-223: Massachusetts' HTML chapter law
+    after the bill's PDF). So a document that carries a diff but has no earlier
+    document of its own type was compared across media types by core's own rule, and
+    the other type's document is the one api-v3 returns for the baseline. The rule's
+    states are not repeated here: the stored diff is core's answer for that pair.
+    Measured 2026-11-15 on the Mac replica: 364 stored diffs have this shape, all
+    Massachusetts HTML, none in any other state.
+    """
+    for version in versions[:i]:
+        for link in version.get("links") or []:
+            if link.get("media_type") in (media_type, None, ""):
+                return False
+    return True
+
+
 async def get_archived_version_transitions(bill_openstates_id: str) -> dict | None:
     """Look up EVERY already-archived version transition for bill_changelog --
     SYNC-44's full-history walk. A sibling of get_archived_changelog_inputs
@@ -527,7 +548,10 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
     are known to be of different media types is skipped: the archiver diffs
     each media type against its own earlier documents (OPEN-217), and api-v3
     returns only one document per version, so the true baseline's text is not
-    available. A missing media type is unknown, not different.
+    available. A missing media type is unknown, not different. SYNC-164: a pair
+    is kept when the newer document has no earlier document of its own type,
+    because then its stored diff is core's own cross-media comparison
+    (`_no_earlier_document_of_type`).
     Still unrecoverable here, and left alone: bills whose versions share a sort
     key (the archiver's order among them was whatever the database returned).
 
@@ -614,7 +638,15 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
         old_media_type = old_link.get("media_type")
         new_media_type = new_link.get("media_type") if new_link else None
         # Skip only when both types are known and differ; an absent one proves nothing.
-        if old_media_type and new_media_type and old_media_type != new_media_type:
+        # SYNC-164: except when the newer document has no possible same-type baseline (see
+        # _no_earlier_document_of_type): then its stored diff can only be core's own
+        # cross-media comparison, taken against the very document returned as the old side.
+        if (
+            old_media_type
+            and new_media_type
+            and old_media_type != new_media_type
+            and not _no_earlier_document_of_type(versions, i, new_media_type)
+        ):
             logger.info(
                 "bill_changelog_transition_skipped_media_type_mismatch",
                 bill_openstates_id=bill_openstates_id,
