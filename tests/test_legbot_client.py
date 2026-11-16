@@ -1223,3 +1223,62 @@ def test_read_task_result_carries_the_request_id_only_when_legbot_wrote_one(tmp_
     assert with_id["request_id"] == "r1"
     assert "request_id" not in without_id
 
+
+
+# ---- SYNC-166: a judge_logo task LegBot could not run now ----
+
+def _failed_logo_task(tmp_path, record, *, question_type="judge_logo", task_id="logo1"):
+    """Fail one task whose record (`task_result.json`) is `record` (a dict, raw text, or None for no file); return the error."""
+    from ddp_sync.services import legbot_client
+
+    if record is not None:
+        (tmp_path / task_id).mkdir()
+        (tmp_path / task_id / "task_result.json").write_text(record if isinstance(record, str) else json.dumps(record))
+    mock_client = _mock_client(statuses=["queued", "failed"], task_id=task_id)
+
+    async def run():
+        with patch("ddp_sync.services.legbot_client.get_settings",
+                   return_value=_FakeSettings(cams_artifacts_dir=str(tmp_path))), \
+                _patch_async_client(mock_client), \
+                patch("ddp_sync.services.legbot_client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(LegBotDispatchError) as raised:
+                if question_type == "judge_logo":
+                    await legbot_client.dispatch_judge_logo(b"\x89PNG", "Sierra Club", candidate_kind="img")
+                else:
+                    await dispatch_bill_question("https://example.com/bill.pdf", question_type)
+        return raised.value
+    return run()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["memory_full", "server_busy"])
+async def test_a_judge_logo_task_legbot_could_not_run_raises_unavailable_with_its_code(tmp_path, code):
+    from ddp_sync.services.legbot_client import LegBotUnavailable
+
+    error = await _failed_logo_task(tmp_path, {"answer": None, "logo_judge_unavailable": code})
+    assert isinstance(error, LegBotUnavailable) and error.code == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", [
+    None,                                                     # no record at all
+    "{not json",                                              # unreadable
+    {"answer": None},                                         # another failure: no field
+    {"answer": None, "logo_judge_unavailable": "image_bad"},  # a code that is not "try later"
+    ["memory_full"],                                          # not an object
+])
+async def test_any_other_judge_logo_failure_stays_a_plain_dispatch_error(tmp_path, record):
+    from ddp_sync.services.legbot_client import LegBotUnavailable
+
+    error = await _failed_logo_task(tmp_path, record)
+    assert not isinstance(error, LegBotUnavailable)
+    assert "status=failed" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_is_only_for_judge_logo(tmp_path):
+    from ddp_sync.services.legbot_client import LegBotUnavailable
+
+    error = await _failed_logo_task(tmp_path, {"answer": None, "logo_judge_unavailable": "memory_full"},
+                                    question_type="pros_cons", task_id="abc123")
+    assert not isinstance(error, LegBotUnavailable)

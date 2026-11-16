@@ -10,6 +10,9 @@ Usage (from the ddp-sync checkout, its .venv):
     .venv/bin/python scripts/backfill_organization_logos.py --limit 500
     .venv/bin/python scripts/backfill_organization_logos.py --older-than 180      # the refresh
 
+When LegBot cannot judge at all (memory full, its vision server busy; SYNC-166) it waits 5 minutes and asks about the same
+organization again, and stops after 4 hours of waiting in one run (`"stopped": "judge_unavailable"`): run it again later.
+
 Prints the counts the first full run must report on SYNC-161: from Commons, from the website (by kind), from the parent,
 none, and how many candidates were turned down or skipped.
 """

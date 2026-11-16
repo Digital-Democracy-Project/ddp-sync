@@ -153,6 +153,33 @@ class LegBotDispatchError(Exception):
     """
 
 
+# SYNC-166: why LegBot could not judge a logo at all (AGENTS-240 writes it into a failed judge_logo task's record):
+# its vision server would not fit in memory, or stayed busy. Neither says anything about the image.
+LOGO_JUDGE_UNAVAILABLE_CODES = ("memory_full", "server_busy")
+
+
+class LegBotUnavailable(LegBotDispatchError):
+    """A judge_logo task failed only because LegBot could not run it now (`code`: memory_full or server_busy), not because
+    of the image (SYNC-166). Ask again later. A subclass, so a caller that catches LegBotDispatchError is unchanged."""
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _logo_judge_unavailable_code(task_id: str) -> str | None:
+    """The `logo_judge_unavailable` code in a failed task's record (`task_result.json`, which CAMS writes on failure too),
+    or None: absent, not one of LOGO_JUDGE_UNAVAILABLE_CODES, or the record missing or unreadable (then the failure stays
+    a plain LegBotDispatchError, as before SYNC-166)."""
+    settings = get_settings()
+    try:
+        snapshot = json.loads((Path(settings.cams_artifacts_dir) / task_id / "task_result.json").read_text())
+    except (OSError, TypeError, ValueError):
+        return None
+    code = snapshot.get("logo_judge_unavailable") if isinstance(snapshot, dict) else None
+    return code if code in LOGO_JUDGE_UNAVAILABLE_CODES else None
+
+
 async def dispatch_bill_question(
     bill_source: str,
     question_type: str,
@@ -669,6 +696,10 @@ async def _dispatch_and_await(
             )
 
     if status != "completed":
+        if question_type == "judge_logo" and status == "failed":
+            code = _logo_judge_unavailable_code(task_id)
+            if code is not None:
+                raise LegBotUnavailable(f"LegBot task {task_id} could not judge the logo now ({code})", code)
         raise LegBotDispatchError(f"LegBot task {task_id} ended with status={status}")
 
     result = read_task_result(task_id)

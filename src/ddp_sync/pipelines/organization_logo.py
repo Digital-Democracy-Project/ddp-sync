@@ -40,7 +40,11 @@ from ddp_sync.services.broker_client import (
     get_organization_logo_state,
     write_organization_logo,
 )
-from ddp_sync.services.legbot_client import LegBotDispatchError, dispatch_judge_logo
+from ddp_sync.services.legbot_client import (
+    LegBotDispatchError,
+    LegBotUnavailable,
+    dispatch_judge_logo,
+)
 
 logger = structlog.get_logger()
 
@@ -58,12 +62,25 @@ JUDGED_LONGEST_SIDE = 768       # px: the PNG the judge sees (LegBot refuses ove
 MAX_JUDGED = 8                   # judge calls per organization: a wall of sponsor logos must not mean 40 model calls
 MAX_PIXELS = 25_000_000          # a small file can unpack into a huge picture: refuse before decoding
 MAX_REDIRECTS = 5
+# SYNC-166: when LegBot cannot judge at all (memory full, vision server busy) the catch-up run waits and asks again about
+# the same organization; it gives up after DEFERRED_LIMIT_SECONDS of waiting in one run (run it again: the list is the
+# progress). Bill research never waits.
+DEFERRED_WAIT_SECONDS = 300
+DEFERRED_LIMIT_SECONDS = 4 * 3600
 
 _site_locks: dict[str, asyncio.Lock] = {}
 
 
 class LogoFetchError(Exception):
     """A page or picture could not be read (down, blocked, too big, not a picture)."""
+
+
+class _JudgeUnavailable(Exception):
+    """LegBot could not judge now (SYNC-166): ends this organization's search with nothing written."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass
@@ -395,8 +412,14 @@ async def find_and_store_organization_logo(
     staff hid, which is never looked for.
 
     Returns {"organization_id", "outcome", "source", "rejected", "skipped"}: outcome `commons` / `website` / `parent` / `none`
-    / `not_needed` / `state_failed` / `write_failed` / `failed`; `source` the candidate kind used; `rejected` how many
-    candidates the rule turned down; `skipped` the counts of candidates not judged (small, svg, unreadable, judge_failed).
+    / `not_needed` / `state_failed` / `write_failed` / `failed` / `deferred`; `source` the candidate kind used; `rejected`
+    how many candidates the rule turned down; `skipped` the counts of candidates not judged (small, svg, unreadable,
+    judge_failed).
+
+    `deferred` (SYNC-166, with `deferred_reason` memory_full or server_busy): LegBot could not judge at all, so the search
+    stopped at once (no more downloads or judgements) and NOTHING was written: no `none`, no `parent`. The organization
+    stays on the broker's logo list, and that is the pause. Any other judge failure is counted as `judge_failed` and the
+    search goes on.
     """
     result = {"organization_id": organization_id, "outcome": "failed", "source": None, "rejected": 0, "skipped": {}}
     try:
@@ -423,6 +446,10 @@ async def _find_and_store(organization_id, org_name, result, *, client, dry_run,
         client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT})
     try:
         write = await _search(client, state, org_name or state.get("name") or "", result)
+    except _JudgeUnavailable as exc:
+        result.update(outcome="deferred", deferred_reason=exc.code, source=None)
+        logger.info("organization logo deferred", organization_id=organization_id, reason=exc.code)
+        return result
     finally:
         if own_client:
             await client.aclose()
@@ -523,6 +550,8 @@ async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: 
     try:
         dispatched = await dispatch_judge_logo(picture.judge_png, org_name, parent_name=(parent or {}).get("name"),
                                                candidate_kind=candidate.kind)
+    except LegBotUnavailable as exc:
+        raise _JudgeUnavailable(exc.code) from exc
     except LegBotDispatchError as exc:
         search.skipped["judge_failed"] += 1
         logger.warning("judge_logo dispatch failed", url=candidate.url, error=str(exc))
@@ -557,6 +586,8 @@ async def backfill_organization_logos(
     dry_run: bool = False,
     pause_seconds: float = 1.0,
     page_size: int = 50,
+    deferred_wait_seconds: float = DEFERRED_WAIT_SECONDS,
+    deferred_limit_seconds: float = DEFERRED_LIMIT_SECONDS,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> dict:
@@ -570,7 +601,12 @@ async def backfill_organization_logos(
     page only (nothing leaves the list). An organization seen once is not looked at again in the same run, so a write that
     keeps failing cannot loop.
 
-    Returns `summarize(...)` of every organization looked at, plus `looked` and `due` (the broker's count at the start).
+    SYNC-166: an organization `deferred` (LegBot cannot judge now: memory full or its vision server busy) is asked about
+    again after `deferred_wait_seconds`, and again, until LegBot answers; after `deferred_limit_seconds` of waiting in all
+    the run stops and says so (`stopped`). Each pause and each resume is logged.
+
+    Returns `summarize(...)` of every organization looked at, plus `looked`, `due` (the broker's count at the start),
+    `waited_seconds`, and `stopped` ("judge_unavailable" when it gave up waiting, else None).
     """
     broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
     from ddp_sync.services.broker_client import list_organizations_needing_logo
@@ -578,6 +614,8 @@ async def backfill_organization_logos(
     seen: set[int] = set()
     outcomes: list[dict] = []
     due = None
+    waited = 0.0
+    stopped = None
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}) as client:
         while limit is None or len(outcomes) < limit:
             size = page_size if limit is None else min(page_size, limit - len(outcomes))
@@ -593,16 +631,32 @@ async def backfill_organization_logos(
                 break
             for row in fresh[:size]:
                 seen.add(row["id"])
-                outcome = await find_and_store_organization_logo(
-                    organization_id=row["id"], org_name=row.get("name") or "", client=client, dry_run=dry_run,
-                    force=older_than_days is not None, **broker)
+                while True:
+                    outcome = await find_and_store_organization_logo(
+                        organization_id=row["id"], org_name=row.get("name") or "", client=client, dry_run=dry_run,
+                        force=older_than_days is not None, **broker)
+                    if outcome["outcome"] != "deferred":
+                        break
+                    if waited + deferred_wait_seconds > deferred_limit_seconds:
+                        stopped = "judge_unavailable"
+                        logger.warning("organization_logo_backfill_stopped", organization_id=row["id"],
+                                       reason=outcome.get("deferred_reason"), waited_seconds=waited)
+                        break
+                    logger.info("organization_logo_backfill_paused", organization_id=row["id"],
+                                reason=outcome.get("deferred_reason"), wait_seconds=deferred_wait_seconds,
+                                waited_seconds=waited)
+                    await asyncio.sleep(deferred_wait_seconds)
+                    waited += deferred_wait_seconds
+                    logger.info("organization_logo_backfill_resumed", organization_id=row["id"], waited_seconds=waited)
+                if stopped:
+                    break
                 outcomes.append(outcome)
                 logger.info("organization_logo_backfill_item", dry_run=dry_run, **{k: v for k, v in outcome.items()
                                                                                     if k != "skipped"})
                 if pause_seconds:
                     await asyncio.sleep(pause_seconds)
-            if dry_run:
+            if dry_run or stopped:
                 break
-    report = {"looked": len(outcomes), "due": due, **summarize(outcomes)}
+    report = {"looked": len(outcomes), "due": due, "waited_seconds": waited, "stopped": stopped, **summarize(outcomes)}
     logger.info("organization_logo_backfill_summary", dry_run=dry_run, **report)
     return report
