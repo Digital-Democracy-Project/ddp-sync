@@ -582,3 +582,129 @@ async def test_a_wall_of_sponsor_logos_is_capped():
 def test_a_lazy_loaded_logo_is_found_behind_its_placeholder():
     page = '<img class="logo" src="data:image/gif;base64,R0lGOD" data-src="/real-logo.png">'
     assert [c.url for c in ol.website_candidates(page, "https://x.example/")] == ["https://x.example/real-logo.png"]
+
+
+# ---- SYNC-166: LegBot cannot judge now (memory full, vision server busy) ----
+
+def _unavailable(code="memory_full"):
+    from ddp_sync.services.legbot_client import LegBotUnavailable
+
+    return LegBotUnavailable(f"could not judge now ({code})", code)
+
+
+@pytest.mark.asyncio
+async def test_when_legbot_cannot_judge_the_search_stops_and_nothing_is_written():
+    page = '<img class="logo" src="/a-logo.png"><img class="logo" src="/b-logo.png">'
+    fetched = []
+    routes = {"https://www.sierraclub.org/": (200, "text/html", page),
+              "https://www.sierraclub.org/a-logo.png": (200, "image/png", png()),
+              "https://www.sierraclub.org/b-logo.png": (200, "image/png", png())}
+    state = _state(parent={"id": 2, "name": "Sierra Club National", "has_logo": True})  # a parent logo is NOT taken
+    judge = AsyncMock(side_effect=_unavailable("server_busy"))
+    write = AsyncMock(return_value={})
+
+    def handler(request):
+        fetched.append(real_url(request))
+        for prefix, (status, content_type, body) in routes.items():
+            if real_url(request) == prefix:
+                return httpx.Response(status, headers={"content-type": content_type},
+                                      content=body if isinstance(body, bytes) else body.encode())
+        if "wikidata.org" in real_url(request):
+            return httpx.Response(200, json={"search": []})
+        return httpx.Response(404)
+
+    with patch(f"{_L}.get_organization_logo_state", new=AsyncMock(return_value=state)), \
+            patch(f"{_L}.write_organization_logo", new=write), patch(f"{_L}.dispatch_judge_logo", new=judge):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+            result = await ol.find_and_store_organization_logo(organization_id=7, org_name="Sierra Club", client=client)
+    assert result["outcome"] == "deferred" and result["deferred_reason"] == "server_busy"
+    write.assert_not_awaited()                                   # no none, no parent: it stays on the broker's list
+    assert judge.await_count == 1
+    assert "https://www.sierraclub.org/b-logo.png" not in fetched  # no further candidate fetched
+
+
+@pytest.mark.asyncio
+async def test_any_other_judge_failure_is_counted_and_the_search_goes_on():
+    from ddp_sync.services.legbot_client import LegBotDispatchError
+
+    page = '<img class="logo" src="/a-logo.png"><img class="logo" src="/b-logo.png">'
+    routes = {"https://www.sierraclub.org/a-logo.png": (200, "image/png", png()),   # images first: prefixes
+              "https://www.sierraclub.org/b-logo.png": (200, "image/png", png(color=(200, 20, 20, 255))),
+              "https://www.sierraclub.org/": (200, "text/html", page)}
+    judge = AsyncMock(side_effect=[LegBotDispatchError("ended with status=failed"), {"answer": OWN, "backend": "mlx"}])
+    write = AsyncMock(return_value={})
+    with patch(f"{_L}.get_organization_logo_state", new=AsyncMock(return_value=_state())), \
+            patch(f"{_L}.write_organization_logo", new=write), patch(f"{_L}.dispatch_judge_logo", new=judge):
+        async with _network(routes) as client:
+            result = await ol.find_and_store_organization_logo(organization_id=7, org_name="Sierra Club", client=client)
+    assert result["outcome"] == "website" and result["skipped"].get("judge_failed") == 1
+    assert write.await_args.kwargs["action"] == "set"
+
+
+@pytest.mark.asyncio
+async def test_bill_research_never_waits_on_a_deferred_logo_and_counts_it():
+    find = AsyncMock(return_value={"organization_id": 1, "outcome": "deferred", "deferred_reason": "memory_full",
+                                   "source": None, "rejected": 0, "skipped": {}})
+    sleep = AsyncMock()
+    results = _results()
+    with patch(f"{_P}.get_settings", return_value=_settings(True)), \
+            patch(f"{_P}.find_and_store_organization_logo", new=find), patch(f"{_L}.asyncio.sleep", new=sleep), \
+            patch(f"{_P}.logger") as log:
+        await resolve_and_describe_organizations(results, citations={}, bill_openstates_id="b", invocation_id="i")
+    assert find.await_count == 1                 # asked once, never again for this bill
+    sleep.assert_not_awaited()
+    summary = [c for c in log.info.call_args_list if c.args and c.args[0] == "organization_logo_summary"]
+    assert summary and summary[0].kwargs["outcomes"] == {"deferred": 1}
+
+
+@pytest.mark.asyncio
+async def test_the_catch_up_run_pauses_on_deferred_and_resumes_the_same_organization():
+    queue = AsyncMock(side_effect=[{"count": 2, "results": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]},
+                                   {"count": 0, "results": []}])
+    outcomes = iter(["deferred", "deferred", "website", "none"])
+
+    async def find(**kwargs):
+        outcome = next(outcomes)
+        return {"organization_id": kwargs["organization_id"], "outcome": outcome, "source": None, "rejected": 0,
+                "skipped": {}, **({"deferred_reason": "memory_full"} if outcome == "deferred" else {})}
+
+    sleep = AsyncMock()
+    with patch("ddp_sync.services.broker_client.list_organizations_needing_logo", new=queue), \
+            patch(f"{_L}.find_and_store_organization_logo", side_effect=find) as mock_find, \
+            patch(f"{_L}.asyncio.sleep", new=sleep):
+        report = await ol.backfill_organization_logos(page_size=2, pause_seconds=0, deferred_wait_seconds=300)
+    assert [c.kwargs["organization_id"] for c in mock_find.call_args_list] == [1, 1, 1, 2]
+    assert [c.args[0] for c in sleep.await_args_list] == [300, 300]
+    assert report["outcomes"] == {"website": 1, "none": 1}       # the deferred attempts are not results
+    assert report["waited_seconds"] == 600 and report["stopped"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_catch_up_run_stops_after_its_waiting_limit_and_says_so():
+    queue = AsyncMock(return_value={"count": 2, "results": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]})
+
+    async def find(**kwargs):
+        return {"organization_id": kwargs["organization_id"], "outcome": "deferred", "deferred_reason": "server_busy",
+                "source": None, "rejected": 0, "skipped": {}}
+
+    async def no_endless_wait(seconds):
+        if sleep.await_count > 10:   # without the limit this would wait forever: fail instead of hanging
+            raise AssertionError("the catch-up run kept waiting past its limit")
+    sleep = AsyncMock(side_effect=no_endless_wait)
+    with patch("ddp_sync.services.broker_client.list_organizations_needing_logo", new=queue), \
+            patch(f"{_L}.find_and_store_organization_logo", side_effect=find) as mock_find, \
+            patch(f"{_L}.asyncio.sleep", new=sleep), patch(f"{_L}.logger") as log:
+        report = await ol.backfill_organization_logos(page_size=2, pause_seconds=0, deferred_wait_seconds=300,
+                                                      deferred_limit_seconds=900)
+    assert report["stopped"] == "judge_unavailable" and report["waited_seconds"] == 900
+    assert {c.kwargs["organization_id"] for c in mock_find.call_args_list} == {1}   # B is never tried
+    assert sleep.await_count == 3 and queue.await_count == 1
+    assert report["looked"] == 0
+    events = [c.args[0] for c in log.info.call_args_list + log.warning.call_args_list]
+    assert events.count("organization_logo_backfill_paused") == 3
+    assert events.count("organization_logo_backfill_resumed") == 3
+    assert "organization_logo_backfill_stopped" in events
+
+
+def test_the_waits_are_module_constants_not_settings():
+    assert ol.DEFERRED_WAIT_SECONDS == 300 and ol.DEFERRED_LIMIT_SECONDS >= ol.DEFERRED_WAIT_SECONDS
