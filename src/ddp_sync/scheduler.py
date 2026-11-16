@@ -388,6 +388,8 @@ class UpdateScheduler:
         self._register_slack_citations_job()
         # --- Nightly Docker cleanup on the Mac (SYNC-119) ---
         self._register_docker_cleanup_job()
+        # --- Weekly organization logo catch-up on the Mac (SYNC-170) ---
+        self._register_organization_logo_catch_up_job()
 
         self.scheduler.start()
         self._is_running = True
@@ -1290,6 +1292,46 @@ class UpdateScheduler:
             misfire_grace_time=3600,
         )
         logger.info("docker_cleanup: registered", sync_time=sync_time_str, script=script_path)
+
+    def _register_organization_logo_catch_up_job(self) -> None:
+        """Register the weekly organization logo catch-up (SYNC-170): `backfill_organization_logos` over the broker's
+        due list, capped per run.
+
+        Two gates, both needed: the shared yaml `organization_logo_catch_up.enabled` and this host's
+        ORGANIZATION_LOGO_CATCH_UP_ENABLED (default off), so only the Mac, where LegBot's results and the SVG drawing are,
+        runs it, and only once Ramon turns it on.
+        """
+        from ddp_sync.pipelines.organization_logo import (
+            CATCH_UP_DEFAULT_LIMIT,
+            run_organization_logo_catch_up_job,
+        )
+
+        config = self._sync_config.get("organization_logo_catch_up", {})
+        if not (self.settings.organization_logo_catch_up_enabled and config.get("enabled", False)):
+            logger.info("organization_logo_catch_up: disabled — skipping")
+            return
+
+        sync_time_str = config.get("sync_time_utc", "16:00")
+        hour, minute = map(int, sync_time_str.split(":"))
+        sync_day = str(config.get("sync_day", "saturday")).lower()
+        limit = int(config.get("max_organizations_per_run", CATCH_UP_DEFAULT_LIMIT))
+        if limit < 1:
+            raise ValueError(f"organization_logo_catch_up.max_organizations_per_run must be 1 or more, got {limit}")
+
+        async def _organization_logo_catch_up_wrapper():
+            return await run_organization_logo_catch_up_job(limit=limit)
+
+        self._add_job_replacing(
+            _organization_logo_catch_up_wrapper,
+            trigger=CronTrigger(day_of_week=sync_day[:3], hour=hour, minute=minute, timezone=_UTC),
+            id="organization_logo_catch_up",
+            name="Organization logo catch-up (weekly, Mac only)",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("organization_logo_catch_up: registered", sync_day=sync_day, sync_time=sync_time_str, limit=limit)
 
     def stop(self) -> None:
         """Stop the scheduler."""

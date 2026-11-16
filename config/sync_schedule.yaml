@@ -926,3 +926,18 @@ docker_cleanup:
   enabled: true
   sync_time_utc: "06:30"           # ends by 07:00 at the latest (30-min timeout), well before ddp-agents' weekly launchd prune (Sundays 08:00 UTC) until it is retired
   timeout_seconds: 1800
+
+# SYNC-170: weekly organization logo catch-up, backfill_organization_logos (the same function as
+# scripts/backfill_organization_logos.py) over the broker's due list: organizations added without a confirmed
+# position on a researched bill, ones deferred during bill research (SYNC-166), and the broker's own re-checks
+# (every logo after 90 days, "no logo of its own" after 14). Runs only where the host sets
+# ORGANIZATION_LOGO_CATCH_UP_ENABLED=true (default off; the Mac, where LegBot's results and the SVG drawing are).
+# Ramon turns it on after the first full catch-up. At most max_organizations_per_run per run (~9 s each, so
+# 1,500 is ~3.75 h); the rest waits for next week. When LegBot can't judge it waits and resumes, and stops after
+# 4 h of waiting with one alert. Saturday 16:00 UTC: after the night's scrapes (WA, USA, PA finish by ~11:00) and
+# away from Sunday's all-states scrape, the 05:00 scorecard chain and Sunday's people refresh and VoteBot eval.
+organization_logo_catch_up:
+  enabled: true
+  sync_day: saturday
+  sync_time_utc: "16:00"
+  max_organizations_per_run: 1500
