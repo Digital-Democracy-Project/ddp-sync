@@ -699,9 +699,10 @@ curl -s http://localhost:8001/ddp-sync/v1/schedule    # verify the six OpenState
 ```
 
 **SVG logo drawing (SYNC-163), once on the Mac:** the logo step draws website SVG candidates for LegBot's judge with
-`resvg-py`, an optional extra the Mac needs and EC2 does not (it has no glibc-Linux wheel). Install it into the Mac's venv
-with `.venv/bin/pip install ".[svg-logos]"` (or `uv pip install`) before the restart. Without it, website SVGs are skipped
-and counted as `svg`, as before.
+`resvg-py`, an optional extra: only the Mac draws SVGs (the logo step runs there), so EC2's image leaves it out. Install
+it into the Mac's venv with `.venv/bin/pip install -e ".[svg-logos]"` before the restart. **Keep `-e`:** the Mac runs
+ddp-sync as an editable install, and a plain `pip install ".[...]"` replaces it with a frozen copy, so later `git pull`s
+would silently not take effect (SYNC-169). Without the extra, website SVGs are skipped and counted as `svg`, as before.
 
 Reinstall the plist (after editing it) and full recovery steps are in
 `ddp-infra/README.md` → "Restart Procedures".

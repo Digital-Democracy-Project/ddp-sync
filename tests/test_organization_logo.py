@@ -779,3 +779,26 @@ async def test_an_svg_that_cannot_be_drawn_is_unreadable_and_the_search_goes_on(
             patch(f"{_L}.svg_drawing.draw_for_judge", new=AsyncMock(side_effect=SVGUnreadable("bad"))):
         result, write, judge = await _run(_state(), routes, [OWN])
     assert result["skipped"].get("unreadable") == 1 and result["outcome"] == "website"
+
+
+@pytest.mark.asyncio
+async def test_an_svg_that_only_wraps_a_picture_stores_nothing_and_is_never_judged():
+    """SYNC-168: Dow Chemical's SVG (a PNG embedded in an SVG) was judged on the PNG and stored blank, because the broker's
+    cleaner drops embedded pictures. Now it draws nothing here too, so it is not judged and nothing is written from it."""
+    from ddp_sync.pipelines import svg_drawing
+    if not svg_drawing.renderer_installed():
+        pytest.skip("resvg-py is not installed")
+    import base64
+
+    inner = io.BytesIO()
+    Image.new("RGB", (300, 100), (200, 0, 0)).save(inner, "PNG")
+    dow = ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 300 100">'
+           '<image xlink:href="data:image/png;base64,' + base64.b64encode(inner.getvalue()).decode() +
+           '" width="300" height="100"/></svg>').encode()
+    page = '<img class="logo" src="/logo.svg">'
+    routes = {"https://www.sierraclub.org/logo.svg": (200, "image/svg+xml", dow),
+              "https://www.sierraclub.org/": (200, "text/html", page)}
+    result, write, judge = await _run(_state(), routes, [OWN])
+    judge.assert_not_awaited()
+    assert result["skipped"].get("unreadable") == 1
+    assert result["outcome"] == "none" and write.await_args.kwargs["action"] == "none"  # no logo written from it

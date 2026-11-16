@@ -5,8 +5,11 @@ cleans it itself (BROKER-503); the website draws it with `<img>` (NEXT-216).
 
 The renderer is resvg (`resvg-py`): no scripting and no network (checked 2026-11-16: an `http://` image and a CSS `@import`
 made no request). It DOES read a local file named by a plain path (`<image href="/some/file.png">`, or a relative one), so
-`for_drawing` removes every reference that is not a `#fragment` or an embedded raster picture (`data:image/png|jpeg|gif|webp`)
-before anything is drawn, and the drawing runs in its own process, in an empty temporary folder, with a time limit and a
+`for_drawing` removes every reference that is not a `#fragment`, and every link on an `<image>` (resvg reads even `#name`
+there as a file path), before anything is drawn. Embedded `data:` pictures go too (SYNC-168): **the judge must see exactly
+what the broker will store**, and the broker's cleaner (`content.svg.clean`, BROKER-503) keeps only `#fragment` links, so an
+SVG that only wraps a picture draws nothing and is not judged (`unreadable`). The drawing runs in its own process, in an
+empty temporary folder, with a time limit (killed on a timeout or when the caller is cancelled) and a
 fixed output size (`DRAWN_LONGEST_SIDE` on the longest side, so a tiny viewBox is not dropped by the 128 px rule and a huge
 one cannot make a huge picture). The parser is the standard library's expat with no entities: a file that declares an entity
 or has an internal DOCTYPE subset is refused. A file that cannot be read or drawn raises SVGUnreadable; the caller counts it
@@ -16,6 +19,7 @@ as `unreadable`. System fonts are loaded, because a wordmark drawn without them 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import re
 import sys
@@ -30,7 +34,6 @@ MAX_ELEMENTS = 20_000
 MAX_DEPTH = 100  # nesting; deeper is not a logo (and would exhaust the recursion below)
 XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
 BACKGROUND = "#808080"  # the same mid-grey the raster candidates are shown on (organization_logo.GREY)
-_RASTER_DATA = re.compile(r"^\s*data:image/(png|jpeg|jpg|gif|webp)[;,]", re.I)
 _URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.I | re.S)
 _IMPORT = re.compile(r"@import[^;]*;?", re.I)
 
@@ -111,7 +114,11 @@ def _strip_references(element: ET.Element) -> None:
         if key == XML_BASE or "\\" in value or "/*" in value:
             del element.attrib[key]
         elif local == "href":
-            if not (value.strip().startswith("#") or (_RASTER_DATA.match(value) and _small_raster(value))):
+            # SYNC-168: the judge must see what the broker will store, and the broker's cleaner (content.svg.clean,
+            # BROKER-503) keeps only "#fragment" links: an embedded data: picture goes too (Dow Chemical's logo, an SVG
+            # wrapping a PNG, was judged on the PNG and stored blank). SYNC-169: on <image> even a "#" link goes, since
+            # resvg reads it as a file path.
+            if not value.strip().startswith("#") or element.tag.rsplit("}", 1)[-1] == "image":
                 del element.attrib[key]
         elif local == "style" and _risky_css(value):
             del element.attrib[key]
@@ -122,29 +129,6 @@ def _strip_references(element: ET.Element) -> None:
         for child in list(element):
             element.remove(child)
         element.text = "" if _risky_css(text) else _clean_css(text)
-
-
-MAX_EMBEDDED_PIXELS = 25_000_000  # the raster candidates' own limit (organization_logo.MAX_PIXELS)
-
-
-def _small_raster(data_url: str) -> bool:
-    """Whether an embedded `data:image/...;base64,` picture is readable and at most MAX_EMBEDDED_PIXELS (read from its header
-    only): a small file can declare a picture that unpacks to gigabytes in the renderer."""
-    import base64
-    import binascii
-    import io
-
-    from PIL import Image, UnidentifiedImageError
-
-    head, _, payload = data_url.partition(",")
-    if ";base64" not in head.lower():
-        return False
-    try:
-        with Image.open(io.BytesIO(base64.b64decode(payload, validate=False))) as img:
-            width, height = img.size
-    except (binascii.Error, ValueError, OSError, UnidentifiedImageError, Image.DecompressionBombError):
-        return False
-    return 0 < width * height <= MAX_EMBEDDED_PIXELS
 
 
 def _size(root: ET.Element) -> tuple[float, float] | None:
@@ -182,15 +166,31 @@ async def draw_for_judge(data: bytes, timeout: float = DRAW_TIMEOUT_SECONDS) -> 
         try:
             png, err = await asyncio.wait_for(process.communicate(safe), timeout)
         except TimeoutError:
-            process.kill()
-            await process.wait()
             raise SVGUnreadable(f"drawing took longer than {timeout:g} s") from None
+        finally:
+            if process.returncode is None:  # timed out, or the caller was cancelled (SYNC-169): never leave the child running
+                with contextlib.suppress(ProcessLookupError):  # it may have exited just now: keep the original error
+                    process.kill()
+                await process.wait()
     if process.returncode != 0 or not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) < 24:
         raise SVGUnreadable(f"could not be drawn: {err.decode('utf-8', 'replace').strip()[-200:]}")
     width, height = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
     if not (0 < width <= DRAWN_LONGEST_SIDE and 0 < height <= DRAWN_LONGEST_SIDE):
         raise SVGUnreadable(f"drawn at {width}x{height}, over {DRAWN_LONGEST_SIDE}")
+    if _draws_nothing(png):
+        raise SVGUnreadable("draws nothing (only the backdrop), for example an SVG that only wraps an embedded picture")
     return png
+
+
+def _draws_nothing(png: bytes) -> bool:
+    """Whether the drawing is the plain backdrop and nothing else (SYNC-168): it is not judged at all."""
+    import io
+
+    from PIL import Image
+
+    grey = tuple(int(BACKGROUND[i:i + 2], 16) for i in (1, 3, 5))
+    with Image.open(io.BytesIO(png)) as img:
+        return all(low == high == level for (low, high), level in zip(img.convert("RGB").getextrema(), grey))
 
 
 def _child_env() -> dict:
