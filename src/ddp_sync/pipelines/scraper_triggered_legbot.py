@@ -342,3 +342,82 @@ async def trigger_scraper_session_pipeline(
                 run_id=run_id,
                 error=str(e),
             )
+
+
+# ---- SYNC-162: the same run, answered at once and checked back on ----
+#
+# EC2's archive hook used to hold one request open for the whole run and gave up at 3,600 s, while Massachusetts' pass
+# took 88 minutes: logged as a failure every week although the run finished. With `background`, the Mac answers 202 with
+# a run id, runs `trigger_scraper_session_pipeline` (same lock, same result) afterwards, and keeps a record that
+# GET /trigger/bill-artifact-generation/{run_id} returns. `updated_at` moves every SESSION_RUN_HEARTBEAT_SECONDS while the
+# run is going, so a run that died with the process reads as "lost" instead of "running" forever.
+
+SESSION_RUN_HEARTBEAT_SECONDS = 60
+SESSION_RUN_LOST_AFTER_SECONDS = 600
+SESSION_RUN_FINAL = ("completed", "failed", "lost")
+
+
+def new_session_run_record(run_id: str, jurisdiction_iso2: str, session_code: str) -> dict[str, Any]:
+    """The record of a background run that has been accepted and not started yet."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {"run_id": run_id, "status": "queued", "jurisdiction_iso2": jurisdiction_iso2, "session_code": session_code,
+            "accepted_at": now, "updated_at": now, "finished_at": None, "error": None, "result": None}
+
+
+def _summary(result: dict[str, Any]) -> dict[str, Any]:
+    """The run's result for the record: every value except long per-bill lists, which become their length."""
+    return {key: (len(value) if isinstance(value, list) else value) for key, value in result.items()}
+
+
+async def run_session_pipeline_in_background(run_id: str, jurisdiction_iso2: str, session_code: str,
+                                             **kwargs: Any) -> None:
+    """Run `trigger_scraper_session_pipeline(jurisdiction_iso2, session_code, **kwargs)` for a 202 caller, keeping its
+    record in Redis: `running` (with `updated_at` renewed every SESSION_RUN_HEARTBEAT_SECONDS), then `completed`, or
+    `failed` with the wrapper's `error` (trigger_disabled, already_running, redis_unavailable, invalid_request,
+    pipeline_error). Never raises."""
+    from ddp_sync.services.redis_store import get_redis_store
+
+    store = get_redis_store()
+    record = new_session_run_record(run_id, jurisdiction_iso2, session_code)
+
+    async def save() -> None:
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await store.set_legbot_session_run(run_id, record)
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(SESSION_RUN_HEARTBEAT_SECONDS)
+            await save()
+
+    record["status"] = "running"
+    await save()
+    beat = asyncio.create_task(heartbeat())
+    try:
+        result = await trigger_scraper_session_pipeline(jurisdiction_iso2, session_code, **kwargs)
+    except Exception as e:  # noqa: BLE001 -- the wrapper never raises; this is the backstop
+        result = {"success": False, "error": "pipeline_error", "detail": str(e)}
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat  # stopped before the final write, so a late heartbeat cannot write "running" after it
+    record.update(status="completed" if result.get("success") else "failed",
+                  finished_at=datetime.now(timezone.utc).isoformat(),
+                  error=None if result.get("success") else result.get("error"),
+                  result=_summary(result))
+    await save()
+    logger.info("legbot_session_background_run_end", run_id=run_id, jurisdiction_iso2=jurisdiction_iso2,
+                session_code=session_code, status=record["status"], error=record["error"])
+
+
+def session_run_as_read(record: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """The record as GET returns it: a `queued` or `running` one whose `updated_at` is older than
+    SESSION_RUN_LOST_AFTER_SECONDS is reported `lost` (ddp-sync restarted under it; nothing resumes it)."""
+    if record.get("status") in SESSION_RUN_FINAL:
+        return record
+    try:
+        age = ((now or datetime.now(timezone.utc)) - datetime.fromisoformat(record["updated_at"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        age = SESSION_RUN_LOST_AFTER_SECONDS + 1
+    if age > SESSION_RUN_LOST_AFTER_SECONDS:
+        return {**record, "status": "lost", "error": "no heartbeat: ddp-sync restarted during the run"}
+    return record

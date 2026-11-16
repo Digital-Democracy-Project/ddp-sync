@@ -231,6 +231,17 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 
 `/trigger/bill-status-sync` accepts query params: `all_sessions` (bool), `jurisdiction` (str)
 
+`/trigger/bill-artifact-generation` with `"background": true` (SYNC-162) answers **202** with a `run_id` at once and runs the
+same pass afterwards (same overlap lock, same result); `GET /trigger/bill-artifact-generation/{run_id}` returns its record
+(`queued` / `running` / `completed` / `failed` / `lost`, the wrapper's `error`, and the run's counts; a list in the result is
+kept as its length). `updated_at` moves every minute while the run goes, so a run ddp-sync restarted under reads `lost` after
+10 minutes. A refusal (`already_running`, `trigger_disabled`, `redis_unavailable`) is the record's `error`, not an HTTP
+status. EC2's archive hook (`openstates_archive._trigger_legbot_session_via_mac_wireguard`) uses it: it checks the record
+every minute for up to 6 hours, and a real failure (the Mac unreachable for 10 checks in a row, a failed or lost run, or no
+end after 6 hours) logs `archiver_triggered_legbot_wireguard_trigger_failed` and sends one operator alert. Another run of the
+same session, or the Mac's automated trigger switched off, is a warning, not an alert. Before SYNC-162 one request was held
+open for the whole run and gave up at 3,600 s, so Massachusetts' 88-minute pass was logged as a failure every week.
+
 `/trigger/bill-artifact-generation` (SYNC-9) is `run_legbot_pipeline`'s (`pipelines/session_pipeline_runner.py`)
 first real production caller — it fills in whatever `BillArtifact` types are missing for every bill in one
 jurisdiction/session. Takes a JSON body, not query params: `jurisdiction_iso2`, `session_code`, `artifact_types`
