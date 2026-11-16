@@ -452,8 +452,9 @@ async def _run_archive_fargate(
             "duration_seconds": duration,
         }
 
+    # SYNC-167: cloud_archiver.py holds `_archive_lock` (holder = this run_id); a stop at max_wait releases it.
     exit_code, wait_detail = await asyncio.to_thread(
-        _wait_for_task_stop, task_arn, fargate_cfg, client
+        _wait_for_task_stop, task_arn, fargate_cfg, client, run_lock=(jurisdiction, run_id, "_archive_lock")
     )
     duration = round(time.monotonic() - start, 1)
 
