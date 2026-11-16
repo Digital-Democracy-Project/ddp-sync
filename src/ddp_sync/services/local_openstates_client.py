@@ -816,6 +816,12 @@ async def list_current_session_bill_candidates(
     # caller has likely been silently returning zero candidates every run.
     base_params: dict[str, str] = {"jurisdiction": jurisdiction_iso2.upper()}
     base_params["session"] = resolved_session_code
+    # SYNC-165: only real bill types (api-v3's `bill_types_only`, OPEN-519; its rule and its one
+    # list live in api-v3's api/bill_types.py, not here). Massachusetts files reports, orders,
+    # communications and study requests under bill numbers; they have no bill text, and checking
+    # them was about 28% of a Massachusetts pass for nothing (3,151 of 11,932 on 2026-11-15). An
+    # api-v3 without the parameter ignores it and lists everything, as before.
+    base_params["bill_types_only"] = "true"
     headers = _auth_headers(settings.local_openstates_api_key)
 
     # Real, separate pagination bug found designing Step 1: per_page=limit
