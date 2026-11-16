@@ -135,11 +135,15 @@ def accept_logo(answer: dict, *, has_parent: bool) -> tuple[bool, bool, str]:
     name, initials or emblem; as the parent's when a parent is set and it shows the parent's (a chapter-site logo showing the
     parent's name counts as "all we have", Ramon 2026-11-15). Strict: a symbol-only image (no name or initials of the
     organization or the parent) is never accepted, wherever it came from (Ramon, 2026-11-15 pop-up "Strict: need the name",
-    after AGENTS-240's re-test: allowing symbols added 4 real logos and 4 wrong ones out of 72)."""
+    after AGENTS-240's re-test: allowing symbols added 4 real logos and 4 wrong ones out of 72). The judge's `shows_org` also
+    counts "an emblem that clearly belongs to it", so the rule is enforced here: no words read (`text_seen` empty) is never
+    accepted (the 2026-11-15 dev trial accepted two wordless images that way, one of them another organization's icon)."""
     if not answer.get("is_logo"):
         return False, False, "not a logo"
     if answer.get("names_other_org"):
         return False, False, "names another organization"
+    if not str(answer.get("text_seen") or "").strip():
+        return False, False, "no name or initials in the image"
     if answer.get("shows_org"):
         return True, False, "shows the organization"
     if has_parent and answer.get("shows_parent"):
@@ -563,7 +567,7 @@ async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: 
         return None
     try:
         dispatched = await dispatch_judge_logo(picture.judge_png, org_name, parent_name=(parent or {}).get("name"),
-                                               candidate_kind=candidate.kind)
+                                               candidate_kind=candidate.kind, source_url=candidate.url)
     except LegBotUnavailable as exc:
         raise _JudgeUnavailable(exc.code) from exc
     except LegBotDispatchError as exc:

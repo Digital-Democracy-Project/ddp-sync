@@ -70,6 +70,10 @@ def fake_dns():
     (OWN, False, (True, False)),
     (SYMBOL_ONLY, False, (False, False)),        # strict: no name, not accepted (Ramon, 2026-11-15, "Strict: need the name")
     (SYMBOL_ONLY, True, (False, False)),
+    # the judge calls an emblem "shows the organization", but no words were read: refused (2026-11-15 dev trial, the Brave lion)
+    ({**SYMBOL_ONLY, "shows_org": True}, False, (False, False)),
+    ({**SYMBOL_ONLY, "shows_parent": True}, True, (False, False)),
+    ({**OWN, "text_seen": "   "}, False, (False, False)),
     (PARENT_NAME, True, (True, True)),           # a chapter site showing the parent's name
     (PARENT_NAME, False, (False, False)),        # no parent set: it does not show this organization
 ])
@@ -175,8 +179,10 @@ async def test_the_judge_payload_is_what_legbots_judge_logo_reads():
     kinds = []
     with patch.object(legbot_client, "_dispatch_and_await", new=capture):
         for kind in ("commons", *ol.WEBSITE_KINDS):
-            await legbot_client.dispatch_judge_logo(picture.judge_png, "Sierra Club", parent_name=None, candidate_kind=kind)
+            await legbot_client.dispatch_judge_logo(picture.judge_png, "Sierra Club", parent_name=None, candidate_kind=kind,
+                                                    source_url="https://www.sierraclub.org/logo.png")
             kinds.append(sent["candidate_kind"])
+    assert sent["source_url"] == "https://www.sierraclub.org/logo.png"  # LegBot keeps it in the task record
     assert kinds == ["commons", "labelled_img", "schema_logo", "apple_touch_icon", "og_image"]
     assert sent["question_type"] == "judge_logo"
     image = base64.b64decode(sent["image_b64"], validate=True)
@@ -738,6 +744,7 @@ async def _run_svg(answers, installed=True):
 async def test_an_accepted_svg_is_judged_on_its_drawing_and_the_original_svg_is_what_is_sent():
     result, write, judge, draw, drawn = await _run_svg([OWN])
     assert result["outcome"] == "website"
+    assert judge.await_args.kwargs["source_url"] == "https://www.sierraclub.org/logo.svg"  # the address judged is sent along
     assert draw.await_args.args[0] == SVG_LOGO
     assert judge.await_args.args[0] == drawn                 # the judge saw the drawing
     kwargs = write.await_args.kwargs

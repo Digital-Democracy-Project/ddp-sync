@@ -406,6 +406,7 @@ async def dispatch_judge_logo(
     *,
     parent_name: str | None = None,
     candidate_kind: str,
+    source_url: str = "",
     timeout_seconds: float | None = None,
 ) -> dict:
     """Dispatch a judge_logo task to LegBot and return its structured answer (SYNC-161; the question type is AGENTS-240's).
@@ -414,7 +415,8 @@ async def dispatch_judge_logo(
     prepared by ddp-sync (an image with see-through parts drawn on mid-grey, so a white logo is visible; tiny images never
     sent; at most 768 px a side), base64 in `image_b64` (LegBot refuses a PNG over 1024 px a side or 2 MB).
     `candidate_kind` is where it came from: commons, img, schema_org, apple_touch_icon or og_image, sent under LegBot's
-    names (`JUDGE_LOGO_KINDS`). The answer is facts only: {"is_logo", "text_seen", "shows_org", "shows_parent",
+    names (`JUDGE_LOGO_KINDS`). `source_url` is the image's address, kept in LegBot's task record so it says what was judged.
+    The answer is facts only: {"is_logo", "text_seen", "shows_org", "shows_parent",
     "names_other_org", "reason"}; the acceptance rule stays in ddp-sync (`pipelines.organization_logo.accept_logo`).
 
     Raises:
@@ -428,6 +430,7 @@ async def dispatch_judge_logo(
             "org_name": org_name,
             "parent_name": parent_name or "",
             "candidate_kind": JUDGE_LOGO_KINDS[candidate_kind],
+            "source_url": source_url or "",
             "question_type": "judge_logo",
             "caller": "ddp_sync",
         },
