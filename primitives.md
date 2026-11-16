@@ -12,6 +12,8 @@ Before sketching new dataclasses, services, or helpers in any PLAN session, scan
 grep -rn "class <Name>\|def <name>" src/ddp_sync/
 ```
 
+**State rules (OPEN-537): no new per-state rule here; fix it in the ETL.** A state's data quirk (action order, labels, vote names, version stages, text) is fixed in openstates-scrapers or openstates-core, and a per-state value goes in the manifest (ddp-infra `PLAN-state-specific-handling.md` §4.1 and §4.2; what may stay downstream is in its §4.3). `tests/test_sync_157_no_state_lists.py` (SYNC-157) fails on a new state list or table.
+
 ---
 
 ## Pinecone layer (`services/vector_store.py`)
