@@ -52,6 +52,8 @@ measured freshness -- not full local-path parity):
     here would duplicate that mechanism rather than add a real guarantee; what this module adds
     on top is only the `stop_task`-on-timeout behavior above, so a run this side gave up on
     doesn't keep occupying that lock indefinitely once ECS itself has genuinely finished with it.
+    SYNC-167: stopping the task does not free that lock (the container dies before its `finally`), so the stop
+    now also releases it (`_release_stopped_run_lock`, only when this run holds it).
   * No bounded-retry wrapper integration (`_retry_eligible()` / `run-scrape-retrying.sh`).
     That wrapper is mac/bash-specific; a cloud-side retry policy is a real design question
     (retry the whole run under a fresh run_id, or resume?) left open rather than answered by
@@ -77,6 +79,7 @@ a resumed one run through, so the two paths can't drift apart from here on.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -118,6 +121,13 @@ _DEFAULT_STALL_S = 45 * 60
 # jurisdictions -- collection is what takes hours, not the import -- so this is generous
 # headroom for a real load, not a number sized to the collection side's own ceiling.
 _DEFAULT_LOAD_TIMEOUT_S = 2 * 3600
+
+_STOP_REQUESTED = "task stop requested"
+
+# SYNC-167: how long to wait, after a stop request, for ECS to report the task STOPPED before releasing its lock.
+# Fargate gives a container at most 120 s between SIGTERM and SIGKILL (stopTimeout), so this covers the longest case.
+_STOP_CONFIRM_S = 150
+_STOP_CONFIRM_POLL_S = 5
 
 
 def _generate_run_id(jurisdiction: str) -> str:
@@ -196,9 +206,54 @@ def _stop_orphaned_task(
     still better reported as "gave up waiting" than as an exception replacing that message."""
     try:
         ecs_client.stop_task(cluster=cluster, task=task_arn, reason=reason)
-        return "task stop requested"
+        return _STOP_REQUESTED
     except Exception as e:  # noqa: BLE001 -- cleanup best-effort, never let this mask the timeout
         return f"stop_task also failed: {e}"
+
+
+def _s3_client():
+    return boto3.client("s3")
+
+
+def _release_stopped_run_lock(
+    ecs_client, task_arn: str, source: str, run_id: str, suffix: str, fargate_cfg: dict
+) -> str:
+    """SYNC-167: release the S3 run lock of a task ddp-sync has just stopped. `ecs stop-task` kills the container
+    without running its `finally` (cloud_collector.py has no SIGTERM handler), so the lock it took (OPEN-187's
+    `SourceLock`, 24 h, the same as a nightly state's cadence) would otherwise refuse the state's next run.
+
+    Same object and format as `SourceLock` in ddp-open-states' cloud_collector.py (`<prefix>/<source>/<suffix>`, a JSON
+    body with `holder`, `acquired_at`, `expires_at`), released the way `SourceLock.release` does it: written already
+    expired, conditional on the ETag just read. Only when that lock's holder is this run_id, so a newer run's lock is
+    never touched, and only once ECS reports the task STOPPED (pm-review: a stop request returns while the container
+    may still be running), so the old run and a new one never hold the state at once. Called only after a stop request
+    that succeeded. Never raises: a release that does not happen leaves the lock to its TTL, as before."""
+    bucket = fargate_cfg.get("memory_bucket", os.environ.get("MEMORY_BUCKET", ""))
+    if not bucket:
+        return "lock not released: no memory_bucket configured"
+    key = f"{fargate_cfg.get('memory_prefix', 'prod')}/{source}/{suffix}"
+    try:
+        deadline = time.monotonic() + _STOP_CONFIRM_S
+        while True:
+            desc = ecs_client.describe_tasks(cluster=fargate_cfg["cluster"], tasks=[task_arn])
+            if any(t.get("lastStatus") == _STOPPED for t in desc.get("tasks", [])):
+                break
+            if time.monotonic() >= deadline:
+                return f"lock not released: task not STOPPED after {_STOP_CONFIRM_S}s"
+            time.sleep(_STOP_CONFIRM_POLL_S)
+        client = _s3_client()
+        existing = client.get_object(Bucket=bucket, Key=key)
+        holder = json.loads(existing["Body"].read()).get("holder")
+        if holder != run_id:
+            return f"lock left alone: held by {holder}, not {run_id}"
+        now = time.time()
+        body = json.dumps({"holder": run_id, "acquired_at": now, "expires_at": now - 1}).encode()
+        client.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=existing["ETag"])
+    except Exception as e:  # noqa: BLE001 -- best-effort, like _stop_orphaned_task
+        logger.warning("cloud_scrape: could not release the stopped run's lock", key=key, run_id=run_id, error=str(e))
+        return f"lock not released ({e})"
+    logger.info("cloud_scrape: released the stopped run's lock", key=key, run_id=run_id)
+    return f"lock {key} released"
 
 
 def _launch_fargate_task(
@@ -322,6 +377,7 @@ def _wait_for_task_stop(
     *,
     logs_client=None,
     label: str | None = None,
+    run_lock: tuple[str, str, str] | None = None,
 ) -> tuple[int | None, str]:
     """Poll DescribeTasks until `task_arn` stops.
 
@@ -342,6 +398,10 @@ def _wait_for_task_stop(
       "still running" alert (sent only after a good read shows it is not stalled) and the wait goes on. A failed read
       never counts as quiet: it is logged, and after `stall_seconds` with no successful read one alert says the stall
       check cannot see this run.
+
+    `run_lock` (SYNC-167): `(source, run_id, suffix)` of the S3 lock the task holds; whenever this wait stops the task,
+    that lock is released too once ECS reports the task STOPPED (`_release_stopped_run_lock`), so the next run is not
+    refused for up to 24 h. A failed stop request releases nothing.
     """
     container_name = fargate_cfg.get("container_name", "scraper")
     max_wait = fargate_cfg.get("max_wait_seconds", _DEFAULT_MAX_WAIT_S)
@@ -374,6 +434,8 @@ def _wait_for_task_stop(
         if logs_client is None:
             if now >= deadline:
                 stop_detail = _stop_orphaned_task(ecs_client, fargate_cfg["cluster"], task_arn)
+                if run_lock and stop_detail == _STOP_REQUESTED:
+                    stop_detail += "; " + _release_stopped_run_lock(ecs_client, task_arn, *run_lock, fargate_cfg)
                 return None, f"gave up waiting after {max_wait}s (task_arn={task_arn}); {stop_detail}"
         else:
             try:
@@ -400,6 +462,8 @@ def _wait_for_task_stop(
                         task_arn,
                         reason=f"ddp-sync: no new log line for {int(quiet)}s (stall)",
                     )
+                    if run_lock and stop_detail == _STOP_REQUESTED:
+                        stop_detail += "; " + _release_stopped_run_lock(ecs_client, task_arn, *run_lock, fargate_cfg)
                     return None, (
                         f"stalled: no new log line for {int(quiet)}s (limit {stall_s}s) "
                         f"(task_arn={task_arn}); {stop_detail}"
@@ -523,7 +587,12 @@ def _finish_after_launch(
     start = time.monotonic()
     # OPEN-477: the scrape wait always runs in stall-check mode (a logs client is what switches it on).
     exit_code, detail = _wait_for_task_stop(
-        task_arn, fargate_cfg, ecs_client, logs_client=logs_client or _logs_client(), label=label
+        task_arn,
+        fargate_cfg,
+        ecs_client,
+        logs_client=logs_client or _logs_client(),
+        label=label,
+        run_lock=(jurisdiction, run_id, "_lock"),
     )
 
     if exit_code != 0:

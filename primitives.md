@@ -332,6 +332,15 @@ after `stall_seconds` without a good read one `openstates_scrape.stall_check` al
 archive and backfill jobs call `_wait_for_task_stop` without a logs client and keep their hard stop. **Do not** add a
 second watchdog: extend this one. Access: `logs:GetLogEvents` on that group, already used by `_fetch_task_output`.
 
+**SYNC-167: a stop releases the task's S3 run lock.** `ecs stop-task` kills the container before its `finally`, so the
+lock it took (ddp-open-states `cloud_collector.py` `SourceLock`, `<memory_prefix>/<state>/_lock`, 24 h TTL, the same as a
+nightly's cadence) used to refuse the state's next run. Whenever `_wait_for_task_stop(..., run_lock=(source, run_id,
+suffix))` stops a task (stall or max wait), `_release_stopped_run_lock` writes that lock already expired, in
+`SourceLock.release`'s own format and conditional on the ETag it read, **only when the lock's holder is that run_id**;
+never raises. The scrape passes `_lock`, the Fargate archive `_archive_lock` (`cloud_archiver.py`); the backfill and
+script jobs hold no S3 lock and pass none. **Do not add a second lock scheme or a second release path:** the lock format
+lives in ddp-open-states; a stop path that holds one passes `run_lock`.
+
 When a scrape that is still logging gets its "still running" alert (before OPEN-477: when it was stopped). One shared value,
 `openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus a state's own ceiling, the manifest's
 `scrape.fargate_max_wait_s` (ma: 86400; SYNC-157 moved it from the yaml map `max_wait_seconds_by_jurisdiction`), read by
