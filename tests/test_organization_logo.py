@@ -316,7 +316,8 @@ async def test_svg_and_tiny_candidates_are_skipped_and_nothing_found_is_recorded
     routes = {"https://www.sierraclub.org/logo.svg": (200, "image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
               "https://www.sierraclub.org/tiny.png": (200, "image/png", png(68, 68)),
               "https://www.sierraclub.org/": (200, "text/html", page)}
-    result, write, judge = await _run(_state(), routes)
+    with patch(f"{_L}.svg_drawing.renderer_installed", return_value=False):  # SYNC-163: drawn where resvg-py is installed
+        result, write, judge = await _run(_state(), routes)
     assert result["outcome"] == "none"
     assert result["skipped"] == {"svg": 1, "small": 1}
     judge.assert_not_awaited()
@@ -708,3 +709,66 @@ async def test_the_catch_up_run_stops_after_its_waiting_limit_and_says_so():
 
 def test_the_waits_are_module_constants_not_settings():
     assert ol.DEFERRED_WAIT_SECONDS == 300 and ol.DEFERRED_LIMIT_SECONDS >= ol.DEFERRED_WAIT_SECONDS
+
+
+# ---- SYNC-163: website SVG candidates, drawn only for the judge; the original SVG is what is sent ----
+
+SVG_LOGO = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 100"><rect width="300" height="100" fill="#fff"/>'
+            b'<text x="10" y="60">Sierra Club</text></svg>')
+
+
+async def _run_svg(answers, installed=True):
+    page = '<img class="logo" src="/logo.svg"><img class="logo" src="/second-logo.png">'
+    routes = {"https://www.sierraclub.org/logo.svg": (200, "image/svg+xml", SVG_LOGO),
+              "https://www.sierraclub.org/second-logo.png": (200, "image/png", png()),
+              "https://www.sierraclub.org/": (200, "text/html", page)}
+    judge = AsyncMock(side_effect=[{"answer": a, "backend": "mlx"} for a in answers])
+    write = AsyncMock(return_value={})
+    drawn = png(512, 171)
+    with patch(f"{_L}.get_organization_logo_state", new=AsyncMock(return_value=_state())), \
+            patch(f"{_L}.write_organization_logo", new=write), patch(f"{_L}.dispatch_judge_logo", new=judge), \
+            patch(f"{_L}.svg_drawing.renderer_installed", return_value=installed), \
+            patch(f"{_L}.svg_drawing.draw_for_judge", new=AsyncMock(return_value=drawn)) as draw:
+        async with _network(routes) as client:
+            result = await ol.find_and_store_organization_logo(organization_id=7, org_name="Sierra Club", client=client)
+    return result, write, judge, draw, drawn
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_svg_is_judged_on_its_drawing_and_the_original_svg_is_what_is_sent():
+    result, write, judge, draw, drawn = await _run_svg([OWN])
+    assert result["outcome"] == "website"
+    assert draw.await_args.args[0] == SVG_LOGO
+    assert judge.await_args.args[0] == drawn                 # the judge saw the drawing
+    kwargs = write.await_args.kwargs
+    assert kwargs["image"] == SVG_LOGO                       # the broker gets the original SVG, never the drawing
+    assert kwargs["image_content_type"] == "image/svg+xml"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_svg_is_never_sent():
+    result, write, judge, draw, drawn = await _run_svg([WRONG_PICTURE, OWN])
+    sent = write.await_args.kwargs
+    assert sent["image"] != SVG_LOGO and sent["image_content_type"] == "image/png"  # the next candidate, a PNG
+    assert result["rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_without_the_renderer_an_svg_is_skipped_as_before():
+    result, write, judge, draw, drawn = await _run_svg([OWN], installed=False)
+    draw.assert_not_awaited()
+    assert result["skipped"].get("svg") == 1
+    assert write.await_args.kwargs["image_content_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_an_svg_that_cannot_be_drawn_is_unreadable_and_the_search_goes_on():
+    from ddp_sync.pipelines.svg_drawing import SVGUnreadable
+    page = '<img class="logo" src="/logo.svg"><img class="logo" src="/second-logo.png">'
+    routes = {"https://www.sierraclub.org/logo.svg": (200, "image/svg+xml", b"<svg><rect"),
+              "https://www.sierraclub.org/second-logo.png": (200, "image/png", png()),
+              "https://www.sierraclub.org/": (200, "text/html", page)}
+    with patch(f"{_L}.svg_drawing.renderer_installed", return_value=True), \
+            patch(f"{_L}.svg_drawing.draw_for_judge", new=AsyncMock(side_effect=SVGUnreadable("bad"))):
+        result, write, judge = await _run(_state(), routes, [OWN])
+    assert result["skipped"].get("unreadable") == 1 and result["outcome"] == "website"

@@ -698,6 +698,11 @@ sudo launchctl kickstart -k system/com.ddp.ddp-sync   # restart to pick up chang
 curl -s http://localhost:8001/ddp-sync/v1/schedule    # verify the six OpenStates jobs
 ```
 
+**SVG logo drawing (SYNC-163), once on the Mac:** the logo step draws website SVG candidates for LegBot's judge with
+`resvg-py`, an optional extra the Mac needs and EC2 does not (it has no glibc-Linux wheel). Install it into the Mac's venv
+with `.venv/bin/pip install ".[svg-logos]"` (or `uv pip install`) before the restart. Without it, website SVGs are skipped
+and counted as `svg`, as before.
+
 Reinstall the plist (after editing it) and full recovery steps are in
 `ddp-infra/README.md` → "Restart Procedures".
 

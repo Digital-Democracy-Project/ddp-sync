@@ -684,7 +684,8 @@ async def write_organization_logo(
             data[key] = str(value)
     files = None
     if image is not None:
-        extension = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}.get(
+        extension = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+                     "image/svg+xml": "svg"}.get(
             image_content_type, "png")
         files = {"image": (f"logo.{extension}", image, image_content_type)}
     headers = {"Authorization": f"Bearer {resolved_api_token}"}
