@@ -15,8 +15,10 @@ There is no staff approval step (Ramon, 2026-11-14). The order to look in, per o
 
 Plain rules before the model is asked: a raster under 128 px on its longest side is skipped; an image with see-through parts
 is drawn on mid-grey for the judge (white logos); downloads are capped; one request per site at a time, with a timeout. An SVG
-from a website is skipped for now (counted as `svg`): ddp-sync has no SVG renderer, and adding one is a dependency decision. A
-Commons SVG is fetched as Commons' own PNG rendering.
+from a website (SYNC-163) is drawn once by `svg_drawing.draw_for_judge` (resvg, its outside references removed first, in its
+own process, 512 px, on grey) only for the judge; when accepted, the ORIGINAL SVG goes to the broker, which cleans it
+(BROKER-503). Where `resvg-py` is not installed it is skipped as before (counted as `svg`). A Commons SVG is fetched as
+Commons' own PNG rendering.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from ddp_sync.services.broker_client import (
     get_organization_logo_state,
     write_organization_logo,
 )
+from ddp_sync.pipelines import svg_drawing
 from ddp_sync.services.legbot_client import (
     LegBotDispatchError,
     LegBotUnavailable,
@@ -91,7 +94,7 @@ class Candidate:
 
 @dataclass
 class Picture:
-    data: bytes          # what the broker stores: re-encoded PNG
+    data: bytes          # what the broker gets: a re-encoded PNG, or the original SVG (the broker cleans it, BROKER-503)
     content_type: str
     judge_png: bytes     # what the judge sees (see-through parts on grey)
     width: int
@@ -537,13 +540,24 @@ async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: 
         search.skipped["unreadable"] += 1
         return None
     if is_svg(data, content_type):
-        search.skipped["svg"] += 1
-        return None
-    try:
-        picture = prepare_picture(data)
-    except LogoFetchError:
-        search.skipped["unreadable"] += 1
-        return None
+        # SYNC-163: drawn once for the judge only; the original SVG is what is sent when it is accepted
+        if not svg_drawing.renderer_installed():  # until resvg-py is installed (a release step), skipped as before
+            search.skipped["svg"] += 1
+            return None
+        try:
+            drawn = await svg_drawing.draw_for_judge(data)
+        except svg_drawing.SVGUnreadable as exc:
+            search.skipped["unreadable"] += 1
+            logger.info("svg logo candidate not drawn", url=candidate.url, error=str(exc))
+            return None
+        picture = Picture(data, "image/svg+xml", drawn, int.from_bytes(drawn[16:20], "big"),
+                          int.from_bytes(drawn[20:24], "big"))
+    else:
+        try:
+            picture = prepare_picture(data)
+        except LogoFetchError:
+            search.skipped["unreadable"] += 1
+            return None
     if picture is None:
         search.skipped["small"] += 1
         return None
