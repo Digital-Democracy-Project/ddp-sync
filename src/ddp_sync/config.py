@@ -185,6 +185,9 @@ class SyncSettings:
     slack_citations_enabled: bool = False
     # SYNC-119: default OFF. Only the Mac runs Docker (Colima); the EC2 hosts must never try the cleanup.
     docker_cleanup_enabled: bool = False
+    # SYNC-170: default OFF. The weekly organization logo catch-up runs only on the Mac (LegBot's results and the SVG
+    # drawing are there); Ramon turns it on after the first full catch-up.
+    organization_logo_catch_up_enabled: bool = False
 
     # CAMS (LegBot dispatch — PLAN-legbot.md Phase 3). Local Mac Studio
     # instance only, per Ramon's 2026-07-20 call to run this dispatching
@@ -634,12 +637,13 @@ _TASK_ENABLE_FLAG_ENV_VARS: dict[str, str] = {
     "jurisdiction_drift_check_enabled": "JURISDICTION_DRIFT_CHECK_ENABLED",
     "slack_citations_enabled": "SLACK_CITATIONS_ENABLED",
     "docker_cleanup_enabled": "DOCKER_CLEANUP_ENABLED",
+    "organization_logo_catch_up_enabled": "ORGANIZATION_LOGO_CATCH_UP_ENABLED",
 }
 
 # SYNC-102: flags that stay off unless the host's environment says "true".
 _TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_check_enabled", "jurisdiction_drift_check_enabled",
                            "slack_citations_enabled",
-                           "docker_cleanup_enabled"}
+                           "docker_cleanup_enabled", "organization_logo_catch_up_enabled"}
 
 
 def _parse_trigger_limit(raw: str | None) -> int | None:

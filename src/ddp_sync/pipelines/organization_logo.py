@@ -678,3 +678,56 @@ async def backfill_organization_logos(
     report = {"looked": len(outcomes), "due": due, "waited_seconds": waited, "stopped": stopped, **summarize(outcomes)}
     logger.info("organization_logo_backfill_summary", dry_run=dry_run, **report)
     return report
+
+
+# ---- the weekly scheduled catch-up (SYNC-170) ----
+
+CATCH_UP_DEFAULT_LIMIT = 1500
+
+# One catch-up at a time per process: a scheduled start while a run is still going does nothing.
+_catch_up_lock = asyncio.Lock()
+
+
+def catch_up_counts(report: dict) -> str:
+    """One line of counts for the catch-up's log line and alert: logos found by source, from the parent, none,
+    deferred, failed (the counts the backfill script prints)."""
+    outcomes = report.get("outcomes") or {}
+    sources = report.get("sources") or {}
+    found = ", ".join(f"{name} {count}" for name, count in sorted(sources.items())) or "0"
+    return (f"looked at {report.get('looked', 0)} of {report.get('due')} due; logos found ({found}); "
+            f"from the parent {outcomes.get('parent', 0)}; none {outcomes.get('none', 0)}; "
+            f"deferred {outcomes.get('deferred', 0)}; failed {outcomes.get('failed', 0)}")
+
+
+async def run_organization_logo_catch_up_job(*, limit: int = CATCH_UP_DEFAULT_LIMIT, pause_seconds: float = 1.0) -> dict:
+    """The weekly logo catch-up (SYNC-170): `backfill_organization_logos` over the broker's due list (new organizations,
+    ones deferred during bill research, and the broker's own 14-day retries and 90-day re-checks), at most `limit`
+    organizations; what is left waits for next week (the broker's list is the progress). Logs one summary line, and posts
+    one alert when the run fails or stops early (LegBot unable to judge for the backfill's whole waiting limit).
+    Returns the backfill's report, or {"skipped": "already_running"}, or {"error": ...}. Never raises."""
+    if _catch_up_lock.locked():
+        logger.info("organization_logo_catch_up_skipped", reason="already_running")
+        return {"skipped": "already_running"}
+    from ddp_sync.slack_alerts import post_alert
+
+    async with _catch_up_lock:
+        logger.info("organization_logo_catch_up_started", limit=limit)
+        try:
+            report = await backfill_organization_logos(limit=limit, pause_seconds=pause_seconds)
+        except Exception as exc:  # noqa: BLE001 -- a scheduled job must report, not raise into the scheduler
+            error = f"{type(exc).__name__}: {exc}"[:300]
+            logger.exception("organization_logo_catch_up_failed", error=error)
+            await asyncio.to_thread(
+                post_alert, f":red_circle: Weekly organization logo catch-up failed ({error}).",
+                source="organization_logo_catch_up")
+            return {"error": error}
+        counts = catch_up_counts(report)
+        logger.info("organization_logo_catch_up_done", summary=counts, stopped=report.get("stopped"),
+                    waited_seconds=report.get("waited_seconds"))
+        if report.get("stopped"):
+            await asyncio.to_thread(
+                post_alert,
+                f":warning: Weekly organization logo catch-up stopped early ({report['stopped']}): {counts}. "
+                "The rest waits for next week's run.",
+                source="organization_logo_catch_up")
+        return report
