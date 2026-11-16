@@ -56,8 +56,8 @@ dev = [
     "ruff>=0.1.0",
 ]
 # SYNC-163: draws website SVG logo candidates for LegBot's judge_logo (resvg: no scripting, no network). Installed on the Mac
-# only (`pip install ".[svg-logos]"`), where the logo step runs; resvg-py has no glibc-Linux wheel, so the EC2 image leaves
-# it out, and without it website SVGs are skipped as before.
+# only (`pip install -e ".[svg-logos]"`, keeping the editable install), where the logo step runs; EC2's image does not
+# draw SVGs and leaves it out, and without it website SVGs are skipped as before.
 svg-logos = [
     "resvg-py>=0.5.0,<0.6",
 ]
