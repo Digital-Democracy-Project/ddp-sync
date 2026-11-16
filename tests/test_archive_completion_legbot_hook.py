@@ -431,6 +431,7 @@ async def test_wireguard_helper_posts_to_the_mac_and_logs_success(monkeypatch):
         "limit": 10000,
         "retry_failed": False,
         "dry_run": False,
+        "background": True,  # SYNC-162: answered at once, followed by checking back
     }
 
 
@@ -496,6 +497,155 @@ async def test_wireguard_helper_request_failure_is_swallowed():
         await _trigger_legbot_session_via_mac_wireguard(
             "US", "2026", _enabled_ec2_settings()
         )  # must not raise
+
+
+# ── SYNC-162: the Mac answers at once; EC2 checks back until the run ends ─────────────
+
+
+def _mac(post_result, get_results):
+    """A fake Mac: the POST answers `post_result` ((status, body) or an exception); each GET answers the next of
+    `get_results` ((status, body) or an exception), repeating the last."""
+    import httpx
+
+    def answer(item, method):
+        if isinstance(item, Exception):
+            raise item
+        status, body = item
+        return httpx.Response(status, json=body, request=httpx.Request(method, "http://10.0.0.8:8001/x"))
+
+    gets = list(get_results)
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=lambda *a, **k: answer(post_result, "POST"))
+
+    async def get(*a, **k):
+        item = gets.pop(0) if len(gets) > 1 else gets[0]
+        return answer(item, "GET")
+    client.get = AsyncMock(side_effect=get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
+async def _trigger(client):
+    from ddp_sync.pipelines import openstates_archive as oa
+
+    sleep = AsyncMock()
+    alert = patch.object(oa, "post_alert")
+    with patch("httpx.AsyncClient", return_value=client), patch.object(oa.asyncio, "sleep", new=sleep), \
+            alert as mock_alert, patch.object(oa, "logger") as log:
+        await oa._trigger_legbot_session_via_mac_wireguard("MA", "194th", _enabled_ec2_settings())
+    return sleep, mock_alert, log
+
+
+def _events(log, level):
+    return [c.args[0] for c in getattr(log, level).call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_a_run_longer_than_the_old_hour_ends_as_success_with_no_failure_line_and_no_alert():
+    running = (200, {"status": "running", "run_id": "legbot-session-1"})
+    done = (200, {"status": "completed", "run_id": "legbot-session-1", "error": None,
+                  "result": {"bills_considered": 11932, "bills_processed": 11932}})
+    client = _mac((202, {"status": "accepted", "run_id": "legbot-session-1"}), [running] * 88 + [done])  # 88 min
+    sleep, alert, log = await _trigger(client)
+    assert sum(c.args[0] for c in sleep.await_args_list) > 3600
+    assert client.get.await_args.args[0].endswith("/trigger/bill-artifact-generation/legbot-session-1")
+    assert "archiver_triggered_legbot_wireguard_result" in _events(log, "info")
+    assert "archiver_triggered_legbot_wireguard_trigger_failed" not in _events(log, "error")
+    alert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_mac_alerts_once_with_a_readable_error():
+    import httpx
+
+    client = _mac(httpx.ConnectTimeout(""), [(200, {})])
+    _sleep, alert, log = await _trigger(client)
+    assert alert.call_count == 1
+    failed = [c for c in log.error.call_args_list if c.args[0] == "archiver_triggered_legbot_wireguard_trigger_failed"]
+    assert len(failed) == 1 and failed[0].kwargs["error"] == "ConnectTimeout"   # never an empty error= again
+    client.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_mac_that_stops_answering_during_the_run_alerts_once():
+    import httpx
+
+    from ddp_sync.pipelines import openstates_archive as oa
+
+    client = _mac((202, {"run_id": "r"}), [httpx.ConnectError("no route to host")])
+    _sleep, alert, _log = await _trigger(client)
+    assert client.get.await_count == oa._MAC_RUN_POLL_FAILURES_ALLOWED
+    assert alert.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_few_failed_checks_do_not_give_up_on_the_run():
+    import httpx
+
+    done = (200, {"status": "completed", "result": {}})
+    client = _mac((202, {"run_id": "r"}), [httpx.ConnectError("blip"), (503, {}), done])
+    _sleep, alert, log = await _trigger(client)
+    alert.assert_not_called()
+    assert "archiver_triggered_legbot_wireguard_result" in _events(log, "info")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", [
+    {"status": "failed", "error": "pipeline_error"},
+    {"status": "failed", "error": "redis_unavailable"},
+    {"status": "lost", "error": "no heartbeat: ddp-sync restarted during the run"},
+])
+async def test_a_run_that_failed_or_was_lost_alerts_once(record):
+    client = _mac((202, {"run_id": "r"}), [(200, {"status": "running"}), (200, record)])
+    _sleep, alert, _log = await _trigger(client)
+    assert alert.call_count == 1
+    assert client.get.await_count == 2      # a final record ends the wait at once
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["already_running", "trigger_disabled"])
+async def test_another_run_going_or_a_paused_trigger_is_a_warning_not_an_alert(error):
+    client = _mac((202, {"run_id": "r"}), [(200, {"status": "failed", "error": error})])
+    _sleep, alert, log = await _trigger(client)
+    alert.assert_not_called()
+    assert "archiver_triggered_legbot_wireguard_result" in _events(log, "warning")
+
+
+@pytest.mark.asyncio
+async def test_a_run_still_going_after_the_longest_wait_alerts_once():
+    from ddp_sync.pipelines import openstates_archive as oa
+
+    client = _mac((202, {"run_id": "r"}), [(200, {"status": "running"})])
+    _sleep, alert, _log = await _trigger(client)
+    assert client.get.await_count == int(oa._MAC_RUN_MAX_WAIT_SECONDS / oa._MAC_RUN_POLL_SECONDS)
+    assert alert.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_older_mac_that_answers_at_the_end_still_works():
+    client = _mac((200, {"success": True, "run_id": "abc", "bills_processed": 5}), [(200, {})])
+    _sleep, alert, log = await _trigger(client)
+    client.get.assert_not_awaited()
+    alert.assert_not_called()
+    assert "archiver_triggered_legbot_wireguard_result" in _events(log, "info")
+
+
+@pytest.mark.asyncio
+async def test_search_refresh_and_embedding_run_after_a_failed_or_slow_legbot_step(monkeypatch):
+    """SYNC-162 item 2: the hooks after LegBot run whether it finished, timed out or failed."""
+    from ddp_sync.pipelines import openstates_archive as oa
+
+    monkeypatch.setattr(oa, "_run_archive", AsyncMock(return_value={"success": True}))
+    legbot = AsyncMock(side_effect=RuntimeError("LegBot step blew up"))
+    refresh, embed = AsyncMock(), AsyncMock()
+    with patch.object(oa, "_maybe_trigger_legbot_for_archive", new=legbot), \
+            patch.object(oa, "_maybe_refresh_bill_search", new=refresh), \
+            patch.object(oa, "_maybe_embed_knowledge_base", new=embed):
+        result = await oa._run_archive_with_hook("ma", openstates_root="/tmp/x", config={})
+    assert result["success"] is True
+    refresh.assert_awaited_once()
+    embed.assert_awaited_once()
 
 
 # ── _run_archive_with_hook: local + Fargate branches, both wired to the hook ───────────

@@ -492,7 +492,56 @@ async def _write_flow_status(flow_key: str, status: dict) -> None:
         logger.warning("openstates_archive: redis write failed", flow=flow_key, error=str(e))
 
 
+# SYNC-162: the POST is answered at once (202 and a run id) by a Mac that knows `background`; an older Mac still answers
+# only when the run ends, which is what the POST's own timeout is for. The run itself is then checked every
+# _MAC_RUN_POLL_SECONDS, for at most _MAC_RUN_MAX_WAIT_SECONDS (Massachusetts' 11-15 pass took 88 min); the Mac counts as
+# unreachable after _MAC_RUN_POLL_FAILURES_ALLOWED checks in a row fail.
 _MAC_TRIGGER_TIMEOUT_SECONDS = 3600.0
+_MAC_RUN_POLL_SECONDS = 60.0
+_MAC_RUN_MAX_WAIT_SECONDS = 6 * 3600.0
+_MAC_RUN_POLL_FAILURES_ALLOWED = 10
+# refusals that are not a failure of LegBot: logged as a warning, no alert (another run of the session is going, or an
+# operator paused the automated path on the Mac)
+_MAC_RUN_QUIET_ERRORS = ("already_running", "trigger_disabled")
+
+
+class _MacRunFailed(Exception):
+    """The Mac run did not end well, or could not be followed; the message says why."""
+
+
+def _describe(exc: BaseException) -> str:
+    """An exception as text that is never empty (httpx's timeouts have an empty str(), which is how 11-15 logged
+    `error=` with nothing after it)."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+async def _wait_for_mac_run(client: httpx.AsyncClient, url: str, headers: dict, run_id: str) -> dict:
+    """Check GET <url>/<run_id> until the run's record is final (completed / failed / lost) and return it. Raises
+    _MacRunFailed when it is still running after _MAC_RUN_MAX_WAIT_SECONDS, or after _MAC_RUN_POLL_FAILURES_ALLOWED
+    checks in a row fail (no answer, an error status, or no record)."""
+    waited = 0.0
+    failures = 0
+    last_problem = ""
+    while waited < _MAC_RUN_MAX_WAIT_SECONDS:
+        await asyncio.sleep(_MAC_RUN_POLL_SECONDS)
+        waited += _MAC_RUN_POLL_SECONDS
+        try:
+            resp = await client.get(f"{url}/{run_id}", headers=headers, timeout=30.0)
+            resp.raise_for_status()
+            record = resp.json()
+            if not isinstance(record, dict):
+                raise ValueError(f"not a run record: {record!r}"[:200])
+        except Exception as e:  # counted; a run is not given up on for one failed check
+            failures += 1
+            last_problem = _describe(e)
+            if failures >= _MAC_RUN_POLL_FAILURES_ALLOWED:
+                raise _MacRunFailed(f"the Mac did not answer {failures} checks in a row on run {run_id} "
+                                    f"(last: {last_problem})") from e
+            continue
+        failures = 0
+        if record.get("status") in ("completed", "failed", "lost"):
+            return record
+    raise _MacRunFailed(f"run {run_id} still not finished after {_MAC_RUN_MAX_WAIT_SECONDS / 3600:g} h")
 
 
 def _mac_capable() -> bool:
@@ -599,27 +648,52 @@ async def _trigger_legbot_session_via_mac_wireguard(
                     "limit": settings.legbot_scrape_completion_trigger_limit,
                     "retry_failed": False,  # SYNC-42: this automated path never retries.
                     "dry_run": False,
+                    "background": True,  # SYNC-162: answered at once; the run is followed below
                 },
             )
             resp.raise_for_status()
             result = resp.json()
+            if resp.status_code == 202:
+                run_id = result.get("run_id") if isinstance(result, dict) else None
+                if not run_id:
+                    raise _MacRunFailed(f"the Mac accepted the run but sent no run_id: {result!r}"[:300])
+                logger.info("archiver_triggered_legbot_wireguard_accepted", jurisdiction=jurisdiction_iso2,
+                            session_code=session_code, run_id=run_id)
+                record = await _wait_for_mac_run(client, url, headers, run_id)
+                result = {**(record.get("result") or {}), "run_id": run_id, "status": record.get("status"),
+                          "error": record.get("error")}
+                result["success"] = record.get("status") == "completed"
         success = bool(isinstance(result, dict) and result.get("success"))
     except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
-        logger.error(
-            "archiver_triggered_legbot_wireguard_trigger_failed",
-            jurisdiction=jurisdiction_iso2,
-            session_code=session_code,
-            error=str(e),
-        )
+        await _wireguard_trigger_failed(jurisdiction_iso2, session_code, _describe(e))
         return
 
-    log_fn = logger.info if success else logger.warning
-    log_fn(
-        "archiver_triggered_legbot_wireguard_result",
-        jurisdiction=jurisdiction_iso2,
-        session_code=session_code,
-        result=result,
-    )
+    error = result.get("error") if isinstance(result, dict) else None
+    if success:
+        logger.info("archiver_triggered_legbot_wireguard_result", jurisdiction=jurisdiction_iso2,
+                    session_code=session_code, result=result)
+    elif error in _MAC_RUN_QUIET_ERRORS:
+        logger.warning("archiver_triggered_legbot_wireguard_result", jurisdiction=jurisdiction_iso2,
+                       session_code=session_code, result=result)
+    else:
+        await _wireguard_trigger_failed(jurisdiction_iso2, session_code,
+                                        f"the Mac's LegBot run ended without success: {error or result!r}"[:500])
+
+
+async def _wireguard_trigger_failed(jurisdiction_iso2: str, session_code: str, error: str) -> None:
+    """A real failure of the EC2 -> Mac LegBot run (Mac unreachable, the run failed or was lost, or it never finished):
+    one error line and one operator alert (SYNC-162). Never raises."""
+    logger.error("archiver_triggered_legbot_wireguard_trigger_failed", jurisdiction=jurisdiction_iso2,
+                 session_code=session_code, error=error)
+    try:
+        await asyncio.to_thread(
+            post_alert,
+            f":warning: LegBot after the {jurisdiction_iso2} archive (session {session_code}) did not complete: {error}",
+            source="openstates_archive.legbot_trigger",
+            dedupe_key=f"legbot-trigger-{jurisdiction_iso2}-{session_code}",
+        )
+    except Exception as e:  # noqa: BLE001 -- the alert must not hide the outcome
+        logger.error("archiver_triggered_legbot_alert_failed", jurisdiction=jurisdiction_iso2, error=str(e))
 
 
 async def _maybe_trigger_legbot_for_archive(

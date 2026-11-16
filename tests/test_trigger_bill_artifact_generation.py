@@ -631,3 +631,102 @@ def test_automated_trigger_header_still_dispatches_when_enabled():
 
     assert response.status_code == 200
     mock_run.assert_awaited_once()
+
+
+# ---- SYNC-162: background=true answers 202 at once; the run's record is read back by id ----
+
+def _store_with_runs():
+    """The fake store, plus real (async) run-record methods backed by a dict."""
+    rs = _fake_redis_store()
+    runs: dict[str, dict] = {}
+
+    async def set_run(run_id, data):
+        runs[run_id] = dict(data)
+
+    async def get_run(run_id):
+        return runs.get(run_id)
+
+    rs.set_legbot_session_run = set_run
+    rs.get_legbot_session_run = get_run
+    return rs, runs
+
+
+def test_background_answers_202_with_a_run_id_and_the_run_is_read_back_completed():
+    client = _make_authed_client()
+    store, _runs = _store_with_runs()
+    with _patch_redis(store), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline",
+        new=AsyncMock(return_value={"bills_considered": 3, "bills_processed": 3, "results": [{}, {}, {}]}),
+    ) as mock_run:
+        response = client.post("/trigger/bill-artifact-generation", json=dict(_VALID_PAYLOAD, background=True))
+        assert response.status_code == 202
+        run_id = response.json()["run_id"]
+        mock_run.assert_awaited_once()            # TestClient runs the background task before returning
+        read = client.get(f"/trigger/bill-artifact-generation/{run_id}")
+    assert read.status_code == 200
+    body = read.json()
+    assert body["status"] == "completed" and body["error"] is None
+    assert body["result"]["bills_processed"] == 3 and body["result"]["results"] == 3   # a list is kept as its length
+    assert body["jurisdiction_iso2"] == "fl" and body["finished_at"]
+
+
+def test_a_background_refusal_is_the_records_error_not_an_http_status():
+    client = _make_authed_client()
+    store, _runs = _store_with_runs()
+    store._client.store[_lock_key("fl", "2026F")] = b"someone-else"
+    with _patch_redis(store):
+        response = client.post("/trigger/bill-artifact-generation", json=dict(_VALID_PAYLOAD, background=True))
+        assert response.status_code == 202
+        body = client.get(f"/trigger/bill-artifact-generation/{response.json()['run_id']}").json()
+    assert body["status"] == "failed" and body["error"] == "already_running"
+
+
+def test_an_unknown_run_id_is_404():
+    client = _make_authed_client()
+    store, _ = _store_with_runs()
+    with _patch_redis(store):
+        assert client.get("/trigger/bill-artifact-generation/legbot-session-nope").status_code == 404
+
+
+def test_a_running_record_whose_heartbeat_stopped_reads_as_lost():
+    from datetime import datetime, timedelta, timezone
+
+    from ddp_sync.pipelines.scraper_triggered_legbot import (
+        SESSION_RUN_LOST_AFTER_SECONDS,
+        session_run_as_read,
+    )
+
+    now = datetime(2026, 11, 15, 18, 0, tzinfo=timezone.utc)
+    fresh = {"status": "running", "updated_at": (now - timedelta(seconds=90)).isoformat()}
+    stale = {"status": "running", "updated_at": (now - timedelta(seconds=SESSION_RUN_LOST_AFTER_SECONDS + 1)).isoformat()}
+    done = {"status": "completed", "updated_at": (now - timedelta(days=2)).isoformat()}
+    assert session_run_as_read(fresh, now)["status"] == "running"
+    assert session_run_as_read(stale, now)["status"] == "lost"
+    assert session_run_as_read(done, now)["status"] == "completed"
+
+
+def test_the_record_heartbeat_moves_while_the_run_is_going():
+    import asyncio
+
+    from ddp_sync.pipelines import scraper_triggered_legbot as stl
+
+    saved = []
+    store = MagicMock()
+
+    async def set_run(run_id, data):
+        saved.append(dict(data))
+    store.set_legbot_session_run = set_run
+
+    async def slow_run(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return {"success": True, "run_id": "x"}
+
+    async def go():
+        with patch("ddp_sync.services.redis_store.get_redis_store", return_value=store), \
+                patch.object(stl, "SESSION_RUN_HEARTBEAT_SECONDS", 0.01), \
+                patch.object(stl, "trigger_scraper_session_pipeline", new=slow_run):
+            await stl.run_session_pipeline_in_background("r1", "FL", "2026F")
+    asyncio.run(go())
+    running = [s for s in saved if s["status"] == "running"]
+    assert len(running) >= 3                     # the first save, then heartbeats
+    assert saved[-1]["status"] == "completed"

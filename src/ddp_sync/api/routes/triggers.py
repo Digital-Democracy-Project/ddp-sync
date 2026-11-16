@@ -214,6 +214,16 @@ class BillArtifactGenerationRequest(BaseModel):
             "62 incident chain this mode exists to prevent a repeat of."
         ),
     )
+    background: bool = Field(
+        default=False,
+        description=(
+            "SYNC-162. False (default): the request answers with the run's full result when it ends. True: answer 202 "
+            "with a `run_id` at once and run it afterwards (same overlap lock, same result); read it with GET "
+            "/trigger/bill-artifact-generation/{run_id}. EC2's archive hook uses this, so a pass longer than an hour "
+            "is not a timed-out request. A refusal (already running, paused, Redis down) is then the record's "
+            "`error`, not an HTTP status."
+        ),
+    )
 
 
 def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, str | None]:
@@ -251,6 +261,8 @@ def _resolve_batch_broker_target(environment: str | None) -> tuple[str | None, s
 @router.post("/trigger/bill-artifact-generation")
 async def trigger_bill_artifact_generation(
     body: BillArtifactGenerationRequest,
+    response: Response,
+    background_tasks: BackgroundTasks,
     x_ddp_environment: str | None = Header(default=None),
     x_ddp_automated_trigger: bool = Header(default=False),
     token: str = Depends(api_key_auth),
@@ -342,12 +354,10 @@ async def trigger_bill_artifact_generation(
         if body.bill_candidates is not None else None
     )
 
-    result = await trigger_scraper_session_pipeline(
-        body.jurisdiction_iso2,
-        body.session_code,
-        body.artifact_types,
-        body.include_org_research,
-        body.limit,
+    run_kwargs = dict(
+        artifact_types=body.artifact_types,
+        include_org_research=body.include_org_research,
+        limit=body.limit,
         include_concept_statements=body.include_concept_statements,
         retry_failed=body.retry_failed,
         dry_run=body.dry_run,
@@ -356,6 +366,26 @@ async def trigger_bill_artifact_generation(
         bill_candidates=bill_candidates,
         require_trigger_enabled=x_ddp_automated_trigger,
     )
+
+    if body.background:
+        # SYNC-162: answer now, run afterwards; the record is written before the 202 so a read straight after finds it
+        import uuid
+
+        from ddp_sync.pipelines.scraper_triggered_legbot import (
+            new_session_run_record,
+            run_session_pipeline_in_background,
+        )
+        from ddp_sync.services.redis_store import get_redis_store
+
+        run_id = f"legbot-session-{uuid.uuid4().hex[:12]}"
+        await get_redis_store().set_legbot_session_run(
+            run_id, new_session_run_record(run_id, body.jurisdiction_iso2, body.session_code))
+        background_tasks.add_task(
+            run_session_pipeline_in_background, run_id, body.jurisdiction_iso2, body.session_code, **run_kwargs)
+        response.status_code = 202
+        return {"status": "accepted", "run_id": run_id}
+
+    result = await trigger_scraper_session_pipeline(body.jurisdiction_iso2, body.session_code, **run_kwargs)
 
     if result.get("success"):
         return result
@@ -386,6 +416,20 @@ async def trigger_bill_artifact_generation(
     # pipeline_error, or any other value this wrapper might return in the future.
     logger.error(f"Bill artifact generation trigger failed: {result.get('detail')}")
     raise HTTPException(status_code=500, detail=result.get("detail", "Unknown pipeline error."))
+
+
+@router.get("/trigger/bill-artifact-generation/{run_id}")
+async def get_bill_artifact_generation_run(run_id: str, token: str = Depends(api_key_auth)):
+    """A background run's record (SYNC-162): status queued / running / completed / failed / lost, `error` (the
+    wrapper's: already_running, trigger_disabled, redis_unavailable, invalid_request, pipeline_error), and `result`
+    (the run's counts). 404 for a run id it has no record of (never accepted here, or older than 7 days)."""
+    from ddp_sync.pipelines.scraper_triggered_legbot import session_run_as_read
+    from ddp_sync.services.redis_store import get_redis_store
+
+    record = await get_redis_store().get_legbot_session_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No LegBot session run {run_id}.")
+    return session_run_as_read(record)
 
 
 # Which of the two configured ddp-broker-py instances (dev vs. prod) an

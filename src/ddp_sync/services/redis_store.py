@@ -169,6 +169,34 @@ class RedisStore:
             logger.error("Redis: failed to get verify run", run_id=run_id, error=str(e))
         return None
 
+    # -- Background LegBot session runs (SYNC-162) --
+
+    LEGBOT_SESSION_RUN_PREFIX = "ddp:legbot_session:run:"
+    LEGBOT_SESSION_RUN_TTL = 86400 * 7
+
+    async def set_legbot_session_run(self, run_id: str, run_data: dict) -> None:
+        """Record (or update) a background /trigger/bill-artifact-generation run (SYNC-162)."""
+        if not self._client:
+            return
+        try:
+            await self._client.set(
+                f"{self.LEGBOT_SESSION_RUN_PREFIX}{run_id}", json.dumps(run_data), ex=self.LEGBOT_SESSION_RUN_TTL
+            )
+        except Exception as e:
+            logger.error("Redis: failed to set LegBot session run", run_id=run_id, error=str(e))
+
+    async def get_legbot_session_run(self, run_id: str) -> dict | None:
+        """A background LegBot session run's record, or None."""
+        if not self._client:
+            return None
+        try:
+            data = await self._client.get(f"{self.LEGBOT_SESSION_RUN_PREFIX}{run_id}")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            logger.error("Redis: failed to get LegBot session run", run_id=run_id, error=str(e))
+        return None
+
     # -- Slack #legislation citations already handled (SYNC-127) --
     #
     # One set of Slack message timestamps (a message's id within its channel), no expiry: a late reply
