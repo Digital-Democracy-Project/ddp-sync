@@ -23,6 +23,48 @@ from ddp_sync.scheduler import UpdateScheduler
 _P = "ddp_sync.pipelines.organization_logo"
 _ALERT = "ddp_sync.slack_alerts.post_alert"
 
+class FakeRedis:
+    """Just what the catch-up lease uses: SET NX EX, GET, EXPIRE, DELETE (async, like redis.asyncio)."""
+
+    def __init__(self):
+        self.data = {}
+
+    async def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.data:
+            return None
+        self.data[key] = value.encode() if isinstance(value, str) else value
+        return True
+
+    async def get(self, key):
+        return self.data.get(key)
+
+    async def expire(self, key, ttl):
+        return key in self.data
+
+    async def delete(self, key):
+        return 1 if self.data.pop(key, None) is not None else 0
+
+    async def eval(self, script, numkeys, key, owner, *args):
+        """The two owner-checked scripts of redis_store (compare and act in one step)."""
+        from ddp_sync.services.redis_store import _EXTEND_SCRIPT, _RELEASE_SCRIPT
+
+        owned = self.data.get(key) == (owner.encode() if isinstance(owner, str) else owner)
+        if script == _RELEASE_SCRIPT:
+            return 1 if owned and self.data.pop(key, None) is not None else 0
+        if script == _EXTEND_SCRIPT:
+            return 1 if owned else 0
+        raise AssertionError("unexpected script")
+
+
+@pytest.fixture(autouse=True)
+def fake_redis():
+    from ddp_sync.services.redis_store import get_redis_store
+
+    client = FakeRedis()
+    with patch.object(get_redis_store(), "_client", client):
+        yield client
+
+
 REPORT = {
     "looked": 1200, "due": 4800, "waited_seconds": 0.0, "stopped": None,
     "outcomes": {"commons": 300, "website": 450, "parent": 90, "none": 340, "failed": 20},
@@ -97,8 +139,11 @@ async def test_the_run_calls_the_backfill_with_the_cap_logs_the_counts_and_alert
             patch(_ALERT) as alert, patch(f"{_P}.logger") as log:
         result = await run_organization_logo_catch_up_job(limit=1500)
 
-    backfill.assert_awaited_once_with(limit=1500, pause_seconds=1.0)
-    assert result == REPORT
+    kwargs = backfill.await_args.kwargs
+    assert kwargs["limit"] == 1500 and kwargs["pause_seconds"] == 1.0
+    assert (kwargs["older_than_days"], kwargs["dry_run"], kwargs["organization_ids"], kwargs["force"]) == (None, False, None, False)
+    assert kwargs["run_id"] == result["run_id"]
+    assert {k: v for k, v in result.items() if k != "run_id"} == REPORT
     alert.assert_not_called()
     done = [c for c in log.info.call_args_list if c.args[0] == "organization_logo_catch_up_done"]
     assert len(done) == 1
@@ -108,7 +153,7 @@ async def test_the_run_calls_the_backfill_with_the_cap_logs_the_counts_and_alert
 def test_the_counts_carry_each_source_the_parent_none_deferred_and_failed():
     line = catch_up_counts({**REPORT, "outcomes": {**REPORT["outcomes"], "deferred": 3}})
     assert line == ("looked at 1200 of 4800 due; logos found (commons 300, website:png 300, website:svg 150); "
-                    "from the parent 90; none 340; deferred 3; failed 20")
+                    "from the parent 90; none 340; deferred 3; not judged 0; failed 20")
 
 
 @pytest.mark.asyncio
@@ -130,13 +175,13 @@ async def test_a_run_that_fails_posts_one_alert_and_does_not_raise():
             patch(_ALERT) as alert:
         result = await run_organization_logo_catch_up_job(limit=1500)
 
-    assert result == {"error": "RuntimeError: broker down"}
+    assert result["error"] == "RuntimeError: broker down"
     alert.assert_called_once()
     assert "failed (RuntimeError: broker down)" in alert.call_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_a_second_start_while_a_run_is_going_does_nothing():
+async def test_a_second_start_while_a_run_is_going_does_nothing(fake_redis):
     release = asyncio.Event()
 
     async def slow_backfill(**_kw):
@@ -149,8 +194,8 @@ async def test_a_second_start_while_a_run_is_going_does_nothing():
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         second = await asyncio.wait_for(run_organization_logo_catch_up_job(limit=1500), timeout=5)  # never waits
-        assert second == {"skipped": "already_running"}
+        assert second["skipped"] == "already_running"
         release.set()
-        assert await first == REPORT
+        assert (await first)["looked"] == REPORT["looked"]
     assert backfill.await_count == 1
-    assert not organization_logo._catch_up_lock.locked()
+    assert organization_logo.CATCH_UP_LOCK_KEY not in fake_redis.data  # released

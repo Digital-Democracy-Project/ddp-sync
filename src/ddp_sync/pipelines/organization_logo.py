@@ -24,6 +24,7 @@ Commons' own PNG rendering.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import io
 import ipaddress
@@ -70,12 +71,28 @@ MAX_REDIRECTS = 5
 # progress). Bill research never waits.
 DEFERRED_WAIT_SECONDS = 300
 DEFERRED_LIMIT_SECONDS = 4 * 3600
+# SYNC-171: the catch-up stops (one alert) after this many organizations in a row whose judging failed outright (the vision
+# server dead: on 2026-11-16 every judge_logo failed in about 1 s for two hours).
+JUDGE_FAILURE_STOP = 10
+# SYNC-171: Wikidata and Commons answer 429 when asked too fast; wait what they say (Retry-After, at most this long) and ask
+# again, at most WIKIMEDIA_RETRIES times, before counting the lookup as unreachable.
+WIKIMEDIA_RETRIES = 3
+WIKIMEDIA_MAX_WAIT_SECONDS = 60
 
 _site_locks: dict[str, asyncio.Lock] = {}
 
 
 class LogoFetchError(Exception):
     """A page or picture could not be read (down, blocked, too big, not a picture)."""
+
+
+class _JudgeFailed(Exception):
+    """SYNC-171: judging failed for at least one candidate and none was accepted: nothing is written (the organization stays
+    on the broker's list), because "no logo" would be a verdict the judge never gave."""
+
+    def __init__(self, error: str):
+        super().__init__(error)
+        self.error = error
 
 
 class _JudgeUnavailable(Exception):
@@ -106,6 +123,7 @@ class Search:
     rejected: list[dict] = field(default_factory=list)   # {"kind", "url", "why", "answer"?}
     skipped: Counter = field(default_factory=Counter)    # small, svg, unreadable, over_cap
     judged: int = 0
+    judge_error: str | None = None                        # the first judge_logo failure (SYNC-171)
 
 
 # ---- names and hosts ----
@@ -389,9 +407,25 @@ def _plain(text: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
 
 
+def _retry_after(resp: httpx.Response) -> float:
+    """Seconds a 429 asks us to wait (Retry-After in seconds), at most WIKIMEDIA_MAX_WAIT_SECONDS; 5 when it says nothing
+    usable (a date form, or no header)."""
+    try:
+        seconds = float(resp.headers.get("Retry-After", ""))
+    except ValueError:
+        seconds = 5.0
+    return min(max(seconds, 1.0), WIKIMEDIA_MAX_WAIT_SECONDS)
+
+
 async def _json(client: httpx.AsyncClient, url: str, params: dict) -> dict:
     try:
-        resp = await client.get(url, params=params)
+        for attempt in range(WIKIMEDIA_RETRIES + 1):
+            resp = await client.get(url, params=params)
+            if resp.status_code != 429 or attempt == WIKIMEDIA_RETRIES:
+                break
+            wait = _retry_after(resp)  # SYNC-171: Wikidata/Commons rate limit: wait as asked, then ask again
+            logger.info("wikimedia rate limited, waiting", url=url, wait_seconds=wait, attempt=attempt + 1)
+            await asyncio.sleep(wait)
         resp.raise_for_status()
         body = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -419,14 +453,15 @@ async def find_and_store_organization_logo(
     staff hid, which is never looked for.
 
     Returns {"organization_id", "outcome", "source", "rejected", "skipped"}: outcome `commons` / `website` / `parent` / `none`
-    / `not_needed` / `state_failed` / `write_failed` / `failed` / `deferred`; `source` the candidate kind used; `rejected`
+    / `not_needed` / `state_failed` / `write_failed` / `failed` / `deferred` / `judge_failed`; `source` the candidate kind used; `rejected`
     how many candidates the rule turned down; `skipped` the counts of candidates not judged (small, svg, unreadable,
     judge_failed).
 
     `deferred` (SYNC-166, with `deferred_reason` memory_full or server_busy): LegBot could not judge at all, so the search
     stopped at once (no more downloads or judgements) and NOTHING was written: no `none`, no `parent`. The organization
     stays on the broker's logo list, and that is the pause. Any other judge failure is counted as `judge_failed` and the
-    search goes on.
+    search goes on; if no candidate is then accepted, the outcome is `judge_failed` (SYNC-171, with `judge_error`) and
+    NOTHING is written either: not `none`, and not `parent`, whose fallback needs the organization's own candidates judged.
     """
     result = {"organization_id": organization_id, "outcome": "failed", "source": None, "rejected": 0, "skipped": {}}
     try:
@@ -456,6 +491,10 @@ async def _find_and_store(organization_id, org_name, result, *, client, dry_run,
     except _JudgeUnavailable as exc:
         result.update(outcome="deferred", deferred_reason=exc.code, source=None)
         logger.info("organization logo deferred", organization_id=organization_id, reason=exc.code)
+        return result
+    except _JudgeFailed as exc:
+        result.update(outcome="judge_failed", judge_error=exc.error, source=None)
+        logger.warning("organization logo not judged, nothing written", organization_id=organization_id, error=exc.error)
         return result
     finally:
         if own_client:
@@ -524,6 +563,8 @@ async def _search(client: httpx.AsyncClient, state: dict, org_name: str, result:
                 "check": {**answer, "rejected": search.rejected}}}
 
     result.update(rejected=len(search.rejected), skipped=dict(search.skipped))
+    if search.skipped["judge_failed"]:  # SYNC-171: not judged is not "no logo", and the parent's logo is only a fallback
+        raise _JudgeFailed(search.judge_error or "judge_logo failed")  # once the organization's own candidates were judged
     if parent and parent.get("has_logo"):
         result.update(outcome="parent", source="parent")
         return {"action": "parent", "fields": {"check": {"rejected": search.rejected}}}
@@ -572,6 +613,7 @@ async def _judge_candidate(client, candidate: Candidate, org_name: str, parent: 
         raise _JudgeUnavailable(exc.code) from exc
     except LegBotDispatchError as exc:
         search.skipped["judge_failed"] += 1
+        search.judge_error = search.judge_error or str(exc)[:300]
         logger.warning("judge_logo dispatch failed", url=candidate.url, error=str(exc))
         return None
     answer = dispatched.get("answer") or {}
@@ -602,12 +644,15 @@ async def backfill_organization_logos(
     limit: int | None = None,
     older_than_days: int | None = None,
     dry_run: bool = False,
+    organization_ids: list[int] | None = None,
+    force: bool = False,
     pause_seconds: float = 1.0,
     page_size: int = 50,
     deferred_wait_seconds: float = DEFERRED_WAIT_SECONDS,
     deferred_limit_seconds: float = DEFERRED_LIMIT_SECONDS,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """Look for the logo of every organization the broker lists as due (`GET /api/organizations/logo-queue/`: never checked
     first, then the oldest check), through `find_and_store_organization_logo`, the same function the pipeline step uses.
@@ -619,12 +664,21 @@ async def backfill_organization_logos(
     page only (nothing leaves the list). An organization seen once is not looked at again in the same run, so a write that
     keeps failing cannot loop.
 
+    SYNC-171: `organization_ids` re-checks exactly those organizations instead of the broker's list (in that order, each
+    once, at most `limit`); with `force` each is looked at even if the broker says it needs no logo (never a hidden one).
+    This is how a set recorded wrongly is repaired.
+
     SYNC-166: an organization `deferred` (LegBot cannot judge now: memory full or its vision server busy) is asked about
     again after `deferred_wait_seconds`, and again, until LegBot answers; after `deferred_limit_seconds` of waiting in all
     the run stops and says so (`stopped`). Each pause and each resume is logged.
 
-    Returns `summarize(...)` of every organization looked at, plus `looked`, `due` (the broker's count at the start),
-    `waited_seconds`, and `stopped` ("judge_unavailable" when it gave up waiting, else None).
+    SYNC-171: after JUDGE_FAILURE_STOP organizations in a row whose judging failed (`judge_failed`: nothing was written for
+    them) the run stops (`stopped: "judge_failing"`) and posts ONE alert with the count and the first error. A deferred
+    wait is SYNC-166's and does not count.
+
+    Returns `summarize(...)` of every organization looked at, plus `looked`, `due` (the broker's count at the start, or the
+    number of ids given), `waited_seconds`, `stopped` ("judge_unavailable", "judge_failing" or None) and `judge_error` (the
+    first error of the failing run, when it stopped for that).
     """
     broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
     from ddp_sync.services.broker_client import list_organizations_needing_logo
@@ -634,100 +688,231 @@ async def backfill_organization_logos(
     due = None
     waited = 0.0
     stopped = None
+    failing: list[dict] = []   # the current run of consecutive judge_failed organizations
+    judge_error = None
+
+    async def one(client, row) -> dict | None:
+        """The organization's outcome after any SYNC-166 waits, or None when the run must stop."""
+        nonlocal waited, stopped
+        while True:
+            outcome = await find_and_store_organization_logo(
+                organization_id=row["id"], org_name=row.get("name") or "", client=client, dry_run=dry_run,
+                force=force or older_than_days is not None, **broker)
+            if outcome["outcome"] != "deferred":
+                return outcome
+            if waited + deferred_wait_seconds > deferred_limit_seconds:
+                stopped = "judge_unavailable"
+                logger.warning("organization_logo_backfill_stopped", run_id=run_id, organization_id=row["id"],
+                               reason=outcome.get("deferred_reason"), waited_seconds=waited)
+                return None
+            logger.info("organization_logo_backfill_paused", run_id=run_id, organization_id=row["id"],
+                        reason=outcome.get("deferred_reason"), wait_seconds=deferred_wait_seconds, waited_seconds=waited)
+            await asyncio.sleep(deferred_wait_seconds)
+            waited += deferred_wait_seconds
+            logger.info("organization_logo_backfill_resumed", run_id=run_id, organization_id=row["id"],
+                        waited_seconds=waited)
+
+    async def record(outcome: dict) -> bool:
+        """Count it; True when this outcome ends the run (JUDGE_FAILURE_STOP judge failures in a row)."""
+        nonlocal stopped, judge_error
+        outcomes.append(outcome)
+        logger.info("organization_logo_backfill_item", run_id=run_id, dry_run=dry_run,
+                    **{k: v for k, v in outcome.items() if k != "skipped"})
+        if outcome["outcome"] != "judge_failed":
+            failing.clear()
+            return False
+        failing.append(outcome)
+        if len(failing) < JUDGE_FAILURE_STOP:
+            return False
+        stopped, judge_error = "judge_failing", failing[0].get("judge_error")
+        logger.error("organization_logo_backfill_stopped", run_id=run_id, reason="judge_failing", in_a_row=len(failing),
+                     first_error=judge_error)
+        from ddp_sync.slack_alerts import post_alert
+
+        await asyncio.to_thread(
+            post_alert,
+            f":red_circle: Organization logo catch-up stopped: judging failed for {len(failing)} organizations in a row, "
+            f"so nothing was written for them (they stay on the broker's list). First error: {judge_error}. "
+            "Check LegBot's vision server, then run the catch-up again.",
+            source="organization_logo_catch_up")
+        return True
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}) as client:
-        while limit is None or len(outcomes) < limit:
-            size = page_size if limit is None else min(page_size, limit - len(outcomes))
-            if dry_run:  # one read only (a dry run writes nothing, so nothing leaves the list): up to --limit, at most 500
-                size = min(500, limit or page_size)
-            # ask past the ones already seen this run (a failed write stays on the list), within the broker's 500 cap
-            page = await list_organizations_needing_logo(limit=min(500, size + len(seen)),
-                                                         older_than_days=older_than_days, **broker)
-            if due is None:
-                due = page.get("count")
-            fresh = [row for row in page.get("results", []) if row.get("id") not in seen]
-            if not fresh:
-                break
-            for row in fresh[:size]:
-                seen.add(row["id"])
-                while True:
-                    outcome = await find_and_store_organization_logo(
-                        organization_id=row["id"], org_name=row.get("name") or "", client=client, dry_run=dry_run,
-                        force=older_than_days is not None, **broker)
-                    if outcome["outcome"] != "deferred":
-                        break
-                    if waited + deferred_wait_seconds > deferred_limit_seconds:
-                        stopped = "judge_unavailable"
-                        logger.warning("organization_logo_backfill_stopped", organization_id=row["id"],
-                                       reason=outcome.get("deferred_reason"), waited_seconds=waited)
-                        break
-                    logger.info("organization_logo_backfill_paused", organization_id=row["id"],
-                                reason=outcome.get("deferred_reason"), wait_seconds=deferred_wait_seconds,
-                                waited_seconds=waited)
-                    await asyncio.sleep(deferred_wait_seconds)
-                    waited += deferred_wait_seconds
-                    logger.info("organization_logo_backfill_resumed", organization_id=row["id"], waited_seconds=waited)
-                if stopped:
+        if organization_ids is not None:
+            ids = list(dict.fromkeys(organization_ids))[:limit] if limit is not None else list(dict.fromkeys(organization_ids))
+            due = len(ids)
+            for organization_id in ids:
+                outcome = await one(client, {"id": organization_id})
+                if outcome is None or await record(outcome):
                     break
-                outcomes.append(outcome)
-                logger.info("organization_logo_backfill_item", dry_run=dry_run, **{k: v for k, v in outcome.items()
-                                                                                    if k != "skipped"})
                 if pause_seconds:
                     await asyncio.sleep(pause_seconds)
-            if dry_run or stopped:
-                break
-    report = {"looked": len(outcomes), "due": due, "waited_seconds": waited, "stopped": stopped, **summarize(outcomes)}
-    logger.info("organization_logo_backfill_summary", dry_run=dry_run, **report)
+        else:
+            while limit is None or len(outcomes) < limit:
+                size = page_size if limit is None else min(page_size, limit - len(outcomes))
+                if dry_run:  # one read only (a dry run writes nothing, so nothing leaves the list): up to --limit, at most 500
+                    size = min(500, limit or page_size)
+                # ask past the ones already seen this run (a failed write stays on the list), within the broker's 500 cap
+                page = await list_organizations_needing_logo(limit=min(500, size + len(seen)),
+                                                             older_than_days=older_than_days, **broker)
+                if due is None:
+                    due = page.get("count")
+                fresh = [row for row in page.get("results", []) if row.get("id") not in seen]
+                if not fresh:
+                    break
+                for row in fresh[:size]:
+                    seen.add(row["id"])
+                    outcome = await one(client, row)
+                    if outcome is None or await record(outcome):
+                        break
+                    if pause_seconds:
+                        await asyncio.sleep(pause_seconds)
+                if dry_run or stopped:
+                    break
+    report = {"looked": len(outcomes), "due": due, "waited_seconds": waited, "stopped": stopped, "judge_error": judge_error,
+              **summarize(outcomes)}
+    logger.info("organization_logo_backfill_summary", run_id=run_id, dry_run=dry_run, **report)
     return report
 
 
-# ---- the weekly scheduled catch-up (SYNC-170) ----
+# ---- the catch-up run: the weekly schedule (SYNC-170) and the manual trigger (SYNC-171) share this one entry ----
 
 CATCH_UP_DEFAULT_LIMIT = 1500
+# One catch-up at a time, whoever starts it (the schedule, `POST /trigger/organization-logo-backfill`): a renewed Redis
+# lease taken with SET NX EX, renewed and released only by its owner, atomically, with the per-state lock's own scripts
+# (`redis_store._EXTEND_SCRIPT` / `_RELEASE_SCRIPT`: compare the run id and act in one step).
+CATCH_UP_LOCK_KEY = "ddp_sync:organization_logo_catch_up:lock"
+CATCH_UP_LOCK_TTL_SECONDS = 900          # a crashed run's lease lapses within this
+CATCH_UP_LOCK_RENEWAL_SECONDS = 120
 
-# One catch-up at a time per process: a scheduled start while a run is still going does nothing.
-_catch_up_lock = asyncio.Lock()
+
+def _decode(value) -> str | None:
+    return value.decode() if isinstance(value, bytes) else value
+
+
+async def acquire_catch_up_lease(run_id: str) -> tuple[bool, str | None]:
+    """(True, None) when `run_id` now holds the catch-up lease; (False, the running run's id) when another run holds it;
+    (False, None) when Redis cannot answer (the caller refuses to start: without the lease two runs could overlap)."""
+    from ddp_sync.services.redis_store import get_redis_store
+
+    store = get_redis_store()
+    if not store._client:
+        return False, None
+    try:
+        if await store._client.set(CATCH_UP_LOCK_KEY, run_id, nx=True, ex=CATCH_UP_LOCK_TTL_SECONDS):
+            return True, None
+        return False, _decode(await store._client.get(CATCH_UP_LOCK_KEY)) or "unknown"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("organization_logo_catch_up_lock_unavailable", run_id=run_id, error=str(exc))
+        return False, None
+
+
+async def _release_catch_up_lease(run_id: str) -> None:
+    """Fenced release, in one atomic step: delete the lease only while this run still holds it (a run that outlived its
+    lease must not delete a newer run's)."""
+    from ddp_sync.services.redis_store import _RELEASE_SCRIPT, get_redis_store
+
+    client = get_redis_store()._client
+    try:
+        if client is None:  # the lease lapses within CATCH_UP_LOCK_TTL_SECONDS
+            logger.warning("organization_logo_catch_up_lock_release_failed", run_id=run_id, error="no Redis client")
+            return
+        await client.eval(_RELEASE_SCRIPT, 1, CATCH_UP_LOCK_KEY, run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("organization_logo_catch_up_lock_release_failed", run_id=run_id, error=str(exc))
+
+
+async def _renew_catch_up_lease(run_id: str) -> None:
+    """Renew the lease every CATCH_UP_LOCK_RENEWAL_SECONDS while the run lives (cancelled when it ends), only while this
+    run still holds it, in one atomic step. A lost lease (taken over after a long stall, or Redis emptied) is logged."""
+    from ddp_sync.services.redis_store import _EXTEND_SCRIPT, get_redis_store
+
+    while True:
+        await asyncio.sleep(CATCH_UP_LOCK_RENEWAL_SECONDS)
+        try:
+            client = get_redis_store()._client
+            if client is None or not await client.eval(_EXTEND_SCRIPT, 1, CATCH_UP_LOCK_KEY, run_id,
+                                                       CATCH_UP_LOCK_TTL_SECONDS):
+                logger.error("organization_logo_catch_up_lease_lost", run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 -- a renewal failure must not end the run
+            logger.warning("organization_logo_catch_up_lease_renewal_failed", run_id=run_id, error=str(exc))
 
 
 def catch_up_counts(report: dict) -> str:
     """One line of counts for the catch-up's log line and alert: logos found by source, from the parent, none,
-    deferred, failed (the counts the backfill script prints)."""
+    deferred, not judged, failed (the counts the backfill script prints)."""
     outcomes = report.get("outcomes") or {}
     sources = report.get("sources") or {}
     found = ", ".join(f"{name} {count}" for name, count in sorted(sources.items())) or "0"
     return (f"looked at {report.get('looked', 0)} of {report.get('due')} due; logos found ({found}); "
             f"from the parent {outcomes.get('parent', 0)}; none {outcomes.get('none', 0)}; "
-            f"deferred {outcomes.get('deferred', 0)}; failed {outcomes.get('failed', 0)}")
+            f"deferred {outcomes.get('deferred', 0)}; not judged {outcomes.get('judge_failed', 0)}; "
+            f"failed {outcomes.get('failed', 0)}")
 
 
-async def run_organization_logo_catch_up_job(*, limit: int = CATCH_UP_DEFAULT_LIMIT, pause_seconds: float = 1.0) -> dict:
-    """The weekly logo catch-up (SYNC-170): `backfill_organization_logos` over the broker's due list (new organizations,
-    ones deferred during bill research, and the broker's own 14-day retries and 90-day re-checks), at most `limit`
-    organizations; what is left waits for next week (the broker's list is the progress). Logs one summary line, and posts
-    one alert when the run fails or stops early (LegBot unable to judge for the backfill's whole waiting limit).
-    Returns the backfill's report, or {"skipped": "already_running"}, or {"error": ...}. Never raises."""
-    if _catch_up_lock.locked():
-        logger.info("organization_logo_catch_up_skipped", reason="already_running")
-        return {"skipped": "already_running"}
+async def run_organization_logo_catch_up_job(
+    *,
+    limit: int | None = CATCH_UP_DEFAULT_LIMIT,
+    older_than_days: int | None = None,
+    dry_run: bool = False,
+    organization_ids: list[int] | None = None,
+    force: bool = False,
+    pause_seconds: float = 1.0,
+    run_id: str | None = None,
+    lease_held: bool = False,
+    trigger: str = "scheduled",
+) -> dict:
+    """THE catch-up run (SYNC-170 schedule, SYNC-171 manual trigger): `backfill_organization_logos` with these arguments
+    under the one catch-up lease, `run_id` in every log line. The weekly job passes the cap; the trigger passes what it was
+    asked (`limit` None = the whole due list; `organization_ids` + `force` = re-check exactly those).
+
+    `lease_held`: the trigger already took the lease for `run_id` (so it could answer 409 itself); otherwise it is taken
+    here, and a start while another run holds it does nothing ({"skipped": "already_running", "current_run_id"}). Logs one
+    summary line, and posts ONE alert when the run fails or stops early (the backfill's own judge-failure stop posts its
+    alert itself, so none is added here). Returns the backfill's report, or {"skipped": ...}, or {"error": ...}. Never
+    raises."""
+    import uuid
+
     from ddp_sync.slack_alerts import post_alert
 
-    async with _catch_up_lock:
-        logger.info("organization_logo_catch_up_started", limit=limit)
+    run_id = run_id or f"organization-logo-catch-up-{uuid.uuid4().hex[:12]}"
+    if not lease_held:
+        acquired, current = await acquire_catch_up_lease(run_id)
+        if not acquired:
+            if current is None:
+                logger.error("organization_logo_catch_up_skipped", run_id=run_id, reason="lock_unavailable")
+                return {"skipped": "lock_unavailable"}
+            logger.info("organization_logo_catch_up_skipped", run_id=run_id, reason="already_running",
+                        current_run_id=current)
+            return {"skipped": "already_running", "current_run_id": current}
+    name = "Weekly organization logo catch-up" if trigger == "scheduled" else "Organization logo catch-up"
+    heartbeat = asyncio.create_task(_renew_catch_up_lease(run_id))
+    try:
+        logger.info("organization_logo_catch_up_started", run_id=run_id, trigger=trigger, limit=limit,
+                    older_than_days=older_than_days, dry_run=dry_run, force=force,
+                    organization_ids=len(organization_ids) if organization_ids is not None else None)
         try:
-            report = await backfill_organization_logos(limit=limit, pause_seconds=pause_seconds)
-        except Exception as exc:  # noqa: BLE001 -- a scheduled job must report, not raise into the scheduler
+            report = await backfill_organization_logos(
+                limit=limit, older_than_days=older_than_days, dry_run=dry_run, organization_ids=organization_ids,
+                force=force, pause_seconds=pause_seconds, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 -- a background job must report, not raise
             error = f"{type(exc).__name__}: {exc}"[:300]
-            logger.exception("organization_logo_catch_up_failed", error=error)
-            await asyncio.to_thread(
-                post_alert, f":red_circle: Weekly organization logo catch-up failed ({error}).",
-                source="organization_logo_catch_up")
-            return {"error": error}
+            logger.exception("organization_logo_catch_up_failed", run_id=run_id, error=error)
+            await asyncio.to_thread(post_alert, f":red_circle: {name} failed ({error}). Run id {run_id}.",
+                                    source="organization_logo_catch_up")
+            return {"error": error, "run_id": run_id}
         counts = catch_up_counts(report)
-        logger.info("organization_logo_catch_up_done", summary=counts, stopped=report.get("stopped"),
+        logger.info("organization_logo_catch_up_done", run_id=run_id, summary=counts, stopped=report.get("stopped"),
                     waited_seconds=report.get("waited_seconds"))
-        if report.get("stopped"):
+        if report.get("stopped") and report["stopped"] != "judge_failing":  # judge_failing: the backfill already alerted
             await asyncio.to_thread(
                 post_alert,
-                f":warning: Weekly organization logo catch-up stopped early ({report['stopped']}): {counts}. "
-                "The rest waits for next week's run.",
+                f":warning: {name} stopped early ({report['stopped']}): {counts}. The rest stays on the broker's list for "
+                f"the next run. Run id {run_id}.",
                 source="organization_logo_catch_up")
-        return report
+        return {**report, "run_id": run_id}
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        await _release_catch_up_lease(run_id)

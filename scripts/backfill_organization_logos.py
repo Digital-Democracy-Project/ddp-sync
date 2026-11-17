@@ -5,6 +5,9 @@ the broker lists as due (`GET /api/organizations/logo-queue/`, BROKER-502). Resu
 rate-limited. Needs the broker's logo routes deployed and LegBot's `judge_logo` (AGENTS-240) live on CAMS; it does not read
 LEGBOT_ORGANIZATION_LOGO_ENABLED (that switch is the pipeline step's), so run it only once both are live.
 
+**Production runs go through the service, not this script (SYNC-171):** `POST /trigger/organization-logo-backfill` on the Mac's
+ddp-sync (202 + run_id, one run at a time, alerts). This script is for dev and dry runs; it takes no run lock.
+
 Usage (from the ddp-sync checkout, its .venv):
     .venv/bin/python scripts/backfill_organization_logos.py --dry-run --limit 20
     .venv/bin/python scripts/backfill_organization_logos.py --limit 500

@@ -885,6 +885,54 @@ async def trigger_docker_cleanup(
     return {"status": "started", "script": settings.docker_prune_script}
 
 
+@router.post("/trigger/organization-logo-backfill", status_code=202)
+async def trigger_organization_logo_backfill(
+    background_tasks: BackgroundTasks,
+    limit: int | None = None,
+    older_than_days: int | None = None,
+    dry_run: bool = False,
+    organization_ids: str | None = None,
+    force: bool = False,
+    token: str = Depends(api_key_auth),
+):
+    """Run the organization logo catch-up now, in this service (SYNC-171): the same run as the weekly schedule
+    (`organization_logo.run_organization_logo_catch_up_job`, which calls `backfill_organization_logos`). 202 at once with a
+    `run_id`, which is in every log line of the run (`organization_logo_backfill_*`, `organization_logo_catch_up_*`).
+
+    `limit` (default: the whole due list), `older_than_days` (the refresh), `dry_run` (writes nothing),
+    `organization_ids` (comma-separated: re-check exactly these instead of the broker's list) with `force` (look even when
+    the broker says no logo is needed; never a hidden one). 409 while a catch-up is running (scheduled or manual), with its
+    run id; 503 when the run lock cannot be read (Redis), since without it two runs could overlap. Production runs go
+    through here, not the script (the script stays for dev and dry runs)."""
+    import uuid
+
+    from ddp_sync.pipelines.organization_logo import acquire_catch_up_lease, run_organization_logo_catch_up_job
+
+    if limit is not None and limit < 1:
+        raise HTTPException(status_code=422, detail="limit must be 1 or more")
+    if older_than_days is not None and older_than_days < 1:
+        raise HTTPException(status_code=422, detail="older_than_days must be 1 or more")
+    ids = None
+    if organization_ids is not None:
+        try:
+            ids = [int(part) for part in organization_ids.split(",") if part.strip()]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="organization_ids must be comma-separated numbers") from None
+        if not ids:
+            raise HTTPException(status_code=422, detail="organization_ids is empty")
+    run_id = f"organization-logo-backfill-{uuid.uuid4().hex[:12]}"
+    acquired, current = await acquire_catch_up_lease(run_id)
+    if not acquired:
+        if current is None:
+            raise HTTPException(status_code=503, detail="the catch-up lock (Redis) cannot be read; not starting")
+        raise HTTPException(status_code=409, detail={"error": "already_running", "current_run_id": current})
+    background_tasks.add_task(
+        run_organization_logo_catch_up_job, limit=limit, older_than_days=older_than_days, dry_run=dry_run,
+        organization_ids=ids, force=force, run_id=run_id, lease_held=True, trigger="manual")
+    return {"status": "started", "run_id": run_id, "limit": limit, "older_than_days": older_than_days,
+            "dry_run": dry_run, "organization_ids": len(ids) if ids is not None else None, "force": force}
+
+
 @router.post("/trigger/slack-citations", status_code=202)
 async def trigger_slack_citations(
     background_tasks: BackgroundTasks,
