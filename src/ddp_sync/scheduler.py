@@ -961,6 +961,10 @@ class UpdateScheduler:
         if not cadence_cfg.get("enabled", False):
             return {"success": True, "skipped": "disabled"}
 
+        # SYNC-156: a state the manifest newly scrapes (or pauses) gets (or loses) its job here, without a restart.
+        # Before the Redis reads on purpose, so a Redis outage cannot hold it back.
+        jobs_synced = self._sync_state_jobs_with_manifest(config)
+
         excluded = sorted(_cadence_excluded(config))
         escalate_window = cadence_cfg.get("escalate_window", 2)
         quiet_window = cadence_cfg.get("quiet_window", 4)
@@ -1088,7 +1092,38 @@ class UpdateScheduler:
             "cadences": cadences,
             "changed": [v["jurisdiction"] for v in changed],
             "verdicts": verdicts,
+            "jobs_synced": jobs_synced,
         }
+
+    def _sync_state_jobs_with_manifest(self, config: dict) -> list[str]:
+        """SYNC-156: re-run the scrape job registration when the manifest's scraped set no longer matches the
+        `openstates_scrape_<state>` jobs, and return the job ids actually added or removed ([] for none or a failure).
+
+        `load_manifest` already re-reads the file when its mtime changes, but registration used to run only at startup
+        and on a cadence change, so a resumed state had no job (and a paused one kept its job) until a restart.
+        Re-registration is the existing one (same ids, same timing, each state's current effective cadence passed
+        back in), so a state already scheduled keeps its trigger. Nothing happens when the sets agree or the manifest
+        cannot be read (the review below logs that). Never raises: a failure leaves the schedule as it was.
+        """
+        from ddp_sync.pipelines.openstates_scrape import enrolled_scrape_states
+
+        try:
+            states = enrolled_scrape_states(config)
+            if states is None:
+                return []
+            have = set(self._job_ids_with_prefix((SCRAPE_JOB_PREFIX,)))
+            if {f"{SCRAPE_JOB_PREFIX}{j}" for j in states} == have:
+                return []
+            self._register_openstates_scrape_jobs(dict(self._openstates_cadence))
+            # What was applied, read back from the scheduler (registration reads the manifest again), not what was asked.
+            after = set(self._job_ids_with_prefix((SCRAPE_JOB_PREFIX,)))
+        except Exception as e:  # noqa: BLE001 — same promise as the review: never raise, keep the schedule
+            logger.error("openstates_scrape: could not re-register after a manifest change; retried at the next review",
+                         error=str(e))
+            return []
+        logger.info("openstates_scrape: jobs re-registered after a manifest change",
+                    added=sorted(after - have), removed=sorted(have - after))
+        return sorted(after ^ have)
 
     def _register_mi_cookie_publish_job(self) -> None:
         """OPEN-188: mint Michigan's WAF cookies and publish them to the shared S3 memory

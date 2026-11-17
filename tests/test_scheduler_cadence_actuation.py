@@ -497,3 +497,121 @@ class TestFailingSafe:
 
         assert result["cadences"]["va"] == "weekly"
         assert "day_of_week='sun'" in _trigger(sched, "openstates_scrape_va")
+
+
+def _set_status(code: str, status: str) -> None:
+    """Edit the temp manifest the way rollout-manifest.sh does (a new file, a new mtime), with no restart."""
+    import os
+
+    path = Path(_ROOT) / "jurisdictions.yaml"
+    manifest = yaml.safe_load(path.read_text())
+    manifest[code]["status"] = status
+    path.write_text(yaml.safe_dump(manifest))
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # never the same mtime as the cached read
+
+
+class TestManifestChangeWithoutRestart:
+    """SYNC-156: the review job re-registers when the manifest's scraped set changes (Alabama, 2026-11-10)."""
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_state_gets_its_job_at_the_next_review(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        before = {j.id: str(j.trigger) for j in sched.scheduler.get_jobs()}
+        assert "openstates_scrape_al" not in before
+
+        _set_status("al", "live")
+        with patch("ddp_sync.services.redis_store.get_redis_store", return_value=_redis()):
+            result = await sched._run_cadence_review()
+
+        assert result["jobs_synced"] == ["openstates_scrape_al"]
+        after = {j.id: str(j.trigger) for j in sched.scheduler.get_jobs()}
+        assert "day_of_week='sun'" in after["openstates_scrape_al"] and "hour='2'" in after["openstates_scrape_al"]
+        # Acceptance 2: every job that was there keeps its id and its timing.
+        assert {k: v for k, v in after.items() if k != "openstates_scrape_al"} == before
+        assert result["cadences"]["al"] == "weekly"
+
+    @pytest.mark.asyncio
+    async def test_a_paused_state_loses_its_job_at_the_next_review(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        before = {j.id: str(j.trigger) for j in sched.scheduler.get_jobs()}
+
+        _set_status("va", "paused")
+        with patch("ddp_sync.services.redis_store.get_redis_store", return_value=_redis()):
+            result = await sched._run_cadence_review()
+
+        assert result["jobs_synced"] == ["openstates_scrape_va"]
+        after = {j.id: str(j.trigger) for j in sched.scheduler.get_jobs()}
+        assert "openstates_scrape_va" not in after
+        assert after == {k: v for k, v in before.items() if k != "openstates_scrape_va"}
+        assert "va" not in result["cadences"]
+
+    @pytest.mark.asyncio
+    async def test_redis_being_down_does_not_hold_back_a_resumed_state(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+
+        _set_status("al", "live")
+        store = MagicMock()
+        store.get_scrape_cadence = AsyncMock(side_effect=ConnectionError("redis down"))
+        store.get_run_history = AsyncMock(return_value=[])
+        with patch("ddp_sync.services.redis_store.get_redis_store", return_value=store):
+            result = await sched._run_cadence_review()
+
+        assert result["success"] is False
+        assert "openstates_scrape_al" in _job_ids(sched)
+
+    def test_an_escalated_state_stays_nightly_when_another_state_is_added(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs({"va": "nightly"})
+
+        _set_status("al", "live")
+        synced = sched._sync_state_jobs_with_manifest(sched._sync_config["openstates_scrape"])
+
+        assert synced == ["openstates_scrape_al"]
+        assert "day_of_week" not in _trigger(sched, "openstates_scrape_va")
+        assert sched._openstates_cadence["va"] == "nightly"
+
+    def test_nothing_is_re_registered_when_the_sets_agree(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        with patch.object(sched, "_register_openstates_scrape_jobs") as reg:
+            assert sched._sync_state_jobs_with_manifest(sched._sync_config["openstates_scrape"]) == []
+        reg.assert_not_called()
+
+    def test_an_unreadable_manifest_changes_nothing(self, tmp_path):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        before = _job_ids(sched)
+        sched._sync_config["openstates_scrape"]["openstates_root"] = str(tmp_path / "nowhere")
+        assert sched._sync_state_jobs_with_manifest(sched._sync_config["openstates_scrape"]) == []
+        assert _job_ids(sched) == before
+
+    def test_a_manifest_read_that_raises_changes_nothing_and_does_not_raise(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        before = _job_ids(sched)
+        with patch("ddp_sync.pipelines.openstates_scrape.enrolled_scrape_states", side_effect=RuntimeError("boom")):
+            assert sched._sync_state_jobs_with_manifest(sched._sync_config["openstates_scrape"]) == []
+        assert _job_ids(sched) == before
+
+    def test_only_what_was_applied_is_reported(self):
+        """Registration reads the manifest again; if it changed nothing, nothing is reported (pm-review)."""
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        _set_status("al", "live")
+        with patch.object(sched, "_register_openstates_scrape_jobs"):
+            assert sched._sync_state_jobs_with_manifest(sched._sync_config["openstates_scrape"]) == []
+        assert "openstates_scrape_al" not in _job_ids(sched)
+
+    @pytest.mark.asyncio
+    async def test_a_registration_that_raises_does_not_stop_the_review(self):
+        sched = _scheduler(cadence_enabled="true")
+        sched._register_openstates_scrape_jobs()
+        _set_status("al", "live")
+        with patch.object(sched, "_register_openstates_scrape_jobs", side_effect=RuntimeError("apscheduler blew up")), \
+             patch("ddp_sync.services.redis_store.get_redis_store", return_value=_redis()):
+            result = await sched._run_cadence_review()  # must not raise
+        assert result["success"] and result["jobs_synced"] == []

@@ -498,7 +498,12 @@ PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is n
 - **Registration** (`scheduler._register_state_pipeline_jobs`): removes the retired ids first (`openstates_secondary_scrape*`,
   `openstates_primary_scrape_*`, `openstates_fl_scrape`, `openstates_wa_scrape`, `openstates_usa_scrape`), removes the job of a
   state no longer scraped, then adds one job per scraped state (`replace_existing`, `max_instances=1`, `coalesce`). A tempo
-  change from the cadence review re-registers the same id without a weekday.
+  change from the cadence review re-registers the same id without a weekday. **SYNC-156:** the daily cadence review
+  (00:30 UTC, plus its catch-up 5 min after start-up) first calls `scheduler._sync_state_jobs_with_manifest`: when the
+  manifest's scraped set differs from the `openstates_scrape_<state>` jobs, it re-runs this same registration with the
+  current effective cadences, so a resumed state gets its job and a paused one loses it by the next review, with no
+  restart (before the Redis reads, so a Redis outage does not hold it back). Existing jobs keep their ids and timing.
+  **Do not add a second watcher job for this.**
 - **Cadence review** covers every scraped state, reading `openstates_scrape:<state>` and, while that is empty, the retired
   `openstates_secondary_scrapes:<state>` (no longer written; expires within 30 days).
 - `openstates_scrape.escalation` and `openstates_scrape.scrapebot_fallback` moved out of the retired `secondary` block.
