@@ -1,4 +1,4 @@
-# REQUEST (waits on Ramon's go): release ddp-sync `629f992` (main). Two halves: the Mac (SYNC-158, LegBot's changelog, any quiet time) and EC2 (SYNC-172's new scrape days, Saturday's window only). 2026-11-17 (Mac side)
+# REQUEST (waits on Ramon's go): release ddp-sync `629f992` (main). Two halves: the Mac (SYNC-158, LegBot's changelog) and EC2 (SYNC-172's new scrape days and the rest of main). 2026-11-17 (Mac side)
 
 **Not a GO yet.** Ramon says go per half. The EC2 half is the prod agent's, after a GO note; the Mac half is Ramon's own step (the Mac checkout is production and no agent session edits it).
 
@@ -31,10 +31,10 @@ Any time no LegBot run is going on the Mac (the weekly states' LegBot follows th
 
 ## Half 2, EC2 (prod agent, after a GO note): SYNC-170/171/172, and the rest of `main`
 
-**Window: Saturday 11-21, 12:05 UTC to Sunday 11-22, 01:55 UTC only** (SYNC-172's rule, Ramon 11-17): released then, no state runs twice in the week and none is skipped. A release on any other day moves the weekly states mid-week.
+**Updated 2026-11-17 (Ramon: no timing gate without a real reason): no calendar window.** Releasing on any day is fine: a weekly state whose new day falls before its next old one may run one extra time that week, which is harmless (catch-up scrapes).
 
 ### 0. Gates (stop and report if any fails)
-* **G0, window:** inside the window above, and not while a scrape, load, archive or LegBot step launched by this ddp-sync is running (under today's schedule every weekly state, NV and OR included, starts Sunday 02:00, so Saturday 12:05 is quiet unless a manual run is going).
+* **G0, nothing in flight:** not while a scrape, load, archive or LegBot step launched by this ddp-sync is running (a restart would cut it off).
 * **G1, code:** `/opt/ddp-sync` at **`ce459b4`** (your `844a932`), `git status` clean.
 * **G2, quiet:** no pipeline, scrape, archive or LegBot line in the last 10 minutes; 0 running `ddp-scrapers` tasks ddp-sync waits on.
 * **G3, rollback point:** tag the running image `ddp-sync:pre-629f992` and record its id.
