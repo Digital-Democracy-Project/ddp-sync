@@ -20,7 +20,7 @@ from ddp_sync.services import jurisdiction_enrollment as je
 def sched(tmp_path, monkeypatch):
     je._cache.clear()
     (tmp_path / "jurisdictions.yaml").write_text(yaml.safe_dump(
-        {"pa": {"status": "scraping"}, "va": {"status": "live"}, "ne": {"status": "scraping"}}))
+        {"pa": {"status": "scraping"}, "va": {"status": "live"}, "ne": {"status": "scraping"}, "zz": {"status": "scraping"}}))
     monkeypatch.setenv("OPENSTATES_ROOT", str(tmp_path))
     settings = MagicMock()
     settings.sync_interval_minutes = 30
@@ -40,10 +40,15 @@ def test_the_real_sync_schedule_has_pa_nightly_at_0400(sched):
     assert (f["hour"], f["minute"], f["day_of_week"]) == ("4", "0", "*")
 
 
-def test_states_with_no_timing_entry_run_weekly_on_sunday_at_0200(sched):
-    for j in ("va", "ne"):
-        f = _fields(sched, f"openstates_scrape_{j}")
-        assert (f["hour"], f["minute"], f["day_of_week"]) == ("2", "0", "sun")
+def test_a_state_with_no_timing_entry_runs_weekly_on_sunday_at_0200(sched):
+    f = _fields(sched, "openstates_scrape_zz")  # a newly scraped state nobody has given a day yet
+    assert (f["hour"], f["minute"], f["day_of_week"]) == ("2", "0", "sun")
+
+
+def test_the_weekly_states_keep_their_own_days_beside_the_pa_nightly(sched):
+    """SYNC-172: VA and NE have their own days now, and PA's nightly is unaffected."""
+    assert (_fields(sched, "openstates_scrape_va")["day_of_week"], _fields(sched, "openstates_scrape_va")["hour"]) == ("tue", "12")
+    assert (_fields(sched, "openstates_scrape_ne")["day_of_week"], _fields(sched, "openstates_scrape_ne")["hour"]) == ("thu", "12")
 
 
 @pytest.mark.asyncio

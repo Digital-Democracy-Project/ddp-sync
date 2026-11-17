@@ -484,7 +484,10 @@ PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is n
 - **`state_timing(config, state)`** — WHEN: `openstates_scrape.timing.<state>` over `openstates_scrape.defaults` over the
   built-in weekly Sunday 02:00 UTC. Fields `floor` (nightly/weekly, a floor dynamic_cadence may raise), `day`, `start_utc`,
   `sessions` (run in turn; empty = one run with no session argument). Timing for a state that is not scraped is drift
-  (`config_disagreements` feature `scrape_timing`).
+  (`config_disagreements` feature `scrape_timing`). **SYNC-172:** every weekly state has its own `day` (one or two
+  states a day, 12:00 UTC, MA alone on Monday; FL and MI Sunday 02:00); the default only catches a newly scraped state.
+  A `day` that is not a weekday name would silently fall back to Sunday in the scheduler, so
+  `tests/test_sync_172_staggered_weekly_scrapes.py` checks every `day` in the real file.
 - **`run_state_pipeline(state, config, archive_config, *, skip_people_check, people_checked)`** — the one path for the
   scheduled job `openstates_scrape_<state>` and `POST /trigger/openstates-scrape/<state>` (202): every session through
   `_run_scrape` (each in its own try), `_record_scrape_history` (`ddp:flow_history:openstates_scrape:<state>`, the

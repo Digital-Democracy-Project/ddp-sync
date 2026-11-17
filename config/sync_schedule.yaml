@@ -203,9 +203,17 @@ api_health_check:
 #   04:00  PA (~7 hours, finishes ~11:00; OPEN-494)
 #   04:00  bill sync [existing]
 #
+#   Weekly states, one day each (SYNC-172, 2026-11-17; each its own job; a weekly floor that
+#   dynamic_cadence may raise to nightly, at the same start time):
+#   Mon 12:00  MA (10-16 h, alone)
+#   Tue 12:00  VA, UT
+#   Wed 12:00  AZ, NC
+#   Thu 12:00  LA (~4 h), NE
+#   Fri 12:00  AL, GA
+#   Sat 12:00  NV, OR
+#   Sun 02:00  FL, MI, and any newly scraped state with no `timing` entry yet (`defaults`)
+#
 #   Sunday additionally:
-#   02:00  FL (weekly floor; dynamic_cadence raises it to nightly) and every scraped state with no
-#          `timing` entry (VA, MI, MA, UT, AZ, NC, NE, LA today), each its own job, started together
 #   06:00  legislator sync [existing]
 #   07:00  bio sync [existing]
 #   10:00  people refresh (USA finishes ~09:00, safe margin)
@@ -237,7 +245,7 @@ openstates_scrape:
   # PLAN-incremental-scraping.md's own rollout condition ("run the VA *or* UT canary first" —
   # singular), before UT and then FL/MA/USA.
   #
-  # Why one and not both: VA and UT both run on the Sunday 02:00 default, so they start
+  # Why one and not both: VA and UT both ran on the Sunday 02:00 default (both Tuesday 12:00 since SYNC-172), so they start
   # simultaneously (confirmed live 2026-08-22 — both at
   # 22:00:00), and run-scrape.sh's import lock is keyed per SCRAPE_KEY so they would NOT
   # serialise. Enabling both would make the very first canary a test of two concurrent
@@ -562,8 +570,8 @@ openstates_scrape:
   # run history is `openstates_scrape:<juris>` for every state and every tempo; the review
   # covers every scraped state (a nightly floor cannot be raised, only advised on).
   #
-  # review_time_utc sits before the day's first scrape (patch refresh 01:00, the Sunday
-  # states 02:00), so a cadence decided this morning takes effect this morning rather than tomorrow.
+  # review_time_utc sits before the day's first scrape (patch refresh 01:00, FL and MI Sunday
+  # 02:00, the other weekly states 12:00), so a cadence decided this morning takes effect this morning rather than tomorrow.
   #
   # Where to see the live cadence: GET /schedule reports `openstates_cadence`, plus the jobs
   # themselves. That endpoint is not a nicety -- the floor rule puts the runtime cadence in
@@ -618,7 +626,7 @@ openstates_scrape:
   defaults:
     floor: weekly
     day: sunday
-    start_utc: "02:00"   # what the retired Sunday batch did: weekly states start together
+    start_utc: "02:00"   # a newly scraped state lands here until it is given its own day below (SYNC-172)
   timing:
     # FL: weekly floor while out of session; OPEN-140's dynamic_cadence raises it to nightly once
     # its run history shows new bills. No session list (SYNC-130): one run scrapes every session the
@@ -632,6 +640,26 @@ openstates_scrape:
     # OPEN-494 (Ramon, 2026-11-06): nightly. The full walk is ~7 h (first scrape 7 h 9 min,
     # 2026-11-02/03), so it finishes ~11:00 UTC.
     pa: {floor: nightly, start_utc: "04:00"}
+    # SYNC-172 (Ramon, 2026-11-17: "Build it now"): the weekly states spread across the week instead of all
+    # starting Sunday 02:00, so the EC2 import, the S3 archive relay and the Mac's LegBot pool get one or two
+    # states a day. 12:00 UTC is after the nightly window (wa 02:30, usa 03:00, pa 04:00, all done by ~11:00).
+    # No day carries more than ~5 h of measured pipeline time except MA's own (10-16 h measured; OPEN-476/477),
+    # which runs alone, so it ends Monday night or early Tuesday. Measured times: the SYNC-172 PR.
+    ma: {floor: weekly, day: monday, start_utc: "12:00"}
+    va: {floor: weekly, day: tuesday, start_utc: "12:00"}
+    ut: {floor: weekly, day: tuesday, start_utc: "12:00"}
+    az: {floor: weekly, day: wednesday, start_utc: "12:00"}
+    nc: {floor: weekly, day: wednesday, start_utc: "12:00"}
+    la: {floor: weekly, day: thursday, start_utc: "12:00"}
+    ne: {floor: weekly, day: thursday, start_utc: "12:00"}
+    al: {floor: weekly, day: friday, start_utc: "12:00"}
+    ga: {floor: weekly, day: friday, start_utc: "12:00"}
+    nv: {floor: weekly, day: saturday, start_utc: "12:00"}
+    or: {floor: weekly, day: saturday, start_utc: "12:00"}
+    # MI stays Sunday 02:00 (the ticket's layout). Nothing ties it to Sunday: mi_cookie_publish is monthly (day 1,
+    # 08:00) and the cloud run only refuses a missing or expiring cookie; it is kept where it is so its WAF history
+    # (OPEN-22 escalation) is not mixed with a day change.
+    mi: {floor: weekly, day: sunday, start_utc: "02:00"}
 
   # Sustained-blocking escalation (OPEN-22). Nothing before this distinguished a first-time
   # WAF block from MI having been blocked for a month straight -- every weekly failure got
@@ -654,7 +682,7 @@ openstates_scrape:
   people_refresh:
     enabled: true
     sync_day: sunday
-    sync_time_utc: "10:00"     # after the Sunday states (~06:00) and USA (~09:00) finish
+    sync_time_utc: "10:00"     # after FL and MI (~03:00) and the nightly USA (~09:00) finish
 
   # SYNC-102: daily fast-forward of the people checkout only. Off unless the host sets
   # OPENSTATES_PEOPLE_PULL_ENABLED=true (per-host, like the other flags).
@@ -935,7 +963,8 @@ docker_cleanup:
 # Ramon turns it on after the first full catch-up. At most max_organizations_per_run per run (~9 s each, so
 # 1,500 is ~3.75 h); the rest waits for next week. When LegBot can't judge it waits and resumes, and stops after
 # 4 h of waiting with one alert. Saturday 16:00 UTC: after the night's scrapes (WA, USA, PA finish by ~11:00) and
-# away from Sunday's all-states scrape, the 05:00 scorecard chain and Sunday's people refresh and VoteBot eval.
+# away from Sunday's FL/MI scrapes, the 05:00 scorecard chain and Sunday's people refresh and VoteBot eval. Saturday's
+# NV and OR (12:00, under an hour, SYNC-172) send LegBot little before it starts.
 organization_logo_catch_up:
   enabled: true
   sync_day: saturday
