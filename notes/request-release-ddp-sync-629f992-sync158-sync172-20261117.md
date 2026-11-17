@@ -21,6 +21,8 @@ No `.env`, IAM, manifest, Dockerfile, compose, requirements or migration change 
 ## Half 1, the Mac (Ramon): SYNC-158
 
 Any time no LegBot run is going on the Mac (the weekly states' LegBot follows their scrape; tonight's wa/usa/pa nightlies end about 11:00 UTC).
+
+**Not while the organization-logo catch-up is running.** As of 11-17 a run is going on the Mac (`organization-logo-backfill-31934376405e`, started 11:00 local, 547 of about 2,100 done at 12:52, so roughly 5 more hours). A kickstart kills it mid-way, and its lease then blocks a new trigger for up to 15 minutes. Before step 2, check `logs/ddp-sync.log` for `organization_logo_catch_up_done` for that run.
 1. `git -C ~/Developer/repos/ddp-sync status` shows `main`, clean apart from the untracked `.env.bak-*` files; then `git -C ~/Developer/repos/ddp-sync pull --ff-only` (expected `629f992`).
 2. `sudo launchctl kickstart -k system/com.ddp.ddp-sync`.
 3. Check: `GET http://localhost:8001/health` healthy; no `Traceback` in the log since the restart. The Mac's scrape jobs stay off as today, so SYNC-172's schedule changes nothing there.
