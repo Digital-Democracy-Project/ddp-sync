@@ -7,13 +7,16 @@ manifest of jurisdictions" (2026-11-10). Two guards:
     (WHEN a state runs, decided to stay in the scheduler; the drift check limits it to scraped states);
   * no module in src/ defines a module- or class-level table (dict, set, list, tuple) whose keys or members are two or
     more state codes, except the reference table below, which covers every state rather than listing the ones we serve (the 50-state session
-    calendar in services/legislative_calendar.py is built without such a literal, so it needs no allowance).
+    calendar in services/legislative_calendar.py is built without such a literal, so it needs no allowance);
+  * (SYNC-159) no module in src/ adds a comparison with a state code (`code == "fl"`, `state in ("ne", "la")`): a state
+    rule belongs in the ETL or the manifest. "us"/"usa" are federal and allowed; today's others are in ALLOWED_COMPARISONS.
 """
 
 from __future__ import annotations
 
 import ast
 import pathlib
+from collections import Counter
 
 import yaml
 
@@ -113,3 +116,115 @@ def test_the_allowed_tables_still_exist():
     """An allowance for a file that no longer has such a table should be removed, not left to excuse a new one."""
     for rel in ALLOWED_TABLES:
         assert list(_tables(REPO / rel)), rel
+
+
+# --- SYNC-159 (PLAN-state-specific-handling, the guard): no new COMPARISON with a state code either. -----------------
+# A branch on one state (`code == "fl"`, `state in ("ne", "la")`) is a state rule; a state's data quirk is fixed in the ETL
+# (openstates-scrapers or openstates-core) and a per-state value goes in the manifest. "us"/"usa" are federal, not states:
+# federal branches stay (plan section 4.3). Today's other comparisons are named by function (code, never a state).
+
+FEDERAL = {"us", "usa"}
+
+# (module path, enclosing scope as Class.function, code compared): (how many such comparisons, why they are allowed).
+# The count is exact: one more comparison with the same code in the same function is a new one and fails. `is` / `is not`
+# with a string is already wrong Python and is not scanned.
+ALLOWED_COMPARISONS = {
+    ("src/ddp_sync/pipelines/knowledge_base_embedding.py", "plan_reconcile", "ok"): (1, "a status ('ok'), not Oklahoma"),
+    ("src/ddp_sync/pipelines/openstates_scrape.py", "read_filing_counts", "ok"): (1, "a status ('ok'), not Oklahoma"),
+    ("src/ddp_sync/pipelines/voatz_brevo.py", "get_voatz_tokens", "ok"): (1, "Voatz's 'OK' reply, not Oklahoma"),
+}
+
+
+def _literals(node) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [n.value for n in node.elts if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    return []
+
+
+def _comparisons(source: str, rel: str):
+    """(module, enclosing function, code) for each ==, !=, in or not in with a state-code literal (each link of a chain
+    on its own; federal codes left out)."""
+    found = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+
+        def _scope(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scope
+
+        def visit_Compare(self, node):
+            operands = [node.left, *node.comparators]
+            codes = {
+                value.lower()
+                for op, left, right in zip(node.ops, operands, operands[1:])
+                if isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn))
+                for side in (left, right)
+                for value in _literals(side)
+                if value.lower() in CODES and value.lower() not in FEDERAL
+            }
+            scope = ".".join(self.stack) or "<module>"
+            found.extend((rel, scope, code) for code in sorted(codes))
+            self.generic_visit(node)
+
+    Visitor().visit(ast.parse(source))
+    return found
+
+
+def _comparisons_in_src():
+    for path in sorted((REPO / "src").rglob("*.py")):
+        yield from _comparisons(path.read_text(), str(path.relative_to(REPO)))
+
+
+def _offenders(found):
+    """Comparisons beyond what ALLOWED_COMPARISONS allows: any not listed, and any listed one seen more times than its
+    count."""
+    counts = Counter(found)
+    return sorted(
+        (key, n) for key, n in counts.items() if n > ALLOWED_COMPARISONS.get(key, (0, ""))[0]
+    )
+
+
+def test_no_module_compares_with_a_state_code():
+    offenders = _offenders(list(_comparisons_in_src()))
+    assert offenders == [], (
+        f"a comparison with a state code (fix the state's data in the ETL or read a manifest value, SYNC-159): {offenders}"
+    )
+
+
+def test_the_comparison_guard_catches_a_planted_branch():
+    planted = '''
+def run(code, state, status):
+    if code == "fl":
+        return 1
+    if state in ("ne", "la"):
+        return 2
+    if "" < code == "WA":
+        return 3
+    if code in ("us", "usa") or status == "done" or code == "xyz":
+        return 4
+'''
+    assert [(f, c) for _, f, c in _comparisons(planted, "new.py")] == [
+        ("run", "fl"), ("run", "la"), ("run", "ne"), ("run", "wa")]
+
+
+def test_a_second_comparison_inside_an_allowed_function_still_fails():
+    key = ("src/ddp_sync/pipelines/openstates_scrape.py", "read_filing_counts", "ok")
+    assert _offenders([key]) == []
+    assert _offenders([key, key]) == [(key, 2)]  # e.g. a `state == "ok"` added beside the status check
+    nested = "class A:\n    def read_filing_counts(self, s):\n        return s == 'ok'\n"
+    # the same function name under a class is a different scope, so the allowance does not cover it
+    assert _offenders(_comparisons(nested, key[0])) == [((key[0], "A.read_filing_counts", "ok"), 1)]
+
+
+def test_the_allowed_comparisons_still_exist():
+    """An allowance for a comparison that was removed should go, not be left to excuse a new one; the count must match."""
+    counts = Counter(_comparisons_in_src())
+    assert {key: counts.get(key, 0) for key in ALLOWED_COMPARISONS} == {
+        key: n for key, (n, _) in ALLOWED_COMPARISONS.items()}
