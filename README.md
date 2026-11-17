@@ -372,6 +372,18 @@ simply undiffed) didn't match the last transition's target ("Substitute #2"). Fi
 caller — instead. A genuinely stale caller (a requested version absent from the bill's archived list
 entirely) still raises and still writes nothing, unchanged.
 
+**Updated 2026-11-17 (SYNC-158, supersedes the SYNC-110 and SYNC-164 rules below): the old side is read,
+not inferred.** The archiver now stamps on every stored comparison the document it was taken against, and
+api-v3 returns it (`diff_baseline_id`, with each version's `current_document_id`; PLAN-state-specific-handling
+phase 1.2). A transition's old version is the one whose document that id names (`_baseline_version`,
+`services/local_openstates_client.py`); when api-v3 returned no version with that document as its text, the
+transition is skipped (`bill_changelog_transition_skipped_no_baseline_text`). This retires ddp-sync's copy of
+the baseline rule (`_diff_baseline_index`), the media-type skip and SYNC-164's cross-media exception: with the
+true baseline named, a media-type mismatch cannot occur. Before the switch (Mac replica, 2026-11-17): every
+stored comparison in every state carries the id (0 without), and every Virginia and Massachusetts bill with a
+comparison gave the same transitions under both rules (VA 6,194, MA 354), with each version's text always
+its current document. The two entries below are kept as history.
+
 **Updated 2026-10-13 (SYNC-110): a transition's *old* version is the one its diff was taken against, not
 the entry before it in api-v3's array.** The walk used to pair each version with `versions[i - 1]`. But
 openstates-core keeps some documents out of the diff lineage (a short procedural document, OPEN-224/246):

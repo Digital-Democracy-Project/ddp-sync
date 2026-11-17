@@ -455,57 +455,29 @@ def _text_link(version: dict) -> dict | None:
     return None
 
 
-def _diff_baseline_index(versions: list[dict], i: int) -> int | None:
-    """Index of the version `versions[i]`'s `diff_from_previous_version` was
-    taken against (SYNC-110), or None if none can be named.
+def _baseline_version(versions: list[dict], newer: dict) -> dict | None:
+    """The version whose document `newer`'s stored comparison was taken against
+    (SYNC-158): the one whose `current_document_id` is `newer`'s
+    `diff_baseline_id`, if api-v3 returned that document as its text. None when
+    no version did (the baseline was a document api-v3 does not return for any
+    version), so the transition is skipped rather than shown against other text.
 
-    Not necessarily `i - 1`. openstates-core's `archive_bill_versions()` gives
-    a version a diff only if it is in the diff lineage, and a version outside
-    it (an unknown stage, or a short procedural document per OPEN-224/246)
-    gets none and is never the baseline for the next one. So the baseline is
-    the nearest earlier version that itself carries a diff -- `""` counts, it
-    means "identical text" -- and, when no earlier version does, the lineage's
-    first document: the first version with archived text. api-v3 does not
-    return the baseline, and this is read off what it does return rather than
-    re-derived: no stage classification and no re-ordering happens here.
-
-    Measured 2026-10-13 by replaying that archiver over the stored documents
-    (read-only; VA, FL, WA, MI, AL, AZ, US and a Utah what-if with its redline
-    and excerpt documents excluded; 21,804 transitions; bills whose versions
-    share a sort key are left out, their lineage order is not recoverable):
-    this rule named the true baseline every time except one Michigan transition
-    in a media-type-split chain, which the caller's media-type check turns into
-    a skip. "The previous array entry" was wrong for 131 of Virginia's 3,184
-    transitions and for about half of Utah's in the what-if.
+    The archiver stamps `diff_baseline_id` on every comparison it stores and
+    api-v3 returns it (PLAN-state-specific-handling phase 1.2a/b). This replaces
+    the inference ddp-sync used to make (SYNC-110's "nearest earlier version
+    with a diff", SYNC-164's cross-media exception and the media-type skip):
+    one of three copies of that rule. Before the switch, on the Mac replica
+    (2026-11-17), every Virginia and Massachusetts bill with a stored comparison
+    gave the same transitions both ways (VA 6,194, MA 354), and every stored
+    comparison in every state carried a baseline id.
     """
-    for j in range(i - 1, -1, -1):
-        if versions[j].get("diff_from_previous_version") is not None and _text_link(versions[j]):
-            return j
-    for j in range(i):
-        if _text_link(versions[j]):
-            return j
+    base = newer.get("diff_baseline_id")
+    if base is None:
+        return None
+    for version in versions:
+        if version is not newer and version.get("current_document_id") == base and _text_link(version):
+            return version
     return None
-
-
-def _no_earlier_document_of_type(versions: list[dict], i: int, media_type: str) -> bool:
-    """True when no version before `versions[i]` has a document that could be of
-    `media_type` (SYNC-164). A link with no media type might be one, so it counts.
-
-    openstates-core compares a document with the previous one of its own media type
-    (OPEN-217), and stores no comparison at all when there is none -- except where its
-    `_diff_baseline` allows another type (OPEN-223: Massachusetts' HTML chapter law
-    after the bill's PDF). So a document that carries a diff but has no earlier
-    document of its own type was compared across media types by core's own rule, and
-    the other type's document is the one api-v3 returns for the baseline. The rule's
-    states are not repeated here: the stored diff is core's answer for that pair.
-    Measured 2026-11-15 on the Mac replica: 364 stored diffs have this shape, all
-    Massachusetts HTML, none in any other state.
-    """
-    for version in versions[:i]:
-        for link in version.get("links") or []:
-            if link.get("media_type") in (media_type, None, ""):
-                return False
-    return True
 
 
 async def get_archived_version_transitions(bill_openstates_id: str) -> dict | None:
@@ -539,21 +511,13 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
     diff against by definition) is simply skipped -- self-correcting once the
     missing input actually appears archived on a later run, never guessed at.
 
-    SYNC-110: the OLD side of a transition is the version that diff was taken
-    against (`_diff_baseline_index`), not blindly the previous array entry. The
-    entry before a version can be one the archiver kept out of the diff lineage
-    (a short procedural document, OPEN-224/246), and then its text and its
-    note would be shown, and recorded as `compare_version`, next to a diff
-    computed against a different document. A pair whose two chosen documents
-    are known to be of different media types is skipped: the archiver diffs
-    each media type against its own earlier documents (OPEN-217), and api-v3
-    returns only one document per version, so the true baseline's text is not
-    available. A missing media type is unknown, not different. SYNC-164: a pair
-    is kept when the newer document has no earlier document of its own type,
-    because then its stored diff is core's own cross-media comparison
-    (`_no_earlier_document_of_type`).
-    Still unrecoverable here, and left alone: bills whose versions share a sort
-    key (the archiver's order among them was whatever the database returned).
+    SYNC-110/SYNC-158: the OLD side of a transition is the version whose
+    document that diff was taken against, read from api-v3's `diff_baseline_id`
+    (`_baseline_version`), not the previous array entry: the entry before a
+    version can be one the archiver kept out of the diff lineage (a short
+    procedural document, OPEN-224/246). When api-v3 returned no version with that
+    document as its text (the baseline was another document of some version),
+    the transition is skipped rather than shown against other text.
 
     Args:
         bill_openstates_id: bare UUID, same convention as
@@ -620,8 +584,7 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
 
     versions = data.get("versions") or []
     transitions: list[dict] = []
-    for i in range(1, len(versions)):
-        newer = versions[i]
+    for newer in versions:
         diff_source = newer.get("diff_from_previous_version")
         if not diff_source:
             # Either `newer` is itself unclassifiable (api-v3 never attaches
@@ -629,33 +592,16 @@ async def get_archived_version_transitions(bill_openstates_id: str) -> dict | No
             # predecessor's text simply isn't archived yet -- either way,
             # nothing to generate for this hop right now.
             continue
-        baseline = _diff_baseline_index(versions, i)
-        if baseline is None:
-            continue
-        older = versions[baseline]
-        old_link = _text_link(older)
-        new_link = _text_link(newer)
-        old_media_type = old_link.get("media_type")
-        new_media_type = new_link.get("media_type") if new_link else None
-        # Skip only when both types are known and differ; an absent one proves nothing.
-        # SYNC-164: except when the newer document has no possible same-type baseline (see
-        # _no_earlier_document_of_type): then its stored diff can only be core's own
-        # cross-media comparison, taken against the very document returned as the old side.
-        if (
-            old_media_type
-            and new_media_type
-            and old_media_type != new_media_type
-            and not _no_earlier_document_of_type(versions, i, new_media_type)
-        ):
+        older = _baseline_version(versions, newer)
+        if older is None:
             logger.info(
-                "bill_changelog_transition_skipped_media_type_mismatch",
+                "bill_changelog_transition_skipped_no_baseline_text",
                 bill_openstates_id=bill_openstates_id,
-                old_version_note=older.get("note", ""),
                 new_version_note=newer.get("note", ""),
-                old_media_type=old_media_type,
-                new_media_type=new_media_type,
+                diff_baseline_id=newer.get("diff_baseline_id"),
             )
             continue
+        old_link = _text_link(older)
         transitions.append({
             "old_bill_source": old_link["raw_text"],
             "diff_source": diff_source,
