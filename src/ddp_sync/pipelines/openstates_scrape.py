@@ -190,7 +190,7 @@ WAF_BLOCK_MARKERS = ("consecutive waf blocks detected", "waf block detected")
 # for a WAF block signature classify_failure_reason() cannot otherwise see (see
 # _read_scraper_log_tail's docstring for the full story). Generous relative to the 500-byte
 # stderr tail elsewhere in this module because scraper.log is shared across concurrent
-# jurisdiction runs (the weekly states start together on Sunday, each its own job),
+# jurisdiction runs (the nightly states overlap, and so do the weekly ones that share a day),
 # so the line this run actually wrote can sit behind other jurisdictions' output; small enough
 # that reading it after every failed run is still a cheap, bounded file read.
 SCRAPER_LOG_TAIL_BYTES = 8192
@@ -1671,7 +1671,7 @@ SCRAPE_HISTORY_FLOW = "openstates_scrape"
 LEGACY_SCRAPE_HISTORY_FLOW = "openstates_secondary_scrapes"
 
 # A scraped state with no `openstates_scrape.timing` entry gets these, overlaid by `openstates_scrape.defaults`.
-# Weekly, Sunday 02:00 UTC: what the retired secondary batch did, so weekly states keep starting together.
+# Weekly, Sunday 02:00 UTC: where a scraped state with no `timing` entry runs (SYNC-172 gave each weekly state its own day).
 DEFAULT_TIMING: dict[str, Any] = {"floor": "weekly", "day": "sunday", "start_utc": "02:00"}
 _TIMING_FLOORS = ("nightly", "weekly")
 
