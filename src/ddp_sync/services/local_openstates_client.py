@@ -472,10 +472,10 @@ def _baseline_version(versions: list[dict], newer: dict) -> dict | None:
     comparison in every state carried a baseline id.
     """
     base = newer.get("diff_baseline_id")
-    if base is None:
+    if base is None or base == newer.get("current_document_id"):  # a document is never its own baseline
         return None
     for version in versions:
-        if version is not newer and version.get("current_document_id") == base and _text_link(version):
+        if version.get("current_document_id") == base and _text_link(version):
             return version
     return None
 

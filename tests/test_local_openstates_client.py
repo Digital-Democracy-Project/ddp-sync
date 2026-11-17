@@ -1347,6 +1347,15 @@ async def test_a_version_never_names_itself():
 
 
 @pytest.mark.asyncio
+async def test_a_version_never_names_itself_even_through_another_entry_with_its_document():
+    """Compared by document, not by list entry: another entry carrying the same document
+    cannot stand in as the baseline."""
+    newer = _ver("Substitute #1", diff=_DIFF, base="Substitute #1")
+    duplicate = _ver("Substitute #1")
+    assert await _transitions_for([_ver("Introduced"), duplicate, newer]) is None
+
+
+@pytest.mark.asyncio
 async def test_current_version_identity_picks_latest_and_title():
     mock_client = AsyncMock()
     response = MagicMock()
