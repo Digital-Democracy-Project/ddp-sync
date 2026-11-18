@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -423,3 +424,59 @@ def session_run_as_read(record: dict[str, Any], now: datetime | None = None) -> 
     if age > SESSION_RUN_LOST_AFTER_SECONDS:
         return {**record, "status": "lost", "error": "no heartbeat: ddp-sync restarted during the run"}
     return record
+
+
+# ---- SYNC-179: nothing of the previous process's session runs survives a restart ----
+#
+# A background session run lives in this process (run_session_pipeline_in_background), so a restart ends it. Its Redis record
+# still said "running" (for up to SESSION_RUN_LOST_AFTER_SECONDS, then `lost`), so `ddp-sync status` showed it running and
+# "Safe to restart: NO"; and its per-session lock (_LOCK_KEY_PREFIX) stayed held until its TTL, so a resend for the same
+# state was refused "already running" (2026-11-18: North Carolina's OPEN-390 batch 3 waited again). Like SYNC-153's
+# clear_state_locks, this runs at start-up before the scheduler (and again when Redis comes up late, SYNC-160): only this
+# process takes these locks and writes these records, so whatever is there then belongs to a process that is gone.
+
+RESTART_STOPPED_ERROR = "stopped by a restart: ddp-sync restarted during the run"
+
+
+async def stop_previous_process_session_runs() -> dict[str, int]:
+    """Delete every per-session LegBot lock, then mark every background session-run record whose status is exactly `queued`
+    or `running` as `lost` (error RESTART_STOPPED_ERROR, finished now); any other status is left alone. Returns
+    {"runs": n, "locks": n}. The locks go first, each step on its own: they are what refuses a resend, and a Redis error in
+    one step must not skip the other. Never raises: start-up must not fail on it.
+
+    Safe because no run of the previous process can still be alive: ddp-sync is one uvicorn process per host bound to its port
+    (a second cannot start while the first holds it, and launchd's `kickstart -k` / systemd stop the old one first), and this
+    runs before the scheduler and before Redis-backed triggers can take a lock (the same ground SYNC-153 stands on)."""
+    from ddp_sync.services.redis_store import RedisStore, get_redis_store
+
+    store = get_redis_store()
+    client = store._client
+    counts = {"runs": 0, "locks": 0}
+    if client is None:
+        return counts
+    try:
+        locks = [k async for k in client.scan_iter(match=f"{_LOCK_KEY_PREFIX}*", count=1000)]
+        if locks:
+            await client.delete(*locks)
+        counts["locks"] = len(locks)
+    except Exception as e:  # noqa: BLE001 -- startup must not fail on this
+        logger.error("legbot_session_locks_startup_release_failed", error=str(e))
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        async for key in client.scan_iter(match=f"{RedisStore.LEGBOT_SESSION_RUN_PREFIX}*", count=1000):
+            raw = await client.get(key)
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if record.get("status") not in ("queued", "running"):
+                continue
+            key_text = key.decode() if isinstance(key, bytes) else str(key)
+            record.update(status="lost", error=RESTART_STOPPED_ERROR, finished_at=now, updated_at=now)
+            await store.set_legbot_session_run(
+                record.get("run_id") or key_text.removeprefix(RedisStore.LEGBOT_SESSION_RUN_PREFIX), record)
+            counts["runs"] += 1
+    except Exception as e:  # noqa: BLE001 -- startup must not fail on this
+        logger.error("legbot_session_runs_startup_cleanup_failed", error=str(e))
+    logger.info("legbot_session_runs_stopped_at_startup", **counts)
+    return counts
