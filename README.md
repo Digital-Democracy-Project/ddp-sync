@@ -372,6 +372,18 @@ simply undiffed) didn't match the last transition's target ("Substitute #2"). Fi
 caller — instead. A genuinely stale caller (a requested version absent from the bill's archived list
 entirely) still raises and still writes nothing, unchanged.
 
+**Updated 2026-11-18 (SYNC-177): one failed transition no longer stops the bill's others.** A LegBot
+timeout or failure (`LegBotDispatchError`) or a broker write rejection (`BrokerClientError`) on one
+transition used to leave the walk at once, so every later transition went untried — NC SB1041's Edition 2
+hit the 1,800 s inference timeout and Edition 3, Edition 4 and Ratified were never dispatched. Now the walk
+logs `bill_changelog_transition_failed` and carries on. Nothing is written for the failed transition (as
+before), so the next run's coverage checks offer it again. A later transition can still be written: its
+compare_version is a non-latest version, and the up-front ledger backfill already wrote every one of those.
+Reporting: if the caller's own version got its row, the call returns `status="failed"` (`failure_stage=
+"dispatch_error"`) and the batch runner counts `bill_changelog` in `artifacts_failed`; if it did not, the
+first error is raised after the walk, exactly as before. Any other exception still stops the walk. No
+retry, timeout or setting changed.
+
 **Updated 2026-11-17 (SYNC-158, supersedes the SYNC-110 and SYNC-164 rules below): the old side is read,
 not inferred.** The archiver now stamps on every stored comparison the document it was taken against, and
 api-v3 returns it (`diff_baseline_id`, with each version's `current_document_id`; PLAN-state-specific-handling

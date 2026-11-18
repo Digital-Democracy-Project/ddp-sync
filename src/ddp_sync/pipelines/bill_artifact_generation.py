@@ -759,10 +759,10 @@ async def _dispatch_and_write_changelog(
     SYNC-44: the write-side body shared by generate_and_store_bill_changelog's
     two callers below (the single latest transition, and its own full-history
     walk) -- both resolve WHICH transition(s) to generate differently, but
-    dispatch and persist a single, already-resolved one identically. Neither
-    caller wraps this in a try/except for LegBotDispatchError or
-    BrokerClientError -- both propagate uncaught, same convention as
-    generate_and_store_bill_artifact.
+    dispatch and persist a single, already-resolved one identically.
+    LegBotDispatchError and BrokerClientError propagate uncaught from here;
+    since SYNC-177 the walk catches them per transition so one failed
+    transition does not stop the bill's others (see that loop's comment).
 
     target_artifact_id (SYNC-62): passed straight through to write_bill_
     artifact -- see that function's own artifact_id docstring. Only ever
@@ -1269,8 +1269,12 @@ async def generate_and_store_bill_changelog(
             with fresh version info -- since nothing was written, a future
             coverage check still sees this bill as missing bill_changelog and
             will dispatch it again.
-        LegBotDispatchError: LegBot unreachable/timed out -- propagates
-            uncaught, same convention as generate_and_store_bill_artifact.
+        LegBotDispatchError: LegBot unreachable/timed out. SYNC-177: caught
+            per transition, so the bill's other transitions are still
+            dispatched; re-raised (the first one) after the walk only when
+            the caller's own version_date/version_note got no row. When it
+            did, the failure is returned as status="failed" instead (see
+            Returns).
         BrokerClientError: ddp-broker-py rejected a request or was
             unreachable -- propagates uncaught, same convention as
             generate_and_store_bill_artifact. Two distinct sources when
@@ -1286,7 +1290,9 @@ async def generate_and_store_bill_changelog(
             once the bill's current latest version still shows no
             bill_changelog, re-walks from the start; re-dispatching an
             already-succeeded transition again is a harmless idempotent
-            update to that same row, not a duplicate.
+            update to that same row, not a duplicate. SYNC-177: a write
+            failing mid-walk no longer stops the walk either; it is handled
+            exactly like LegBotDispatchError above.
 
     Returns:
         The BillArtifact write response as ddp-broker-py's API reports it,
@@ -1303,7 +1309,10 @@ async def generate_and_store_bill_changelog(
         get reported as "complete" to session_pipeline_runner.py's caller,
         even though a real failed row was left behind with nothing left to
         revisit it (the outer coverage gate only ever looks at the bill's
-        current latest version).
+        current latest version). SYNC-177: a transition that raised counts as
+        a failure here too, reported as {"status": "failed", "failure_stage":
+        "dispatch_error", "failure_reason": <the error>} with nothing written
+        for it.
 
         SYNC-56: also carries `requested_version_written: False` -- omitted
         entirely otherwise -- when none of the dispatched transitions
@@ -1539,6 +1548,26 @@ async def generate_and_store_bill_changelog(
     # kept a `pending` bill_changelog row 40+ seconds after dispatch, sitting
     # beside the older transition's real, complete row.
     requested_version_written = False
+    # SYNC-177: the first transition that RAISED (LegBot timed out or failed,
+    # or the broker rejected the write). Before this, that raise left the loop
+    # at once and every later transition of the bill went untried -- NC SB1041
+    # (2026-11-18): Edition 2's task hit the 1,800 s inference timeout, so
+    # Edition 3, Edition 4 and Ratified were never dispatched. Now the loop
+    # carries on and the failure is reported after it (see below).
+    #
+    # A later transition can still be written after an earlier one failed:
+    # its compare_version (the failed transition's target) is never the
+    # bill's latest version, and _backfill_missing_versions above already
+    # wrote every non-latest version as a ledger row -- so the write does not
+    # depend on the earlier transition's artifact existing. If that backfill
+    # did miss the row, the later write fails on its own and is caught here
+    # like any other.
+    #
+    # Nothing is written for a transition that raised -- the same as before
+    # this ticket. Its version keeps no bill_changelog, so the outer coverage
+    # gate (_changelog_fully_covered) and the per-transition filter above
+    # both offer it again on the next run.
+    first_exception: Exception | None = None
     for transition in transitions:
         # SYNC-62: computed before dispatching, not after -- target_artifact_id
         # must only ever reach the one transition targeting the caller's own
@@ -1549,33 +1578,61 @@ async def generate_and_store_bill_changelog(
             transition["new_version_date"] == version_date
             and transition["new_version_note"] == version_note
         )
-        last_result = await _dispatch_and_write_changelog(
-            bill_openstates_id=bill_openstates_id,
-            jurisdiction=jurisdiction,
-            session_code=session_code,
-            version_date=transition["new_version_date"],
-            version_note=transition["new_version_note"],
-            old_bill_source=transition["old_bill_source"],
-            diff_source=transition["diff_source"],
-            old_version_date=transition["old_version_date"],
-            old_version_note=transition["old_version_note"],
-            target_artifact_id=target_artifact_id if is_requested_version else None,
-            broker_api_base=broker_api_base,
-            broker_api_token=broker_api_token,
-        )
+        try:
+            last_result = await _dispatch_and_write_changelog(
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction=jurisdiction,
+                session_code=session_code,
+                version_date=transition["new_version_date"],
+                version_note=transition["new_version_note"],
+                old_bill_source=transition["old_bill_source"],
+                diff_source=transition["diff_source"],
+                old_version_date=transition["old_version_date"],
+                old_version_note=transition["old_version_note"],
+                target_artifact_id=target_artifact_id if is_requested_version else None,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        except (LegBotDispatchError, BrokerClientError) as exc:
+            logger.warning(
+                "bill_changelog_transition_failed -- carrying on with the "
+                "bill's other transitions (SYNC-177)",
+                bill_openstates_id=bill_openstates_id,
+                version_note=transition["new_version_note"],
+                compare_version_note=transition["old_version_note"],
+                error=str(exc),
+            )
+            if first_exception is None:
+                first_exception = exc
+            if first_failure is None:
+                first_failure = {
+                    "status": "failed",
+                    "failure_stage": "dispatch_error",
+                    "failure_reason": str(exc),
+                }
+            continue
         if is_requested_version:
             # Named "written", not just "targeted": _dispatch_and_write_
             # changelog above either returns after a real write_bill_artifact
             # call (complete, or failed via insufficient_information) or
             # raises (BrokerClientError/LegBotDispatchError) -- there is no
-            # path where it returns without one. A raise here propagates out
-            # of this whole function uncaught, and dispatch_and_record_bill_
-            # artifact's own outer except block already resolves the
-            # placeholder in that case -- so by the time this line runs at
-            # all, a real terminal row exists for this transition.
+            # path where it returns without one, and a raise skips this line
+            # (SYNC-177: `continue` above).
             requested_version_written = True
         if first_failure is None and last_result.get("status") != "complete":
             first_failure = last_result
+    if first_exception is not None and not requested_version_written:
+        # The caller's own version got no row (its transition raised, or it
+        # has no transition of its own, SYNC-46): raise exactly as before,
+        # only now after the other transitions were tried. The batch caller
+        # records it in artifacts_failed and logs session_pipeline_artifact_
+        # dispatch_failed; the on-demand caller resolves its placeholder to
+        # failed/dispatch_error. When the caller's own version WAS written,
+        # raising would make the on-demand caller overwrite that real row
+        # (its placeholder) with a failed one, so the failure is reported as
+        # the status above instead -- the batch caller counts any
+        # non-complete status in artifacts_failed.
+        raise first_exception
     result = first_failure if first_failure is not None else last_result
     if requested_version_written:
         return result

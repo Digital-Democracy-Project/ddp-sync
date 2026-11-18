@@ -1254,6 +1254,317 @@ async def test_changelog_requested_version_not_targeted_and_an_older_transition_
 
 
 # ---------------------------------------------------------------------------
+# SYNC-177: one transition that times out or fails must not stop the bill's
+# other transitions. The case: NC SB1041 (2026-11-18), whose Edition 2 task
+# hit the 1,800 s inference timeout, so Edition 3, Edition 4 and Ratified
+# were never tried. Same shape here with three hops, the middle one failing.
+# ---------------------------------------------------------------------------
+
+_LATER_TRANSITION = {
+    "old_bill_source": "Archived engrossed text.",
+    "diff_source": "--- Engrossed\n+++ Enrolled\n@@ -1 +1 @@\n-x\n+y\n",
+    "old_version_date": "2026-02-01",
+    "old_version_note": "Engrossed",
+    "new_version_date": "2026-03-01",
+    "new_version_note": "Enrolled",
+}
+
+_RESOLVED_THREE_TRANSITIONS = {
+    # Filed -> Introduced, Introduced -> Engrossed (the one that fails),
+    # Engrossed -> Enrolled (names the failed one's target as compare_version).
+    "transitions": [_EARLIER_TRANSITION, _ONE_TRANSITION, _LATER_TRANSITION],
+    "versions": _RESOLVED_LATEST_HAS_NO_DIFF["versions"],
+}
+
+_THREE_TRANSITION_KWARGS = {**_CHANGELOG_KWARGS, "version_date": "2026-03-01", "version_note": "Enrolled"}
+
+
+def _middle_fails(exc):
+    """A dispatch_bill_changelog fake that raises `exc` for the middle hop
+    (Introduced -> Engrossed) only, and records every call in order."""
+    calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        calls.append(old_bill_source)
+        if old_bill_source == "Archived introduced text.":
+            raise exc
+        return _CHANGELOG_DISPATCH_RESULT
+
+    return calls, _fake_dispatch
+
+
+@pytest.mark.asyncio
+async def test_changelog_middle_transition_timeout_still_writes_the_others():
+    """SYNC-177 acceptance: the middle hop times out, the hops before and after
+    it are still dispatched and written, nothing is written for the failed hop,
+    and the call reports failed (so the batch runner's artifacts_failed stays
+    truthful)."""
+    calls, fake_dispatch = _middle_fails(LegBotDispatchError(
+        "LegBot task 2f04a3ef did not finish within its timeout window "
+        "(inference timeout 1800.0s (generation had started)) (last status: running)"
+    ))
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": len(write_calls), "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        result = await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS)
+
+    # All three were tried, oldest-first.
+    assert calls == ["Archived filed text.", "Archived introduced text.", "Archived engrossed text."]
+    # Rows for the two that worked; none for the one that timed out (the same
+    # as before SYNC-177, so the next run sees that version as missing one).
+    assert [(w["version_note"], w["status"]) for w in write_calls] == [
+        ("Introduced", "complete"), ("Enrolled", "complete"),
+    ]
+    assert result["status"] == "failed"
+    assert result["failure_stage"] == "dispatch_error"
+    assert "did not finish within its timeout window" in result["failure_reason"]
+    # The requested version (Enrolled) was written, so no placeholder fix-up.
+    assert "requested_version_written" not in result
+
+
+@pytest.mark.asyncio
+async def test_changelog_later_transition_is_written_against_the_failed_ones_target():
+    """SYNC-177, the earlier-must-exist rule (SYNC-26/28): the hop after the
+    failed one names the failed hop's target (Engrossed) as compare_version.
+    That row comes from the up-front ledger backfill, which ran before any
+    dispatch and included Engrossed, not from the failed hop's artifact, so
+    the later write still goes out with compare_version = Engrossed."""
+    order = []
+    calls, fake_dispatch = _middle_fails(LegBotDispatchError("timed out"))
+
+    async def _fake_backfill(**kwargs):
+        order.append(("backfill", [v["note"] for v in kwargs["versions"]], kwargs["latest_version"]["note"]))
+        return 0
+
+    async def _dispatch(**kwargs):
+        order.append(("dispatch", kwargs["old_bill_source"]))
+        return await fake_dispatch(**kwargs)
+
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": len(write_calls), "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=_fake_backfill,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS)
+
+    # Backfill first, over every version (Engrossed included; it skips only
+    # the latest, Enrolled, by its own rule), before any dispatch.
+    assert order[0] == ("backfill", ["Filed", "Introduced", "Engrossed", "Enrolled"], "Enrolled")
+    assert [o[0] for o in order[1:]] == ["dispatch", "dispatch", "dispatch"]
+    enrolled = [w for w in write_calls if w["version_note"] == "Enrolled"]
+    assert len(enrolled) == 1
+    assert enrolled[0]["compare_version_note"] == "Engrossed"
+    assert enrolled[0]["compare_version_date"] == "2026-02-01"
+
+
+@pytest.mark.asyncio
+async def test_changelog_middle_write_rejected_still_writes_the_later_transition():
+    """SYNC-177: the broker rejecting one hop's write (e.g. the compare_version
+    row missing because the best-effort backfill missed it) is handled the same
+    way as a LegBot timeout -- the next hop is still dispatched and written."""
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs["version_note"])
+        if kwargs["version_note"] == "Engrossed":
+            raise BrokerClientError("No BillVersion exists for compare_version_note=Introduced")
+        return {"id": len(write_calls), "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=AsyncMock(return_value=_CHANGELOG_DISPATCH_RESULT),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        result = await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS)
+
+    assert write_calls == ["Introduced", "Engrossed", "Enrolled"]
+    assert result["status"] == "failed"
+    assert "No BillVersion exists" in result["failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_changelog_requested_transition_failing_still_raises_after_the_others():
+    """SYNC-177: when the hop that targets the caller's own version is the one
+    that fails, the call still raises as before (the batch runner logs it and
+    counts it failed; the on-demand caller marks its placeholder failed) -- but
+    only after the earlier hops were tried and written. With two failures, the
+    first one is what is raised."""
+    write_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        if old_bill_source == "Archived introduced text.":
+            raise LegBotDispatchError("first: middle timed out")
+        if old_bill_source == "Archived engrossed text.":
+            raise LegBotDispatchError("second: last timed out")
+        return _CHANGELOG_DISPATCH_RESULT
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs["version_note"])
+        return {"id": 1, "created": True}
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        with pytest.raises(LegBotDispatchError, match="first: middle timed out"):
+            await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS)
+
+    assert write_calls == ["Introduced"]
+
+
+@pytest.mark.asyncio
+async def test_changelog_an_unexpected_error_still_stops_the_walk():
+    """SYNC-177 is scoped to LegBot and broker failures. Any other exception
+    (a bug) still leaves the loop at once, as before."""
+    calls, fake_dispatch = _middle_fails(KeyError("answer"))
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ):
+        with pytest.raises(KeyError):
+            await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS)
+
+    assert calls == ["Archived filed text.", "Archived introduced text."]
+
+
+@pytest.mark.asyncio
+async def test_changelog_next_run_retries_only_the_failed_transition():
+    """SYNC-177 acceptance "a later run can retry it": after the run above, the
+    broker holds changelogs on Introduced and Enrolled and none on Engrossed.
+    The next batch run (gov_id given) re-dispatches only Engrossed's hop."""
+    coverage = {
+        "versions": [
+            {"version_note": "Filed", "artifacts": {}},
+            {"version_note": "Introduced", "artifacts": {"bill_changelog": {"status": "complete"}}},
+            {"version_note": "Engrossed", "artifacts": {}},
+            {"version_note": "Enrolled", "artifacts": {"bill_changelog": {"status": "complete"}}},
+        ],
+        "unclassified_versions": [],
+    }
+    dispatch_calls = []
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        dispatch_calls.append(old_bill_source)
+        return _CHANGELOG_DISPATCH_RESULT
+
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_bill_artifact_coverage_all_versions",
+        new=AsyncMock(return_value=coverage),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=_fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=AsyncMock(return_value={"id": 1, "created": True}),
+    ) as mock_write:
+        result = await generate_and_store_bill_changelog(**_THREE_TRANSITION_KWARGS, gov_id="SB1041")
+
+    assert dispatch_calls == ["Archived introduced text."]
+    assert mock_write.await_args.kwargs["version_note"] == "Engrossed"
+    assert result["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_ondemand_changelog_keeps_its_written_placeholder_when_an_older_transition_fails():
+    """SYNC-177, on-demand path: an older hop timing out must not make
+    dispatch_and_record_bill_artifact overwrite the placeholder that the
+    requested hop has just filled with a real changelog. Runs the real
+    generate_and_store_bill_changelog underneath."""
+    write_calls = []
+
+    async def _fake_write(**kwargs):
+        write_calls.append(kwargs)
+        return {"id": 77 if kwargs["status"] == "pending" else len(write_calls), "created": True}
+
+    calls, fake_dispatch = _middle_fails(LegBotDispatchError("timed out"))
+    with patch(
+        "ddp_sync.pipelines.bill_artifact_generation.get_archived_version_transitions",
+        new=AsyncMock(return_value=_RESOLVED_THREE_TRANSITIONS),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.dispatch_bill_changelog",
+        new=fake_dispatch,
+    ), patch(
+        "ddp_sync.pipelines.bill_artifact_generation.write_bill_artifact",
+        new=_fake_write,
+    ):
+        await dispatch_and_record_bill_artifact(
+            **{**_ONDEMAND_KWARGS, "version_date": "2026-03-01", "version_note": "Enrolled"},
+            artifact_type="bill_changelog",
+        )
+
+    placeholder_writes = [(w["status"], w["version_note"]) for w in write_calls if w.get("artifact_id") == 77]
+    # The requested hop wrote "complete" onto the placeholder, and nothing
+    # wrote "failed" over it afterwards.
+    assert placeholder_writes == [("complete", "Enrolled")]
+    assert [w["status"] for w in write_calls] == ["pending", "complete", "complete"]
+
+
+# ---------------------------------------------------------------------------
 # AC2/BROKER-130 (2026-08-29): a subsequent run must skip transitions that
 # already have a bill_changelog, gated on gov_id being supplied. This is the
 # gap /pm-review's SECOND pass found live: calling generate_and_store_

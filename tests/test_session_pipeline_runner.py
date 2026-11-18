@@ -19,6 +19,7 @@ from ddp_sync.pipelines.session_pipeline_runner import (
     run_single_bill_full,
 )
 from ddp_sync.services.broker_client import BrokerClientError
+from ddp_sync.services.legbot_client import LegBotDispatchError
 
 
 @pytest.fixture(autouse=True)
@@ -724,6 +725,66 @@ async def test_a_transition_holding_only_a_rejected_changelog_is_not_covered():
 
     mock_changelog.assert_awaited_once()
     assert result["results"][0]["artifacts_skipped_present"] == []
+
+
+@pytest.mark.asyncio
+async def test_one_timed_out_changelog_transition_is_reported_failed_and_the_rest_written():
+    """SYNC-177, through the batch runner with the real changelog function: the
+    NC SB1041 shape (the middle of three transitions times out). The other two
+    are written, and the per-bill result still lists bill_changelog under
+    artifacts_failed, not artifacts_generated."""
+    transitions = [
+        {
+            "old_bill_source": f"text {old}", "diff_source": f"diff {old}->{new}",
+            "old_version_date": "", "old_version_note": old,
+            "new_version_date": "", "new_version_note": new,
+        }
+        for old, new in (("Edition 1", "Edition 2"), ("Edition 2", "Edition 3"), ("Edition 3", "Ratified"))
+    ]
+    resolved = {
+        "transitions": transitions,
+        "versions": [{"date": "", "note": n} for n in ("Edition 1", "Edition 2", "Edition 3", "Ratified")],
+    }
+
+    async def _fake_dispatch(*, old_bill_source, diff_source, on_task_created=None):
+        if old_bill_source == "text Edition 2":
+            raise LegBotDispatchError("did not finish within its timeout window")
+        return {
+            "answer": {
+                "insufficient_information": False, "sections_added": [], "sections_removed": [],
+                "sections_modified": [], "policy_implications": "",
+            },
+            "backend": "mlx",
+        }
+
+    written = []
+
+    async def _fake_write(**kwargs):
+        written.append(kwargs["version_note"])
+        return {"id": len(written), "created": True}
+
+    gen = "ddp_sync.pipelines.bill_artifact_generation"
+    with _patch_lister([_CANDIDATE]), _patch_coverage(None), _patch_version(
+        {**_VERSION_IDENTITY, "version_date": "", "version_note": "Ratified"}
+    ), patch(f"{gen}.get_archived_version_transitions", new=AsyncMock(return_value=resolved)), patch(
+        f"{gen}.get_bill_artifact_coverage_all_versions", new=AsyncMock(return_value=None),
+    ), patch(
+        "ddp_sync.pipelines.bill_version.BillVersionSyncService._backfill_missing_versions",
+        new=AsyncMock(return_value=0),
+    ), patch(f"{gen}.dispatch_bill_changelog", new=_fake_dispatch), patch(
+        f"{gen}.write_bill_artifact", new=_fake_write,
+    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        result = await run_legbot_pipeline(
+            "fl", "2026F", ["bill_changelog"], True, limit=10,
+            include_concept_statements=False,
+            retry_failed=False,
+        )
+
+    assert written == ["Edition 2", "Ratified"]
+    bill = result["results"][0]
+    assert bill["artifacts_failed"] == ["bill_changelog"]
+    assert bill["artifacts_generated"] == []
+    assert bill["error"] is None
 
 
 @pytest.mark.asyncio
