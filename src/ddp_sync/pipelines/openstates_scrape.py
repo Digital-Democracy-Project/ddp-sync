@@ -999,11 +999,41 @@ def _run_with_group_kill(
             watchdog.join(timeout=_STALL_POLL_SECONDS + 5)
 
 
-# SYNC-128: how long one jurisdiction's bill-event signal to the broker covers. FL/USA call
-# _run_scrape() once per session, back to back; this keeps that to one signal per run. A later
-# scrape of the same jurisdiction (new data) signals again once the window has passed.
-_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_PREFIX = "ddp:broker_bill_event_signal:"
-_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_TTL_SECONDS = 900
+# SYNC-128: how long one jurisdiction's signal to the broker covers. FL/USA call _run_scrape() once per session, back to
+# back; this keeps that to one signal per run. A later scrape of the same jurisdiction (new data) signals again once the
+# window has passed. Each signal has its own key, `ddp:<signal name>:<code>`.
+_BROKER_SIGNAL_DEBOUNCE_TTL_SECONDS = 900
+
+
+async def _send_broker_signal(name: str, code: str, send) -> None:
+    """Send one after-scrape signal to ddp-broker-py, the way every such signal is sent (SYNC-128): skipped loudly when
+    the broker base or token is unset, debounced 15 minutes per jurisdiction (`ddp:<name>:<code>`, SET NX EX; the
+    debounce fails open, a duplicate signal is harmless), then `await send(code)`. Logs `<name>_sent`; raises what
+    `send` raises (the caller's catch-all turns it into a WARNING)."""
+    from ddp_sync.config import get_settings
+
+    settings = get_settings()
+    if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
+        logger.warning(f"{name}_not_configured", jurisdiction=code)
+        return
+
+    try:
+        from ddp_sync.services.redis_store import get_redis_store
+
+        redis_client = get_redis_store()._client
+        if redis_client and not await redis_client.set(
+            f"ddp:{name}:{code}",
+            "1",
+            nx=True,
+            ex=_BROKER_SIGNAL_DEBOUNCE_TTL_SECONDS,
+        ):
+            logger.info(f"{name}_debounced", jurisdiction=code)
+            return
+    except Exception as e:  # noqa: BLE001 -- fail open: a duplicate signal is harmless
+        logger.warning(f"{name}_debounce_failed_proceeding", jurisdiction=code, error=str(e))
+
+    await send(code)
+    logger.info(f"{name}_sent", jurisdiction=code)
 
 
 async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | None) -> None:
@@ -1025,34 +1055,39 @@ async def _maybe_signal_broker_bill_events(jurisdiction: str, config: dict | Non
         if not enrollment.is_enrolled("broker_bill_event_signal", code, _get_root(config)):  # SYNC-157: the manifest
             return
 
-        from ddp_sync.config import get_settings
+        from ddp_sync.services import broker_client
 
-        settings = get_settings()
-        if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
-            logger.warning("broker_bill_event_signal_not_configured", jurisdiction=code)
-            return
-
-        try:
-            from ddp_sync.services.redis_store import get_redis_store
-
-            redis_client = get_redis_store()._client
-            if redis_client and not await redis_client.set(
-                f"{_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_PREFIX}{code}",
-                "1",
-                nx=True,
-                ex=_BROKER_BILL_EVENT_SIGNAL_DEBOUNCE_TTL_SECONDS,
-            ):
-                logger.info("broker_bill_event_signal_debounced", jurisdiction=code)
-                return
-        except Exception as e:  # noqa: BLE001 -- fail open: a duplicate signal is harmless
-            logger.warning("broker_bill_event_signal_debounce_failed_proceeding", jurisdiction=code, error=str(e))
-
-        from ddp_sync.services.broker_client import request_bill_event_check
-
-        await request_bill_event_check(code)
-        logger.info("broker_bill_event_signal_sent", jurisdiction=code)
+        await _send_broker_signal("broker_bill_event_signal", code, broker_client.request_bill_event_check)
     except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
         logger.warning("broker_bill_event_signal_failed", jurisdiction=jurisdiction, error=str(e))
+
+
+async def _maybe_signal_broker_scorecard_refresh(jurisdiction: str, config: dict | None) -> None:
+    """BROKER-537: after a successful scrape, tell ddp-broker-py so it reads this state's changed bills and roster and
+    refreshes the scorecards they change (its `fetch_jurisdiction_after_scrape`). From 2027-01-01 the broker has no
+    nightly chain, so this is how new votes reach scorecards.
+
+    Sent before the archive: a cloud scrape's load into RDS (the database the broker's api-v3 reads) is part of the
+    scrape step, so the bills and votes are readable once the scrape succeeds; the archive adds bill texts, which
+    scorecards do not use.
+
+    Switch: `openstates_scrape.broker_scorecard_signal.enabled` (default off). No per-state list: every scraped state is
+    sent, and the broker decides which it tracks (it answers 200 `queued: false` for the others), so no second copy of
+    "which states have scorecards" is kept here. Same sending rules as the bill-event signal (`_send_broker_signal`),
+    its own debounce key. Never raises, never retries: a lost signal costs only time, because the broker's next run
+    reads everything changed since its last clean run.
+    """
+    try:
+        block = (config or {}).get("broker_scorecard_signal") or {}
+        if not block.get("enabled", False):
+            return
+        from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
+        from ddp_sync.services import broker_client
+
+        code = _archive_jurisdiction_code(jurisdiction).lower()
+        await _send_broker_signal("broker_scorecard_signal", code, broker_client.request_scorecard_refresh)
+    except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
+        logger.warning("broker_scorecard_signal_failed", jurisdiction=jurisdiction, error=str(e))
 
 
 # SYNC-147: runbook rule 1 (people before the first import). Pilot #2's first scrapes loaded with 0 legislators in
@@ -1843,6 +1878,7 @@ async def _run_state_pipeline_locked(
         await _logged("history", jurisdiction, _record_scrape_history(jurisdiction, results, config))
         if any(r.get("success") for r in results):
             await _logged("broker_signal", jurisdiction, _maybe_signal_broker_bill_events(jurisdiction, config))
+            await _logged("broker_scorecard_signal", jurisdiction, _maybe_signal_broker_scorecard_refresh(jurisdiction, config))
             archived = await archive_with_retry(jurisdiction, archive_config)
         if not all(r.get("success") for r in results) or archived is False:
             raise PipelineFailed(jurisdiction, results, archived)

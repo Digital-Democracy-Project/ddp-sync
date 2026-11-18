@@ -709,6 +709,28 @@ async def write_organization_logo(
         raise BrokerClientError("ddp-broker-py returned a non-JSON logo body") from exc
 
 
+async def _post_jurisdiction_signal(path: str, jurisdiction: str, what: str) -> None:
+    """POST `{"jurisdiction": ...}` to one of the broker's after-scrape signal routes with the service token. The broker
+    only queues its work and answers at once. Raises `BrokerClientError` on an unset base/token, an unreachable broker,
+    or any non-2xx, a redirect included (pm-review, SYNC-128)."""
+    settings = get_settings()
+    if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
+        raise BrokerClientError("DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN not configured")
+
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.post(
+                f"{settings.ddp_broker_api_base}{path}",
+                headers={"Authorization": f"Bearer {settings.ddp_broker_api_token}"},
+                json={"jurisdiction": jurisdiction},
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+
+    if not resp.is_success:
+        raise BrokerClientError(f"ddp-broker-py rejected the {what} ({resp.status_code}): {resp.text[:200]}")
+
+
 async def request_bill_event_check(jurisdiction: str) -> None:
     """Ask ddp-broker-py to run its bill-event check for one jurisdiction now (SYNC-128 / BROKER-300).
 
@@ -720,24 +742,22 @@ async def request_bill_event_check(jurisdiction: str) -> None:
             a redirect included (400 = a jurisdiction the broker does not check, 401 = bad token,
             503 = its queue is down).
     """
-    settings = get_settings()
-    if not settings.ddp_broker_api_base or not settings.ddp_broker_api_token:
-        raise BrokerClientError("DDP_BROKER_API_BASE/DDP_BROKER_API_TOKEN not configured")
+    await _post_jurisdiction_signal("/api/openstates-bill-events/check/", jurisdiction, "bill-event check")
 
-    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-        try:
-            resp = await client.post(
-                f"{settings.ddp_broker_api_base}/api/openstates-bill-events/check/",
-                headers={"Authorization": f"Bearer {settings.ddp_broker_api_token}"},
-                json={"jurisdiction": jurisdiction},
-            )
-        except httpx.RequestError as exc:
-            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
 
-    if not resp.is_success:  # a redirect is not a queued check either (pm-review)
-        raise BrokerClientError(
-            f"ddp-broker-py rejected the bill-event check ({resp.status_code}): {resp.text[:200]}"
-        )
+async def request_scorecard_refresh(jurisdiction: str) -> None:
+    """Tell ddp-broker-py that this jurisdiction's scrape has finished, so it reads the state's changed bills and roster
+    and refreshes the scorecards they change (BROKER-537; the broker's `fetch_jurisdiction_after_scrape`).
+
+    The broker only queues the fetch (202) and answers 200 with `queued: false` for a state it does not track; both are
+    success here. Used by the post-scrape signal in `openstates_scrape._maybe_signal_broker_scorecard_refresh`.
+
+    Raises:
+        BrokerClientError: DDP_BROKER_API_BASE/TOKEN unset, the broker unreachable, or any non-2xx, a redirect included
+            (400 = a code the broker does not know, 401 = bad token, 404 = a broker without BROKER-537,
+            503 = its queue is down).
+    """
+    await _post_jurisdiction_signal("/api/scorecards/refresh-after-scrape/", jurisdiction, "scorecard refresh")
 
 
 async def get_bill_topics_taxonomy(
