@@ -91,6 +91,15 @@ class UpdateScheduler:
         self.settings = settings or get_settings()
         self.config_path = config_path or DEFAULT_CONFIG_PATH
         self.scheduler = AsyncIOScheduler(timezone=_UTC)
+        # SYNC-178: every scheduled job is visible to `ddp-sync status` while it runs.
+        from apscheduler.events import (
+            EVENT_JOB_ERROR,
+            EVENT_JOB_EXECUTED,
+            EVENT_JOB_SUBMITTED,
+        )
+
+        from ddp_sync.services import activity
+        self.scheduler.add_listener(activity.scheduler_listener, EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
         self.calendar = StateLegislativeCalendar()
         self._is_running = False
         self._update_callbacks: list[Callable] = []

@@ -141,6 +141,7 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500,
         include_concept_statements=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
+        started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
 
 
@@ -161,6 +162,7 @@ def test_null_limit_means_no_limit_and_reaches_the_pipeline_as_none():
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, None,
         include_concept_statements=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
+        started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
 
 
@@ -212,6 +214,7 @@ def test_valid_payload_returns_200_and_calls_pipeline_with_exact_args():
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
         include_concept_statements=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
+        started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
 
 

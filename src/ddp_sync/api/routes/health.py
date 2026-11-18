@@ -1,9 +1,12 @@
 """Health check and schedule endpoints."""
 
 import logging
-from fastapi import APIRouter
 
-from ddp_sync.config import get_settings, get_config_source
+from fastapi import APIRouter, Depends
+from fastapi.responses import PlainTextResponse
+
+from ddp_sync.api.auth import api_key_auth
+from ddp_sync.config import get_config_source, get_settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -88,29 +91,26 @@ async def health():
 
 @router.get("/schedule")
 async def schedule():
-    """Show all scheduled jobs and their next run times."""
+    """Show all scheduled jobs and their next run times, next run first. OPEN-140: with the effective scrape cadence per
+    jurisdiction (Redis is the runtime source of truth and the YAML value only a floor, so without this it would take a
+    redis-cli to answer "is Florida nightly right now?"). The same listing `ddp-sync status` shows (SYNC-178)."""
     try:
-        from ddp_sync.scheduler import get_scheduler
-        scheduler = get_scheduler()
-        if not scheduler or not scheduler.scheduler.running:
-            return {"status": "scheduler_not_running", "jobs": []}
+        from ddp_sync.status_report import scheduled_jobs
 
-        jobs = []
-        for job in scheduler.scheduler.get_jobs():
-            jobs.append({
-                "id": job.id,
-                "name": job.name,
-                "next_run": str(job.next_run_time) if job.next_run_time else None,
-                "trigger": str(job.trigger),
-            })
-        # OPEN-140: the effective scrape cadence per jurisdiction. Redis is the runtime
-        # source of truth and the YAML value is only a floor, so the live cadence no
-        # longer shows up in a git diff — without this it would take a redis-cli to
-        # answer "is Florida nightly right now?".
-        return {
-            "status": "running",
-            "jobs": jobs,
-            "openstates_cadence": getattr(scheduler, "_openstates_cadence", {}),
-        }
+        return scheduled_jobs()
     except Exception as e:
         return {"status": f"error: {e}", "jobs": []}
+
+
+@router.get("/status")
+async def status(format: str = "json", token: str = Depends(api_key_auth)):
+    """SYNC-178: everything this ddp-sync is running, holding and has scheduled (`ddp-sync status` prints it):
+    runs in flight with their progress, locks with their expiry, scheduled jobs (next first), recently finished runs
+    (including any a restart stopped), and whether a restart now would interrupt something. Read only; behind the same
+    API key as the trigger routes. `?format=text` answers in the plain text the command prints."""
+    from ddp_sync.status_report import collect, format_text
+
+    data = await collect()
+    if format == "text":
+        return PlainTextResponse(format_text(data) + "\n")
+    return data

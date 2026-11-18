@@ -285,6 +285,8 @@ async def trigger_scraper_session_pipeline(
             broker_api_base=broker_api_base,
             broker_api_token=broker_api_token,
             bill_candidates=bill_candidates,
+            # SYNC-178: require_trigger_enabled is the automated caller's flag (the archive hook, EC2's call)
+            started_by="automated, after an archive" if require_trigger_enabled else "manual trigger",
         )
         logger.info(
             "scraper_triggered_legbot_complete",
