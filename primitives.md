@@ -303,10 +303,13 @@ Pub/sub channels (hardcoded strings in callers):
 - **`OpenStatesPerson`** — bio data shape
 - **`OpenStatesError`** / **`OpenStatesRateLimitError`** — exception hierarchy
 
-## Broker bill-event signal (`pipelines/openstates_scrape.py`, SYNC-128)
+## Broker after-scrape signals (`pipelines/openstates_scrape.py`, SYNC-128, BROKER-537)
 
 - **`_maybe_signal_broker_bill_events(jurisdiction, config)`** — called once per run by `run_state_pipeline` when at least one session succeeded, before the archive (SYNC-152; it used to run inside `_run_scrape`, once per session). Gated by `openstates_scrape.broker_bill_event_signal` (`enabled`, `jurisdictions`; default off), maps `usa` to `us` with `openstates_archive._archive_jurisdiction_code`, debounces 15 minutes per jurisdiction (`ddp:broker_bill_event_signal:<code>`, SET NX EX, fails open). Never raises, never retries.
 - **`broker_client.request_bill_event_check(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/openstates-bill-events/check/` `{"jurisdiction": ...}` with the service token (BROKER-300; 202 queued). Raises `BrokerClientError` on an unset base/token, unreachable broker, or any 4xx/5xx (400 unknown jurisdiction, 401 token, 503 queue down).
+- **`_send_broker_signal(name, code, send)`** — how every after-scrape signal to the broker is sent: skipped with a `<name>_not_configured` WARNING when the broker base or token is unset, debounced 15 minutes per jurisdiction (`ddp:<name>:<code>`, SET NX EX, fails open), then `send(code)` and `<name>_sent`. **A new after-scrape signal uses this; do not copy the debounce or the settings check.**
+- **`_maybe_signal_broker_scorecard_refresh(jurisdiction, config)`** (BROKER-537) — called by `run_state_pipeline` right after the bill-event signal, before the archive (a cloud scrape's RDS load is part of the scrape step, so the bills and votes are readable then; the archive adds texts, which scorecards do not use). Gated only by `openstates_scrape.broker_scorecard_signal.enabled` (default off): **no per-state list**, every scraped state is sent and the broker decides which it tracks (200 `queued: false` for the others). Its own switch and debounce key, independent of the bill-event signal (that one drives the alert engine). Maps `usa` to `us`. Never raises, never retries: the broker's next run reads everything changed since its last clean run, so a lost signal costs time only.
+- **`broker_client.request_scorecard_refresh(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/scorecards/refresh-after-scrape/` `{"jurisdiction": ...}` with the service token (BROKER-537; 202 queued, 200 not tracked). Raises `BrokerClientError` like the call above (both go through `_post_jurisdiction_signal`).
 
 ## Voatz → Brevo opt-outs (`pipelines/voatz_brevo.py`, SYNC-122)
 

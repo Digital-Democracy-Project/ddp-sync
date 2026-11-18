@@ -231,6 +231,17 @@ openstates_scrape:
   broker_bill_event_signal:
     enabled: false
 
+  # BROKER-537: after a successful scrape, POST the jurisdiction to ddp-broker-py's
+  # /api/scorecards/refresh-after-scrape/ so it reads that state's changed bills and roster and refreshes the scorecards
+  # they change (from 2027-01-01 the broker has no nightly chain; this is how new votes reach scorecards). Read by
+  # _maybe_signal_broker_scorecard_refresh in openstates_scrape.py. No per-state list: every scraped state is sent and
+  # the broker decides which it tracks. Separate from broker_bill_event_signal above (that one drives the alert engine,
+  # switched on separately). Off until the broker release with BROKER-537 is live (it ships after BROKER-534, A5) AND the
+  # scraping host (the EC2 broker host owns every state's scrape) has a real DDP_BROKER_API_TOKEN, the broker's
+  # DDP_SYNC_SERVICE_TOKEN: today it is the placeholder "public-endpoint-no-auth", which the broker answers with 401.
+  broker_scorecard_signal:
+    enabled: false
+
   # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
   # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
   # loses everything it had collected. That is not theoretical: FL 213 + MA 473 bills went that
