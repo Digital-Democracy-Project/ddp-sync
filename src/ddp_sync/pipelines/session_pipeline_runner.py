@@ -71,6 +71,7 @@ from ddp_sync.pipelines.bill_organization_position_research import (
 from ddp_sync.pipelines.concept_statement_dispatch import (
     dispatch_and_store_concept_statements,
 )
+from ddp_sync.services import activity
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     artifact_counts_as_present,
@@ -1026,6 +1027,7 @@ async def run_legbot_pipeline(
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
     bill_candidates: list[dict] | None = None,
+    started_by: str = "trigger",
 ) -> dict:
     """Fill in whatever's missing, for every bill in one jurisdiction/session.
 
@@ -1272,6 +1274,9 @@ async def run_legbot_pipeline(
 
     run_id = str(uuid.uuid4())
     run_started = time.monotonic()
+    # SYNC-178: visible to `ddp-sync status` while it runs (progress per bill, below), whoever started it.
+    activity.start(run_id, "LegBot session pipeline", started_by=started_by, jurisdiction=jurisdiction_iso2,
+                   session=session_code, detail="dry run" if dry_run else None)
     logger.info(
         "session_pipeline_run_start",
         run_id=run_id,
@@ -1286,29 +1291,34 @@ async def run_legbot_pipeline(
         peak_memory_mb=round(_peak_memory_mb(), 1),
     )
 
-    if bill_candidates is not None:
-        # SYNC-63: an explicit, caller-supplied list replaces the session-wide
-        # scan entirely -- limit does not select or truncate here (every
-        # supplied entry is processed), and there's no "more exist beyond
-        # what was considered" for truncated to report, since the caller
-        # already supplied their own complete list.
-        candidates = list(bill_candidates)
-        truncated = False
-    else:
-        # Request limit + 1 so truncated is actually computable: if more than
-        # `limit` candidates come back, we know more exist beyond what's
-        # considered, without misreporting a specific further count (a
-        # limit + 1 probe only proves "more than limit exist"). SYNC-103: with no
-        # limit, every candidate is considered and nothing is truncated.
-        candidates = await list_current_session_bill_candidates(
-            jurisdiction_iso2,
-            session_code=session_code,
-            limit=None if limit is None else limit + 1,
-        )
-        truncated = limit is not None and len(candidates) > limit
-        if limit is not None:
-            candidates = candidates[:limit]
+    try:
+        if bill_candidates is not None:
+            # SYNC-63: an explicit, caller-supplied list replaces the session-wide
+            # scan entirely -- limit does not select or truncate here (every
+            # supplied entry is processed), and there's no "more exist beyond
+            # what was considered" for truncated to report, since the caller
+            # already supplied their own complete list.
+            candidates = list(bill_candidates)
+            truncated = False
+        else:
+            # Request limit + 1 so truncated is actually computable: if more than
+            # `limit` candidates come back, we know more exist beyond what's
+            # considered, without misreporting a specific further count (a
+            # limit + 1 probe only proves "more than limit exist"). SYNC-103: with no
+            # limit, every candidate is considered and nothing is truncated.
+            candidates = await list_current_session_bill_candidates(
+                jurisdiction_iso2,
+                session_code=session_code,
+                limit=None if limit is None else limit + 1,
+            )
+            truncated = limit is not None and len(candidates) > limit
+            if limit is not None:
+                candidates = candidates[:limit]
+    except BaseException as exc:  # SYNC-178: a run that ends here must not stay "running" in `ddp-sync status`
+        activity.finish(run_id, "failed", error=type(exc).__name__)
+        raise
     bills_considered = len(candidates)
+    activity.set_total(run_id, bills_considered)
 
     # Bounded concurrency (2026-08-18, made process-wide by SYNC-72 on
     # 2026-09-20): several bills' own _process_bill calls run at once
@@ -1334,7 +1344,9 @@ async def run_legbot_pipeline(
 
     async def _process_bill_bounded(candidate: dict) -> dict:
         global _session_pipeline_active_holders
+        bill_label = str(candidate.get("gov_id") or candidate.get("bill_openstates_id") or "?")
         async with semaphore:
+            activity.bill_started(run_id, bill_label)
             # SYNC-79: log the real concurrent-holder count at the instant
             # this bill is admitted -- the only way to tell, from logs
             # alone, whether session_pipeline_concurrency=2 ever actually
@@ -1390,9 +1402,15 @@ async def run_legbot_pipeline(
         # for the next queued one as soon as the real work finishes, rather
         # than holding it through this log call too.
         logger.info("session_pipeline_bill_complete", run_id=run_id, **bill_result)
+        activity.bill_finished(run_id, bill_label, _bill_outcome(bill_result))
         return bill_result
 
-    results = list(await asyncio.gather(*(_process_bill_bounded(c) for c in candidates)))
+    try:
+        results = list(await asyncio.gather(*(_process_bill_bounded(c) for c in candidates)))
+    except BaseException as exc:
+        activity.finish(run_id, "failed", error=type(exc).__name__)
+        raise
+    activity.finish(run_id, "done")
 
     summary = {
         "bills_considered": bills_considered,
@@ -1546,3 +1564,13 @@ async def run_single_bill_full(
     return result
 
 
+
+
+def _bill_outcome(bill_result: dict) -> str:
+    """SYNC-178: one bill's result as `ddp-sync status` counts it: "failed" (an error or a failed result type),
+    "generated" (LegBot wrote at least one result type), else "skipped" (nothing was needed)."""
+    if bill_result.get("error") or bill_result.get("artifacts_failed"):
+        return "failed"
+    if bill_result.get("artifacts_generated"):
+        return "generated"
+    return "skipped"

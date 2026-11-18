@@ -705,3 +705,19 @@ Before sketching a new dataclass / service / helper:
 5. **Check the rate limiter.** `RateLimitConfig.from_yaml()` + `RateLimiter` is the shared primitive. Don't add per-pipeline sleep loops.
 6. **Check ingestion.** `IngestionPipeline.ingest_document()` is the one path to Pinecone. Don't call `VectorStoreService.upsert_documents()` directly from pipelines.
 7. **Check document types.** New document types must be added to the table above AND to VoteBot's `VALID_RETRIEVAL_SOURCES` to avoid analytics warnings.
+
+## What is running now: `services.activity` and `ddp-sync status` (SYNC-178)
+
+`services/activity.py` is the ONE register of what this process is running: `start(run_id, kind, started_by=, ...)`,
+`set_total`, `bill_started`, `bill_finished(outcome)`, `finish(outcome)`, `running()`, `recent()`. The session pipeline
+(`run_legbot_pipeline`, which now takes `started_by`) reports each bill to it; every scheduled job registers itself through an
+APScheduler listener (`scheduler_listener`, added in `UpdateScheduler.__init__`). It lives in memory (a run is alive exactly
+while it is there) and mirrors to `ddp:activity:running` only so that `sweep_restart_leftovers()` (in `app.lifespan`, before
+the scheduler starts) can show a run a restart killed as "stopped by a restart" in `ddp:activity:recent` (20 newest, 7 days).
+Every Redis call fails open and never slows a run. `status_report.collect()` adds what ddp-sync already keeps (background
+LegBot session runs, sync tasks, LegBot tasks in CAMS, in-flight Fargate jobs, the locks in `LOCK_PATTERNS`,
+`scheduled_jobs()`, which `/schedule` also returns) and `format_text()` prints it for `ddp-sync status` (`cli.py`,
+`scripts/ddp-sync`). Records are copied field by field: a LegBot task record can hold a broker token. **A new long-running
+job reports to `activity`, and a new lock is added to `LOCK_PATTERNS`; do not add a second register or a second status
+route.** Tests: `tests/test_sync_178_status.py`.
+

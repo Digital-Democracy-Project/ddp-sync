@@ -721,6 +721,7 @@ reloaded over SSH. Deploy from an admin account:
 
 ```bash
 cd /Users/agentsmith/Developer/repos/ddp-sync && git pull origin main
+ddp-sync status                                       # SYNC-178: anything a restart would interrupt? (below)
 sudo launchctl kickstart -k system/com.ddp.ddp-sync   # restart to pick up changes
 curl -s http://localhost:8001/ddp-sync/v1/schedule    # verify the six OpenStates jobs
 ```
@@ -730,6 +731,23 @@ curl -s http://localhost:8001/ddp-sync/v1/schedule    # verify the six OpenState
 it into the Mac's venv with `.venv/bin/pip install -e ".[svg-logos]"` before the restart. **Keep `-e`:** the Mac runs
 ddp-sync as an editable install, and a plain `pip install ".[...]"` replaces it with a frozen copy, so later `git pull`s
 would silently not take effect (SYNC-169). Without the extra, website SVGs are skipped and counted as `svg`, as before.
+
+**`ddp-sync status` (SYNC-178), the ddp-sync counterpart of `cams status`.** `cams status` sees only what reaches CAMS, and a
+LegBot session walk that skips most bills reaches it rarely (2026-11-18: US 119 ran for an hour while `cams status` said "No
+active tasks"). `ddp-sync status` prints, from the running service (`GET /ddp-sync/v1/status`, same API key as the triggers;
+`?format=text` for the text):
+
+* **Safe to restart: yes/no**, and what a restart would interrupt (and what it would not lose: a Fargate job resumes, a
+  LegBot task in CAMS is collected by the recovery sweep);
+* **Running now:** each run with who started it, since when, its progress (bills done/total, generated, skipped, failed) and
+  the bill(s) it is on; background LegBot session runs; sync tasks; Fargate jobs being waited on; LegBot tasks in CAMS;
+* **Locks held**, with owner and expiry (why a trigger answers 409 right now);
+* **Scheduled next** (the `/schedule` list, next run first);
+* **Recently finished**, including a run a restart stopped ("stopped by a restart").
+
+Install once per host, from the checkout the service runs: `sudo ln -sf "$PWD/scripts/ddp-sync" /usr/local/bin/ddp-sync`
+(`DDP_SYNC_URL` if the service is not on `http://localhost:8001`). `ddp-sync status --json` prints the JSON. Read only; the API
+key is read through ddp-sync's own settings and never printed.
 
 Reinstall the plist (after editing it) and full recovery steps are in
 `ddp-infra/README.md` → "Restart Procedures".

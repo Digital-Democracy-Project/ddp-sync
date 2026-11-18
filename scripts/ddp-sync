@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# SYNC-178: `ddp-sync status` on a ddp-sync host (the Mac or EC2), the ddp-sync counterpart of `cams status`.
+# Link it once:  sudo ln -sf "$PWD/scripts/ddp-sync" /usr/local/bin/ddp-sync   (from the checkout the service runs)
+# Runs ddp_sync.cli with that checkout's own venv, so it always matches the running code. Read only.
+set -euo pipefail
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+exec "$REPO/.venv/bin/python" -m ddp_sync.cli "$@"

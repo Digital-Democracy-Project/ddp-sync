@@ -45,6 +45,10 @@ async def lifespan(app: FastAPI):
     # SYNC-153: no run survives a restart, so no per-state pipeline lock may either.
     from ddp_sync.services.redis_store import clear_state_locks, reconnect_until_available
     await clear_state_locks()
+    # SYNC-178: whatever the previous process was running when it stopped shows in `ddp-sync status` as
+    # "stopped by a restart" (before the scheduler starts, so nothing of this process's own is swept).
+    from ddp_sync.services import activity
+    await activity.sweep_restart_leftovers()
     # SYNC-160: if Redis was not up yet, keep retrying (and alert once) instead of running without
     # it until the next restart. Returns at once when the connect above succeeded.
     redis_reconnect_task = asyncio.create_task(reconnect_until_available())
