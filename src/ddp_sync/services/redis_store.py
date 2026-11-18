@@ -920,6 +920,12 @@ async def reconnect_until_available(
         await store.connect()
         if store._client is not None:
             await clear_state_locks()
+            # SYNC-179: and what start-up would have done for the previous process's LegBot session runs
+            from ddp_sync.pipelines.scraper_triggered_legbot import (
+                stop_previous_process_session_runs,
+            )
+
+            await stop_previous_process_session_runs()
             logger.info("redis_reconnected", waited_seconds=round(clock() - started))
             return
         if not alerted and clock() - started >= alert_after:

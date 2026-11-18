@@ -743,7 +743,7 @@ active tasks"). `ddp-sync status` prints, from the running service (`GET /ddp-sy
   the bill(s) it is on; background LegBot session runs; sync tasks; Fargate jobs being waited on; LegBot tasks in CAMS;
 * **Locks held**, with owner and expiry (why a trigger answers 409 right now);
 * **Scheduled next** (the `/schedule` list, next run first);
-* **Recently finished**, including a run a restart stopped ("stopped by a restart").
+* **Recently finished**, including a run a restart stopped ("stopped by a restart"). Since SYNC-179, start-up also marks the previous process's background LegBot session runs that way and releases their per-session locks, so right after a restart nothing of the old process shows as running and a resend is accepted at once.
 
 Install once per host, from the checkout the service runs: `sudo ln -sf "$PWD/scripts/ddp-sync" /usr/local/bin/ddp-sync`
 (`DDP_SYNC_URL` if the service is not on `http://localhost:8001`). `ddp-sync status --json` prints the JSON. Read only; the API

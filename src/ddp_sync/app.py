@@ -49,6 +49,13 @@ async def lifespan(app: FastAPI):
     # "stopped by a restart" (before the scheduler starts, so nothing of this process's own is swept).
     from ddp_sync.services import activity
     await activity.sweep_restart_leftovers()
+    # SYNC-179: the previous process's background LegBot session runs ended with it: their records stop saying "running"
+    # and their per-session locks are released, so a resend for the same state is accepted at once.
+    from ddp_sync.pipelines.scraper_triggered_legbot import (
+        stop_previous_process_session_runs,
+    )
+
+    await stop_previous_process_session_runs()
     # SYNC-160: if Redis was not up yet, keep retrying (and alert once) instead of running without
     # it until the next restart. Returns at once when the connect above succeeded.
     redis_reconnect_task = asyncio.create_task(reconnect_until_available())
