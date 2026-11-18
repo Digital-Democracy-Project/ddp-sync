@@ -353,6 +353,17 @@ timeout for this: that is the Mac-path ceiling (`scrape_timeout_s`) and the clou
 its own separate `max_wait_seconds`, still a hard stop. The SYNC-153 pipeline lock's TTL (`pipeline_lock_ttl_s`) is
 still sized from these numbers (53.5 h or more), so ddp-sync never starts a second run of a state while one is going.
 
+## Cloud load core = the scrapers image's core (`infrastructure/Dockerfile`, SYNC-180)
+
+`cloud_scrape_trigger.py` runs `cloud_loader.py` (ddp-open-states) inside this container, and its import (`os-update`)
+uses the copy of openstates-core built into **this** image, not the Fargate image's. So the build fetches core at
+`DDP_CORE_SHA`, the live scrapers image's core commit (its `/opt/openstates-core/DDP_CORE_COMMIT`), with no default, and
+writes the same record. On EC2: `DDP_CORE_SHA=<full sha> docker-compose -f infrastructure/docker-compose.prod.yml build
+ddp-sync`, at every scrapers image release that changes core. ddp-open-states' `check-core-pin-drift.py
+--sync-container <name>` compares it with the image's (do not add a second comparison here). Found 2026-11-18: the live
+copy was v62's `44c3b8dc` while v65 ran, so newer state rules did not apply on load. Lasting fix: OPEN-633 (the load
+moves into the Fargate task). Guard: `tests/test_sync_180_core_at_image_commit.py`.
+
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida

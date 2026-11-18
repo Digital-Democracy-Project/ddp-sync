@@ -65,13 +65,30 @@ RUN rm -f /opt/venv-openstates/bin/python3 /opt/venv-openstates/bin/python3.13 /
 # layer, before it can ever occupy a final-image layer -- see that file's own comment for why
 # that matters (a `git clone` URL embeds the token in .git/config, and the secret mount alone
 # does not keep it out of the checkout it produces).
-ARG OPENSTATES_CORE_REF=main
+#
+# SYNC-180: core is fetched at DDP_CORE_SHA, the commit the live scrapers image was built from
+# (its /opt/openstates-core/DDP_CORE_COMMIT), never "main at build time". cloud_loader.py's
+# import (os-update) runs on this copy, so a ddp-sync built at another moment imported with an
+# older core than the image scraped with (found 2026-11-18: 44c3b8dc, v62's, while v65 was live;
+# none of the newer state rules or the Oregon joint-committee lookup applied on load). No default,
+# the same as api-v3's deploy/Dockerfile.ddp (OPEN-586): a build without a full 40-character
+# commit stops here. The commit is written to /opt/openstates-core/DDP_CORE_COMMIT, the same
+# record the scrapers image keeps, so ddp-open-states' check-core-pin-drift.py --sync-container
+# can compare it with the image's.
+ARG DDP_CORE_SHA
 ARG OPENSTATES_SCRAPERS_REF=main
 RUN --mount=type=secret,id=github_token \
+    { [ "${#DDP_CORE_SHA}" -eq 40 ] && [ -z "$(printf '%s' "${DDP_CORE_SHA}" | tr -d 0-9a-f)" ]; } \
+       || { echo "DDP_CORE_SHA must be the scrapers image's full core commit (40 hex), got '${DDP_CORE_SHA}'" >&2; exit 1; } && \
     TOKEN=$(cat /run/secrets/github_token) && \
-    git clone --branch "$OPENSTATES_CORE_REF" --depth 1 \
+    git init -q /opt/openstates-core && \
+    git -C /opt/openstates-core fetch -q --depth 1 \
         "https://x-access-token:${TOKEN}@github.com/Digital-Democracy-Project/openstates-core.git" \
-        /opt/openstates-core && \
+        "$DDP_CORE_SHA" && \
+    git -C /opt/openstates-core checkout -q FETCH_HEAD && \
+    git -C /opt/openstates-core rev-parse HEAD > /opt/openstates-core/DDP_CORE_COMMIT && \
+    [ "$(cat /opt/openstates-core/DDP_CORE_COMMIT)" = "$DDP_CORE_SHA" ] && \
+    echo "DDP openstates-core: ${DDP_CORE_SHA}" && \
     git clone --branch "$OPENSTATES_SCRAPERS_REF" --depth 1 \
         "https://x-access-token:${TOKEN}@github.com/Digital-Democracy-Project/openstates-scrapers.git" \
         /opt/openstates-scrapers && \
