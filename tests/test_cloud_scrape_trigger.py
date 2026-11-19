@@ -47,6 +47,7 @@ def _fargate_config(**overrides):
     cfg = {
         "cluster": "ddp-scrapers-prototype",
         "task_definition": "ddp-scraper-prototype",
+        "task_definition_db": "ddp-scraper-prototype-db",  # OPEN-639: load and archive tasks
         "subnets": ["subnet-abc"],
         "security_groups": ["sg-abc"],
     }

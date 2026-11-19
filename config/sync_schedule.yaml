@@ -463,6 +463,7 @@ openstates_scrape:
     fargate:
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
+      task_definition_db: "ddp-scrapers-db" # OPEN-639: load and archive tasks only; the one definition that may carry the RDS login
       subnets:
         - "subnet-0fdc71c33a5cb60bc"  # us-east-1c
         - "subnet-0dbb01bb8fd1cd1e8"  # us-east-1a
@@ -785,6 +786,7 @@ openstates_archive:
       # cluster ever change, this block needs the same edit.
       cluster: "ddp-scrapers"
       task_definition: "ddp-scrapers"
+      task_definition_db: "ddp-scrapers-db" # OPEN-639: load and archive tasks only; the one definition that may carry the RDS login
       subnets:
         - "subnet-0fdc71c33a5cb60bc"  # us-east-1c
         - "subnet-0dbb01bb8fd1cd1e8"  # us-east-1a
