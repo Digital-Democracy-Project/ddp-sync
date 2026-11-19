@@ -112,6 +112,21 @@ async def test_one_states_failure_does_not_stop_the_others_or_the_job(settings, 
 
 
 @pytest.mark.asyncio
+async def test_a_state_whose_code_cannot_be_mapped_does_not_stop_the_others(settings, redis, send):
+    real = __import__("ddp_sync.pipelines.openstates_archive", fromlist=["_archive_jurisdiction_code"])._archive_jurisdiction_code
+
+    def _map(code):
+        if code == "fl":
+            raise ValueError("bad code")
+        return real(code)
+
+    with patch("ddp_sync.pipelines.openstates_archive._archive_jurisdiction_code", side_effect=_map):
+        result = await _people_refresh(ON)
+    assert result["success"] is True
+    assert _sent(send) == ["us", "ut"]
+
+
+@pytest.mark.asyncio
 async def test_a_scrape_signal_sent_minutes_before_does_not_swallow_this_one(settings, redis, send):
     """The scrape signal may have read the roster before this import finished: this one has its own debounce name."""
     redis.keys.add("ddp:broker_scorecard_signal:ut")

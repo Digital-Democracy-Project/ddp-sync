@@ -1925,8 +1925,9 @@ async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | Non
 
         codes = enrollment.manifest_codes("people_refresh", _get_root(config)) or []
         for jurisdiction in codes:
-            code = _archive_jurisdiction_code(jurisdiction).lower()
+            code = jurisdiction
             try:
+                code = _archive_jurisdiction_code(jurisdiction).lower()
                 await _send_broker_signal(
                     "broker_scorecard_signal_people", code, broker_client.request_scorecard_refresh
                 )
