@@ -1904,6 +1904,38 @@ async def _run_state_pipeline_locked(
         }))
 
 
+async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | None) -> None:
+    """BROKER-541: after a successful weekly people refresh, tell ddp-broker-py once for each state it imported, so a
+    roster change (a resignation, a new member) reaches that state's scorecards now, not at its next scrape (up to a
+    week out of session; Ramon, 2026-11-18: "make the weekly job refresh too"). The broker route reads the state's
+    roster on every call (`fetch_jurisdiction_after_scrape`).
+
+    The states are the manifest's `enrollment.people_refresh`, the same field run-people-refresh.sh imports. Same switch
+    as the after-scrape signal (`openstates_scrape.broker_scorecard_signal.enabled`, default off) and the same sending
+    rules (`_send_broker_signal`), under its own debounce name: a scrape signal sent minutes before the import finished
+    must not swallow this one. Called only when the script exited 0 (it exits 1 when any state failed, without saying
+    which). One state's failure never stops the others; nothing here raises or changes the job's result.
+    """
+    try:
+        block = (config or {}).get("broker_scorecard_signal") or {}
+        if not block.get("enabled", False):
+            return
+        from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
+        from ddp_sync.services import broker_client
+
+        codes = enrollment.manifest_codes("people_refresh", _get_root(config)) or []
+        for jurisdiction in codes:
+            code = _archive_jurisdiction_code(jurisdiction).lower()
+            try:
+                await _send_broker_signal(
+                    "broker_scorecard_signal_people", code, broker_client.request_scorecard_refresh
+                )
+            except Exception as e:  # noqa: BLE001 -- one state's failure must not stop the others
+                logger.warning("broker_scorecard_signal_people_failed", jurisdiction=code, error=str(e))
+    except Exception as e:  # noqa: BLE001 -- must never affect the people refresh's own result
+        logger.warning("broker_scorecard_signal_people_failed", error=str(e))
+
+
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
     """Pull the people repo and run os-people to-database for all states."""
     openstates_root = _get_root(config)
@@ -1998,6 +2030,7 @@ async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
             "status": "completed",
             "duration_seconds": duration,
         })
+        await _maybe_signal_broker_scorecard_refresh_after_people(config)
         return {"success": True, "duration_seconds": duration}
 
     # No `except subprocess.TimeoutExpired` here any more: _run_with_group_kill swallows it and

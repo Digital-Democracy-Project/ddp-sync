@@ -61,6 +61,8 @@ _FEATURES = {
     "scrapebot_fallback": (lambda e: e["waf"]["scrapebot_fallback"], True),  # the scrape spells the federal one "usa"
     "scrapebot_fallback_archive": (lambda e: e["waf"]["scrapebot_fallback"], False),  # the archive spells it "us"
     "broker_bill_event_signal": (lambda e: e["enrollment"]["broker_bill_event_signal"], False),
+    # BROKER-541: the states ddp-open-states' run-people-refresh.sh imports (it reads the same field), spelled "us".
+    "people_refresh": (lambda e: e["enrollment"]["people_refresh"], False),
 }
 
 # SYNC-157: sync_schedule.yaml keys that were copies of the manifest (or per-state lists that moved into it). A config
