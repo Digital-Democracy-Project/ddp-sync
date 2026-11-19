@@ -382,6 +382,12 @@ task definition carries the RDS secret) stops passing `DATABASE_URL` to the load
 `apply_rds_task_secret` builds it inside the task. Every launch-failure and load-failure message goes through
 `openstates_archive.redact_dsn`, so no connection string reaches a log or an alert.
 
+**OPEN-639, two task definitions:** the load and archive tasks launch from `cloud_path.fargate.task_definition_db`
+(`ddp-scrapers-db`, set in both blocks), the only definition that may carry the RDS login; collection keeps
+`task_definition` (`ddp-scrapers`). `_launch_archive_fargate_task` refuses a launch when `task_definition_db` is not
+set rather than falling back. The backfill launchers (`openstates_backfill`, `vote_person_backfill`) still run on
+`ddp-scrapers` with a passed `DATABASE_URL`, unchanged.
+
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida

@@ -351,11 +351,17 @@ def _launch_archive_fargate_task(
     path picking up something it doesn't need; a second small function with its own environment
     list keeps the two genuinely independent.
     """
+    # OPEN-639: the load and archive tasks run from their own task definition, the only one that may carry the database
+    # login; collection and probe tasks (`task_definition`) never get it. No fallback to `task_definition`: a missing
+    # setting refuses the launch rather than running a database job on the collection definition.
+    task_definition = fargate_cfg.get("task_definition_db")
+    if not task_definition:
+        return False, None, "cloud_path.fargate.task_definition_db is not set (OPEN-639: load and archive tasks run only on the database task definition)"
     container_name = fargate_cfg.get("container_name", "scraper")
     try:
         resp = ecs_client.run_task(
             cluster=fargate_cfg["cluster"],
-            taskDefinition=fargate_cfg["task_definition"],
+            taskDefinition=task_definition,
             launchType="FARGATE",
             networkConfiguration={
                 "awsvpcConfiguration": {

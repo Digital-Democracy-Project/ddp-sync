@@ -60,6 +60,7 @@ def _stopped(exit_code=0, container_name="scraper", reason=""):
 _FARGATE_CFG = {
     "cluster": "ddp-scrapers",
     "task_definition": "ddp-scrapers",
+    "task_definition_db": "ddp-scrapers-db",  # OPEN-639
     "subnets": ["subnet-a"],
     "security_groups": ["sg-a"],
     "container_name": "scraper",
