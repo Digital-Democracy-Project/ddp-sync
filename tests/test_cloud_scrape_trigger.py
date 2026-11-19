@@ -39,6 +39,9 @@ class FakeRedisClient:
     def hgetall(self, key):
         return dict(self._hashes.get(key, {}))
 
+    def hget(self, key, field):
+        return self._hashes.get(key, {}).get(field)
+
 
 def _fargate_config(**overrides):
     cfg = {

@@ -340,8 +340,9 @@ lock it took (ddp-open-states `cloud_collector.py` `SourceLock`, `<memory_prefix
 nightly's cadence) used to refuse the state's next run. Whenever `_wait_for_task_stop(..., run_lock=(source, run_id,
 suffix))` stops a task (stall or max wait), `_release_stopped_run_lock` writes that lock already expired, in
 `SourceLock.release`'s own format and conditional on the ETag it read, **only when the lock's holder is that run_id**;
-never raises. The scrape passes `_lock`, the Fargate archive `_archive_lock` (`cloud_archiver.py`); the backfill and
-script jobs hold no S3 lock and pass none. **Do not add a second lock scheme or a second release path:** the lock format
+never raises. The scrape passes `_lock`, the Fargate archive `_archive_lock` (`cloud_archiver.py`), the Fargate load
+`_import_lock` under `loader_lock_key(state, session_arg)` (OPEN-633: the loader keys it on ddp-open-states'
+`derive_scrape_key`, e.g. `fl_2026`, not the bare state); the backfill and script jobs hold no S3 lock and pass none. **Do not add a second lock scheme or a second release path:** the lock format
 lives in ddp-open-states; a stop path that holds one passes `run_lock`.
 
 When a scrape that is still logging gets its "still running" alert (before OPEN-477: when it was stopped). One shared value,
@@ -363,6 +364,22 @@ ddp-sync`, at every scrapers image release that changes core. ddp-open-states' `
 --sync-container <name>` compares it with the image's (do not add a second comparison here). Found 2026-11-18: the live
 copy was v62's `44c3b8dc` while v65 ran, so newer state rules did not apply on load. Lasting fix: OPEN-633 (the load
 moves into the Fargate task). Guard: `tests/test_sync_180_core_at_image_commit.py`.
+
+## The cloud load as a Fargate task (`cloud_scrape_trigger._run_load_on_fargate`, OPEN-633)
+
+A state whose manifest says `scrape.load_on_fargate: true` (read by `state_loads_on_fargate`, folded into the per-state
+`fargate_cfg` copy by `_fargate_config(config, jurisdiction)`, so the in-flight record and a resume replay the launch's
+choice) has its load run as a task of the scrapers image: `RUNNER_SCRIPT=cloud_loader.py`, command `[state, run_id,
+session args...]`, launched through **`openstates_archive._launch_archive_fargate_task(..., runner=, command=)`**, the
+one launcher for every non-collection task of that image (do not add another `run_task` copy). The task's ARN is added
+to the in-flight record (`inflight_fargate_jobs.record_load_started`), and a resume with it waits for that task instead
+of loading again. Hard ceiling `load_timeout_seconds` (2 h, as the local subprocess had), no stall check; a stop releases
+the loader's `_import_lock` (SYNC-167). `false` or a missing field keeps the local load, unchanged.
+
+**D2, the RDS login:** `cloud_path.fargate.rds_from_task_secret` (both the scrape and archive blocks, false until the
+task definition carries the RDS secret) stops passing `DATABASE_URL` to the load and archive tasks; ddp-open-states'
+`apply_rds_task_secret` builds it inside the task. Every launch-failure and load-failure message goes through
+`openstates_archive.redact_dsn`, so no connection string reaches a log or an alert.
 
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 

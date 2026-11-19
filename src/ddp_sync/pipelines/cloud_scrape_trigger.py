@@ -175,11 +175,21 @@ def _fargate_config(config: dict | None, jurisdiction: str | None = None) -> dic
     if jurisdiction is not None:
         from ddp_sync.pipelines.openstates_scrape import _get_root
 
-        own = state_max_wait_s(jurisdiction, _get_root(config))
+        root = _get_root(config)
+        # A copy: the caller's config dict is shared across jurisdictions and must not change.
+        cfg = {**cfg, "load_on_fargate": state_loads_on_fargate(jurisdiction, root)}
+        own = state_max_wait_s(jurisdiction, root)
         if own is not None:
-            # A copy: the caller's config dict is shared across jurisdictions and must not change.
-            return {**cfg, "max_wait_seconds": own}
+            cfg["max_wait_seconds"] = own
     return cfg
+
+
+def state_loads_on_fargate(jurisdiction: str, root: str) -> bool:
+    """OPEN-633: the manifest's `scrape.load_on_fargate` for one state. Only a real `true` turns it on; a missing
+    field (a manifest older than the field) or any other value keeps today's local load."""
+    from ddp_sync.services.jurisdiction_enrollment import manifest_value
+
+    return manifest_value(jurisdiction, ("scrape", "load_on_fargate"), root) is True
 
 
 def state_max_wait_s(jurisdiction: str, root: str) -> int | None:
@@ -492,6 +502,66 @@ def _default_subprocess_runner(load_timeout_s: int):
     return _run
 
 
+def loader_lock_key(jurisdiction: str, session_arg: str | None) -> str:
+    """The key cloud_loader.py takes its `_import_lock` under: ddp-open-states' `derive_scrape_key(source,
+    parse_kv_args(argv))`, mirrored here because ddp-sync releases that lock when it stops a load task
+    (`_release_stopped_run_lock`). `fl` + `session=2026` -> `fl_2026`; `usa` + `session=119 chamber=lower` ->
+    `usa_119_lower`. A wrong key only means the lock is not found and lives out its TTL, as before SYNC-167."""
+    params = dict(p.split("=", 1) for p in (session_arg or "").split() if "=" in p)
+    session = params.pop("session", None)
+    return "_".join([jurisdiction, *([session] if session else []), *(v for _, v in sorted(params.items()))])
+
+
+def _run_load_on_fargate(
+    jurisdiction: str,
+    session_arg: str | None,
+    run_id: str,
+    fargate_cfg: dict,
+    ecs_client,
+    load_task_arn: str | None = None,
+) -> tuple[bool, str]:
+    """OPEN-633: run cloud_loader.py as a Fargate task of the scrapers image (`RUNNER_SCRIPT=cloud_loader.py`) instead
+    of in this container. Launched through the archive's launcher; the load task's ARN goes into the in-flight record
+    so a restarted ddp-sync waits for it instead of starting a second load (`load_task_arn` is that resumed ARN).
+
+    Waited on with a hard ceiling, `load_timeout_seconds` (2 h), the same limit today's local subprocess has: at the
+    ceiling the task is stopped and its `_import_lock` released once ECS reports it STOPPED. The import is one
+    database transaction, so a stopped load leaves nothing behind. No stall check: in stall mode the ceiling stops
+    nothing, and a load is minutes."""
+    from ddp_sync.pipelines.openstates_archive import (
+        _launch_archive_fargate_task,
+        redact_dsn,
+    )
+
+    if load_task_arn is None:
+        rds_url = None
+        if not fargate_cfg.get("rds_from_task_secret"):
+            rds_url, error = resolve_rds_database_url()
+            if error:
+                return False, f"cannot resolve an RDS target: {error}"
+        command = [jurisdiction, run_id, *(session_arg.split() if session_arg else [])]
+        started, load_task_arn, detail = _launch_archive_fargate_task(
+            jurisdiction, run_id, rds_url, fargate_cfg, ecs_client, runner="cloud_loader.py", command=command
+        )
+        if not started:
+            return False, f"load task did not start: {detail}"
+        inflight_fargate_jobs.record_load_started(run_id, load_task_arn)
+        logger.info("cloud_scrape: load task started", jurisdiction=jurisdiction, run_id=run_id,
+                    load_task_arn=load_task_arn)
+
+    load_cfg = {**fargate_cfg, "max_wait_seconds": fargate_cfg.get("load_timeout_seconds", _DEFAULT_LOAD_TIMEOUT_S)}
+    exit_code, detail = _wait_for_task_stop(
+        load_task_arn,
+        load_cfg,
+        ecs_client,
+        label=f"{jurisdiction} load",
+        run_lock=(loader_lock_key(jurisdiction, session_arg), run_id, "_import_lock"),
+    )
+    if exit_code != 0:
+        return False, f"load task exited {exit_code} (task_arn={load_task_arn}): {redact_dsn(detail)}"
+    return True, ""
+
+
 def _run_load(
     jurisdiction: str,
     session_arg: str | None,
@@ -499,8 +569,14 @@ def _run_load(
     openstates_root: str,
     fargate_cfg: dict,
     subprocess_runner,
+    *,
+    ecs_client=None,
+    load_task_arn: str | None = None,
 ) -> tuple[bool, str]:
     """Run cloud_loader.py locally against RDS. Returns (success, detail).
+
+    OPEN-633: when the state's manifest says `scrape.load_on_fargate: true` (folded into `fargate_cfg` at launch, so a
+    resumed job replays the same choice), the load runs as its own Fargate task instead (`_run_load_on_fargate`).
 
     Resolves the target database live from Secrets Manager (OPEN-260), deliberately not from
     a cached `DATABASE_URL`-style env var: `_run_scrape()`'s own mac-side branch (this same
@@ -517,6 +593,11 @@ def _run_load(
     after the collection had already run). This function keeps its own check too, so a
     caller that invokes it directly -- tests included -- gets the same guarantee.
     """
+    if fargate_cfg.get("load_on_fargate"):
+        return _run_load_on_fargate(
+            jurisdiction, session_arg, run_id, fargate_cfg, ecs_client or boto3.client("ecs"), load_task_arn
+        )
+
     rds_url, error = resolve_rds_database_url()
     if error:
         return False, f"cannot resolve an RDS target: {error}"
@@ -564,8 +645,12 @@ def _finish_after_launch(
     subprocess_runner,
     label: str,
     logs_client=None,
+    load_task_arn: str | None = None,
 ) -> dict[str, Any]:
     """Wait for an already-launched ECS task to stop, then load into RDS on success.
+
+    OPEN-633: `load_task_arn` (from a resumed in-flight record) means the collection already finished and its load
+    task was launched; the wait goes straight to that load task instead of starting a second load.
 
     Shared by `run_cloud_scrape()` (task_arn just came back from `_launch_fargate_task()`) and
     `resume_inflight_fargate_job()` (task_arn was persisted by a previous process -- OPEN-251):
@@ -585,15 +670,18 @@ def _finish_after_launch(
     )
 
     start = time.monotonic()
-    # OPEN-477: the scrape wait always runs in stall-check mode (a logs client is what switches it on).
-    exit_code, detail = _wait_for_task_stop(
-        task_arn,
-        fargate_cfg,
-        ecs_client,
-        logs_client=logs_client or _logs_client(),
-        label=label,
-        run_lock=(jurisdiction, run_id, "_lock"),
-    )
+    if load_task_arn:
+        exit_code, detail = 0, ""
+    else:
+        # OPEN-477: the scrape wait always runs in stall-check mode (a logs client is what switches it on).
+        exit_code, detail = _wait_for_task_stop(
+            task_arn,
+            fargate_cfg,
+            ecs_client,
+            logs_client=logs_client or _logs_client(),
+            label=label,
+            run_lock=(jurisdiction, run_id, "_lock"),
+        )
 
     if exit_code != 0:
         duration = round(time.monotonic() - start, 1)
@@ -621,7 +709,14 @@ def _finish_after_launch(
         run_id=run_id,
     )
     load_ok, load_detail = _run_load(
-        jurisdiction, session_arg, run_id, openstates_root, fargate_cfg, subprocess_runner
+        jurisdiction,
+        session_arg,
+        run_id,
+        openstates_root,
+        fargate_cfg,
+        subprocess_runner,
+        ecs_client=ecs_client,
+        load_task_arn=load_task_arn,
     )
     duration = round(time.monotonic() - start, 1)
 
@@ -710,6 +805,7 @@ def resume_inflight_fargate_job(
             subprocess_runner,
             label,
             logs_client,
+            load_task_arn=record.get("load_task_arn"),
         )
     except Exception as e:  # noqa: BLE001 -- see docstring: nothing may escape uncaught here
         duration = round(time.monotonic() - start, 1)
@@ -861,7 +957,10 @@ def run_cloud_scrape(
         # _run_load() below resolves it again live, deliberately, so a Secrets Manager rotation
         # that happens during this collection's hours-long run is picked up at load time rather
         # than carrying forward whatever was current when this preflight check ran.
-        _, preflight_error = resolve_rds_database_url()
+        # OPEN-633: a load task that reads the RDS secret itself needs nothing resolved here.
+        preflight_error = ""
+        if not (fargate_cfg.get("load_on_fargate") and fargate_cfg.get("rds_from_task_secret")):
+            _, preflight_error = resolve_rds_database_url()
         if preflight_error:
             duration = round(time.monotonic() - start, 1)
             error = f"cannot resolve an RDS target: {preflight_error}"

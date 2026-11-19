@@ -479,6 +479,9 @@ openstates_scrape:
       # SYNC-157: a state's own ceiling is the manifest's scrape.fargate_max_wait_s (ma: 86400), not a map here.
       load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
                                   # loads were minutes even for multi-thousand-row jurisdictions
+      rds_from_task_secret: false # OPEN-633 (D2): true = pass no DATABASE_URL to the load task; it builds its own from
+                                  # the task definition's RDS secret. Turn on only after the release note confirms the
+                                  # ddp-scrapers task definition has the secret and its role can read it.
 
   # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
   #
@@ -791,6 +794,8 @@ openstates_archive:
       memory_bucket: "ddp-openstates-scraper-memory"
       memory_prefix: "prod"
       max_wait_seconds: 43200   # 12h backstop, same reasoning as the scrape block's
+      rds_from_task_secret: false # OPEN-633 (D2): true = pass no DATABASE_URL to the archive task (it builds its own
+                                  # from the task definition's RDS secret); same switch as the scrape block's, same go.
   # SYNC-83 (PLAN-enterprise-search.md 5.6): embed the bills this archive run touched into the NEW
   # `ddp-knowledge-base` Pinecone index (bill text per version; no version diffs, no votes). Off until
   # BOTH `enabled` is true here AND the host's KNOWLEDGE_BASE_INDEX_NAME is set (SYNC-89) -- and the
