@@ -102,6 +102,27 @@ def record_started(
         )
 
 
+def record_load_started(run_id: str, load_task_arn: str) -> None:
+    """OPEN-633: add the load task's ARN to a job's record once its Fargate load task has launched, so a restart
+    during the load waits for that task (`resume_inflight_fargate_job`) instead of starting a second load. Best-effort
+    like `record_started`: if it is not written, a restart starts the load again, and that second load meets the
+    first one's import lock and refuses (nothing imported)."""
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        raw = client.hget(INFLIGHT_KEY, run_id)
+        if raw is None:
+            return
+        record = json.loads(raw)
+        record["load_task_arn"] = load_task_arn
+        client.hset(INFLIGHT_KEY, run_id, json.dumps(record))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "inflight_fargate_jobs: failed to record the load task", run_id=run_id, error=str(e)
+        )
+
+
 def clear(run_id: str) -> None:
     """Remove a job's record once it has reached a terminal outcome -- collection failure, load
     failure, or success. From here on its fate is already captured by the caller's own

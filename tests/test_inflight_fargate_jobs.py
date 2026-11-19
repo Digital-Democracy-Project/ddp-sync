@@ -28,6 +28,10 @@ class FakeRedisClient:
         self._maybe_raise("hgetall")
         return dict(self._hashes.get(key, {}))
 
+    def hget(self, key, field):
+        self._maybe_raise("hget")
+        return self._hashes.get(key, {}).get(field)
+
 
 def test_record_started_then_list_inflight_round_trips():
     client = FakeRedisClient()
@@ -84,3 +88,26 @@ def test_unparseable_stored_value_is_skipped_not_fatal():
         records = ifj.list_inflight()
 
     assert list(records.keys()) == ["good"]
+
+
+def test_record_load_started_adds_the_load_task_to_the_existing_record():
+    """OPEN-633: the load task's ARN joins the record the collection wrote, so a restart during the load waits for
+    that task instead of starting a second load."""
+    client = FakeRedisClient()
+    with patch.object(ifj, "_client", client):
+        ifj.record_started("fl-abc", "fl", "session=2026", "arn:task/collect", {"cluster": "x"}, "/root")
+        ifj.record_load_started("fl-abc", "arn:task/load")
+        record = ifj.list_inflight()["fl-abc"]
+    assert record["load_task_arn"] == "arn:task/load"
+    assert record["task_arn"] == "arn:task/collect"
+    assert record["session_arg"] == "session=2026"
+
+
+def test_record_load_started_never_creates_a_record_of_its_own_nor_raises():
+    client = FakeRedisClient()
+    with patch.object(ifj, "_client", client):
+        ifj.record_load_started("fl-gone", "arn:task/load")  # already cleared: nothing to add to
+        assert ifj.list_inflight() == {}
+    failing = FakeRedisClient(raise_on={"hget"})
+    with patch.object(ifj, "_client", failing):
+        ifj.record_load_started("fl-abc", "arn:task/load")  # logged, not raised

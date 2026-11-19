@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -313,14 +314,32 @@ async def _run_archive(
         }
 
 
+_DSN_RE = re.compile(r"postgres(?:ql)?://\S+")
+
+
+def redact_dsn(text: str) -> str:
+    """OPEN-633: cut any connection string out of a message before it is logged or alerted. A launch error from ECS
+    could echo the task's overrides, and until `rds_from_task_secret` is on those carry DATABASE_URL, password
+    included."""
+    return _DSN_RE.sub("postgresql://<redacted>", text or "")
+
+
 def _launch_archive_fargate_task(
     jurisdiction: str,
     run_id: str,
-    rds_url: str,
+    rds_url: str | None,
     fargate_cfg: dict,
     ecs_client,
+    *,
+    runner: str = "cloud_archiver.py",
+    command: list[str] | None = None,
 ) -> tuple[bool, str | None, str]:
     """Launch cloud_archiver.py for one jurisdiction as a Fargate task.
+
+    OPEN-633: also launches the cloud load (`runner="cloud_loader.py"`, `command=[state, run_id, session args...]`),
+    so there is no fourth copy of `run_task`. `rds_url=None` passes no DATABASE_URL at all: the task builds it from
+    its task definition's RDS secret (`cloud_path.fargate.rds_from_task_secret`; ddp-open-states
+    `apply_rds_task_secret`). A launch failure's detail has any connection string cut out (`redact_dsn`).
 
     Deliberately its own function rather than reusing cloud_scrape_trigger._launch_fargate_task
     -- that function's `environment` override is fixed to just RUN_ID, which is correct for
@@ -349,11 +368,11 @@ def _launch_archive_fargate_task(
                 "containerOverrides": [
                     {
                         "name": container_name,
-                        "command": [jurisdiction],
+                        "command": command or [jurisdiction],
                         "environment": [
                             {"name": "RUN_ID", "value": run_id},
-                            {"name": "RUNNER_SCRIPT", "value": "cloud_archiver.py"},
-                            {"name": "DATABASE_URL", "value": rds_url},
+                            {"name": "RUNNER_SCRIPT", "value": runner},
+                            *([{"name": "DATABASE_URL", "value": rds_url}] if rds_url else []),
                             {
                                 "name": "MEMORY_BUCKET",
                                 "value": fargate_cfg.get(
@@ -370,13 +389,13 @@ def _launch_archive_fargate_task(
             },
         )
     except Exception as e:  # noqa: BLE001 -- ClientError and friends, all "never started" alike
-        return False, None, str(e)
+        return False, None, redact_dsn(str(e))
 
     failures = resp.get("failures", [])
     tasks = resp.get("tasks", [])
     if failures or not tasks:
         detail = "; ".join(f.get("reason", "unknown") for f in failures) or "no task returned"
-        return False, None, detail
+        return False, None, redact_dsn(detail)
     return True, tasks[0]["taskArn"], ""
 
 
@@ -406,19 +425,6 @@ async def _run_archive_fargate(
     # var -- RDS's own automatic 7-day credential rotation goes stale under a cached value
     # regardless of how recently this process started (see rds_credentials.py's docstring for
     # the full incident this fixes, 2026-09-09).
-    rds_url, rds_error = resolve_rds_database_url()
-    if rds_error:
-        error = f"cannot resolve an RDS target: {rds_error}"
-        logger.error(
-            "openstates_archive: fargate launch refused", jurisdiction=jurisdiction, error=error
-        )
-        return {
-            "success": False,
-            "error": error,
-            "jurisdiction": jurisdiction,
-            "duration_seconds": 0.0,
-        }
-
     try:
         fargate_cfg = _fargate_config(config)
     except ValueError as e:
@@ -431,6 +437,23 @@ async def _run_archive_fargate(
             "jurisdiction": jurisdiction,
             "duration_seconds": 0.0,
         }
+
+    # OPEN-633 (D2): once the task definition carries the RDS secret, the task builds its own DATABASE_URL and none
+    # is passed here (so the password is no longer in ECS's task start record).
+    rds_url = None
+    if not fargate_cfg.get("rds_from_task_secret"):
+        rds_url, rds_error = resolve_rds_database_url()
+        if rds_error:
+            error = f"cannot resolve an RDS target: {rds_error}"
+            logger.error(
+                "openstates_archive: fargate launch refused", jurisdiction=jurisdiction, error=error
+            )
+            return {
+                "success": False,
+                "error": error,
+                "jurisdiction": jurisdiction,
+                "duration_seconds": 0.0,
+            }
 
     client = ecs_client or boto3.client("ecs")
     run_id = f"{jurisdiction}-archive-{uuid.uuid4().hex[:12]}"
