@@ -1748,7 +1748,9 @@ def _wait_s(block: dict | None, jurisdiction: str | None = None) -> int:
     return int(own or fargate.get("max_wait_seconds") or _DEFAULT_MAX_WAIT_S)
 
 
-def pipeline_lock_ttl_s(jurisdiction: str, config: dict | None, archive_config: dict | None) -> int:
+def pipeline_lock_ttl_s(
+    jurisdiction: str, config: dict | None, archive_config: dict | None, sessions: list[str] | None = None
+) -> int:
     """SYNC-153: the state's pipeline lock TTL, the worst case of a whole run: per session, the scrape's Fargate wait
     plus its RDS load timeout; then 1 + len(ARCHIVE_RETRY_DELAYS_S) archive attempts at the archive's Fargate wait;
     the retry delays; and 1 h. With today's limits: about 53.5 h for a one-session state, 65.5 h for MA (24 h scrape
@@ -1759,7 +1761,7 @@ def pipeline_lock_ttl_s(jurisdiction: str, config: dict | None, archive_config: 
     from ddp_sync.pipelines.cloud_scrape_trigger import _DEFAULT_LOAD_TIMEOUT_S
     from ddp_sync.pipelines.openstates_archive import ARCHIVE_RETRY_DELAYS_S
 
-    sessions = max(len(state_timing(config, jurisdiction)["sessions"]), 1)
+    sessions = max(len(sessions if sessions is not None else state_timing(config, jurisdiction)["sessions"]), 1)
     fargate = ((config or {}).get("cloud_path") or {}).get("fargate") or {}
     load = int(fargate.get("load_timeout_seconds") or _DEFAULT_LOAD_TIMEOUT_S)
     attempts = 1 + len(ARCHIVE_RETRY_DELAYS_S)
@@ -1820,6 +1822,8 @@ async def run_state_pipeline(
     skip_people_check: bool = False,
     people_checked: bool = False,
     lock_token: str | None = None,
+    sessions: list[str] | None = None,
+    full: bool = False,
 ) -> dict[str, Any]:
     """Scrape one state, then archive it (which fires LegBot, search refresh and embedding). The ONE path for the
     scheduler's `openstates_scrape_<state>` job and the manual trigger.
@@ -1834,25 +1838,56 @@ async def run_state_pipeline(
     The status record `openstates_scrape_<state>` is written once, in `finally`, after the archive outcome is known.
     History, broker signal and status are bookkeeping: a failure in any of them is logged and changes nothing.
     `skip_people_check` / `people_checked` are the manual trigger's SYNC-147 override and "already read" flags.
+    SYNC-181: `sessions` (a manual run's own list, same form as `timing.<state>.sessions`) replaces the scheduled ones;
+    `full` makes each collection full (no `start=`) and keeps the state's lock renewed for the whole run.
 
     SYNC-153: the whole run holds the state's pipeline lock (`redis_store.state_lock`); a run that finds it held raises
     `PipelineBusy` and does nothing else (no status record: the run holding the lock writes its own). A manual trigger
     took the lock before answering and passes its `lock_token`. The archive is `archive_with_retry` (retries, then an
     alert); a failed lock release is logged and never replaces the outcome.
     """
+    from ddp_sync.pipelines.cloud_scrape_trigger import FULL_COLLECTION
     from ddp_sync.services.redis_store import state_lock
 
-    ttl = pipeline_lock_ttl_s(jurisdiction, config, archive_config)
+    ttl = pipeline_lock_ttl_s(jurisdiction, config, archive_config, sessions)
     async with state_lock(jurisdiction, ttl, token=lock_token) as held:
         if not held:
             raise PipelineBusy(jurisdiction)
-        return await _run_state_pipeline_locked(
-            jurisdiction, config, archive_config, skip_people_check=skip_people_check, people_checked=people_checked
-        )
+        # SYNC-181: a full re-import can outlive the computed TTL (the scrape's wait is an alert, not a stop: OPEN-477),
+        # so its lock is renewed for as long as the run lasts and a nightly of the same state is refused throughout.
+        keeper = asyncio.create_task(_keep_state_lock(jurisdiction, lock_token, ttl)) if full and lock_token else None
+        full_token = FULL_COLLECTION.set(bool(full))
+        try:
+            return await _run_state_pipeline_locked(
+                jurisdiction, config, archive_config, skip_people_check=skip_people_check,
+                people_checked=people_checked, sessions=sessions,
+            )
+        finally:
+            FULL_COLLECTION.reset(full_token)
+            if keeper is not None:
+                keeper.cancel()
+
+
+# SYNC-181: how often a full re-import renews its state lock (to the run's full TTL each time).
+STATE_LOCK_RENEW_S = 600
+
+
+async def _keep_state_lock(jurisdiction: str, token: str, ttl_s: int) -> None:
+    """Renew the state's lock every STATE_LOCK_RENEW_S while a full re-import runs (cancelled when it ends). A lock no
+    longer ours is logged and the renewal stops; a Redis that cannot answer is skipped and retried (fail open, as
+    acquiring does)."""
+    from ddp_sync.services.redis_store import extend_state_lock
+
+    while True:
+        await asyncio.sleep(STATE_LOCK_RENEW_S)
+        if await extend_state_lock(jurisdiction, token, ttl_s) is False:
+            logger.error("openstates_pipeline: full re-import lost its state lock", jurisdiction=jurisdiction)
+            return
 
 
 async def _run_state_pipeline_locked(
-    jurisdiction: str, config: dict | None, archive_config: dict | None, *, skip_people_check: bool, people_checked: bool
+    jurisdiction: str, config: dict | None, archive_config: dict | None, *, skip_people_check: bool, people_checked: bool,
+    sessions: list[str] | None = None,
 ) -> dict[str, Any]:
     """`run_state_pipeline`'s body, run while the state's lock is held."""
     from ddp_sync.pipelines.openstates_archive import archive_with_retry
@@ -1867,7 +1902,8 @@ async def _run_state_pipeline_locked(
     checked_token = _PEOPLE_ALREADY_CHECKED.set(bool(people_checked))
     logger.info("openstates_pipeline: starting", jurisdiction=jurisdiction)
     try:
-        for session in state_timing(config, jurisdiction)["sessions"] or [None]:
+        # SYNC-181: a manual run may name its own sessions (same form as `timing.<state>.sessions`)
+        for session in (sessions if sessions is not None else state_timing(config, jurisdiction)["sessions"]) or [None]:
             session_arg = f"session={session}" if session else None
             try:
                 results.append(await _run_scrape(jurisdiction, session_arg, openstates_root, None, config))
