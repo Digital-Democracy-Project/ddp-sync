@@ -526,13 +526,21 @@ PLAN-push-button-onboarding.md, "2026-11-10: One pipeline per state". There is n
   states a day, 12:00 UTC, MA alone on Monday; FL and MI Sunday 02:00); the default only catches a newly scraped state.
   A `day` that is not a weekday name would silently fall back to Sunday in the scheduler, so
   `tests/test_sync_172_staggered_weekly_scrapes.py` checks every `day` in the real file.
-- **`run_state_pipeline(state, config, archive_config, *, skip_people_check, people_checked)`** — the one path for the
+- **`run_state_pipeline(state, config, archive_config, *, skip_people_check, people_checked, sessions, full)`** — the one path for the
   scheduled job `openstates_scrape_<state>` and `POST /trigger/openstates-scrape/<state>` (202): every session through
   `_run_scrape` (each in its own try), `_record_scrape_history` (`ddp:flow_history:openstates_scrape:<state>`, the
   OPEN-22/OPEN-139 record and checks, for every state), the broker signal, then ONE `openstates_archive.archive_with_retry`
   (None not archived / True / False; SYNC-153). Raises **`PipelineFailed`** when any session failed or the archive failed, so APScheduler
   logs an error; writes the status record `openstates_scrape_<state>` once, in `finally`. History, signal and status go through
   `_logged` (a failure is logged, never raised). `_run_scrape` itself no longer archives or signals.
+  **SYNC-181, a whole-session re-import:** the trigger's `?sessions=` (comma-separated, each in the form of
+  `timing.<state>.sessions`: a session code, then optional scraper `key=value`s; `session=`, `start=` and `full=` are
+  refused) runs those sessions instead of the scheduled ones, and `?full=true` sets `cloud_scrape_trigger.FULL_COLLECTION`
+  so the Fargate collection gets `full=true` (ddp-open-states `cloud_collector.py`: no `start=` cutoff; never on the
+  load's command, so the load's key and lock stay the session's own). Cloud path only (a 400 otherwise). A full run
+  renews the state's lock every `STATE_LOCK_RENEW_S` (`_keep_state_lock`) for as long as it lasts, so the nightly is
+  refused throughout; the lock's TTL also counts the named sessions. Without either parameter the run and its answer
+  are exactly as before. **Do not add a second re-import path** (no hand-launched `aws ecs run-task`: it takes no lock).
 - **Registration** (`scheduler._register_state_pipeline_jobs`): removes the retired ids first (`openstates_secondary_scrape*`,
   `openstates_primary_scrape_*`, `openstates_fl_scrape`, `openstates_wa_scrape`, `openstates_usa_scrape`), removes the job of a
   state no longer scraped, then adds one job per scraped state (`replace_existing`, `max_instances=1`, `coalesce`). A tempo

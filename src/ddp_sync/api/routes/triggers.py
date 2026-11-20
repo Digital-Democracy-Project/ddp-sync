@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from dataclasses import asdict
 from datetime import date
 from typing import Literal
@@ -1263,6 +1264,33 @@ def _single_jurisdiction_targets(config: dict) -> set[str]:
     return {str(j).strip().lower() for j in enrolled_scrape_states(config) or []} - _OPENSTATES_JOB_TARGETS
 
 
+_SESSION_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SESSION_EXTRA = re.compile(r"^([a-z_]+)=([A-Za-z0-9_.-]+)$")
+# Words a session entry may not carry: the session is the entry's first word, `start=` is the collector's cutoff (a
+# full re-import drops it), and `full=` is `?full=true`.
+_SESSION_RESERVED = {"session", "start", "full"}
+
+
+def _parse_sessions(raw: str | None) -> list[str] | None:
+    """SYNC-181: `?sessions=` as the scrape runs them, comma-separated, each in the form of `timing.<state>.sessions` in
+    sync_schedule.yaml: a session code, then optional scraper arguments (`118 chamber=lower`; `bill_no=HB1` also works).
+    None when absent; a 400 on anything else, so nothing unexpected reaches the scraper's command."""
+    if raw is None:
+        return None
+    entries = [" ".join(e.split()) for e in raw.split(",")]  # one spelling per entry, so duplicates collapse
+    if not entries or any(not e for e in entries):
+        raise HTTPException(status_code=400, detail="sessions must be a comma-separated list of non-empty entries")
+    for entry in entries:
+        code, *extras = entry.split()
+        bad = not _SESSION_CODE.match(code) or any(
+            not (m := _SESSION_EXTRA.match(x)) or m.group(1) in _SESSION_RESERVED for x in extras)
+        if bad:
+            raise HTTPException(status_code=400, detail=(
+                f"bad session entry {entry!r}: a session code, then optional key=value scraper arguments "
+                f"(not {', '.join(sorted(_SESSION_RESERVED))}), for example '118 chamber=lower'"))
+    return list(dict.fromkeys(entries))
+
+
 async def _take_state_lock(target: str) -> str:
     """SYNC-153: take the state's pipeline lock before answering, so the answer cannot race the run: 409 while it is
     held; otherwise the token goes to the background run, which never takes the lock a second time."""
@@ -1298,6 +1326,8 @@ async def trigger_openstates_scrape(
     target: str,
     background_tasks: BackgroundTasks,
     skip_people_check: bool = False,
+    full: bool = False,
+    sessions: str | None = None,
     token: str = Depends(api_key_auth),
 ):
     """Trigger an OpenStates job immediately, without waiting for its cron.
@@ -1317,6 +1347,12 @@ async def trigger_openstates_scrape(
                       answers 409 (runbook rule 1); `?skip_people_check=true` starts it anyway.
                       SYNC-153: the state's pipeline lock is taken BEFORE the answer: 409 while a run for that
                       state (scheduled, manual scrape or manual archive) holds it; a 202 means this run owns it.
+                      SYNC-181: `?sessions=118 chamber=lower,118 chamber=upper` runs those sessions instead of the
+                      scheduled ones (each entry in the form of `timing.<state>.sessions`); `?full=true` makes every
+                      collection full, with no `start=` cutoff, so every bill is scraped again (a whole-session
+                      re-import; the cloud path only, a 400 otherwise). A full run renews the state's lock for as
+                      long as it lasts, so the state's nightly is refused throughout. Example (the US re-import):
+                      `?full=true&sessions=118%20chamber%3Dlower,118%20chamber%3Dupper,119%20chamber%3Dlower,...`
     """
     from ddp_sync.pipelines.fork_upstream_check import run_fork_upstream_check_job
     from ddp_sync.pipelines.jurisdiction_drift_check import run_jurisdiction_drift_check
@@ -1331,7 +1367,10 @@ async def trigger_openstates_scrape(
     config = scheduler._sync_config.get("openstates_scrape", {}) if scheduler else {}
     archive_config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
 
+    session_list = _parse_sessions(sessions)
     if target in _OPENSTATES_JOB_TARGETS:
+        if full or session_list is not None:
+            raise HTTPException(status_code=400, detail=f"full and sessions apply to a state, not to {target}")
         job_map = {
             "patches": run_patch_refresh_job,
             "people": run_people_refresh_job,
@@ -1347,8 +1386,15 @@ async def trigger_openstates_scrape(
         # SYNC-147: a state that is not live yet and has no legislators in production is refused HERE, so the answer
         # to the person triggering it says so (the job itself runs in the background). `?skip_people_check=true` starts
         # it anyway, on purpose; the job logs that.
-        from ddp_sync.pipelines.openstates_scrape import people_check_refusal
+        from ddp_sync.pipelines.openstates_scrape import (
+            _cloud_path_owns,
+            people_check_refusal,
+        )
 
+        if full and not _cloud_path_owns(target, config):
+            raise HTTPException(status_code=400, detail=f"full=true runs on the cloud path only, and {target} is not on it")
+        # only what was asked for, so an ordinary run is started exactly as before
+        run = {k: v for k, v in (("sessions", session_list), ("full", True if full else None)) if v is not None}
         if not skip_people_check:
             refusal = await people_check_refusal(target, config)
             if refusal:
@@ -1356,11 +1402,11 @@ async def trigger_openstates_scrape(
         token = await _take_state_lock(target)
         if skip_people_check:
             background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
-                                      skip_people_check=True, lock_token=token)
-            return {"status": "started", "target": target, "people_check": "skipped on purpose"}
+                                      skip_people_check=True, lock_token=token, **run)
+            return {"status": "started", "target": target, "people_check": "skipped on purpose", **run}
         background_tasks.add_task(_run_state_pipeline_in_background, target, config, archive_config,
-                                  people_checked=True, lock_token=token)
-        return {"status": "started", "target": target}
+                                  people_checked=True, lock_token=token, **run)
+        return {"status": "started", "target": target, **run}
 
     available = sorted(_OPENSTATES_JOB_TARGETS | single_targets)
     raise HTTPException(

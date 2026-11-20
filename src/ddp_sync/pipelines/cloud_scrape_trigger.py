@@ -79,6 +79,7 @@ a resumed one run through, so the two paths can't drift apart from here on.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import subprocess
@@ -266,6 +267,13 @@ def _release_stopped_run_lock(
     return f"lock {key} released"
 
 
+# SYNC-181: a whole-session re-import (`/trigger/openstates-scrape/<state>?full=true`). Set by the pipeline for the run;
+# `asyncio.to_thread` carries it into this module's blocking calls. The collector reads `full=true` as "no `start=`
+# cutoff" (ddp-open-states cloud_collector.py); it is NOT part of `session_arg`, so the load's key and lock stay the
+# session's own.
+FULL_COLLECTION: contextvars.ContextVar[bool] = contextvars.ContextVar("full_collection", default=False)
+
+
 def _launch_fargate_task(
     jurisdiction: str,
     session_arg: str | None,
@@ -301,6 +309,8 @@ def _launch_fargate_task(
     command = [jurisdiction]
     if session_arg:
         command.extend(session_arg.split())
+    if FULL_COLLECTION.get():
+        command.append("full=true")  # SYNC-181: the collector's own word, never the scraper's
 
     container_name = fargate_cfg.get("container_name", "scraper")
     try:
