@@ -18,6 +18,7 @@ at 01:00 UTC handles apply-local-patches.sh before the 02:00 UTC scrapes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import os
@@ -1864,8 +1865,10 @@ async def run_state_pipeline(
             )
         finally:
             FULL_COLLECTION.reset(full_token)
-            if keeper is not None:
+            if keeper is not None:  # stopped before state_lock releases the lock, so nothing renews it afterwards
                 keeper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await keeper
 
 
 # SYNC-181: how often a full re-import renews its state lock (to the run's full TTL each time).
@@ -1874,8 +1877,8 @@ STATE_LOCK_RENEW_S = 600
 
 async def _keep_state_lock(jurisdiction: str, token: str, ttl_s: int) -> None:
     """Renew the state's lock every STATE_LOCK_RENEW_S while a full re-import runs (cancelled when it ends). A lock no
-    longer ours is logged and the renewal stops; a Redis that cannot answer is skipped and retried (fail open, as
-    acquiring does)."""
+    longer ours is logged and the renewal stops; a Redis that cannot answer is retried at the next tick
+    (`extend_state_lock` catches its own errors and returns None: fail open, as acquiring does)."""
     from ddp_sync.services.redis_store import extend_state_lock
 
     while True:

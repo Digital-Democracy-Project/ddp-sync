@@ -35,9 +35,22 @@ from tests.test_sync_153_archive_after_scrape_only import (  # noqa: F401
 US_REIMPORT = "118 chamber=lower,118 chamber=upper,119 chamber=lower,119 chamber=upper"
 
 
+class CountingRedis(FakeRedis):
+    """FakeRedis that also records every compare-and-expire (a renewal)."""
+
+    def __init__(self):
+        super().__init__()
+        self.extend_calls = []
+
+    async def eval(self, script, n, key, token, *args):
+        if "'expire'" in script:
+            self.extend_calls.append(key)
+        return await super().eval(script, n, key, token, *args)
+
+
 @pytest.fixture
 def redis():
-    fake = FakeRedis()
+    fake = CountingRedis()
     with patch("ddp_sync.services.redis_store.get_redis_store", return_value=SimpleNamespace(_client=fake)):
         yield fake
 
@@ -99,6 +112,12 @@ def test_a_bad_session_entry_is_a_400_and_takes_no_lock(redis, bad):
     assert resp.status_code == 400, (bad, resp.text)
     bg.assert_not_awaited()
     assert redis.data == {}
+
+
+def test_entries_are_normalised_so_the_same_session_runs_once(redis):
+    resp, bg = _post("usa", sessions=" 118  chamber=lower ,118 chamber=lower,119")
+    assert resp.status_code == 202
+    assert bg.await_args.kwargs["sessions"] == ["118 chamber=lower", "119"]
 
 
 def test_full_or_sessions_on_a_job_target_is_a_400(redis):
@@ -163,7 +182,26 @@ async def test_a_full_run_keeps_its_lock_and_a_nightly_is_refused_throughout(red
     ttl = scrape.pipeline_lock_ttl_s("usa", {}, {"enabled": True}, ["118"])
     assert (observed["ttl"] == ttl) is renewed
     assert observed["nightly"] is None  # refused while the run holds the lock
-    assert key not in redis.data  # released at the end; the renewal stopped with the run
+    assert key not in redis.data  # released at the end
+    calls_at_end = len(redis.extend_calls)
+    await asyncio.sleep(0.05)
+    assert len(redis.extend_calls) == calls_at_end  # the renewal stopped with the run: nothing renews afterwards
+
+
+@pytest.mark.asyncio
+async def test_a_redis_that_cannot_answer_is_retried_not_the_end_of_the_renewal(redis):
+    token = await redis_store.acquire_state_lock("usa", 60)
+    calls = []
+
+    async def _extend(j, t, ttl):
+        calls.append(ttl)
+
+    with patch.object(scrape, "STATE_LOCK_RENEW_S", 0.001), \
+            patch("ddp_sync.services.redis_store.extend_state_lock", new=_extend):
+        task = asyncio.create_task(scrape._keep_state_lock("usa", token, 100))
+        await asyncio.sleep(0.05)
+        assert not task.done() and len(calls) >= 2  # still renewing after unanswered ticks
+        task.cancel()
 
 
 @pytest.mark.asyncio

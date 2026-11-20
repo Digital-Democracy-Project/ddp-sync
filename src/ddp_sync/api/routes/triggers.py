@@ -1277,7 +1277,7 @@ def _parse_sessions(raw: str | None) -> list[str] | None:
     None when absent; a 400 on anything else, so nothing unexpected reaches the scraper's command."""
     if raw is None:
         return None
-    entries = [e.strip() for e in raw.split(",")]
+    entries = [" ".join(e.split()) for e in raw.split(",")]  # one spelling per entry, so duplicates collapse
     if not entries or any(not e for e in entries):
         raise HTTPException(status_code=400, detail="sessions must be a comma-separated list of non-empty entries")
     for entry in entries:
