@@ -36,10 +36,10 @@ def _reset_session_pipeline_semaphore():
     creates the singleton doesn't leak it forward even if this fixture's own
     teardown ordering relative to other fixtures ever changes.
     """
-    session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._legbot_line = None
     session_pipeline_runner._session_pipeline_active_holders = 0
     yield
-    session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._legbot_line = None
     session_pipeline_runner._session_pipeline_active_holders = 0
 
 _CANDIDATE = {

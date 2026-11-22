@@ -100,7 +100,7 @@ async def _settle():
 async def test_a_running_session_pipeline_shows_with_its_progress_and_makes_a_restart_unsafe(redis, no_scheduler,
                                                                                           monkeypatch):
     """The 2026-11-18 gap: US 119 walked two bills at a time, most skipped, CAMS idle, nothing on any status screen."""
-    session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._legbot_line = None
     monkeypatch.setattr(session_pipeline_runner, "get_settings",
                         lambda: SimpleNamespace(session_pipeline_concurrency=1))
     candidates = [{"gov_id": f"HR {n}", "bill_openstates_id": f"ocd-bill/{n}"} for n in (1, 2, 3)]
@@ -275,7 +275,7 @@ def test_the_scheduler_listens_for_job_starts_and_ends():
 
 @pytest.mark.asyncio
 async def test_a_pipeline_that_fails_before_its_first_bill_does_not_stay_running(redis, monkeypatch):
-    session_pipeline_runner._session_pipeline_semaphore = None
+    session_pipeline_runner._legbot_line = None
     with patch.object(session_pipeline_runner, "list_current_session_bill_candidates",
                       new=AsyncMock(side_effect=RuntimeError("replica down"))), pytest.raises(RuntimeError):
         await session_pipeline_runner.run_legbot_pipeline(
