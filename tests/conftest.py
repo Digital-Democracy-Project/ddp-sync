@@ -77,6 +77,18 @@ def _no_operator_alert_route(monkeypatch):
     monkeypatch.setattr(slack_alerts, "requests", _NO_UNREPLACED_POST)
 
 
+@pytest.fixture(autouse=True)
+def _no_polled_bill_lookup(monkeypatch):
+    """SYNC-185: a session run reads its polled bills from the broker at its start; in tests that read answers "none"
+    (no network). The line's own tests set it back."""
+    from ddp_sync.pipelines import session_pipeline_runner
+
+    async def _none(*args, **kwargs):
+        return set()
+
+    monkeypatch.setattr(session_pipeline_runner, "list_polled_bill_ids", _none)
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-mark all coroutine tests with asyncio."""
     for item in items:

@@ -53,6 +53,7 @@ correctly.
 from __future__ import annotations
 
 import asyncio
+import collections
 import resource
 import sys
 import time
@@ -80,6 +81,7 @@ from ddp_sync.services.broker_client import (
     get_bill_artifacts,
     get_bill_organization_positions_status,
     get_concept_statement_statuses,
+    list_polled_bill_ids,
 )
 from ddp_sync.services.jurisdiction_enrollment import default_root, enrolled
 from ddp_sync.services.local_openstates_client import (
@@ -127,25 +129,111 @@ def _alert_legbot_list_unreadable() -> None:
 
 logger = structlog.get_logger()
 
-# SYNC-72: process-wide, not per-call -- see get_session_pipeline_semaphore()'s
-# own docstring for why a semaphore created fresh inside run_legbot_pipeline on
-# every call can't actually bound anything once two calls are in flight at the
-# same time (e.g. two jurisdictions' scheduled batch runs overlapping).
-_session_pipeline_semaphore: asyncio.Semaphore | None = None
+# SYNC-72: process-wide, not per-call -- see get_legbot_line()'s own docstring for why a gate created fresh inside
+# run_legbot_pipeline on every call can't bound anything once two calls are in flight at the same time (e.g. two
+# jurisdictions' runs overlapping). SYNC-185: a fair, prioritised line, no longer a first-come asyncio.Semaphore.
+_legbot_line: LegBotLine | None = None
 
 # SYNC-79: a plain module-level int, incremented/decremented around the
-# semaphore's own acquire/release in _process_bill_bounded below -- not an
-# asyncio.Lock-guarded counter, because (like _session_pipeline_semaphore
-# itself) every mutation here happens with no `await` between the check and
-# the update, so nothing can interleave on asyncio's single-threaded event
-# loop. Exists to answer, from real logs, a question the semaphore alone
-# can't: whether 2 bills' worth of work were ever ACTUALLY in flight at
-# once, or whether real concurrency stayed at 1 despite session_pipeline_
-# concurrency=2 (the still-open question SYNC-79 was filed to resolve).
+# line's own acquire/release in _process_bill_bounded below -- not an
+# asyncio.Lock-guarded counter, because every mutation here happens with no
+# `await` between the check and the update, so nothing can interleave on
+# asyncio's single-threaded event loop. Exists to answer, from real logs, a
+# question the line alone can't: whether 2 bills' worth of work were ever
+# ACTUALLY in flight at once.
 _session_pipeline_active_holders = 0
 
+PRIORITY_POLLED = 0  # SYNC-185: a bill that has a voter poll (the broker's has_poll rule)
+PRIORITY_OTHER = 1
 
-def get_session_pipeline_semaphore() -> asyncio.Semaphore:
+
+class LegBotLine:
+    """SYNC-185: the Mac's LegBot slots, handed out bill by bill, fairly across runs.
+
+    Same capacity as the semaphore it replaces (session_pipeline_concurrency). When a slot frees it goes to the
+    next waiting bill of the highest priority (a polled bill before any other), and within a priority to the RUN
+    served longest ago (a run never served yet first; ties in arrival order), each run's bills in their own order.
+    A slot taken at once because nobody was waiting counts as that run's turn too. So a run that
+    arrives behind a 2,600-bill run starts its first bill when the next slot frees, not after the other run's last
+    bill (Ramon, 2026-11-22: US 119 waited ~20 h behind Louisiana).
+
+    A staff single-bill run (run_single_bill_full) never comes here: it already goes first, unchanged.
+    No awaits between a check and its update, so asyncio's single thread needs no lock.
+    """
+
+    def __init__(self, slots: int):
+        self._free = slots
+        # priority -> {run_id: waiting futures in that run's order}; dict order (arrival) breaks ties between runs
+        self._waiting: dict[int, dict[str, collections.deque]] = {PRIORITY_POLLED: {}, PRIORITY_OTHER: {}}
+        self._tick = 0
+        self._last_served: dict[str, int] = {}  # run_id -> when it last got a slot; dropped once it has none waiting
+
+    def _served(self, run_id: str) -> None:
+        self._tick += 1
+        self._last_served[run_id] = self._tick
+
+    def waiting(self) -> int:
+        return sum(len(q) for runs in self._waiting.values() for q in runs.values())
+
+    async def acquire(self, run_id: str, priority: int = PRIORITY_OTHER) -> None:
+        if self._free > 0 and not self.waiting():
+            self._free -= 1
+            self._served(run_id)
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._waiting[priority].setdefault(run_id, collections.deque()).append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # the slot was handed over just as this bill was cancelled: pass it on
+            raise
+
+    def release(self) -> None:
+        self._free += 1
+        while self._free > 0:
+            fut = self._next()
+            if fut is None:
+                break
+            self._free -= 1
+            fut.set_result(None)
+        if not self.waiting():
+            self._last_served.clear()  # nobody waiting: no turn to keep (and no entry left behind by a finished run)
+
+    def _next(self):
+        """The next waiting bill: highest priority first; within it the first bill of the run served longest ago. A
+        cancelled waiter is skipped."""
+        for priority in (PRIORITY_POLLED, PRIORITY_OTHER):
+            runs = self._waiting[priority]
+            while runs:
+                run_id = min(runs, key=lambda r: self._last_served.get(r, 0))  # min keeps arrival order on ties
+                queue = runs[run_id]
+                fut = queue.popleft()
+                if not queue:
+                    del runs[run_id]
+                if not fut.done():
+                    if any(run_id in waiting for waiting in self._waiting.values()):
+                        self._served(run_id)
+                    else:
+                        self._last_served.pop(run_id, None)  # its last bill: nothing left to be fair to
+                    return fut
+        return None
+
+    def slot(self, run_id: str, priority: int = PRIORITY_OTHER):
+        line = self
+
+        class _Slot:
+            async def __aenter__(self):
+                await line.acquire(run_id, priority)
+
+            async def __aexit__(self, *exc):
+                line.release()
+                return False
+
+        return _Slot()
+
+
+def get_legbot_line() -> LegBotLine:
     """The single, process-wide gate on how many _process_bill calls can be
     in flight across ALL run_legbot_pipeline invocations at once -- not just
     within one call.
@@ -155,43 +243,32 @@ def get_session_pipeline_semaphore() -> asyncio.Semaphore:
     local variable -- never shared across calls. That correctly bounded any
     ONE call to session_pipeline_concurrency bills in flight, a clean 1:1
     match with CAMS's configured MLX worker count (2) when only one
-    jurisdiction's run was active. But run_legbot_pipeline has two real
-    callers that ran independently of each other and could overlap freely --
-    run_scheduled_session_pipeline's cron-driven batch job (removed, SYNC-135), and
-    scraper_triggered_legbot.py's archive-completion hook (SYNC-65) -- so
-    two jurisdictions' batch runs overlapping meant two separate
-    semaphores, each independently admitting 2 bills, for a real total of 4
-    competing for CAMS's 2 actual workers.
+    jurisdiction's run was active. But run_legbot_pipeline has callers that
+    can overlap freely, so two jurisdictions' runs overlapping meant two
+    separate semaphores, each independently admitting 2 bills, for a real
+    total of 4 competing for CAMS's 2 actual workers.
 
     Confirmed live (US 119th Congress + MI running concurrently,
     2026-09-20): throughput collapsed from 136.7 bills/hr (US alone) to
-    22.6 bills/hr combined -- far worse than ordinary queueing delay would
-    explain, because CAMS's own KV-cache reuse (a `branch=warm_hit` in its
-    own audit log, versus a full cold `mlx_prefill_started`) depends on a
+    22.6 bills/hr combined, because CAMS's own KV-cache reuse depends on a
     bill's worker staying free until its own next follow-up call arrives.
     With more distinct bills in flight than there are workers, a bill's
-    worker gets claimed by a competing bill from the OTHER semaphore first,
-    forcing a full prefill every single follow-up instead of ever reusing
-    that bill's own cache.
+    worker gets claimed by a competing bill first, forcing a full prefill
+    every follow-up. SYNC-185 keeps that cap and only changes WHICH waiting
+    bill gets a freed slot (see LegBotLine).
 
-    Same lazy-singleton idiom as get_redis_store() (services/redis_store.py)
-    -- constructed once, on first use, at module scope. Safe without a lock:
-    the check-then-create below has no `await` between the check and the
-    assignment, so nothing can interleave on asyncio's single-threaded event
-    loop.
+    Same lazy-singleton idiom as get_redis_store() (services/redis_store.py).
+    Safe without a lock: no `await` between the check and the assignment.
 
-    Deliberately does NOT also gate run_single_bill_full or
-    dispatch_and_record_bill_artifact -- both bypass concurrency control
-    entirely today (confirmed while investigating SYNC-72) and are a
-    separate, lower-volume gap (human-triggered single-bill requests, not
-    automated backlogs), not widened into this fix's scope.
+    Deliberately does NOT gate run_single_bill_full or
+    dispatch_and_record_bill_artifact: a staff member's single-bill request
+    goes straight through, which is what puts it first (SYNC-185 confirmed
+    and kept this).
     """
-    global _session_pipeline_semaphore
-    if _session_pipeline_semaphore is None:
-        _session_pipeline_semaphore = asyncio.Semaphore(
-            get_settings().session_pipeline_concurrency
-        )
-    return _session_pipeline_semaphore
+    global _legbot_line
+    if _legbot_line is None:
+        _legbot_line = LegBotLine(get_settings().session_pipeline_concurrency)
+    return _legbot_line
 
 
 # The recognized BillArtifact types this plan ships -- matches
@@ -1334,18 +1411,20 @@ async def run_legbot_pipeline(
     # benefit once only a handful of MLX-LM instances can usefully be busy
     # at the same time.
     #
-    # get_session_pipeline_semaphore() (SYNC-72), not a local
+    # get_legbot_line() (SYNC-72, SYNC-185), not a local
     # asyncio.Semaphore(...) constructed here -- see that function's own
     # docstring for why a semaphore scoped to just this one call can't
     # actually bound anything once a second run_legbot_pipeline call (a
     # different jurisdiction's own scheduled batch, say) is in flight at
     # the same time.
-    semaphore = get_session_pipeline_semaphore()
+    line = get_legbot_line()
+    polled = await _polled_bill_ids(jurisdiction_iso2, broker_api_base, broker_api_token) if candidates else set()
 
     async def _process_bill_bounded(candidate: dict) -> dict:
         global _session_pipeline_active_holders
         bill_label = str(candidate.get("gov_id") or candidate.get("bill_openstates_id") or "?")
-        async with semaphore:
+        priority = PRIORITY_POLLED if candidate.get("bill_openstates_id") in polled else PRIORITY_OTHER
+        async with line.slot(run_id, priority):
             activity.bill_started(run_id, bill_label)
             # SYNC-79: log the real concurrent-holder count at the instant
             # this bill is admitted -- the only way to tell, from logs
@@ -1358,7 +1437,7 @@ async def run_legbot_pipeline(
             # overlapping jurisdiction runs sharing the one global budget
             # can each log active_holders=2 while holding only 1 of those
             # 2 slots themselves; that's expected, not a bug, and matches
-            # get_session_pipeline_semaphore()'s own docstring.
+            # get_legbot_line()'s own docstring.
             #
             # Both the increment and the decrement live inside this single
             # try/finally (started before the acquire log, not after it) so
@@ -1430,6 +1509,20 @@ async def run_legbot_pipeline(
         peak_memory_mb=summary["peak_memory_mb"],
     )
     return summary
+
+
+async def _polled_bill_ids(jurisdiction_iso2: str, broker_api_base: str | None, broker_api_token: str | None) -> set[str]:
+    """SYNC-185: the run's polled bills, read once at its start. A broker that cannot answer marks none: the run goes
+    on in plain turns, never fails for it."""
+    try:
+        polled = await list_polled_bill_ids(
+            jurisdiction_iso2, broker_api_base=broker_api_base, broker_api_token=broker_api_token
+        )
+    except Exception as exc:  # noqa: BLE001 -- before the run's own try: anything here must not fail or strand the run
+        logger.warning("session_pipeline_polled_bills_unavailable", jurisdiction=jurisdiction_iso2, error=str(exc))
+        return set()
+    logger.info("session_pipeline_polled_bills", jurisdiction=jurisdiction_iso2, polled=len(polled))
+    return polled
 
 
 async def run_single_bill_full(

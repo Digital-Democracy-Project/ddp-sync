@@ -202,7 +202,17 @@ specific connection-failure mode that was confirmed transient in production. **I
 this function, remember `None` and `[]` mean different things to every caller — don't
 special-case "falsy" without checking which one you actually got.**
 
-**SYNC-79 (2026-09-27): `get_session_pipeline_semaphore()`'s acquire/release is now
+**SYNC-185 (2026-11-22): the Mac's LegBot slots are a fair line, not first come.**
+`get_legbot_line()` (`LegBotLine` in `pipelines/session_pipeline_runner.py`) replaces the
+SYNC-72 semaphore, with the same `session_pipeline_concurrency` cap across all runs. A freed slot
+goes to a **polled** bill first (each run reads its state's polled bills once at start:
+`broker_client.list_polled_bill_ids`, the broker's `has_poll=true` list; a broker that cannot
+answer marks none). Otherwise it goes to the waiting **run served longest ago**, each run's bills in
+order. So a small run no longer waits for a large run's last bill (US 119 waited ~20 h behind
+Louisiana). A staff single-bill run (`run_single_bill_full`) never enters the line and stays
+first. **Do not add a second gate or a per-state queue.**
+
+**SYNC-79 (2026-09-27): the gate's acquire/release is now
 logged** (`session_pipeline_semaphore_acquired`/`_releasing` in `_process_bill_bounded`,
 each carrying the real, process-wide `active_holders` count and `configured_concurrency`
 at that instant). Added to answer a real, still-partially-unresolved anomaly: a completed

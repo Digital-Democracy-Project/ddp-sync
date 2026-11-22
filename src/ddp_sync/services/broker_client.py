@@ -809,6 +809,61 @@ async def get_bill_topics_taxonomy(
     return {"version": data["version"], "max_topics": data["max_topics"], "topics": list(data["topics"])}
 
 
+_POLLED_PAGE_SIZE = 200  # the broker's largest page for GET /api/bills/
+_POLLED_MAX_PAGES = 50  # 10,000 bills: far above any state's polled count (828 in all on 2026-11-22)
+
+
+async def list_polled_bill_ids(
+    jurisdiction_iso2: str,
+    *,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> set[str]:
+    """The OpenStates ids of one jurisdiction's bills that have a Voatz poll (SYNC-185), from the broker's one rule
+    (BROKER-435 `polled_bills`, a closed poll counts): `GET /api/bills/?has_poll=true&jurisdiction=<iso2>`, page by
+    page by number (the answer's own `next` link names the broker's internal host, so it is not followed).
+
+    Raises:
+        BrokerClientError: base unset, the broker unreachable, any answer but 200, or a body that is not the list.
+            The caller treats a failure as "no bill known to be polled", never as a reason to stop.
+    """
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError("DDP_BROKER_API_BASE is not configured — cannot read the polled bills.")
+
+    ids: set[str] = set()
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        for page in range(1, _POLLED_MAX_PAGES + 1):
+            try:
+                resp = await client.get(
+                    f"{resolved_api_base}/api/bills/",
+                    params={"has_poll": "true", "jurisdiction": jurisdiction_iso2.upper(),
+                            "page": page, "page_size": _POLLED_PAGE_SIZE},
+                    headers={"Authorization": f"Bearer {resolved_api_token}"},
+                )
+            except httpx.RequestError as exc:
+                raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+            if resp.status_code != 200:
+                raise BrokerClientError(
+                    f"ddp-broker-py did not return the polled bills ({resp.status_code}): {resp.text[:200]}"
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise BrokerClientError("ddp-broker-py returned a polled-bill list that is not JSON") from exc
+            results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(results, list) or type(data.get("count")) is not int:
+                raise BrokerClientError(f"ddp-broker-py returned an unusable polled-bill list: {str(data)[:200]}")
+            ids.update(r["openstates_id"] for r in results
+                       if isinstance(r, dict) and isinstance(r.get("openstates_id"), str) and r["openstates_id"])
+            if not results or page * _POLLED_PAGE_SIZE >= data["count"]:
+                return ids
+    # More bills than the page limit: a partial set would treat the rest as unpolled, so say the list is unusable.
+    raise BrokerClientError(f"ddp-broker-py lists more polled bills than {_POLLED_MAX_PAGES} pages for {jurisdiction_iso2}")
+
+
 async def _post_organization_resolution(
     path: str,
     payload: dict,
