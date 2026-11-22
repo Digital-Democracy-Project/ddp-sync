@@ -652,40 +652,35 @@ async def _process_bill_inner(
     # here instead, with no row written, means the next scheduled run reconsiders this bill
     # exactly as if this attempt never happened.
     settings = get_settings()
-    if settings.replica_freshness_check_enabled:
-        # OPEN-276 (plan §3.6): the publication itself has no per-jurisdiction filter -- once the
-        # subscription is live, the local replica can hold rows for a jurisdiction OPEN-193 hasn't
-        # actually finished migrating yet (e.g. a partial in-progress load), so trust is gated
-        # here, at dispatch, not at the replication layer. Checked first (before the RDS
-        # round-trip the freshness check needs) since it's a cheap local membership test -- no
-        # reason to query RDS at all for a jurisdiction this dispatch won't trust regardless of
-        # what it finds. Same skip-with-no-write posture as the freshness check below: a
-        # jurisdiction not yet on the allowlist should be reconsidered on the next scheduled run
-        # once it's added, not permanently recorded as failed.
-        #
-        # pm-review round 1: intentionally the SAME flag as the freshness check below, not a
-        # second independent one -- there is no separate "is dispatch reading from the RDS-fed
-        # replica" toggle anywhere in this codebase to decouple from (the local Postgres a bill
-        # is read through is a single database, determined by real infrastructure state --
-        # whether it's been rebuilt from RDS per plan §7.4 -- not by a ddp-sync setting). A second
-        # flag here would control a distinction this codebase has no other code path for.
-        # Operationally, once that infrastructure cutover has actually happened: DO NOT disable
-        # replica_freshness_check_enabled as an incident workaround without first re-narrowing (or
-        # emptying) this allowlist -- doing so removes BOTH safety nets at once and would let
-        # every jurisdiction dispatch untrusted, not just skip the freshness check alone.
-        allowlist = _legbot_allowed_codes(settings)
-        if jurisdiction_iso2.upper() not in allowlist:
-            logger.info(
-                "session_pipeline_bill_skipped_jurisdiction_not_on_rds_replica_allowlist",
-                jurisdiction_iso2=jurisdiction_iso2.upper(),
-                gov_id=gov_id,
-            )
-            result["error"] = (
-                f"jurisdiction_not_on_rds_replica_allowlist: {jurisdiction_iso2.upper()}"
-            )
-            result["duration_seconds"] = time.monotonic() - bill_started
-            return result
+    # OPEN-276 (plan §3.6): the publication itself has no per-jurisdiction filter -- once the
+    # subscription is live, the local replica can hold rows for a jurisdiction OPEN-193 hasn't
+    # actually finished migrating yet (e.g. a partial in-progress load), so trust is gated
+    # here, at dispatch, not at the replication layer. Checked first (before the RDS
+    # round-trip the freshness check needs) since it's a cheap local membership test -- no
+    # reason to query RDS at all for a jurisdiction this dispatch won't trust regardless of
+    # what it finds. Same skip-with-no-write posture as the freshness check below: a
+    # jurisdiction not yet on the allowlist should be reconsidered on the next scheduled run
+    # once it's added, not permanently recorded as failed.
+    #
+    # SYNC-186: no longer nested inside replica_freshness_check_enabled. The allowlist is the
+    # manifest's `legbot_replica` (SYNC-142), the switch a human flips for LegBot; turning the
+    # freshness check off must not send a state with LegBot off to LegBot. The archive hook and
+    # trigger_scraper_session_pipeline refuse such a state before a run starts; this per-bill
+    # check is the last of the three.
+    allowlist = _legbot_allowed_codes(settings)
+    if jurisdiction_iso2.upper() not in allowlist:
+        logger.info(
+            "session_pipeline_bill_skipped_jurisdiction_not_on_rds_replica_allowlist",
+            jurisdiction_iso2=jurisdiction_iso2.upper(),
+            gov_id=gov_id,
+        )
+        result["error"] = (
+            f"jurisdiction_not_on_rds_replica_allowlist: {jurisdiction_iso2.upper()}"
+        )
+        result["duration_seconds"] = time.monotonic() - bill_started
+        return result
 
+    if settings.replica_freshness_check_enabled:
         # OPEN-289 follow-up (2026-09-13, Ramon's call): the RDS content-hash round-trip
         # itself is independently toggleable now -- see
         # replica_freshness_content_check_enabled's own docstring in config.py for why. The

@@ -505,6 +505,8 @@ class SyncSettings:
     # (normalized to uppercase at parse time).
     # SYNC-157: the old env list LEGBOT_RDS_REPLICA_JURISDICTION_ALLOWLIST is gone. Which states LegBot may be sent
     # from the replica is the manifest's `enrollment.legbot_replica` only (session_pipeline_runner._legbot_allowed_codes).
+    # SYNC-186: that check no longer depends on replica_freshness_check_enabled (it runs on every bill), and the archive
+    # hook and trigger_scraper_session_pipeline refuse a state that is off before a run starts.
 
     # SYNC-48: independent enable flag for an automated scraper-completion
     # caller of run_legbot_pipeline (pipelines/scraper_triggered_legbot.py).

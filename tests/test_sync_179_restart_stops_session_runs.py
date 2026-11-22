@@ -27,6 +27,9 @@ from tests.test_sync_160_redis_reconnect import (
     _FakeRedisWithScan,
 )
 
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
+
 
 class _Fake(_FakeRedisWithScan):
     """SYNC-160's fake, taking the `count` hint the start-up cleanup passes to SCAN."""

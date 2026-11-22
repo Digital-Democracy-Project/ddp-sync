@@ -101,6 +101,9 @@ separate RDS-facing api-v3 instance. Two gates sit in `session_pipeline_runner.p
   `enrollment.legbot_replica` from ddp-open-states' `jurisdictions.yaml` (the ONE setting a human flips for
   LegBot, because it depends on the data being good). **SYNC-157 (2026-11-12) deleted the env list and its
   fallback:** an unreadable shared list sends nothing and alerts once; an empty answer sends nothing.
+  **SYNC-186 (2026-11-22): this check is no longer inside `REPLICA_FRESHNESS_CHECK_ENABLED`**; it runs on every
+  bill, and the archive hook and `trigger_scraper_session_pipeline` refuse a state whose `legbot_replica` is false
+  before any run starts (North Dakota and Kentucky started real runs on 2026-11-22 that only the per-bill check stopped).
 
 **As of 2026-09-13, both are live in production**, not just built: real logical replication
 from production RDS is up (OPEN-271/272/273/274 all Done, independently verified), and

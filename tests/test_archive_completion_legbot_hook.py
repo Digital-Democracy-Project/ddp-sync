@@ -49,6 +49,9 @@ from ddp_sync.pipelines.openstates_archive import (
     _run_archive_with_hook,
 )
 
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
+
 
 def _enabled_settings(**overrides) -> SyncSettings:
     """Defaults to the Mac-capable path (cams_api_token set) -- most of this file's

@@ -26,6 +26,9 @@ from ddp_sync.pipelines.scraper_triggered_legbot import (
     trigger_scraper_session_pipeline,
 )
 
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
+
 
 class FakeRedisClient:
     """Mirrors test_votebot_eval.py's own FakeRedisClient -- same minimal

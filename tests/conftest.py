@@ -89,6 +89,16 @@ def _no_polled_bill_lookup(monkeypatch):
     monkeypatch.setattr(session_pipeline_runner, "list_polled_bill_ids", _none)
 
 
+@pytest.fixture
+def legbot_stand_in_manifest(tmp_path, monkeypatch):
+    """SYNC-186: the LegBot gate (`legbot_replica`) now answers on every hand-off and every bill, not only when the
+    freshness check is on, so a test of those paths reads the stand-in manifest (tests/sync157_manifest.py), not this
+    host's ddp-open-states checkout. A test that sets its own OPENSTATES_ROOT afterwards still wins."""
+    from tests import sync157_manifest
+
+    return sync157_manifest.use(tmp_path, monkeypatch)
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-mark all coroutine tests with asyncio."""
     for item in items:

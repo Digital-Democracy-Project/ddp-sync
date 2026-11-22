@@ -19,6 +19,9 @@ from ddp_sync.services.redis_store import (
 )
 from tests.test_scraper_triggered_legbot import FakeRedisClient
 
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
+
 
 class _FakeRedisWithScan(FakeRedisClient):
     """The trigger's SET-NX/GET/DELETE/EXPIRE plus the SCAN/DELETE that clear_state_locks uses."""

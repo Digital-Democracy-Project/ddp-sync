@@ -780,6 +780,15 @@ async def _maybe_trigger_legbot_for_archive(
     if not settings.legbot_scrape_completion_trigger_enabled:
         return
 
+    # SYNC-186: no hand-off at all for a state whose manifest `legbot_replica` is false (ND and KY started real runs on
+    # 2026-11-22 that only the per-bill check stopped). The same reader as that per-bill check (SYNC-142), no second list;
+    # an unreadable manifest answers "none" there, so nothing is handed off either.
+    from ddp_sync.pipelines.session_pipeline_runner import _legbot_allowed_codes
+
+    if jurisdiction.upper() not in _legbot_allowed_codes(settings):
+        logger.info("archiver_triggered_legbot_skipped_legbot_replica_off", jurisdiction=jurisdiction.upper())
+        return
+
     mac_capable = _mac_capable()
 
     from ddp_sync.services.local_openstates_client import resolve_touched_sessions
