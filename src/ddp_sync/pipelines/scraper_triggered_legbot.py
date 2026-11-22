@@ -194,6 +194,7 @@ async def trigger_scraper_session_pipeline(
 
     Returns one of:
         {"success": False, "error": "trigger_disabled"}
+        {"success": False, "error": "legbot_replica_off"}  (SYNC-186)
         {"success": False, "error": "redis_unavailable"}
         {"success": False, "error": "already_running", "current_run_id": str}
         {"success": False, "error": "invalid_request", "detail": str}
@@ -208,6 +209,18 @@ async def trigger_scraper_session_pipeline(
             session_code=session_code,
         )
         return {"success": False, "error": "trigger_disabled"}
+
+    # SYNC-186: refused for a state whose manifest `legbot_replica` is false, whoever calls (the archive hook, EC2 over
+    # WireGuard, a manual trigger), before the lock is taken and a LegBot slot is held. Same reader as the per-bill check.
+    from ddp_sync.pipelines.session_pipeline_runner import _legbot_allowed_codes
+
+    if jurisdiction_iso2.upper() not in _legbot_allowed_codes(settings):
+        logger.info(
+            "scraper_triggered_legbot_refused_legbot_replica_off",
+            jurisdiction_iso2=jurisdiction_iso2.upper(),
+            session_code=session_code,
+        )
+        return {"success": False, "error": "legbot_replica_off"}
 
     from ddp_sync.services.redis_store import get_redis_store
 
@@ -376,7 +389,7 @@ async def run_session_pipeline_in_background(run_id: str, jurisdiction_iso2: str
                                              **kwargs: Any) -> None:
     """Run `trigger_scraper_session_pipeline(jurisdiction_iso2, session_code, **kwargs)` for a 202 caller, keeping its
     record in Redis: `running` (with `updated_at` renewed every SESSION_RUN_HEARTBEAT_SECONDS), then `completed`, or
-    `failed` with the wrapper's `error` (trigger_disabled, already_running, redis_unavailable, invalid_request,
+    `failed` with the wrapper's `error` (trigger_disabled, legbot_replica_off, already_running, redis_unavailable, invalid_request,
     pipeline_error). Never raises."""
     from ddp_sync.services.redis_store import get_redis_store
 

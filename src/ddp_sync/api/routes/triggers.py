@@ -404,6 +404,12 @@ async def trigger_bill_artifact_generation(
         return result
     if error == "invalid_request":
         raise HTTPException(status_code=400, detail=result.get("detail"))
+    if error == "legbot_replica_off":
+        # SYNC-186: the manifest says LegBot is off for this state; a refusal, not a server fault.
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "legbot_replica_off", "jurisdiction_iso2": body.jurisdiction_iso2.upper()},
+        )
     if error == "already_running":
         raise HTTPException(
             status_code=409,

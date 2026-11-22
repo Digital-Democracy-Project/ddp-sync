@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -28,6 +29,9 @@ from ddp_sync.api.auth import api_key_auth
 from ddp_sync.api.routes.triggers import router
 from ddp_sync.config import SyncSettings
 from ddp_sync.pipelines.scraper_triggered_legbot import _lock_key
+
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
 
 _VALID_PAYLOAD = {
     "jurisdiction_iso2": "fl",

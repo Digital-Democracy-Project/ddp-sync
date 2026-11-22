@@ -21,6 +21,9 @@ from ddp_sync.pipelines.session_pipeline_runner import (
 from ddp_sync.services.broker_client import BrokerClientError
 from ddp_sync.services.legbot_client import LegBotDispatchError
 
+# SYNC-186: the LegBot gate reads the stand-in manifest (tests/conftest.py), not this host's checkout.
+pytestmark = pytest.mark.usefixtures("legbot_stand_in_manifest")
+
 
 @pytest.fixture(autouse=True)
 def _reset_session_pipeline_semaphore():
@@ -1116,24 +1119,26 @@ async def test_allowlist_matching_normalizes_case_even_if_settings_were_not_norm
 
 
 @pytest.mark.asyncio
-async def test_allowlist_not_checked_when_freshness_flag_is_off():
-    """The empty-by-default allowlist must have zero effect on today's existing dispatch -- this
-    gate only exists nested inside replica_freshness_check_enabled, which stays off until real RDS
-    replication infrastructure lands."""
+async def test_allowlist_is_still_checked_when_freshness_flag_is_off():
+    """SYNC-186: the allowlist (the manifest's `legbot_replica`) used to sit inside
+    replica_freshness_check_enabled, so turning that check off sent every state to LegBot. It no
+    longer does: with the flag off, a state off the list is still skipped with no broker read or
+    write."""
     with _patch_lister([_CANDIDATE]), _patch_freshness_enabled(
         False, allowlist=frozenset()
-    ), _patch_coverage(None), _patch_version(), patch(
+    ), _patch_coverage(None) as mock_coverage, patch(
         "ddp_sync.pipelines.session_pipeline_runner.generate_and_store_bill_artifact",
-        new=AsyncMock(return_value={"id": 1, "status": "complete"}),
-    ), _patch_org_status({"has_rows": True, "row_count": 0}):
+        new=AsyncMock(),
+    ) as mock_artifact:
         result = await run_legbot_pipeline(
             "fl", "2026F", ["bill_summary"], True, limit=10,
             include_concept_statements=False,
             retry_failed=False,
         )
 
-    assert result["results"][0]["error"] is None
-    assert result["results"][0]["artifacts_generated"] == ["bill_summary"]
+    mock_coverage.assert_not_awaited()
+    mock_artifact.assert_not_awaited()
+    assert result["results"][0]["error"] == "jurisdiction_not_on_rds_replica_allowlist: FL"
 
 
 @pytest.mark.asyncio
