@@ -32,7 +32,10 @@ from typing import Any, NamedTuple
 import requests
 import structlog
 
-from ddp_sync.pipelines.cloud_scrape_trigger import run_cloud_scrape
+from ddp_sync.pipelines.cloud_scrape_trigger import (
+    run_cloud_scrape,
+    run_in_cloud_scrape_slot,
+)
 from ddp_sync.services import jurisdiction_enrollment as enrollment
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.jurisdiction_enrollment import enrolled
@@ -1217,8 +1220,9 @@ async def _run_scrape_impl(
             "(OPEN-193)",
             jurisdiction=jurisdiction,
         )
-        return await asyncio.to_thread(
-            run_cloud_scrape, jurisdiction, session_arg, openstates_root, config
+        # SYNC-187: on the cloud-scrape pool, not the default one alerts share; a run that must wait logs it.
+        return await run_in_cloud_scrape_slot(
+            jurisdiction, run_cloud_scrape, jurisdiction, session_arg, openstates_root, config
         )
 
     await _maybe_preseed_scrapebot_cookies(jurisdiction, config, openstates_root)

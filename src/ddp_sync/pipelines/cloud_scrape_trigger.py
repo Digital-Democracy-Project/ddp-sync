@@ -9,7 +9,7 @@ triggered by ddp-sync itself. Every cloud-owned run so far (the OPEN-191 rehears
 ongoing, scheduled feed.
 
 Two calls, run synchronously and sequentially. `run_cloud_scrape()` is meant to be awaited via
-`asyncio.to_thread()`, exactly like the mac-side subprocess path in openstates_scrape.py --
+`run_in_cloud_scrape_slot()` (its own thread pool, SYNC-187), like the mac-side subprocess path in openstates_scrape.py --
 every call in this module blocks.
 
   1. Launch an ECS Fargate task running `cloud_collector.py <jurisdiction> [session=...]`
@@ -85,6 +85,7 @@ import os
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import boto3
@@ -129,6 +130,50 @@ _STOP_REQUESTED = "task stop requested"
 # Fargate gives a container at most 120 s between SIGTERM and SIGKILL (stopTimeout), so this covers the longest case.
 _STOP_CONFIRM_S = 150
 _STOP_CONFIRM_POLL_S = 5
+
+# SYNC-187: how many cloud scrapes this process watches at once. Each one holds a thread for its whole Fargate wait
+# and load (hours; Florida's full re-import about 25 h), so they get a pool of their own: before this they used
+# Python's default pool, 8 threads on the 4-CPU EC2 container, shared with alerts and every other `to_thread` call.
+# On 2026-11-23 the ninth of a burst waited there with no log line (notes/ops-handoff c35a38c). 32 is Python's own
+# ceiling for that default pool and covers every cloud-owned state of the onboarding wave running at once.
+CLOUD_SCRAPE_SLOTS = 32
+_cloud_scrape_pool = ThreadPoolExecutor(max_workers=CLOUD_SCRAPE_SLOTS, thread_name_prefix="cloud-scrape")
+# Runs handed to the pool and not finished, oldest first (read and changed only on the event loop).
+_cloud_scrape_runs: list[str] = []
+
+
+async def run_in_cloud_scrape_slot(jurisdiction: str, func, *args) -> Any:
+    """Run one cloud scrape's blocking `func(*args)` on the cloud-scrape pool, like `asyncio.to_thread` (SYNC-187).
+
+    When every slot is taken the run waits in the pool's own first-in-first-out queue, and says so once
+    (`cloud_scrape_waiting_for_slot`: the state, its place in the queue, the states holding slots), then
+    `cloud_scrape_slot_acquired` with how long it waited. Context variables are carried as `to_thread` does
+    (FULL_COLLECTION).
+    """
+    loop = asyncio.get_running_loop()
+    ahead = len(_cloud_scrape_runs)
+    _cloud_scrape_runs.append(jurisdiction)
+    queued_at = time.monotonic()
+    if ahead >= CLOUD_SCRAPE_SLOTS:
+        logger.warning(
+            "cloud_scrape_waiting_for_slot",
+            jurisdiction=jurisdiction,
+            queue_position=ahead - CLOUD_SCRAPE_SLOTS + 1,
+            slots=CLOUD_SCRAPE_SLOTS,
+            running=_cloud_scrape_runs[:CLOUD_SCRAPE_SLOTS],
+        )
+
+    def _in_slot():
+        if ahead >= CLOUD_SCRAPE_SLOTS:
+            logger.info("cloud_scrape_slot_acquired", jurisdiction=jurisdiction,
+                        waited_seconds=round(time.monotonic() - queued_at, 1))
+        return func(*args)
+
+    ctx = contextvars.copy_context()
+    try:
+        return await loop.run_in_executor(_cloud_scrape_pool, ctx.run, _in_slot)
+    finally:
+        _cloud_scrape_runs.remove(jurisdiction)
 
 
 def _generate_run_id(jurisdiction: str) -> str:
@@ -868,7 +913,7 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
     anything still present here when a NEW process starts was orphaned by the previous process
     dying (crash, deploy restart) mid-wait or mid-load, not a job someone else is still watching.
 
-    Each resumed job runs on its own background thread via `asyncio.to_thread`, exactly like a
+    Each resumed job runs on the cloud-scrape pool (`run_in_cloud_scrape_slot`, SYNC-187), exactly like a
     fresh `run_cloud_scrape()` call is already run from `openstates_scrape.py` -- this function
     itself never blocks, so it never delays app startup.
 
@@ -888,8 +933,8 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
             jurisdiction=record.get("jurisdiction"),
             task_arn=record.get("task_arn"),
         )
-        task = asyncio.create_task(
-            asyncio.to_thread(resume_inflight_fargate_job, run_id, record)
+        task = asyncio.create_task(  # SYNC-187: a resumed scrape takes a cloud-scrape slot like a fresh one
+            run_in_cloud_scrape_slot(record.get("jurisdiction") or run_id, resume_inflight_fargate_job, run_id, record)
         )
         _reconciliation_tasks.add(task)
         task.add_done_callback(_reconciliation_tasks.discard)
@@ -910,7 +955,7 @@ def run_cloud_scrape(
 ) -> dict[str, Any]:
     """Trigger a Fargate collection and, on success, load it into RDS.
 
-    Meant to be called from `_run_scrape()`'s cloud-path branch via `asyncio.to_thread` --
+    Meant to be called from `_run_scrape()`'s cloud-path branch via `run_in_cloud_scrape_slot` (SYNC-187) --
     this function itself makes only blocking calls (ECS polling, a blocking subprocess),
     exactly like the mac-side branch it replaces.
 

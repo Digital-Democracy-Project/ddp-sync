@@ -330,6 +330,17 @@ Pub/sub channels (hardcoded strings in callers):
 
 - **`run_people_pull_job(config)`** — SYNC-102. Daily `git -C <OPENSTATES_ROOT>/people pull --ff-only` (03:00 UTC, `openstates_scrape.people_pull` in `sync_schedule.yaml`); no DB import (that is `run_people_refresh_job`, weekly). Registered only when `OPENSTATES_PEOPLE_PULL_ENABLED=true` on the host (default off). It has its own registration step (`_register_people_pull_job`), independent of `OPENSTATES_SCRAPE_ENABLED` (SYNC-108, PR 217): before that it never registered on a host with scrapes off, which is the Mac's case. Writes flow status `openstates_people_pull` (shown by `/health`) with before/after head sha + commit date, branch, git's summary line; every failure path writes `failed` and alerts via `_alert_scrape_failure`. Manual: `POST /trigger/openstates-scrape/people-pull`.
 
+## Cloud scrape slots (`cloud_scrape_trigger.run_in_cloud_scrape_slot`, SYNC-187)
+
+Every cloud scrape's blocking launch-wait-load (`run_cloud_scrape`, from `_run_scrape_impl`) and every scrape resumed after
+a restart (`reconcile_inflight_fargate_jobs`) runs on the module's own thread pool, `CLOUD_SCRAPE_SLOTS` (32, the one place
+the size is set), never on Python's default pool (8 threads on EC2's 4 CPUs, shared with alerts and every other
+`asyncio.to_thread`). A run that finds every slot taken waits in the pool's first-in-first-out queue and logs
+`cloud_scrape_waiting_for_slot` (WARNING: `jurisdiction`, `queue_position`, `slots`, `running`), then
+`cloud_scrape_slot_acquired` (`waited_seconds`). Context variables (`FULL_COLLECTION`) are carried as `to_thread` does.
+**A new long cloud wait for a scrape goes through this, not `asyncio.to_thread`; do not add a second scrape pool or
+semaphore.** The archive's Fargate wait (`openstates_archive`) still uses the default pool.
+
 ## Cloud scrape wait: stall check, no hard limit (`pipelines/cloud_scrape_trigger.py`, OPEN-477, OPEN-476)
 
 **OPEN-477:** the scrape wait (`_wait_for_task_stop(..., logs_client=...)`, switched on by `_finish_after_launch`, so a
