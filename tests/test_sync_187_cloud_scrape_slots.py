@@ -29,7 +29,7 @@ def slots(monkeypatch, tmp_path):
     pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cloud-scrape-test")
     monkeypatch.setattr(cst, "CLOUD_SCRAPE_SLOTS", 3)
     monkeypatch.setattr(cst, "_cloud_scrape_pool", pool)
-    monkeypatch.setattr(cst, "_cloud_scrape_runs", [])
+    monkeypatch.setattr(cst, "_cloud_scrape_runs", {})
     yield 3
     pool.shutdown(wait=False, cancel_futures=True)
 
@@ -84,7 +84,7 @@ async def test_n_plus_one_scrapes_with_a_cap_of_n_one_waits_and_logs_it(slots):
     acquired = [e for e in logs if e["event"] == "cloud_scrape_slot_acquired"]
     assert [e["jurisdiction"] for e in acquired] == [late]
     assert acquired[0]["log_level"] == "info" and acquired[0]["waited_seconds"] >= 0.2
-    assert cst._cloud_scrape_runs == []
+    assert cst._cloud_scrape_runs == {}
 
 
 @pytest.mark.asyncio
@@ -161,3 +161,60 @@ async def test_a_resumed_job_takes_a_cloud_scrape_slot(slots):
         tasks = cst.reconcile_inflight_fargate_jobs()
         await asyncio.wait_for(asyncio.gather(*tasks), 5)
     assert len(names) == 1 and names[0].startswith("cloud-scrape-test")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_caller_keeps_its_slot_until_the_thread_is_done(slots):
+    """Cancelling the waiting coroutine does not stop a scrape already running in its thread, so it still holds a slot:
+    the next run must still see the pool full and log that it waits (pm-review)."""
+    scrape = BlockingScrape()
+    with capture_logs() as logs:
+        first = [asyncio.create_task(cst.run_in_cloud_scrape_slot(st, scrape, st, None, "/r", None)) for st in STATES[:3]]
+        await _until(lambda: len(scrape.started) == slots)
+        first[0].cancel()
+        await asyncio.gather(first[0], return_exceptions=True)
+        assert len(cst._cloud_scrape_runs) == 3  # its thread is still running
+        late = asyncio.create_task(cst.run_in_cloud_scrape_slot("wa", scrape, "wa", None, "/r", None))
+        await _until(lambda: any(e["event"] == "cloud_scrape_waiting_for_slot" for e in logs))
+        scrape.release.set()
+        await asyncio.wait_for(asyncio.gather(*first[1:], late), 5)
+    await _until(lambda: cst._cloud_scrape_runs == {})
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_that_never_started_leaves_the_queue(slots):
+    scrape = BlockingScrape()
+    with capture_logs() as logs:
+        held = [asyncio.create_task(cst.run_in_cloud_scrape_slot(st, scrape, st, None, "/r", None)) for st in STATES[:3]]
+        await _until(lambda: len(scrape.started) == slots)
+        queued = asyncio.create_task(cst.run_in_cloud_scrape_slot("ut", scrape, "ut", None, "/r", None))
+        await asyncio.sleep(0.05)
+        queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+        await _until(lambda: len(cst._cloud_scrape_runs) == 3)
+        nxt = asyncio.create_task(cst.run_in_cloud_scrape_slot("wa", scrape, "wa", None, "/r", None))
+        await asyncio.sleep(0.05)
+        scrape.release.set()
+        await asyncio.wait_for(asyncio.gather(*held, nxt), 5)
+    positions = [(e["jurisdiction"], e["queue_position"]) for e in logs if e["event"] == "cloud_scrape_waiting_for_slot"]
+    assert positions == [("ut", 1), ("wa", 1)]
+    assert "ut" not in scrape.started
+
+
+@pytest.mark.asyncio
+async def test_two_runs_of_one_state_are_counted_separately(slots):
+    """A state can be in the pool twice (a resumed run and a new one); the one that finishes is the one removed."""
+    first = BlockingScrape()
+    second = BlockingScrape()
+    a = asyncio.create_task(cst.run_in_cloud_scrape_slot("fl", first, "fl", None, "/r", None))
+    await _until(lambda: first.started)
+    (key_a,) = cst._cloud_scrape_runs
+    b = asyncio.create_task(cst.run_in_cloud_scrape_slot("fl", second, "fl", None, "/r", None))
+    c = asyncio.create_task(cst.run_in_cloud_scrape_slot("az", second, "az", None, "/r", None))
+    await _until(lambda: len(second.started) == 2)
+    second.release.set()
+    await asyncio.wait_for(asyncio.gather(b, c), 5)
+    assert cst._cloud_scrape_runs == {key_a: "fl"} and not a.done()
+    first.release.set()
+    await asyncio.wait_for(a, 5)
+    assert cst._cloud_scrape_runs == {}

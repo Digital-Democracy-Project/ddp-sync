@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import itertools
 import json
 import os
 import subprocess
@@ -138,8 +139,10 @@ _STOP_CONFIRM_POLL_S = 5
 # ceiling for that default pool and covers every cloud-owned state of the onboarding wave running at once.
 CLOUD_SCRAPE_SLOTS = 32
 _cloud_scrape_pool = ThreadPoolExecutor(max_workers=CLOUD_SCRAPE_SLOTS, thread_name_prefix="cloud-scrape")
-# Runs handed to the pool and not finished, oldest first (read and changed only on the event loop).
-_cloud_scrape_runs: list[str] = []
+# Runs handed to the pool and not finished, oldest first, by a key of their own (a state can have two at once). Changed
+# only on the event loop, and a run leaves it when its thread is done, not when its caller stops waiting (cancelled).
+_cloud_scrape_runs: dict[int, str] = {}
+_cloud_scrape_keys = itertools.count()
 
 
 async def run_in_cloud_scrape_slot(jurisdiction: str, func, *args) -> Any:
@@ -151,8 +154,9 @@ async def run_in_cloud_scrape_slot(jurisdiction: str, func, *args) -> Any:
     (FULL_COLLECTION).
     """
     loop = asyncio.get_running_loop()
+    key = next(_cloud_scrape_keys)
     ahead = len(_cloud_scrape_runs)
-    _cloud_scrape_runs.append(jurisdiction)
+    _cloud_scrape_runs[key] = jurisdiction
     queued_at = time.monotonic()
     if ahead >= CLOUD_SCRAPE_SLOTS:
         logger.warning(
@@ -160,7 +164,7 @@ async def run_in_cloud_scrape_slot(jurisdiction: str, func, *args) -> Any:
             jurisdiction=jurisdiction,
             queue_position=ahead - CLOUD_SCRAPE_SLOTS + 1,
             slots=CLOUD_SCRAPE_SLOTS,
-            running=_cloud_scrape_runs[:CLOUD_SCRAPE_SLOTS],
+            running=list(_cloud_scrape_runs.values())[:CLOUD_SCRAPE_SLOTS],
         )
 
     def _in_slot():
@@ -169,11 +173,15 @@ async def run_in_cloud_scrape_slot(jurisdiction: str, func, *args) -> Any:
                         waited_seconds=round(time.monotonic() - queued_at, 1))
         return func(*args)
 
-    ctx = contextvars.copy_context()
-    try:
-        return await loop.run_in_executor(_cloud_scrape_pool, ctx.run, _in_slot)
-    finally:
-        _cloud_scrape_runs.remove(jurisdiction)
+    def _done(_future):
+        try:
+            loop.call_soon_threadsafe(_cloud_scrape_runs.pop, key, None)
+        except RuntimeError:  # the loop is closed (process shutting down): nothing left to count for
+            pass
+
+    future = _cloud_scrape_pool.submit(contextvars.copy_context().run, _in_slot)
+    future.add_done_callback(_done)  # before wrap_future's own, so the run is gone when the caller resumes
+    return await asyncio.wrap_future(future)
 
 
 def _generate_run_id(jurisdiction: str) -> str:

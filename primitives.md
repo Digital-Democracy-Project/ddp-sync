@@ -337,7 +337,8 @@ a restart (`reconcile_inflight_fargate_jobs`) runs on the module's own thread po
 the size is set), never on Python's default pool (8 threads on EC2's 4 CPUs, shared with alerts and every other
 `asyncio.to_thread`). A run that finds every slot taken waits in the pool's first-in-first-out queue and logs
 `cloud_scrape_waiting_for_slot` (WARNING: `jurisdiction`, `queue_position`, `slots`, `running`), then
-`cloud_scrape_slot_acquired` (`waited_seconds`). Context variables (`FULL_COLLECTION`) are carried as `to_thread` does.
+`cloud_scrape_slot_acquired` (`waited_seconds`). A run is counted until its thread is done (a cancelled caller does not free
+a slot its scrape still holds), each by its own key (one state can be in the pool twice). Context variables (`FULL_COLLECTION`) are carried as `to_thread` does.
 **A new long cloud wait for a scrape goes through this, not `asyncio.to_thread`; do not add a second scrape pool or
 semaphore.** The archive's Fargate wait (`openstates_archive`) still uses the default pool.
 
