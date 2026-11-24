@@ -386,6 +386,16 @@ ddp-sync`, at every scrapers image release that changes core. ddp-open-states' `
 copy was v62's `44c3b8dc` while v65 ran, so newer state rules did not apply on load. Lasting fix: OPEN-633 (the load
 moves into the Fargate task). Guard: `tests/test_sync_180_core_at_image_commit.py`.
 
+**Scrapers too (SYNC-188).** The build fetches openstates-scrapers at `DDP_SCRAPERS_SHA` (no default, a full commit; a
+branch name is refused), never "main at build time", and writes it to `/opt/openstates-scrapers/DDP_SCRAPERS_COMMIT`
+(`check-core-pin-drift.py --sync-container` reports it). Pass the **same scrapers commit as the live scrapers image**: on
+EC2, `DDP_CORE_SHA=<full sha> DDP_SCRAPERS_SHA=<full sha> docker-compose -f infrastructure/docker-compose.prod.yml build
+ddp-sync`. ddp-open-states' RUNBOOK ("Scrapers image release") says how to find that commit. The builder stage then runs
+ddp-open-states' `check-scraper-imports.sh` (OPEN-125; reached through the `openstates` build context, do not add a second
+import check) on the installed pair, so a scrapers commit that needs a newer core than `DDP_CORE_SHA` fails the build
+instead of every load (found 2026-11-23: scrapers main at `a121b5dd` needed `openstates.utils.tls`, core `58205e01`+,
+while the pin was `9157b6b5`; 52 of 56 states failed to import). Guard: `tests/test_sync_188_scrapers_at_commit.py`.
+
 ## The cloud load as a Fargate task (`cloud_scrape_trigger._run_load_on_fargate`, OPEN-633)
 
 A state whose manifest says `scrape.load_on_fargate: true` (read by `state_loads_on_fargate`, folded into the per-state
