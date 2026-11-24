@@ -1176,6 +1176,8 @@ async def list_touched_bill_ids(
             "document_updated_since": since.isoformat(),
             "per_page": str(_API_V3_MAX_PER_PAGE),
             "page": str(page),
+            # SYNC-190: a draft a bill has replaced is no longer embedded (api-v3's OPEN-870; an older api-v3 ignores it)
+            "exclude_introduced_drafts": "true",
         }
         if session:
             params["session"] = session
@@ -1219,7 +1221,7 @@ _LEDGER_PAGE_LIMIT = 500  # api-v3's maximum bills per ledger page
 
 
 async def list_embedding_ledger(
-    jurisdiction_iso2: str, *, api_base: str, api_key: str = ""
+    jurisdiction_iso2: str, *, api_base: str, api_key: str = "", exclude_introduced_drafts: bool = True
 ) -> tuple[dict[str, dict[str, str | None]], bool] | None:
     """SYNC-95 / OPEN-319: what api-v3 says the embedder should have written for every bill of a
     jurisdiction that has archived documents: `{bare ocd_bill_id: {archived_document_id (str):
@@ -1229,7 +1231,11 @@ async def list_embedding_ledger(
     Returns `(ledger, complete)`: `complete` is False when a later page failed (the ledger is then a
     partial list, so "not on it" proves nothing). Returns None when nothing could be read, including an
     api-v3 that does not have the endpoint yet (a 404 is a failed read here). Never raises. Not capped,
-    for the same reason as `list_touched_bill_ids`."""
+    for the same reason as `list_touched_bill_ids`.
+
+    SYNC-190: by default a draft a bill has replaced is left out (api-v3's OPEN-870 `exclude_introduced_drafts`; an older
+    api-v3 ignores it), so it is no longer embedded. `exclude_introduced_drafts=False` lists it too (SYNC-191's clean-up
+    compares the two lists)."""
     if not api_base:
         return None
     headers = {"x-api-key": api_key} if api_key else {}
@@ -1237,6 +1243,8 @@ async def list_embedding_ledger(
     after: str | None = None
     while True:
         params = {"jurisdiction": jurisdiction_iso2.lower(), "limit": str(_LEDGER_PAGE_LIMIT)}
+        if exclude_introduced_drafts:
+            params["exclude_introduced_drafts"] = "true"
         if after:
             params["after"] = after
         data = await _get_json_with_retry(
