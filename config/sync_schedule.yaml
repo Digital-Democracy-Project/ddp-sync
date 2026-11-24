@@ -491,9 +491,13 @@ openstates_scrape:
       # SYNC-157: a state's own ceiling is the manifest's scrape.fargate_max_wait_s (ma: 86400), not a map here.
       load_timeout_seconds: 7200 # 2h backstop for cloud_loader.py itself -- the rehearsal's
                                   # loads were minutes even for multi-thousand-row jurisdictions
-      rds_from_task_secret: false # OPEN-633 (D2): true = pass no DATABASE_URL to the load task; it builds its own from
-                                  # the task definition's RDS secret. Turn on only after the release note confirms the
-                                  # ddp-scrapers task definition has the secret and its role can read it.
+      rds_from_task_secret: true  # OPEN-633 (D2): true = pass no DATABASE_URL to the load task; it builds its own from
+                                  # the `ddp-scrapers-db` task definition's RDS secret (RDS_USERNAME/RDS_PASSWORD secrets,
+                                  # RDS_HOST/PORT/DBNAME environment). Only a state with scrape.load_on_fargate true
+                                  # (Arizona, the canary) has a load task; the archive's own flag (openstates_archive.
+                                  # cloud_path.fargate, below) stays false. Turn on only after the release note confirms
+                                  # the definition has those entries; without them the load task refuses, naming what is
+                                  # missing. Flip back to false to pass the login at launch again.
 
   # OPEN-139: alert when a jurisdiction that was filing bills stops filing them.
   #
