@@ -75,11 +75,18 @@ RUN rm -f /opt/venv-openstates/bin/python3 /opt/venv-openstates/bin/python3.13 /
 # commit stops here. The commit is written to /opt/openstates-core/DDP_CORE_COMMIT, the same
 # record the scrapers image keeps, so ddp-open-states' check-core-pin-drift.py --sync-container
 # can compare it with the image's.
+#
+# SYNC-188: scrapers the same way, at DDP_SCRAPERS_SHA (no default, a full commit), never "main at build time". On
+# 2026-11-23 a rebuild at an approved core picked up scrapers main, which by then imported openstates.utils.tls (core
+# 58205e01 or later) while the pinned core was 9157b6b5: every cloud load failed with ModuleNotFoundError. The commit is
+# written to /opt/openstates-scrapers/DDP_SCRAPERS_COMMIT, which check-core-pin-drift.py --sync-container reports.
 ARG DDP_CORE_SHA
-ARG OPENSTATES_SCRAPERS_REF=main
+ARG DDP_SCRAPERS_SHA
 RUN --mount=type=secret,id=github_token \
     { [ "${#DDP_CORE_SHA}" -eq 40 ] && [ -z "$(printf '%s' "${DDP_CORE_SHA}" | tr -d 0-9a-f)" ]; } \
        || { echo "DDP_CORE_SHA must be the scrapers image's full core commit (40 hex), got '${DDP_CORE_SHA}'" >&2; exit 1; } && \
+    { [ "${#DDP_SCRAPERS_SHA}" -eq 40 ] && [ -z "$(printf '%s' "${DDP_SCRAPERS_SHA}" | tr -d 0-9a-f)" ]; } \
+       || { echo "DDP_SCRAPERS_SHA must be the scrapers image's full scrapers commit (40 hex), got '${DDP_SCRAPERS_SHA}'" >&2; exit 1; } && \
     TOKEN=$(cat /run/secrets/github_token) && \
     git init -q /opt/openstates-core && \
     git -C /opt/openstates-core fetch -q --depth 1 \
@@ -89,9 +96,14 @@ RUN --mount=type=secret,id=github_token \
     git -C /opt/openstates-core rev-parse HEAD > /opt/openstates-core/DDP_CORE_COMMIT && \
     [ "$(cat /opt/openstates-core/DDP_CORE_COMMIT)" = "$DDP_CORE_SHA" ] && \
     echo "DDP openstates-core: ${DDP_CORE_SHA}" && \
-    git clone --branch "$OPENSTATES_SCRAPERS_REF" --depth 1 \
+    git init -q /opt/openstates-scrapers && \
+    git -C /opt/openstates-scrapers fetch -q --depth 1 \
         "https://x-access-token:${TOKEN}@github.com/Digital-Democracy-Project/openstates-scrapers.git" \
-        /opt/openstates-scrapers && \
+        "$DDP_SCRAPERS_SHA" && \
+    git -C /opt/openstates-scrapers checkout -q FETCH_HEAD && \
+    git -C /opt/openstates-scrapers rev-parse HEAD > /opt/openstates-scrapers/DDP_SCRAPERS_COMMIT && \
+    [ "$(cat /opt/openstates-scrapers/DDP_SCRAPERS_COMMIT)" = "$DDP_SCRAPERS_SHA" ] && \
+    echo "DDP openstates-scrapers: ${DDP_SCRAPERS_SHA}" && \
     rm -rf /opt/openstates-core/.git /opt/openstates-scrapers/.git
 
 # Editable install for openstates-core only -- DDP's patches take effect this way, exactly as
@@ -99,6 +111,16 @@ RUN --mount=type=secret,id=github_token \
 # (see PYTHONPATH below and the root Dockerfile's own note on why an editable install of that
 # package fails outright).
 RUN /opt/venv-openstates/bin/pip install --no-cache-dir --no-deps -e /opt/openstates-core
+
+# SYNC-188: a scrapers commit that needs a newer core than DDP_CORE_SHA must stop the build, not reach a restart. This
+# runs ddp-open-states' check-scraper-imports.sh (OPEN-125, the one import check; do not add a second) against the pair
+# just installed: it imports every state's package as os-update does and exits 1 on any ModuleNotFoundError (on
+# 2026-11-23's pair, 52 of 56 states failed on openstates.utils.tls). Every state rather than `import scrapers.utils`
+# alone, so a core feature that only one state's scraper uses also stops the build. A state missing only a credential
+# (dc) passes.
+COPY --from=openstates check-scraper-imports.sh /build/check-scraper-imports.sh
+RUN IMPORT_CHECK_VENV=/opt/venv-openstates IMPORT_CHECK_SCRAPERS_DIR=/opt/openstates-scrapers \
+    bash /build/check-scraper-imports.sh
 
 
 FROM python:3.11-slim-bookworm AS app

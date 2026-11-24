@@ -32,7 +32,7 @@ def test_core_is_fetched_at_the_given_commit_with_no_default():
     assert re.search(r"^ARG DDP_CORE_SHA$", step, re.MULTILINE), "DDP_CORE_SHA must have no default"
     assert '"$DDP_CORE_SHA"' in step and "checkout -q FETCH_HEAD" in step
     assert "OPENSTATES_CORE_REF" not in DOCKERFILE, "core must not be taken from a branch at build time"
-    core_fetch = step[:step.index('git clone --branch "$OPENSTATES_SCRAPERS_REF"')]
+    core_fetch = step[:step.index("git init -q /opt/openstates-scrapers")]
     assert "openstates-core.git" in core_fetch and "--branch" not in core_fetch
 
 
@@ -54,7 +54,7 @@ def _guard() -> str:
     """The shell test at the head of the core step, as it runs in the build."""
     step = _core_step()
     body = step[step.index("RUN --mount=type=secret,id=github_token \\\n") + len("RUN --mount=type=secret,id=github_token \\\n"):]
-    guard = body[:body.index(" && \\\n    TOKEN=")]
+    guard = body[:body.index(" && \\\n")]  # the core guard only; SYNC-188's scrapers guard follows it
     return guard  # backslash-newlines kept: sh joins them as the build does
 
 

@@ -38,6 +38,9 @@ services:
         # SYNC-180: the live scrapers image's core commit (set DDP_CORE_SHA; empty fails the build), so
         # cloud loads import with the same openstates-core the image scraped with.
         DDP_CORE_SHA: ${DDP_CORE_SHA:-}
+        # SYNC-188: the live scrapers image's scrapers commit (set DDP_SCRAPERS_SHA; empty fails the build). The build
+        # also fails when that commit needs a newer core than DDP_CORE_SHA (check-scraper-imports.sh).
+        DDP_SCRAPERS_SHA: ${DDP_SCRAPERS_SHA:-}
     image: ddp-sync:prod
     env_file:
       - ../.env
