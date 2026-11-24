@@ -681,6 +681,22 @@ async def test_list_touched_bill_ids_passes_the_session_filter():
     assert "session" not in get.await_args_list[1].args[1]
 
 
+async def test_the_touched_list_and_the_ledger_ask_api_v3_to_leave_out_introduced_drafts():
+    """SYNC-190: a draft a bill has replaced is not embedded; api-v3 leaves it out only when asked."""
+    from ddp_sync.services import local_openstates_client as c
+
+    touched = AsyncMock(return_value={"results": [{"id": "ocd-bill/aaa"}], "pagination": {"max_page": 1}})
+    with patch.object(c, "_get_json_with_retry", touched):
+        await c.list_touched_bill_ids("mt", since=_STARTED, api_base="http://api")
+    assert touched.await_args.args[1]["exclude_introduced_drafts"] == "true"
+    ledger = AsyncMock(return_value={"results": [], "next_after": None})
+    with patch.object(c, "_get_json_with_retry", ledger):
+        await c.list_embedding_ledger("mt", api_base="http://api")
+        await c.list_embedding_ledger("mt", api_base="http://api", exclude_introduced_drafts=False)
+    assert ledger.await_args_list[0].args[1]["exclude_introduced_drafts"] == "true"
+    assert "exclude_introduced_drafts" not in ledger.await_args_list[1].args[1]
+
+
 class _BlipRedis(FakeRedis):
     """`get_bill_version` returns None (what a Redis error looks like) on the read numbers in `blips`."""
 
