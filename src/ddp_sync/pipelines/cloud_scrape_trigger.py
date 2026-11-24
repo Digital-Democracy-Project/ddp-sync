@@ -286,16 +286,11 @@ def _release_stopped_run_lock(
     without running its `finally` (cloud_collector.py has no SIGTERM handler), so the lock it took (OPEN-187's
     `SourceLock`, 24 h, the same as a nightly state's cadence) would otherwise refuse the state's next run.
 
-    Same object and format as `SourceLock` in ddp-open-states' cloud_collector.py (`<prefix>/<source>/<suffix>`, a JSON
-    body with `holder`, `acquired_at`, `expires_at`), released the way `SourceLock.release` does it: written already
-    expired, conditional on the ETag just read. Only when that lock's holder is this run_id, so a newer run's lock is
-    never touched, and only once ECS reports the task STOPPED (pm-review: a stop request returns while the container
-    may still be running), so the old run and a new one never hold the state at once. Called only after a stop request
-    that succeeded. Never raises: a release that does not happen leaves the lock to its TTL, as before."""
-    bucket = fargate_cfg.get("memory_bucket", os.environ.get("MEMORY_BUCKET", ""))
-    if not bucket:
+    Only once ECS reports the task STOPPED (pm-review: a stop request returns while the container may still be
+    running), so the old run and a new one never hold the state at once; then `_release_run_lock`. Called only after a
+    stop request that succeeded. Never raises: a release that does not happen leaves the lock to its TTL, as before."""
+    if not fargate_cfg.get("memory_bucket", os.environ.get("MEMORY_BUCKET", "")):
         return "lock not released: no memory_bucket configured"
-    key = f"{fargate_cfg.get('memory_prefix', 'prod')}/{source}/{suffix}"
     try:
         deadline = time.monotonic() + _STOP_CONFIRM_S
         while True:
@@ -305,6 +300,26 @@ def _release_stopped_run_lock(
             if time.monotonic() >= deadline:
                 return f"lock not released: task not STOPPED after {_STOP_CONFIRM_S}s"
             time.sleep(_STOP_CONFIRM_POLL_S)
+    except Exception as e:  # noqa: BLE001 -- best-effort, like _stop_orphaned_task
+        logger.warning("cloud_scrape: could not confirm the stopped task", task_arn=task_arn, run_id=run_id,
+                       error=str(e))
+        return f"lock not released ({e})"
+    return _release_run_lock(source, run_id, suffix, fargate_cfg)
+
+
+def _release_run_lock(source: str, run_id: str, suffix: str, fargate_cfg: dict) -> str:
+    """Release `run_id`'s S3 run lock once the caller knows the process that took it is gone (SYNC-167: a task ECS
+    reports STOPPED; SYNC-189: a local load of the ddp-sync process a restart replaced).
+
+    Same object and format as `SourceLock` in ddp-open-states' cloud_collector.py (`<prefix>/<source>/<suffix>`, a JSON
+    body with `holder`, `acquired_at`, `expires_at`), released the way `SourceLock.release` does it: written already
+    expired, conditional on the ETag just read. Only when that lock's holder is this run_id, so another run's lock is
+    never touched. Never raises: a release that does not happen leaves the lock to its TTL, as before."""
+    bucket = fargate_cfg.get("memory_bucket", os.environ.get("MEMORY_BUCKET", ""))
+    if not bucket:
+        return "lock not released: no memory_bucket configured"
+    key = f"{fargate_cfg.get('memory_prefix', 'prod')}/{source}/{suffix}"
+    try:
         client = _s3_client()
         existing = client.get_object(Bucket=bucket, Key=key)
         holder = json.loads(existing["Body"].read()).get("holder")
@@ -314,9 +329,9 @@ def _release_stopped_run_lock(
         body = json.dumps({"holder": run_id, "acquired_at": now, "expires_at": now - 1}).encode()
         client.put_object(Bucket=bucket, Key=key, Body=body, IfMatch=existing["ETag"])
     except Exception as e:  # noqa: BLE001 -- best-effort, like _stop_orphaned_task
-        logger.warning("cloud_scrape: could not release the stopped run's lock", key=key, run_id=run_id, error=str(e))
+        logger.warning("cloud_scrape: could not release the run's lock", key=key, run_id=run_id, error=str(e))
         return f"lock not released ({e})"
-    logger.info("cloud_scrape: released the stopped run's lock", key=key, run_id=run_id)
+    logger.info("cloud_scrape: released the run's lock", key=key, run_id=run_id)
     return f"lock {key} released"
 
 
@@ -635,8 +650,14 @@ def _run_load(
     *,
     ecs_client=None,
     load_task_arn: str | None = None,
+    resumed: bool = False,
 ) -> tuple[bool, str]:
     """Run cloud_loader.py locally against RDS. Returns (success, detail).
+
+    SYNC-189: `resumed` (a run a previous ddp-sync process left in flight) first releases this run's own
+    `_import_lock`. A local load is a child of the ddp-sync process, so a restart killed it before its `finally`, and
+    the resumed load would otherwise be refused by its own run's lock for 24 h (Oklahoma 2026, 2026-11-23). Only a lock
+    whose holder is this run_id, and only on the local path: a Fargate load task survives the restart and is waited on.
 
     OPEN-633: when the state's manifest says `scrape.load_on_fargate: true` (folded into `fargate_cfg` at launch, so a
     resumed job replays the same choice), the load runs as its own Fargate task instead (`_run_load_on_fargate`).
@@ -660,6 +681,9 @@ def _run_load(
         return _run_load_on_fargate(
             jurisdiction, session_arg, run_id, fargate_cfg, ecs_client or boto3.client("ecs"), load_task_arn
         )
+
+    if resumed:  # before anything that can fail: the killed loader is gone either way
+        _release_run_lock(loader_lock_key(jurisdiction, session_arg), run_id, "_import_lock", fargate_cfg)
 
     rds_url, error = resolve_rds_database_url()
     if error:
@@ -709,8 +733,11 @@ def _finish_after_launch(
     label: str,
     logs_client=None,
     load_task_arn: str | None = None,
+    resumed: bool = False,
 ) -> dict[str, Any]:
     """Wait for an already-launched ECS task to stop, then load into RDS on success.
+
+    `resumed` (from `resume_inflight_fargate_job`): see `_run_load` (SYNC-189).
 
     OPEN-633: `load_task_arn` (from a resumed in-flight record) means the collection already finished and its load
     task was launched; the wait goes straight to that load task instead of starting a second load.
@@ -780,6 +807,7 @@ def _finish_after_launch(
         subprocess_runner,
         ecs_client=ecs_client,
         load_task_arn=load_task_arn,
+        resumed=resumed,
     )
     duration = round(time.monotonic() - start, 1)
 
@@ -869,6 +897,7 @@ def resume_inflight_fargate_job(
             label,
             logs_client,
             load_task_arn=record.get("load_task_arn"),
+            resumed=True,
         )
     except Exception as e:  # noqa: BLE001 -- see docstring: nothing may escape uncaught here
         duration = round(time.monotonic() - start, 1)
