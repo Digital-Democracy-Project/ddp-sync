@@ -242,6 +242,14 @@ openstates_scrape:
   broker_scorecard_signal:
     enabled: false
 
+  # OPEN-855: after each state's load (once per run, before the archive), ddp-open-states' unmatched-voters.py counts
+  # the roll-call voter names that matched no one (Stage 3's Gate 1 rule) and ddp-sync alerts in #automation-errors on a
+  # new one or a rising share (pipelines/unmatched_voter_alert.py). No per-state list: every scraped state; accepted
+  # names live in the manifest (quality.accepted_unmatched_voters). Needs ddp-open-states with unmatched-voters.py on
+  # the host's OPENSTATES_ROOT first; without it the check only logs unmatched_voter_check_failed.
+  unmatched_voter_alert:
+    enabled: true
+
   # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
   # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
   # loses everything it had collected. That is not theoretical: FL 213 + MA 473 bills went that

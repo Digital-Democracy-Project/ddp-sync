@@ -320,6 +320,23 @@ Pub/sub channels (hardcoded strings in callers):
 - **`_maybe_signal_broker_scorecard_refresh_after_people(config)`** (BROKER-541) — called by `run_people_refresh_job` only when `run-people-refresh.sh` exited 0 (it exits 1 if any state failed, without naming which). Sends the same broker scorecard signal once for each state in the manifest's `enrollment.people_refresh` (the field the script imports; feature `people_refresh` in `jurisdiction_enrollment._FEATURES`, spelled "us"), so a roster change reaches scorecards without waiting for the state's next scrape. Same switch as above (`broker_scorecard_signal.enabled`, default off) and `_send_broker_signal`, under its **own** debounce name `broker_scorecard_signal_people` (a scrape signal minutes earlier may have read the roster before the import). One state's failure does not stop the others; never raises, never changes the job's result.
 - **`broker_client.request_scorecard_refresh(jurisdiction)`** — `POST {DDP_BROKER_API_BASE}/api/scorecards/refresh-after-scrape/` `{"jurisdiction": ...}` with the service token (BROKER-537; 202 queued, 200 not tracked). Raises `BrokerClientError` like the call above (both go through `_post_jurisdiction_signal`).
 
+## After-load unmatched-voter alert (`pipelines/unmatched_voter_alert.py`, OPEN-855)
+
+- **`maybe_alert_unmatched_voters(jurisdiction, config)`** — called by `run_state_pipeline` once per run, after the two
+  broker signals and before the archive, when at least one session succeeded (the RDS load is part of the scrape step).
+  Runs ddp-open-states' **`unmatched-voters.py <code>`** (`read_unmatched`: the image's openstates venv Python
+  `/opt/venv-openstates/bin/python`, `cwd` = `OPENSTATES_ROOT`, `DATABASE_URL` from `resolve_rds_database_url()`), which
+  counts with Stage 3's Gate 1 rule (`qa_primitives.unresolved_voter_names`: a person-vote with `voter_id` NULL) and
+  prints per-session totals and every unmatched name with its count, read-only. Alerts once through `post_alert`
+  (source `openstates_scrape.unmatched_voters`) when a (session, name) is new since the last run or a session's
+  unmatched share rose; the text lists the top 10 names summed over sessions. Names the manifest accepts
+  (`quality.accepted_unmatched_voters` in jurisdictions.yaml, marked `accepted` by the script) never alert and are left
+  out of the share. Memory: `ddp:unmatched_voters:<code>` in Redis (no expiry), written only when no alert was needed or
+  it was delivered; none (first run, Redis down) means every name is new. Switch `openstates_scrape.unmatched_voter_alert.enabled`
+  (code default off, `true` in `sync_schedule.yaml`); every scraped state, no per-state list. Never raises.
+  **Do not add a second unmatched-voter query here** (the count is ddp-open-states'), **nor a list of accepted names in
+  this repo** (the manifest holds it).
+
 ## Voatz → Brevo opt-outs (`pipelines/voatz_brevo.py`, SYNC-122)
 
 - **`fetch_ddp_suppressed_emails()`** — DDP's suppression list from ddp-broker-py (`GET /api/email/suppressions/`, BROKER-305), lower-cased; `None` when unreadable (callers then add nobody).
