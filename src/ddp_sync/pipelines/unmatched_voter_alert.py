@@ -12,7 +12,7 @@ the scrape step).
   Python (ddp-sync's own has no Postgres driver for it) and the live RDS login (`resolve_rds_database_url`), like
   `cloud_loader.py`.
 * **Alert** (`post_alert`, #automation-errors) when the state has a name it did not have at its last run, in a session,
-  or a session's unmatched share rose above its last run; it lists the top names with counts. Names the manifest
+  or a session's unmatched share rose above its last run; it lists up to 10 names with counts, new ones first. Names the manifest
   accepts (`quality.accepted_unmatched_voters`, marked `accepted` by the script) are left out of both.
 * **Memory:** the last run's names and shares in Redis (`ddp:unmatched_voters:<code>`, no expiry), written only after a
   run that needed no alert or whose alert was delivered, so an undelivered alert is tried again next run. With no
@@ -106,7 +106,8 @@ def compare(current: dict[str, Any], previous: dict[str, Any] | None) -> tuple[l
 
 def alert_text(code: str, current: dict[str, Any], new: list[dict], risen: list[tuple[str, float, float]],
                first_run: bool) -> str:
-    """The alert: what changed, then the top unaccepted names, each with its votes summed over sessions."""
+    """The alert: what changed, then up to TOP_NAMES unaccepted names, each with its votes summed over sessions: the new
+    names first (the ones that raised it, so a small new one is never hidden behind big old ones), then the rest."""
     new_names = {entry["name"] for entry in new}
     totals: dict[str, list] = {}
     for entry in current.get("names") or []:
@@ -120,10 +121,13 @@ def alert_text(code: str, current: dict[str, Any], new: list[dict], risen: list[
         lines.append(f"{len(new_names)} new name(s).")
     for session, before, after in risen:
         lines.append(f"Session {session}: unmatched share rose from {before:.2%} to {after:.2%}.")
-    lines.append(f"Top names (of {len(totals)}):")
-    for name, (count, sessions) in sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))[:TOP_NAMES]:
+    lines.append(f"Names (of {len(totals)}, new first):")
+    ranked = sorted(totals.items(), key=lambda item: (item[0] not in new_names, -item[1][0], item[0]))
+    for name, (count, sessions) in ranked[:TOP_NAMES]:
         mark = " (new)" if name in new_names else ""
         lines.append(f"• \"{name}\": {count:,} votes in {', '.join(sorted(sessions))}{mark}")
+    if len(new_names) > TOP_NAMES:
+        lines.append(f"... and {len(new_names) - TOP_NAMES} more new name(s).")
     lines.append("Fix: add the printed name to the member's people file (other_names), or list it under the state's "
                  "quality.accepted_unmatched_voters in ddp-open-states' jurisdictions.yaml.")
     return "\n".join(lines)

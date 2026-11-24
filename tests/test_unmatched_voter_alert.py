@@ -109,6 +109,17 @@ async def test_one_name_over_several_sessions_is_one_line_with_its_total(redis, 
 
 
 @pytest.mark.asyncio
+async def test_a_small_new_name_is_listed_ahead_of_bigger_old_ones(redis, alert):
+    old = [("2026", f"OLD{i}", 500 + i) for i in range(12)]
+    await _check(_state(old))
+    alert.reset_mock()
+    await _check(_state([*old, ("2026", "NEWBIE", 3)]))
+    text = alert.call_args.args[0]
+    assert '"NEWBIE": 3 votes in 2026 (new)' in text
+    assert text.count("votes in") == 10  # still at most TOP_NAMES lines
+
+
+@pytest.mark.asyncio
 async def test_a_rising_share_with_no_new_name_alerts(redis, alert):
     await _check(_state([("2026", "Lewis C", 10)], {"2026": {"total": 1000, "unresolved": 10}}))
     alert.reset_mock()

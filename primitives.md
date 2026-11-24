@@ -329,7 +329,7 @@ Pub/sub channels (hardcoded strings in callers):
   counts with Stage 3's Gate 1 rule (`qa_primitives.unresolved_voter_names`: a person-vote with `voter_id` NULL) and
   prints per-session totals and every unmatched name with its count, read-only. Alerts once through `post_alert`
   (source `openstates_scrape.unmatched_voters`) when a (session, name) is new since the last run or a session's
-  unmatched share rose; the text lists the top 10 names summed over sessions. Names the manifest accepts
+  unmatched share rose; the text lists up to 10 names summed over sessions, the new ones first (a small new name is never hidden). Names the manifest accepts
   (`quality.accepted_unmatched_voters` in jurisdictions.yaml, marked `accepted` by the script) never alert and are left
   out of the share. Memory: `ddp:unmatched_voters:<code>` in Redis (no expiry), written only when no alert was needed or
   it was delivered; none (first run, Redis down) means every name is new. Switch `openstates_scrape.unmatched_voter_alert.enabled`

@@ -245,8 +245,9 @@ openstates_scrape:
   # OPEN-855: after each state's load (once per run, before the archive), ddp-open-states' unmatched-voters.py counts
   # the roll-call voter names that matched no one (Stage 3's Gate 1 rule) and ddp-sync alerts in #automation-errors on a
   # new one or a rising share (pipelines/unmatched_voter_alert.py). No per-state list: every scraped state; accepted
-  # names live in the manifest (quality.accepted_unmatched_voters). Needs ddp-open-states with unmatched-voters.py on
-  # the host's OPENSTATES_ROOT first; without it the check only logs unmatched_voter_check_failed.
+  # names live in the manifest (quality.accepted_unmatched_voters). Release order: ddp-open-states with
+  # unmatched-voters.py on the host's OPENSTATES_ROOT FIRST, then this; without it the check only logs
+  # unmatched_voter_check_failed (no alert), so check for the `unmatched_voter_check` log line, not only Slack silence.
   unmatched_voter_alert:
     enabled: true
 
