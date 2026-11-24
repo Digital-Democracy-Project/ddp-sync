@@ -36,6 +36,7 @@ from ddp_sync.pipelines.cloud_scrape_trigger import (
     run_cloud_scrape,
     run_in_cloud_scrape_slot,
 )
+from ddp_sync.pipelines.unmatched_voter_alert import maybe_alert_unmatched_voters
 from ddp_sync.services import jurisdiction_enrollment as enrollment
 from ddp_sync.services import scrapebot_client
 from ddp_sync.services.jurisdiction_enrollment import enrolled
@@ -1836,7 +1837,8 @@ async def run_state_pipeline(
     1. every session in `timing.<state>.sessions` in turn (the US: both chambers), each in its own try, so one
        session's crash does not skip the next; no sessions means one run with no session argument;
     2. the run history for every session (`_record_scrape_history`);
-    3. once at least one session succeeded: the broker signal (SYNC-128) and ONE archive, after all sessions;
+    3. once at least one session succeeded: the broker signals (SYNC-128, BROKER-537), the unmatched-voter check
+       (OPEN-855) and ONE archive, after all sessions;
     4. raises `PipelineFailed` when any session failed or the archive failed. A one-chamber US run still archives
        what it got (that data is real), but is reported as failed.
 
@@ -1922,6 +1924,7 @@ async def _run_state_pipeline_locked(
         if any(r.get("success") for r in results):
             await _logged("broker_signal", jurisdiction, _maybe_signal_broker_bill_events(jurisdiction, config))
             await _logged("broker_scorecard_signal", jurisdiction, _maybe_signal_broker_scorecard_refresh(jurisdiction, config))
+            await _logged("unmatched_voter_alert", jurisdiction, maybe_alert_unmatched_voters(jurisdiction, config))  # OPEN-855
             archived = await archive_with_retry(jurisdiction, archive_config)
         if not all(r.get("success") for r in results) or archived is False:
             raise PipelineFailed(jurisdiction, results, archived)
