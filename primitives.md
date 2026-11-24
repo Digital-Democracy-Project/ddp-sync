@@ -365,6 +365,13 @@ never raises. The scrape passes `_lock`, the Fargate archive `_archive_lock` (`c
 `_import_lock` under `loader_lock_key(state, session_arg)` (OPEN-633: the loader keys it on ddp-open-states'
 `derive_scrape_key`, e.g. `fl_2026`, not the bare state); the backfill and script jobs hold no S3 lock and pass none. **Do not add a second lock scheme or a second release path:** the lock format
 lives in ddp-open-states; a stop path that holds one passes `run_lock`.
+**SYNC-189: a restart during a local load.** A local load (`cloud_loader.py` as a child of ddp-sync, no
+`load_on_fargate`) dies with the ddp-sync container, before its `finally`, so its `_import_lock` stayed behind and the
+resumed run's own load was refused for 24 h (Oklahoma 2026, 2026-11-23). `resume_inflight_fargate_job` passes
+`resumed=True` through `_finish_after_launch` to `_run_load`, which, on the local path only, releases the lock first with
+the same `_release_run_lock` (holder must be this run_id; conditional on the ETag). A Fargate load task, the collection
+task (`_lock`) and a Fargate archive (`_archive_lock`) outlive a restart and keep their locks; a fresh run never touches
+the lock.
 
 When a scrape that is still logging gets its "still running" alert (before OPEN-477: when it was stopped). One shared value,
 `openstates_scrape.cloud_path.fargate.max_wait_seconds` (12 h), plus a state's own ceiling, the manifest's
