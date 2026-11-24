@@ -1731,6 +1731,57 @@ async def trigger_knowledge_base_reconcile_plan(
     return {"status": "started", "run_id": run_id, "jurisdiction": jurisdiction, "dry_run": True, "ledger": ledger}
 
 
+@router.post("/trigger/knowledge-base-draft-cleanup/{jurisdiction}", status_code=202)
+async def trigger_knowledge_base_draft_cleanup(
+    jurisdiction: str,
+    background_tasks: BackgroundTasks,
+    dry_run: bool = True,
+    token: str = Depends(api_key_auth),
+):
+    """SYNC-191 (OPEN-861): remove the knowledge-base vectors of drafts a bill has since replaced (Montana's "LC nnnn").
+    Dry run by default: it lists the introduced drafts api-v3 names (the ledger with and without
+    `exclude_introduced_drafts`) and counts the documents and vectors recorded for them; `dry_run=false` deletes those
+    vectors by exact id and empties their version records. Bill data and LegBot's artifacts are never touched. The result
+    lands in the log line `knowledge_base_draft_cleanup` (not in this 202). Run the dry run, read it, then apply.
+
+    404 for a jurisdiction not enrolled in the manifest's `enrollment.embedding`; 503 when `KNOWLEDGE_BASE_INDEX_NAME` or
+    the read api is not configured on this host. Needs api-v3's OPEN-870 option: an older api-v3 ignores it, both ledgers
+    then match and the run finds no drafts."""
+    import uuid
+
+    from ddp_sync.config import get_settings, knowledge_base_settings
+    from ddp_sync.pipelines.knowledge_base_draft_cleanup import remove_introduced_draft_vectors
+    from ddp_sync.pipelines.knowledge_base_embedding import read_target
+    from ddp_sync.pipelines.openstates_archive import _mac_capable
+    from ddp_sync.pipelines.openstates_scrape import _get_root
+    from ddp_sync.scheduler import get_scheduler
+    from ddp_sync.services.jurisdiction_enrollment import enrolled as _enrolled
+
+    scheduler = get_scheduler()
+    config = scheduler._sync_config.get("openstates_archive", {}) if scheduler else {}
+    enrolled = {str(j).lower() for j in (_enrolled("embedding", None, _get_root(config)) or [])}
+    if jurisdiction.lower() not in enrolled:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{jurisdiction}' is not enrolled in the manifest's enrollment.embedding: {sorted(enrolled)}",
+        )
+    settings = get_settings()
+    if not settings.knowledge_base_index_name:
+        raise HTTPException(status_code=503, detail="KNOWLEDGE_BASE_INDEX_NAME is not set on this host")
+    try:
+        knowledge_base_settings(settings)  # refuses the legacy index here, not silently in the background
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    api_base, api_key = read_target(settings, mac_capable=_mac_capable())
+    if not api_base:
+        raise HTTPException(status_code=503, detail="no api-v3 read path is configured on this host")
+
+    run_id = f"{jurisdiction}-kb-draft-cleanup-{'dry' if dry_run else 'run'}-{uuid.uuid4().hex[:12]}"
+    background_tasks.add_task(remove_introduced_draft_vectors, jurisdiction.lower(), api_base=api_base, api_key=api_key,
+                              settings=settings, apply=not dry_run, run_id=run_id)
+    return {"status": "started", "run_id": run_id, "jurisdiction": jurisdiction, "dry_run": dry_run}
+
+
 @router.post("/trigger/knowledge-base-entities/{entity}", status_code=202)
 async def trigger_knowledge_base_entities(
     entity: str,
