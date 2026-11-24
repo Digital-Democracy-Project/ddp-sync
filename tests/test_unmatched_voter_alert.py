@@ -120,6 +120,16 @@ async def test_a_small_new_name_is_listed_ahead_of_bigger_old_ones(redis, alert)
 
 
 @pytest.mark.asyncio
+async def test_more_new_names_than_fit_are_counted(redis, alert):
+    await _check(_state([("2026", f"NEW{i:02d}", 100 - i) for i in range(13)]))
+    text = alert.call_args.args[0]
+    assert "13 new name(s)" in text
+    assert text.count("votes in") == 10
+    assert '"NEW09": 91 votes in 2026 (new)' in text and '"NEW10"' not in text
+    assert "... and 3 more new name(s)." in text
+
+
+@pytest.mark.asyncio
 async def test_a_rising_share_with_no_new_name_alerts(redis, alert):
     await _check(_state([("2026", "Lewis C", 10)], {"2026": {"total": 1000, "unresolved": 10}}))
     alert.reset_mock()

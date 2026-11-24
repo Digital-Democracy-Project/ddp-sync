@@ -247,7 +247,9 @@ openstates_scrape:
   # new one or a rising share (pipelines/unmatched_voter_alert.py). No per-state list: every scraped state; accepted
   # names live in the manifest (quality.accepted_unmatched_voters). Release order: ddp-open-states with
   # unmatched-voters.py on the host's OPENSTATES_ROOT FIRST, then this; without it the check only logs
-  # unmatched_voter_check_failed (no alert), so check for the `unmatched_voter_check` log line, not only Slack silence.
+  # unmatched_voter_check_failed (no alert: that line means the release is NOT working). A working check logs the event
+  # `unmatched_voter_check` (with new_names / risen_sessions / delivered) once per state run; look for it, not only for
+  # Slack silence.
   unmatched_voter_alert:
     enabled: true
 
