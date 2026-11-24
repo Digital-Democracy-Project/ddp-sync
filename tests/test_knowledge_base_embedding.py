@@ -1058,7 +1058,8 @@ async def test_only_the_knowledge_base_path_writes_bill_versions_without_an_expi
     src = Path(__file__).parent.parent / "src"
     users = {str(p.relative_to(src)) for p in src.rglob("*.py")
              if "persistent=True" in p.read_text() and p.name != "redis_store.py"}
-    assert users == {"ddp_sync/pipelines/knowledge_base_embedding.py"}
+    # SYNC-191's clean-up empties a draft's knowledge-base record: also the knowledge-base path
+    assert users == {"ddp_sync/pipelines/knowledge_base_embedding.py", "ddp_sync/pipelines/knowledge_base_draft_cleanup.py"}
 
 
 # --- SYNC-95: the dry run -----------------------------------------------------------------------------
