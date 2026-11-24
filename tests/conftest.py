@@ -89,6 +89,35 @@ def _no_polled_bill_lookup(monkeypatch):
     monkeypatch.setattr(session_pipeline_runner, "list_polled_bill_ids", _none)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_inflight_redis(monkeypatch):
+    """SYNC-192: a Fargate archive now writes its in-flight record, so a test that runs one without faking the store would
+    reach the developer's real Redis (localhost:6379 is up on the Mac) and leave records a ddp-sync restart would try to
+    resume. Every test starts with an empty in-memory store; a test that patches `_client` or `_get_client` still wins."""
+    from ddp_sync.pipelines import inflight_fargate_jobs
+
+    class _Hash:
+        def __init__(self):
+            self.h: dict[str, dict[str, str]] = {}
+
+        def ping(self):
+            return True
+
+        def hset(self, key, field, value):
+            self.h.setdefault(key, {})[field] = value
+
+        def hget(self, key, field):
+            return self.h.get(key, {}).get(field)
+
+        def hdel(self, key, field):
+            self.h.get(key, {}).pop(field, None)
+
+        def hgetall(self, key):
+            return dict(self.h.get(key, {}))
+
+    monkeypatch.setattr(inflight_fargate_jobs, "_client", _Hash())
+
+
 @pytest.fixture
 def legbot_stand_in_manifest(tmp_path, monkeypatch):
     """SYNC-186: the LegBot gate (`legbot_replica`) now answers on every hand-off and every bill, not only when the

@@ -964,6 +964,23 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
     records = inflight_fargate_jobs.list_inflight()
     tasks = []
     for run_id, record in records.items():
+        if record.get("kind") == "archive":
+            # SYNC-192: an archive's task waits and runs its follow-ups in openstates_archive, on the event loop (the
+            # archive's own wait uses the default thread pool, not the scrape slots).
+            from ddp_sync.pipelines.openstates_archive import resume_inflight_archive_job
+
+            logger.warning(
+                "openstates_archive: resuming an archive orphaned by a previous restart",
+                run_id=run_id,
+                jurisdiction=record.get("jurisdiction"),
+                task_arn=record.get("task_arn"),
+            )
+            task = asyncio.create_task(resume_inflight_archive_job(run_id, record))
+            _reconciliation_tasks.add(task)
+            task.add_done_callback(_reconciliation_tasks.discard)
+            task.add_done_callback(_log_reconciliation_outcome)
+            tasks.append(task)
+            continue
         logger.warning(
             "cloud_scrape: resuming a Fargate job orphaned by a previous restart",
             run_id=run_id,

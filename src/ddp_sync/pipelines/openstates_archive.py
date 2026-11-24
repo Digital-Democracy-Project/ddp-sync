@@ -25,6 +25,7 @@ not a re-fetch — or with any other scrape.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -39,6 +40,7 @@ import requests
 import structlog
 
 from ddp_sync.config import SyncSettings, get_settings
+from ddp_sync.pipelines import inflight_fargate_jobs
 from ddp_sync.pipelines.openstates_scrape import _get_root as _scrape_root
 from ddp_sync.pipelines.openstates_scrape import _run_with_group_kill
 from ddp_sync.services.jurisdiction_enrollment import enrolled, is_enrolled
@@ -61,6 +63,9 @@ _SCRAPE_TO_ARCHIVE_JURISDICTION = {"usa": "us"}
 # (services/redis_store.state_lock). A failed archive is retried after these delays, then alerted. Plan open question 3
 # proposed two retries, 30 min and 2 h after a failure; built with those values, not yet confirmed by Ramon.
 ARCHIVE_RETRY_DELAYS_S: tuple[int, ...] = (1800, 7200)
+# SYNC-192: which retry attempt (1-based) is running, set by `_archive_with_retry` so `_run_archive_fargate` can put it in the
+# in-flight record without a new parameter on the three functions between them.
+_archive_attempt: contextvars.ContextVar[int] = contextvars.ContextVar("archive_attempt", default=1)
 
 # Per-jurisdiction archive timeouts. Downloads + extracts every not-yet-captured
 # document, so these scale with total historical bill count, not just what
@@ -409,6 +414,7 @@ async def _run_archive_fargate(
     jurisdiction: str,
     config: dict | None = None,
     ecs_client=None,
+    archive_started_at: datetime | None = None,
 ) -> dict[str, Any]:
     """OPEN-192 (reopened): run cloud_archiver.py for one jurisdiction as a real Fargate task,
     instead of run-archive.sh locally. Selected by run_single_archive_job()
@@ -424,6 +430,11 @@ async def _run_archive_fargate(
     Reuses cloud_scrape_trigger's config validation and task-completion wait -- both are
     generic over what the task actually runs, not scrape-specific -- rather than a second
     implementation of the same run_task-and-poll mechanics.
+
+    SYNC-192: once the task has launched its ARN goes into the in-flight record (`record_archive_started`), so a
+    restarted ddp-sync waits for it (`resume_inflight_archive_job`). A success returns `archive_run_id` and LEAVES the
+    record: `_run_archive_followups` clears it when the follow-ups are done. A failed task clears it here (its retry and
+    alert are the caller's, as before). A cancelled wait (ddp-sync stopping) clears nothing: that is the record's purpose.
     """
     from ddp_sync.pipelines.cloud_scrape_trigger import _fargate_config, _wait_for_task_stop
 
@@ -481,6 +492,12 @@ async def _run_archive_fargate(
             "duration_seconds": duration,
         }
 
+    # Between run_task above and this write a restart leaves a running task nobody waits for (as the load's gap, OPEN-633):
+    # its follow-ups do not run, and the state's next archive meets the task's own `_archive_lock` and is retried.
+    inflight_fargate_jobs.record_archive_started(
+        run_id, jurisdiction, task_arn, fargate_cfg,
+        (archive_started_at or datetime.now(timezone.utc)).isoformat(), _archive_attempt.get(),
+    )
     # SYNC-167: cloud_archiver.py holds `_archive_lock` (holder = this run_id); a stop at max_wait releases it.
     exit_code, wait_detail = await asyncio.to_thread(
         _wait_for_task_stop, task_arn, fargate_cfg, client, run_lock=(jurisdiction, run_id, "_archive_lock")
@@ -488,6 +505,7 @@ async def _run_archive_fargate(
     duration = round(time.monotonic() - start, 1)
 
     if exit_code != 0:
+        inflight_fargate_jobs.clear(run_id)
         error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
         logger.error(
             "openstates_archive: fargate task failed",
@@ -509,7 +527,7 @@ async def _run_archive_fargate(
         jurisdiction=jurisdiction,
         duration_seconds=duration,
     )
-    return {"success": True, "jurisdiction": jurisdiction, "duration_seconds": duration}
+    return {"success": True, "jurisdiction": jurisdiction, "duration_seconds": duration, "archive_run_id": run_id}
 
 
 async def _write_flow_status(flow_key: str, status: dict) -> None:
@@ -1067,8 +1085,12 @@ def _load_archive_config_for_scrape_trigger() -> dict[str, Any]:
     return full_config.get("openstates_archive", {})
 
 
-async def _archive_with_retry(jurisdiction: str, archive_config: dict | None) -> tuple[bool | None, int]:
-    """`archive_with_retry`'s work, plus the number of attempts made (the manual archive's status record shows it)."""
+async def _archive_with_retry(
+    jurisdiction: str, archive_config: dict | None, *, first_attempt: int = 1
+) -> tuple[bool | None, int]:
+    """`archive_with_retry`'s work, plus the number of attempts made (the manual archive's status record shows it).
+    `first_attempt` (SYNC-192, from `resume_inflight_archive_job`): attempts before it already happened in a previous
+    process, so the loop continues from there with the same delays and the same final alert."""
     j = _archive_jurisdiction_code(jurisdiction)
     if archive_config is None:
         archive_config = _load_archive_config_for_scrape_trigger()
@@ -1079,8 +1101,11 @@ async def _archive_with_retry(jurisdiction: str, archive_config: dict | None) ->
         return None, 0
     attempt = 0
     for attempt, delay in enumerate((0, *ARCHIVE_RETRY_DELAYS_S), start=1):
+        if attempt < first_attempt:
+            continue
         if delay:
             await asyncio.sleep(delay)
+        _archive_attempt.set(attempt)
         try:
             result = await run_single_archive_job(j, archive_config)  # Fargate (or local), then LegBot/search/embedding
         except Exception as e:  # noqa: BLE001 -- an exception is a failed attempt, not the end of the retries
@@ -1169,37 +1194,134 @@ async def _run_archive_with_hook(
     """
     archive_started_at = datetime.now(timezone.utc)
     if (config or {}).get("use_fargate", False):
-        result = await _run_archive_fargate(jurisdiction, config=config)
+        result = await _run_archive_fargate(jurisdiction, config=config, archive_started_at=archive_started_at)
     else:
         result = await _run_archive(jurisdiction, openstates_root or _get_root(config), config=config)
 
     if result.get("success"):
-        try:
-            await _maybe_trigger_legbot_for_archive(jurisdiction, archive_started_at)
-        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
-            logger.error(
-                "archiver_triggered_legbot_hook_failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
-        # Before the embedding hook: that one can run for hours, and search should not wait for it.
-        try:
-            await _maybe_refresh_bill_search(jurisdiction, config)
-        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
-            logger.error(
-                "archiver_triggered_bill_search_hook_failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
-        try:
-            await _maybe_embed_knowledge_base(jurisdiction, archive_started_at, config)
-        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
-            logger.error(
-                "archiver_triggered_knowledge_base_hook_failed",
-                jurisdiction=jurisdiction,
-                error=str(e),
-            )
+        await _run_archive_followups(jurisdiction, archive_started_at, config, run_id=result.get("archive_run_id"))
     return result
+
+
+async def _run_archive_followups(
+    jurisdiction: str,
+    archive_started_at: datetime,
+    config: dict | None,
+    *,
+    run_id: str | None = None,
+    done: frozenset[str] | set[str] = frozenset(),
+) -> None:
+    """The follow-ups of a successful archive, in order: LegBot dispatch, bill search refresh, knowledge-base embedding.
+    Shared by a normal run (`_run_archive_with_hook`) and a resumed one (`resume_inflight_archive_job`), so they cannot
+    drift (SYNC-192). Each runs in its own try and never changes the archive's result.
+
+    With a `run_id` (a Fargate archive, which has an in-flight record) each finished follow-up is noted in the record
+    (`record_hook_done`; `done` are those a previous process already finished and are skipped), and the record is
+    cleared once all have finished. A cancelled run (ddp-sync stopping) clears nothing, so the next process resumes at
+    the follow-up it was in."""
+    hooks = (
+        ("legbot", "archiver_triggered_legbot_hook_failed",
+         lambda: _maybe_trigger_legbot_for_archive(jurisdiction, archive_started_at)),
+        # Before the embedding hook: that one can run for hours, and search should not wait for it.
+        ("bill_search", "archiver_triggered_bill_search_hook_failed",
+         lambda: _maybe_refresh_bill_search(jurisdiction, config)),
+        ("knowledge_base", "archiver_triggered_knowledge_base_hook_failed",
+         lambda: _maybe_embed_knowledge_base(jurisdiction, archive_started_at, config)),
+    )
+    for name, failed_event, hook in hooks:
+        if name in done:
+            continue
+        try:
+            await hook()
+        except Exception as e:  # noqa: BLE001 -- must never affect the archive job's own result
+            logger.error(failed_event, jurisdiction=jurisdiction, error=str(e))
+        if run_id:
+            inflight_fargate_jobs.record_hook_done(run_id, name)
+    if run_id:
+        inflight_fargate_jobs.clear(run_id)
+
+
+def _task_known_to_ecs(task_arn: str, fargate_cfg: dict, ecs_client) -> bool:
+    """False only when ECS answers that it has no such task (it forgets a stopped task after about an hour). Any error
+    counts as known: the wait that follows reports it."""
+    try:
+        return bool(ecs_client.describe_tasks(cluster=fargate_cfg["cluster"], tasks=[task_arn]).get("tasks"))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+async def resume_inflight_archive_job(run_id: str, record: dict[str, Any], *, ecs_client=None) -> dict[str, Any]:
+    """SYNC-192: finish an archive a previous ddp-sync process left in flight (called by `reconcile_inflight_fargate_jobs`
+    at startup for each `kind: "archive"` record). Never raises (a cancel at shutdown aside, which leaves the record).
+
+    0. A record missing its fields is alerted and cleared. Any other error before the task is known to have stopped (ECS
+       throttling, a config read) alerts and KEEPS the record for the next restart: clearing it would hide a task that
+       may still be running.
+    1. Takes the state's pipeline lock (`startup` cleared every lock, so this puts back the one the archive held; a
+       scheduled or manual run of the state is refused while this runs, as during a normal archive). If another run
+       already holds it, this goes on without it and logs: the second archive would meet the task's own `_archive_lock`.
+    2. Waits for the recorded task (no second archive is launched). A task ECS no longer knows (a stale record) is
+       alerted and cleared, nothing relaunched; the state's next archive covers it.
+    3. Success: the same follow-ups a normal run runs, minus those the record says finished, then clears the record.
+       Failure: clears the record, sends the per-attempt alert as a normal failure does, and continues the retry
+       sequence from the next attempt (`_archive_with_retry(first_attempt=)`), ending in the same final alert.
+    A resumed wait starts a fresh `max_wait_seconds` (as `reconcile_inflight_fargate_jobs` explains for scrapes)."""
+    from ddp_sync.pipelines.cloud_scrape_trigger import _wait_for_task_stop
+    from ddp_sync.pipelines.openstates_scrape import pipeline_lock_ttl_s
+    from ddp_sync.services.redis_store import state_lock
+
+    start = time.monotonic()
+    jurisdiction = record.get("jurisdiction") or run_id
+    try:
+        task_arn = record["task_arn"]
+        fargate_cfg = record["fargate_cfg"]
+        started_at = datetime.fromisoformat(record["archive_started_at"])
+        attempt = int(record.get("attempt") or 1)
+    except (KeyError, TypeError, ValueError) as e:  # a record that can never be resumed: say so, drop it
+        inflight_fargate_jobs.clear(run_id)
+        logger.error("resumed_archive_record_malformed", jurisdiction=jurisdiction, run_id=run_id, error=str(e))
+        await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"unusable in-flight record {run_id}: {e!r}", 0.0)
+        return {"success": False, "jurisdiction": jurisdiction, "error": f"malformed_record: {e!r}"}
+    try:
+        archive_config = _load_archive_config_for_scrape_trigger()
+        client = ecs_client or boto3.client("ecs")
+        async with state_lock(jurisdiction, pipeline_lock_ttl_s(jurisdiction, None, archive_config)) as held:
+            if not held:
+                logger.warning("resumed_archive_state_lock_held_by_another_run", jurisdiction=jurisdiction, run_id=run_id)
+            if not await asyncio.to_thread(_task_known_to_ecs, task_arn, fargate_cfg, client):
+                inflight_fargate_jobs.clear(run_id)
+                error = f"ECS no longer knows task {task_arn}; its result and follow-ups are unknown, nothing relaunched"
+                logger.error("resumed_archive_task_unknown", jurisdiction=jurisdiction, run_id=run_id, task_arn=task_arn)
+                await asyncio.to_thread(_alert_archive_failure, jurisdiction, error, round(time.monotonic() - start, 1))
+                return {"success": False, "jurisdiction": jurisdiction, "error": "task_unknown"}
+            exit_code, detail = await asyncio.to_thread(
+                _wait_for_task_stop, task_arn, fargate_cfg, client, run_lock=(jurisdiction, run_id, "_archive_lock")
+            )
+            if exit_code == 0:
+                logger.info("resumed_archive_task_done", jurisdiction=jurisdiction, run_id=run_id)
+                await _run_archive_followups(
+                    jurisdiction, started_at, archive_config, run_id=run_id, done=set(record.get("hooks_done") or ())
+                )
+                return {"success": True, "jurisdiction": jurisdiction, "resumed": True}
+            inflight_fargate_jobs.clear(run_id)
+            error = "exit_code_none" if exit_code is None else f"exit_code_{exit_code}"
+            logger.error("resumed_archive_task_failed", jurisdiction=jurisdiction, run_id=run_id, error=error, detail=detail)
+            await asyncio.to_thread(_alert_archive_failure, jurisdiction, f"{error}: {detail}", round(time.monotonic() - start, 1))
+            archived, _ = await _archive_with_retry(jurisdiction, archive_config, first_attempt=attempt + 1)
+            return {"success": archived is not False, "jurisdiction": jurisdiction, "resumed": True, "archived": archived}
+    except Exception as e:  # noqa: BLE001 -- runs unobserved on a background task: nothing may escape
+        # NOT cleared: an error here (ECS throttling, a config read) does not show the task has stopped, so the record
+        # stays and the next restart tries again (a stale one is then cleared above). The lock was released on the way out.
+        logger.error("resumed_archive_failed_unexpectedly", jurisdiction=jurisdiction, run_id=run_id, error=str(e))
+        try:
+            await asyncio.to_thread(
+                _alert_archive_failure, jurisdiction,
+                f"resuming the archive failed ({e}); record {run_id} kept for the next restart, task {task_arn}",
+                round(time.monotonic() - start, 1),
+            )
+        except Exception as alert_error:  # noqa: BLE001 -- the alert must not hide the outcome
+            logger.error("resumed_archive_alert_failed", jurisdiction=jurisdiction, error=str(alert_error))
+        return {"success": False, "jurisdiction": jurisdiction, "error": str(e)}
 
 
 async def run_single_archive_job(

@@ -144,7 +144,8 @@ async def test_successful_run_passes_runner_script_and_database_url_overrides(mo
         "mi", config={"cloud_path": {"fargate": _FARGATE_CFG}}, ecs_client=ecs
     )
 
-    assert result == {"success": True, "jurisdiction": "mi", "duration_seconds": result["duration_seconds"]}
+    assert result == {"success": True, "jurisdiction": "mi", "duration_seconds": result["duration_seconds"],
+                      "archive_run_id": result["archive_run_id"]}  # SYNC-192: the in-flight record's key
     assert result["duration_seconds"] >= 0
     [call] = ecs.run_task_calls
     env = {e["name"]: e["value"] for e in call["overrides"]["containerOverrides"][0]["environment"]}
