@@ -38,12 +38,13 @@ import os
 import re
 import time
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 import structlog
 
 from ddp_sync.pipelines.verify_org_citations import (
+    _match_key,
     new_run_record,
     run_verify_org_citations_in_background,
 )
@@ -187,8 +188,23 @@ def _window(config: dict, now: float) -> tuple[float, float]:
     return since, since - float(config.get("thread_lookback_days", 730)) * 86400
 
 
-async def run_slack_citations_job(config: dict, *, trigger: str = "scheduled") -> dict:
+def _range_window(since: date, until: date, config: dict) -> tuple[float, float, float]:
+    """(citations_since, citations_until, roots_since) for a one-off range (SYNC-195): citations posted from
+    00:00 UTC on `since` through the end of `until` (both days included), in threads started up to
+    `thread_lookback_days` before `since`. `start_date` and `lookback_days` play no part: they belong to
+    the nightly window, which this never changes."""
+    start = datetime.combine(since, datetime.min.time(), tzinfo=UTC).timestamp()
+    end = datetime.combine(until + timedelta(days=1), datetime.min.time(), tzinfo=UTC).timestamp()
+    return start, end, start - float(config.get("thread_lookback_days", 730)) * 86400
+
+
+async def run_slack_citations_job(
+    config: dict, *, trigger: str = "scheduled", window: tuple[date, date] | None = None
+) -> dict:
     """One pass: read #legislation, report or send the new citations, record what is settled.
+
+    `window` (SYNC-195, a manual trigger only) is a (since, until) pair of UTC dates that replaces the
+    nightly window for this one pass; without it the window is `_window(config)`, as before.
 
     Returns a summary dict (also logged as slack_citations_summary). Never raises; a failure that stops
     the run is logged and posted to the alerts channel."""
@@ -197,7 +213,7 @@ async def run_slack_citations_job(config: dict, *, trigger: str = "scheduled") -
         return {"status": "skipped_already_running"}
     async with _run_lock:
         try:
-            summary = await _run(config, trigger=trigger)
+            summary = await _run(config, trigger=trigger, window=window)
         except Exception as exc:
             logger.exception("slack_citations: run failed", trigger=trigger)
             await asyncio.to_thread(post_alert, f"Slack citation pull failed: {type(exc).__name__}: {exc}"[:300], source="slack_citations")
@@ -206,7 +222,7 @@ async def run_slack_citations_job(config: dict, *, trigger: str = "scheduled") -
     return summary
 
 
-async def _run(config: dict, *, trigger: str) -> dict:
+async def _run(config: dict, *, trigger: str, window: tuple[date, date] | None = None) -> dict:
     mode = config.get("mode", "report_only")
     if mode not in ("report_only", "write"):
         raise ValueError(f"slack_citations.mode must be report_only or write, not {mode!r}")
@@ -217,13 +233,20 @@ async def _run(config: dict, *, trigger: str) -> dict:
     cap = int(config.get("max_citations_per_run", 200))
     source = config.get("source", "slack-legislation")
 
-    citations_since, roots_since = _window(config, time.time())
+    if window is None:
+        citations_since, roots_since = _window(config, time.time())
+        citations_until = None
+    else:
+        citations_since, citations_until, roots_since = _range_window(*window, config)
     threads = await fetch_threads(token, channel, roots_since=roots_since, active_since=citations_since)
 
     found = []  # (citation, bill reference)
     for messages in threads:
         bill_ref, citations = parse_thread(messages)
-        found += [(c, bill_ref) for c in citations if float(c["ts"]) >= citations_since]
+        found += [
+            (c, bill_ref) for c in citations
+            if float(c["ts"]) >= citations_since and (citations_until is None or float(c["ts"]) < citations_until)
+        ]
 
     store = get_redis_store()
     done = await store.get_processed_slack_citations([c["ts"] for c, _ in found])
@@ -261,6 +284,13 @@ async def _run(config: dict, *, trigger: str) -> dict:
         "mode": mode, "threads": len(threads), "citations_in_window": len(found), "already_handled": len(found) - len(new),
         "ready": len(ready), "unmatched": dict(unmatched), "left_for_next_run": max(0, len(new) - len(ready) - sum(unmatched.values())),
     }
+    if window is not None:
+        # A one-off range: what the cap leaves is found again by sending the same range again (handled
+        # messages are skipped). Nothing drops out of a window here, so no age-out alert; `distinct_items`
+        # is how many verification calls the batch can cost (the same citation in two threads is one).
+        summary["window"] = {"since": window[0].isoformat(), "until": window[1].isoformat()}
+        summary["bills"] = len({(item["bill_openstates_id"]) for _, item in ready})
+        summary["distinct_items"] = len({_match_key(item) for _, item in ready})
     if summary["left_for_next_run"]:
         # Left-overs are the newest (oldest first above); they are found again while inside lookback_days.
         logger.warning("slack_citations: cap reached, the rest wait for the next run",
@@ -268,7 +298,7 @@ async def _run(config: dict, *, trigger: str) -> dict:
         handled = set(settled_ts) | {ts for ts, _ in ready}
         oldest_left = min(float(c["ts"]) for c, _ in new if c["ts"] not in handled)
         age_days = (time.time() - oldest_left) / 86400
-        if age_days >= float(config.get("lookback_days", 30)) - _AGE_OUT_WARNING_DAYS:
+        if window is None and age_days >= float(config.get("lookback_days", 30)) - _AGE_OUT_WARNING_DAYS:
             await asyncio.to_thread(
                 post_alert,
                 f"Slack citation pull: {summary['left_for_next_run']} citations wait beyond the nightly cap of "
