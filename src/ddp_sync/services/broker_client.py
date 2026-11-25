@@ -1451,6 +1451,130 @@ async def create_concept_statement_set(
     return result
 
 
+# SYNC-183: the policy_statement step's calls to the broker's policy-matching routes (BROKER-573 / BROKER-598,
+# ddp-broker-py docs/policy-matching.md). Service-token auth, like every other write here.
+_POLICY_MATCHING_PAGE_SIZE = 200
+_POLICY_MATCHING_MAX_PAGES = 100  # a list longer than this many pages is not a list this step can match against
+
+
+async def _policy_matching_call(
+    method: str,
+    path: str,
+    *,
+    what: str,
+    params: dict | None = None,
+    payload: dict | None = None,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> dict:
+    settings = get_settings()
+    resolved_api_base = broker_api_base if broker_api_base is not None else settings.ddp_broker_api_base
+    resolved_api_token = broker_api_token if broker_api_token is not None else settings.ddp_broker_api_token
+    if not resolved_api_base:
+        raise BrokerClientError(f"DDP_BROKER_API_BASE is not configured — cannot {what}.")
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        try:
+            resp = await client.request(
+                method,
+                f"{resolved_api_base}/api/policy-matching/{path}",
+                headers={"Authorization": f"Bearer {resolved_api_token}"},
+                params=params,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise BrokerClientError(f"ddp-broker-py unreachable: {exc}") from exc
+    if resp.status_code >= 400:
+        raise BrokerClientError(f"ddp-broker-py rejected the {what} ({resp.status_code}): {resp.text[:500]}")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise BrokerClientError(f"ddp-broker-py returned a {what} answer that is not JSON") from exc
+    if not isinstance(body, dict):
+        raise BrokerClientError(f"ddp-broker-py returned an unusable {what} answer: {str(body)[:200]}")
+    return body
+
+
+async def _policy_matching_pages(path: str, *, what: str, params: dict | None = None, **kwargs) -> list[dict]:
+    """Every row of a paged policy-matching list (`results` plus `next_after`, null at the end)."""
+    rows: list[dict] = []
+    after = 0
+    for _ in range(_POLICY_MATCHING_MAX_PAGES):
+        body = await _policy_matching_call(
+            "GET", path, what=what, params={**(params or {}), "after": after, "limit": _POLICY_MATCHING_PAGE_SIZE}, **kwargs
+        )
+        results = body.get("results")
+        if not isinstance(results, list):
+            raise BrokerClientError(f"ddp-broker-py returned an unusable {what} answer: {str(body)[:200]}")
+        rows.extend(results)
+        after = body.get("next_after")
+        if after is None:
+            return rows
+    raise BrokerClientError(f"ddp-broker-py lists more than {_POLICY_MATCHING_MAX_PAGES} pages for the {what}")
+
+
+async def list_policy_statement_work(
+    *,
+    bill_openstates_id: str,
+    jurisdiction_iso2: str,
+    rubric_version: str,
+    broker_api_base: str | None = None,
+    broker_api_token: str | None = None,
+) -> list[dict]:
+    """The statements of one bill's current published set that have no current match row (SYNC-183): `GET
+    /api/policy-matching/work/?bill=&jurisdiction=&rubric_version=`, every page. Each row is {concept_statement_set_id,
+    statement_index, statement_text, jurisdiction, session, gov_id, why}. The broker's own staleness rule decides; this
+    side never reads sets or keeps a second record of what was done. No `prompt_hash` is sent: the writer's judge id is
+    known only after it has answered, so a re-walk because the prompt moved is not asked for here.
+
+    Raises:
+        BrokerClientError: as every call here.
+    """
+    return await _policy_matching_pages(
+        "work/",
+        what="policy-matching work list",
+        params={"bill": bill_openstates_id, "jurisdiction": jurisdiction_iso2.upper(), "rubric_version": rubric_version},
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
+async def list_policy_matching_policies(
+    *, broker_api_base: str | None = None, broker_api_token: str | None = None
+) -> list[dict]:
+    """Every non-merged Policy, public or not, as {id, label, canonical_statement, definition, exclusions, concept_id,
+    definition_version}, ordered by id (BROKER-598 `GET /api/policy-matching/policies/`). Read again for each bill, so a
+    Policy created for the previous bill is a candidate."""
+    return await _policy_matching_pages(
+        "policies/", what="policy list", broker_api_base=broker_api_base, broker_api_token=broker_api_token
+    )
+
+
+async def list_policy_matching_concepts(
+    *, broker_api_base: str | None = None, broker_api_token: str | None = None
+) -> list[dict]:
+    """Every non-merged Concept as {id, label, definition, exclusions, topic_id}, ordered by id (BROKER-598 `GET
+    /api/policy-matching/concepts/`)."""
+    return await _policy_matching_pages(
+        "concepts/", what="concept list", broker_api_base=broker_api_base, broker_api_token=broker_api_token
+    )
+
+
+async def write_policy_statement_match(
+    payload: dict, *, broker_api_base: str | None = None, broker_api_token: str | None = None
+) -> dict:
+    """One statement's result (BROKER-598 `POST /api/policy-matching/drafts/`): matched, created (a new Policy under an
+    existing Concept, cleared by the broker) or excluded. A 409 (a different answer on a current row) raises; this side
+    never retries or overwrites."""
+    return await _policy_matching_call(
+        "POST",
+        "drafts/",
+        what="policy statement match write",
+        payload=payload,
+        broker_api_base=broker_api_base,
+        broker_api_token=broker_api_token,
+    )
+
+
 async def list_organizations(
     *,
     page: int = 1,

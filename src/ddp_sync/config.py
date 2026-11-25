@@ -296,6 +296,16 @@ class SyncSettings:
     # data (four artifacts silently failed) for no actual cost savings.
     legbot_dispatch_timeout_seconds: float = 1200.0
 
+    # SYNC-183: the policy_statement step's matching tool (TypeSafe's Jev, api.typesafe.ai). The key is only read where
+    # the step runs (the Mac, with CAMS); empty = the step fails per bill ("TYPESAFE_API_KEY is not set") and nothing is
+    # written. Never logged and sent only in the Authorization header.
+    typesafe_api_key: str = ""
+    typesafe_jev_model: str = "jev-latest"
+    # SYNC-183: a draft Policy whose best Jev score against the broker's Policy list is at or over this is a match; under
+    # it the draft becomes a new Policy under the Concept Jev picks. 0.7 is the value measured in ddp-agents AGENTS-261
+    # (a 0.01 move changes about 1 in 100 decisions, so change it only with a new measurement).
+    policy_statement_match_cutoff: float = 0.7
+
     # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
     # finished. It was a module constant of 5 in legbot_client.py.
     #
@@ -648,6 +658,20 @@ _TASK_FLAGS_DEFAULT_OFF = {"openstates_people_pull_enabled", "fork_upstream_chec
                            "docker_cleanup_enabled", "organization_logo_catch_up_enabled"}
 
 
+def _unit_interval(raw: str | None, *, default: float, name: str) -> float:
+    """A score cutoff (SYNC-183): unset or blank = the default, else a number from 0 to 1; anything else raises at
+    startup, so a typo can never mean "match everything" (0) or "match nothing" (above 1)."""
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number from 0 to 1, got {raw!r}") from None
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be a number from 0 to 1, got {raw!r}")
+    return value
+
+
 def _parse_trigger_limit(raw: str | None) -> int | None:
     """LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT (SYNC-103): unset or blank = no limit, a positive
     integer = that cap. Anything else raises, so a typo fails at startup instead of quietly
@@ -733,6 +757,12 @@ def _load_from_env() -> dict:
         "mac_ddp_sync_api_key": os.getenv("MAC_DDP_SYNC_API_KEY", ""),
         "legbot_dispatch_timeout_seconds": float(
             os.getenv("LEGBOT_DISPATCH_TIMEOUT_SECONDS", "1200")
+        ),
+        # SYNC-183: CAMS's own .env names the key LEGBOT_TYPESAFE_API_KEY; the vendor SDK's name also works.
+        "typesafe_api_key": os.getenv("TYPESAFE_API_KEY") or os.getenv("LEGBOT_TYPESAFE_API_KEY", ""),
+        "typesafe_jev_model": os.getenv("TYPESAFE_JEV_MODEL", "jev-latest"),
+        "policy_statement_match_cutoff": _unit_interval(
+            os.getenv("POLICY_STATEMENT_MATCH_CUTOFF"), default=0.7, name="POLICY_STATEMENT_MATCH_CUTOFF"
         ),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
