@@ -444,6 +444,40 @@ task definition carries the RDS secret) stops passing `DATABASE_URL` to the load
 set rather than falling back. The backfill launchers (`openstates_backfill`, `vote_person_backfill`) still run on
 `ddp-scrapers` with a passed `DATABASE_URL`, unchanged.
 
+## A running archive survives a ddp-sync restart (`openstates_archive`, `inflight_fargate_jobs`, SYNC-192)
+
+The Fargate archive's task is in the **same** Redis in-flight hash as the scrape and load (`ddp:inflight_fargate_jobs`; **do
+not add a second store or a second startup routine**). `_run_archive_fargate` writes it right after `run_task`
+(`inflight_fargate_jobs.record_archive_started`): `kind: "archive"` (scrape records have no `kind`), `jurisdiction` (the archive
+code, `us` not `usa`), `task_arn`, the `fargate_cfg` of the launch, `archive_started_at` (the LegBot hook's floor), `attempt`
+(which retry, from the `_archive_attempt` context variable `_archive_with_retry` sets) and `hooks_done`. No connection string
+is in it. A failed task clears it at once (the retry and per-attempt alert are the caller's, unchanged). A success **keeps**
+it: `_run_archive_followups` (the one copy of LegBot dispatch, bill search refresh, embedding; a normal and a resumed run both
+call it) notes each finished follow-up (`record_hook_done`) and clears the record when all three have finished. A cancel
+(ddp-sync stopping) clears nothing, in the wait or in a follow-up: that is the record's purpose. A local archive
+(`use_fargate` false) has no record, as before. The broker signals are **not** archive follow-ups: they run before the archive
+(`run_state_pipeline`), so there is nothing of them to repeat.
+
+**Startup:** `reconcile_inflight_fargate_jobs` sends a `kind: "archive"` record to `resume_inflight_archive_job` (no scrape slot;
+the archive wait uses the default pool). It (1) takes the state's pipeline lock again (startup's `clear_state_locks` had cleared
+it), so a scheduled or manual run of the state is refused (`PipelineBusy` / "busy") until the archive and its follow-ups end; the
+window between the clear and this resume's first step is milliseconds, and a lock already held by another run is neither
+taken nor released (logged; the second archive would meet the task's own `_archive_lock`, exit 90, and be retried); (2) waits for
+the recorded task, launching nothing; (3) on success runs the follow-ups the record does not list as done, from the recorded
+`archive_started_at`, then clears; on failure alerts as a normal failed attempt, clears, and continues the retry sequence from
+the next attempt (`_archive_with_retry(first_attempt=)`, the same 30 min / 2 h delays and final alert). A resumed wait starts a
+fresh `max_wait_seconds`. **A stale record** (ECS answers it has no such task, which it does about an hour after a task stops):
+alert, clear, nothing relaunched, nothing run; the state's next archive covers it. An error before the task is known to have stopped (ECS throttling, a config read) alerts and **keeps** the record
+for the next restart (clearing it would hide a task that may still run); only a record missing its fields is dropped. The lock
+is released on every path. `hooks_done` is restart de-duplication, not strict exactly-once: a crash between a follow-up
+finishing and its note repeats that one follow-up.
+
+**The gap:** a restart between `run_task` returning and the record write leaves a running task and no record: nothing resumes, that
+run's follow-ups do not run, and the state's next archive meets the task's `_archive_lock` and is retried (the load's gap is the
+same). A restart during a retry's 30 min / 2 h sleep also still loses the retries (the task before it is already cleared); that
+is as before this change. `tests/conftest.py` keeps every test off the real Redis (`_no_real_inflight_redis`): a test of the
+archive path reached the Mac's own Redis before it. Guard: `tests/test_sync_192_archive_inflight_record.py`.
+
 ## Jurisdiction source names (`services/jurisdiction_names.py`, OPEN-420)
 
 `source_name(code)` is the one place that turns a jurisdiction code into the label put on ingested documents ("Florida

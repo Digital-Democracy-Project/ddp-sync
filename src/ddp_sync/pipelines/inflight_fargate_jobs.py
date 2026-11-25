@@ -123,6 +123,56 @@ def record_load_started(run_id: str, load_task_arn: str) -> None:
         )
 
 
+def record_archive_started(
+    run_id: str, jurisdiction: str, task_arn: str, fargate_cfg: dict, archive_started_at: str, attempt: int
+) -> None:
+    """SYNC-192: persist an archive's Fargate task the moment it has launched, in the same Hash and with the same
+    rules as `record_started`, so a restarted ddp-sync waits for it (`openstates_archive.resume_inflight_archive_job`)
+    instead of losing its follow-ups. `kind: "archive"` is what tells `reconcile_inflight_fargate_jobs` apart from a
+    scrape record (which has no `kind`). `archive_started_at` is the floor the LegBot hook resolves sessions from;
+    `attempt` is which of the archive's retry attempts this task is; `hooks_done` is filled by `record_hook_done`.
+    Best-effort: if it is not written, a restart in that gap leaves the task running and its follow-ups unrun, as before."""
+    client = _get_client()
+    if client is None:
+        return
+    record = {
+        "kind": "archive",
+        "run_id": run_id,
+        "jurisdiction": jurisdiction,
+        "task_arn": task_arn,
+        "fargate_cfg": fargate_cfg,
+        "archive_started_at": archive_started_at,
+        "attempt": attempt,
+        "hooks_done": [],
+    }
+    try:
+        client.hset(INFLIGHT_KEY, run_id, json.dumps(record))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "inflight_fargate_jobs: failed to record the archive task", run_id=run_id, error=str(e)
+        )
+
+
+def record_hook_done(run_id: str, hook: str) -> None:
+    """SYNC-192: note that one of an archive's follow-ups has finished (run, or failed and logged), so a restart during a
+    later one does not run it a second time. Best-effort; a missing record is left missing."""
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        raw = client.hget(INFLIGHT_KEY, run_id)
+        if raw is None:
+            return
+        record = json.loads(raw)
+        if hook not in record.setdefault("hooks_done", []):
+            record["hooks_done"].append(hook)
+        client.hset(INFLIGHT_KEY, run_id, json.dumps(record))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "inflight_fargate_jobs: failed to record a finished follow-up", run_id=run_id, hook=hook, error=str(e)
+        )
+
+
 def clear(run_id: str) -> None:
     """Remove a job's record once it has reached a terminal outcome -- collection failure, load
     failure, or success. From here on its fate is already captured by the caller's own
