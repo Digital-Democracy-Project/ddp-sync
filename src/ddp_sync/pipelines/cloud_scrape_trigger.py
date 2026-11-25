@@ -981,6 +981,22 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
             task.add_done_callback(_log_reconciliation_outcome)
             tasks.append(task)
             continue
+        if record.get("kind") == "unmatched_voters":
+            # OPEN-881: the after-load unmatched-voter check's task; its result is read from S3 on the event loop.
+            from ddp_sync.pipelines.unmatched_voter_alert import resume_inflight_unmatched_voters_job
+
+            logger.warning(
+                "unmatched_voter_check: resuming a check orphaned by a previous restart",
+                run_id=run_id,
+                jurisdiction=record.get("jurisdiction"),
+                task_arn=record.get("task_arn"),
+            )
+            task = asyncio.create_task(resume_inflight_unmatched_voters_job(run_id, record))
+            _reconciliation_tasks.add(task)
+            task.add_done_callback(_reconciliation_tasks.discard)
+            task.add_done_callback(_log_reconciliation_outcome)
+            tasks.append(task)
+            continue
         logger.warning(
             "cloud_scrape: resuming a Fargate job orphaned by a previous restart",
             run_id=run_id,

@@ -252,6 +252,12 @@ openstates_scrape:
   # Slack silence.
   unmatched_voter_alert:
     enabled: true
+    # OPEN-881: false = the count runs in this container with the openstates venv (today's path, kept for one release as the
+    # rollback). true = ddp-sync launches ddp-open-states' cloud_unmatched_voters.py as a Fargate task on
+    # cloud_path.fargate.task_definition_db, waits, and reads its JSON from S3; the comparison, memory and alert are the
+    # same code. Release order: the scrapers image with cloud_unmatched_voters.py FIRST (confirm the image is live), then
+    # this switch; until then true only logs unmatched_voter_check_failed. Flip back to false to undo.
+    on_fargate: false
 
   # OPEN-86: import-as-you-go. run-scrape.sh normally imports into Postgres once, at the very
   # end, and the next --scrape wipes $STATE_DATADIR first -- so a run killed partway through
