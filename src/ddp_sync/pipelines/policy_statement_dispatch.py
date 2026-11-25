@@ -124,7 +124,9 @@ async def _write_drafts(
             "concept_statement_set_id": item["concept_statement_set_id"],
             "statement_index": item["statement_index"],
             "statement_text": item["statement_text"],
-            "draft": draft,
+            # The broker's prompt_hash holds only the writer's judge_id (no model name), so the writer's own model and
+            # prompt version ride inside the stored draft JSON (the broker keeps any keys of `draft` as they come).
+            "draft": {**draft, "writer": {"model_name": answer.get("model_name") or "", "prompt_version": answer.get("prompt_version") or ""}},
             "scores": scores,
             "model_name": jev.name,
             "prompt_version": answer.get("prompt_version") or "",

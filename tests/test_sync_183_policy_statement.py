@@ -300,7 +300,8 @@ def _work(texts, gov_id="HB 1", session="2026", set_id=7, indices=None):
 
 def _answer(drafts, **kw):
     return {"answer": {"drafts": drafts, "source_support": "direct", "insufficient_information": False,
-                       "judge_id": "judge-abc", "prompt_version": "v1", **kw}, "backend": "mlx"}
+                       "judge_id": "policy_statement:p1r1:0123456789abcdef", "prompt_version": "1",
+                       "model_name": "mlx-community/gemma-4-26b-a4b-it-8bit", **kw}, "backend": "mlx"}
 
 
 def _concepts(n=3):
@@ -369,7 +370,9 @@ async def test_matched_excluded_and_new_are_written_with_the_scores_and_the_writ
     assert w3["scores"]["concept"] == 0.6 and w3["scores"]["policy"] == 0.0
     for w in broker.writes:
         assert (w["concept_statement_set_id"], w["model_name"], w["prompt_hash"], w["prompt_version"], w["rubric_version"]) == (
-            7, "typesafe:fake", "judge-abc", "v1", "policy_statement:v1")
+            7, "typesafe:fake", "policy_statement:p1r1:0123456789abcdef", "1", "policy_statement:v1")
+        # the writer's model and prompt version ride in the stored draft (the broker's prompt_hash has no model name)
+        assert w["draft"]["writer"] == {"model_name": "mlx-community/gemma-4-26b-a4b-it-8bit", "prompt_version": "1"}
         assert w["statement_text"] in ("s one", "s two", "s three") and w["draft"]["n"] in (1, 2, 3)
     assert broker.work_kwargs["rubric_version"] == "policy_statement:v1" and "prompt_hash" not in broker.work_kwargs
     assert (broker.work_kwargs["gov_id"], broker.work_kwargs["jurisdiction_iso2"], broker.work_kwargs["session_code"]) == (
@@ -464,9 +467,10 @@ async def test_a_failed_legbot_task_is_a_failed_bill_and_writes_nothing(run_step
 
 @pytest.mark.asyncio
 async def test_a_judge_id_longer_than_the_brokers_prompt_hash_fails_the_bill_before_any_write(run_step):
-    # the id LegBot builds for its default MLX model: "policy_statement:" + model + ":p1r1:" + 8 hex characters
+    # the OLD id format (model name inside it, AGENTS-262 before its fix): a safety net in case an id over 64 ever arrives
     long_id = "policy_statement:mlx-community/gemma-4-26b-a4b-it-8bit:p1r1:0123abcd"
     assert len(long_id) == 68
+    assert len("policy_statement:p1r1:0123456789abcdef") <= 64  # the compact format AGENTS-262 now builds
     broker = FakeBroker(_work(["a", "b"]), _policies(1), _concepts())
     jev = FakeJev()
     with pytest.raises(LegBotDispatchError, match="judge_id is 68 characters"):
