@@ -338,6 +338,23 @@ Pub/sub channels (hardcoded strings in callers):
   (code default off, `true` in `sync_schedule.yaml`); every scraped state, no per-state list. Never raises.
   **Do not add a second unmatched-voter query here** (the count is ddp-open-states'), **nor a list of accepted names in
   this repo** (the manifest holds it).
+- **On Fargate (OPEN-881), `unmatched_voter_alert.on_fargate`** (code default **false**, `false` in `sync_schedule.yaml`; the local
+  path above is the one-release rollback, removed with the other local paths): `read_unmatched_on_fargate(code, config, run_id)`
+  launches ddp-open-states' **`cloud_unmatched_voters.py <code> <run_id>`** through `_launch_archive_fargate_task(runner=, command=)`
+  on `task_definition_db` (`ddp-scrapers-db`; **no new run_task copy, no new connection-string builder**: with `rds_from_task_secret`
+  the task builds its own login and none is passed), waits with `_wait_for_task_stop` (hard stop at `FARGATE_TIMEOUT_S`, 15 min),
+  and reads `working-tier/<code>/<run_id>/unmatched-voters.json` from the memory bucket (`_read_result`: refuses an absent,
+  unreadable or other-state result). `_compare_and_alert` (the one copy of compare, alert, remember) then runs on it, the same
+  as for a local result. Any failure (launch, exit code, no result) is a `unmatched_voter_check_failed` warning with any
+  connection string cut out (`redact_dsn`): no alert, no memory change, **never a change to the run's outcome**.
+  **In-flight record:** the task is written to the same `ddp:inflight_fargate_jobs` hash as the scrape, load and archive
+  (`record_unmatched_voters_started`, `kind: "unmatched_voters"`, no connection string; **do not add a second store or startup
+  routine**). It is kept until `_compare_and_alert` has run, then cleared (also cleared on any error; a cancel, ddp-sync
+  stopping, keeps it). **Startup:** `reconcile_inflight_fargate_jobs` sends it to `resume_inflight_unmatched_voters_job`: waits for
+  the same task (nothing relaunched), reads the result, compares, alerts, remembers, clears. A task ECS no longer knows is read
+  straight from S3 (absent: dropped quietly); a failed task or a record missing its fields is dropped. The gap: a restart between
+  `run_task` and the record write loses that one check (the next load's check compares with the same memory). Guard:
+  `tests/test_open_881_unmatched_voters_task.py`.
 
 ## Voatz → Brevo opt-outs (`pipelines/voatz_brevo.py`, SYNC-122)
 

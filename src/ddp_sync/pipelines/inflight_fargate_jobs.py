@@ -153,6 +153,30 @@ def record_archive_started(
         )
 
 
+def record_unmatched_voters_started(run_id: str, jurisdiction: str, task_arn: str, fargate_cfg: dict) -> None:
+    """OPEN-881: persist the after-load unmatched-voter check's Fargate task the moment it has launched, in the same Hash
+    and with the same rules as `record_archive_started`, so a restarted ddp-sync reads the task's result and still
+    compares and alerts (`unmatched_voter_alert.resume_inflight_unmatched_voters_job`). `kind: "unmatched_voters"` is what
+    `reconcile_inflight_fargate_jobs` tells it apart by. Best-effort: if it is not written, a restart in that gap loses
+    this one check (the next load's check compares with the same last-run memory)."""
+    client = _get_client()
+    if client is None:
+        return
+    record = {
+        "kind": "unmatched_voters",
+        "run_id": run_id,
+        "jurisdiction": jurisdiction,
+        "task_arn": task_arn,
+        "fargate_cfg": fargate_cfg,
+    }
+    try:
+        client.hset(INFLIGHT_KEY, run_id, json.dumps(record))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "inflight_fargate_jobs: failed to record the unmatched-voter task", run_id=run_id, error=str(e)
+        )
+
+
 def record_hook_done(run_id: str, hook: str) -> None:
     """SYNC-192: note that one of an archive's follow-ups has finished (run, or failed and logged), so a restart during a
     later one does not run it a second time. Best-effort; a missing record is left missing."""

@@ -18,6 +18,13 @@ the scrape step).
   run that needed no alert or whose alert was delivered, so an undelivered alert is tried again next run. With no
   memory (the first run after the release, or Redis down) every unmatched name counts as new.
 
+* **Where the count runs (OPEN-881).** `unmatched_voter_alert.on_fargate` (default false: the local path above, kept for one
+  release as the rollback) true launches ddp-open-states' `cloud_unmatched_voters.py` as a Fargate task of the scrapers
+  image on `task_definition_db` (`ddp-scrapers-db`, the one definition that may hold the database login), through the
+  archive's launcher, and waits for it. The task writes the SAME JSON to S3 under its run id and ddp-sync reads it; the
+  comparison, the Redis memory and the alert are the same code either way. The task is in the in-flight record
+  (`kind: "unmatched_voters"`, kept until the comparison has run), so a restarted ddp-sync reads its result and still alerts.
+
 Switch: `openstates_scrape.unmatched_voter_alert.enabled`. No per-state list: every scraped state is checked. Never
 raises (the caller's `_logged` would catch it anyway) and never changes the run's outcome.
 """
@@ -28,10 +35,12 @@ import asyncio
 import json
 import os
 import subprocess
+import uuid
 from typing import Any
 
 import structlog
 
+from ddp_sync.pipelines import inflight_fargate_jobs
 from ddp_sync.services.rds_credentials import resolve_rds_database_url
 from ddp_sync.slack_alerts import post_alert
 
@@ -43,6 +52,11 @@ SCRIPT = "unmatched-voters.py"
 TIMEOUT_S = 300
 TOP_NAMES = 10
 _KEY = "ddp:unmatched_voters:{code}"
+# OPEN-881: the task's own ceiling (a cold Fargate start plus one read-only query; the local run's limit is 5 minutes),
+# and where it writes (ddp-open-states cloud_unmatched_voters.py: `<WORKING_TIER_PREFIX>/<state>/<run_id>/<name>`).
+FARGATE_TIMEOUT_S = 900
+WORKING_TIER_PREFIX = "working-tier"
+RESULT_NAME = "unmatched-voters.json"
 
 
 def read_unmatched(code: str, openstates_root: str, runner=subprocess.run) -> dict[str, Any]:
@@ -63,6 +77,71 @@ def read_unmatched(code: str, openstates_root: str, runner=subprocess.run) -> di
     if result.returncode != 0:
         raise RuntimeError(f"{SCRIPT} exited {result.returncode}: {(result.stderr or '')[-300:].strip()}")
     return json.loads(result.stdout)
+
+
+def new_run_id(code: str) -> str:
+    return f"{code}-unmatched-{uuid.uuid4().hex[:12]}"
+
+
+def read_unmatched_on_fargate(
+    code: str, config: dict | None, run_id: str, *, ecs_client=None, s3_client=None
+) -> dict[str, Any]:
+    """OPEN-881: launch `cloud_unmatched_voters.py <code> <run_id>` (`run_id` from `new_run_id`) on `ddp-scrapers-db`,
+    wait for it and return the JSON it wrote to S3. Blocking (run it in a thread). Raises RuntimeError, never with a connection string, when the task
+    cannot start, fails, or leaves no readable result. The task's ARN is in the in-flight record from launch until
+    `_compare_and_alert` has run (the caller clears it), so a restart during the wait still finds the result."""
+    import boto3
+
+    from ddp_sync.pipelines.cloud_scrape_trigger import _fargate_config
+    from ddp_sync.pipelines.openstates_archive import _launch_archive_fargate_task
+
+    try:
+        fargate_cfg = _fargate_config(config)
+    except ValueError as e:
+        raise RuntimeError(f"fargate config error: {e}") from e
+    rds_url = None
+    if not fargate_cfg.get("rds_from_task_secret"):
+        rds_url, error = resolve_rds_database_url()
+        if error or not rds_url:
+            raise RuntimeError(f"cannot resolve an RDS login: {error}")
+    client = ecs_client or boto3.client("ecs")
+    started, task_arn, detail = _launch_archive_fargate_task(
+        code, run_id, rds_url, fargate_cfg, client, runner="cloud_unmatched_voters.py", command=[code, run_id]
+    )
+    if not started:
+        raise RuntimeError(f"task did not start: {detail}")
+    inflight_fargate_jobs.record_unmatched_voters_started(run_id, code, task_arn, fargate_cfg)
+    return _await_result(code, run_id, task_arn, fargate_cfg, client, s3_client)
+
+
+def _await_result(code: str, run_id: str, task_arn: str, fargate_cfg: dict, ecs_client, s3_client=None) -> dict[str, Any]:
+    """Wait for the recorded task to stop (a hard stop at `FARGATE_TIMEOUT_S`), then read and check its result."""
+    from ddp_sync.pipelines.cloud_scrape_trigger import _wait_for_task_stop
+    from ddp_sync.pipelines.openstates_archive import redact_dsn
+
+    wait_cfg = {**fargate_cfg, "max_wait_seconds": FARGATE_TIMEOUT_S}
+    exit_code, detail = _wait_for_task_stop(task_arn, wait_cfg, ecs_client, label=f"{code} unmatched voters")
+    if exit_code != 0:
+        raise RuntimeError(f"task exited {exit_code} (task_arn={task_arn}): {redact_dsn(detail)}")
+    return _read_result(code, run_id, fargate_cfg, s3_client)
+
+
+def _read_result(code: str, run_id: str, fargate_cfg: dict, s3_client=None) -> dict[str, Any]:
+    """The JSON the task wrote for `run_id`. Raises RuntimeError when it is absent, unreadable, or not this state's."""
+    from ddp_sync.pipelines.cloud_scrape_trigger import _s3_client
+
+    bucket = fargate_cfg.get("memory_bucket", os.environ.get("MEMORY_BUCKET", ""))
+    if not bucket:
+        raise RuntimeError("no memory_bucket configured")
+    key = f"{WORKING_TIER_PREFIX}/{code}/{run_id}/{RESULT_NAME}"
+    try:
+        body = (s3_client or _s3_client()).get_object(Bucket=bucket, Key=key)["Body"].read()
+        result = json.loads(body)
+    except Exception as e:
+        raise RuntimeError(f"cannot read the task's result {key}: {type(e).__name__}") from e
+    if not isinstance(result, dict) or result.get("state") != code or "sessions" not in result or "names" not in result:
+        raise RuntimeError(f"the task's result {key} is not {code}'s unmatched-voter JSON")
+    return result
 
 
 def snapshot(current: dict[str, Any]) -> dict[str, Any]:
@@ -151,8 +230,34 @@ async def _remember(code: str, value: dict[str, Any]) -> None:
         await client.set(_KEY.format(code=code), json.dumps(value))
 
 
+async def _compare_and_alert(code: str, current: dict[str, Any]) -> None:
+    """Compare one state's unmatched names with the last run's, alert on a change, and remember them (module docstring).
+    The same for a result read locally, from a task just waited for, or from a task a restart picked up."""
+    try:
+        previous = await _remembered(code)
+    except Exception as e:  # noqa: BLE001 -- no memory means every name counts as new: louder, never quieter
+        logger.warning("unmatched_voter_memory_unreadable", jurisdiction=code, error=str(e))
+        previous = None
+    new, risen = compare(current, previous)
+    delivered = True
+    if new or risen:
+        text = alert_text(code, current, new, risen, first_run=previous is None)
+        delivered = await asyncio.to_thread(post_alert, text, source="openstates_scrape.unmatched_voters")
+    logger.info("unmatched_voter_check", jurisdiction=code, new_names=len(new), risen_sessions=len(risen),
+                alerted=bool(new or risen), delivered=delivered)
+    if delivered:
+        await _remember(code, snapshot(current))
+
+
+def _redacted(error: BaseException) -> str:
+    from ddp_sync.pipelines.openstates_archive import redact_dsn
+
+    return redact_dsn(str(error))
+
+
 async def maybe_alert_unmatched_voters(jurisdiction: str, config: dict | None) -> None:
     """Check one state after its load and alert on a new unmatched voter name or a rising share (module docstring)."""
+    run_id = None
     try:
         block = (config or {}).get("unmatched_voter_alert") or {}
         if not block.get("enabled", False):
@@ -161,20 +266,44 @@ async def maybe_alert_unmatched_voters(jurisdiction: str, config: dict | None) -
         from ddp_sync.pipelines.openstates_scrape import _get_root
 
         code = _archive_jurisdiction_code(jurisdiction).lower()
-        current = await asyncio.to_thread(read_unmatched, code, _get_root(config))
-        try:
-            previous = await _remembered(code)
-        except Exception as e:  # noqa: BLE001 -- no memory means every name counts as new: louder, never quieter
-            logger.warning("unmatched_voter_memory_unreadable", jurisdiction=code, error=str(e))
-            previous = None
-        new, risen = compare(current, previous)
-        delivered = True
-        if new or risen:
-            text = alert_text(code, current, new, risen, first_run=previous is None)
-            delivered = await asyncio.to_thread(post_alert, text, source="openstates_scrape.unmatched_voters")
-        logger.info("unmatched_voter_check", jurisdiction=code, new_names=len(new), risen_sessions=len(risen),
-                    alerted=bool(new or risen), delivered=delivered)
-        if delivered:
-            await _remember(code, snapshot(current))
+        if block.get("on_fargate", False):  # OPEN-881; false = the local path, the one-release rollback
+            run_id = new_run_id(code)
+            current = await asyncio.to_thread(read_unmatched_on_fargate, code, config, run_id)
+        else:
+            current = await asyncio.to_thread(read_unmatched, code, _get_root(config))
+        await _compare_and_alert(code, current)
     except Exception as e:  # noqa: BLE001 -- must never affect the scrape job's own result
-        logger.warning("unmatched_voter_check_failed", jurisdiction=jurisdiction, error=str(e))
+        logger.warning("unmatched_voter_check_failed", jurisdiction=jurisdiction, error=_redacted(e))
+    # Reached on success and on any error, not on a cancel (ddp-sync stopping): a cancelled wait keeps the record, which is
+    # what lets the next process finish the check. An errored one is dropped: the next load's check does not need it.
+    if run_id:
+        inflight_fargate_jobs.clear(run_id)
+
+
+async def resume_inflight_unmatched_voters_job(run_id: str, record: dict[str, Any], *, ecs_client=None, s3_client=None) -> None:
+    """OPEN-881: finish a check a previous ddp-sync process left in flight (called by `reconcile_inflight_fargate_jobs` at
+    startup for each `kind: "unmatched_voters"` record). Waits for the recorded task (nothing is launched), reads its
+    result, then compares, alerts and remembers exactly as a normal check, and clears the record. A record missing its
+    fields, a task that failed, ECS no longer knowing the task with no result in S3, or any other error is logged and the
+    record dropped: the check never changes anything, and the next load runs it again. Never raises (a cancel aside)."""
+    code = record.get("jurisdiction") or run_id
+    try:
+        task_arn, fargate_cfg = record["task_arn"], record["fargate_cfg"]
+    except KeyError as e:
+        logger.warning("unmatched_voter_resume_record_unusable", run_id=run_id, error=repr(e))
+        inflight_fargate_jobs.clear(run_id)
+        return
+    try:
+        import boto3
+
+        from ddp_sync.pipelines.openstates_archive import _task_known_to_ecs
+
+        client = ecs_client or boto3.client("ecs")
+        if await asyncio.to_thread(_task_known_to_ecs, task_arn, fargate_cfg, client):
+            current = await asyncio.to_thread(_await_result, code, run_id, task_arn, fargate_cfg, client, s3_client)
+        else:  # ECS forgets a stopped task after about an hour: its result may still be in S3
+            current = await asyncio.to_thread(_read_result, code, run_id, fargate_cfg, s3_client)
+        await _compare_and_alert(code, current)
+    except Exception as e:  # noqa: BLE001 -- runs unobserved on a background task
+        logger.warning("unmatched_voter_check_failed", jurisdiction=code, run_id=run_id, resumed=True, error=_redacted(e))
+    inflight_fargate_jobs.clear(run_id)
