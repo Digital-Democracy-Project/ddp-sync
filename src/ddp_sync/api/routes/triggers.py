@@ -8,7 +8,7 @@ from datetime import date
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ddp_sync.api.auth import api_key_auth
 from ddp_sync.config import get_settings
@@ -957,16 +957,46 @@ async def trigger_organization_logo_backfill(
             "dry_run": dry_run, "organization_ids": len(ids) if ids is not None else None, "force": force}
 
 
+class SlackCitationsRange(BaseModel):
+    """A one-off import of the citations posted in a date range (SYNC-195)."""
+
+    since: date = Field(description="First day to read, UTC, included")
+    until: date = Field(description="Last day to read, UTC, included")
+    limit: int | None = Field(
+        None, ge=1, le=2000, description="Most citations this call may verify; default: the yaml max_citations_per_run"
+    )
+    mode: Literal["report_only", "write"] = Field(
+        "report_only", description="report_only logs what it would send and writes nothing; write must be asked for"
+    )
+
+    @model_validator(mode="after")
+    def _since_not_after_until(self):
+        if self.since > self.until:
+            raise ValueError("since must not be after until")
+        if self.until >= date.max:  # the window ends at the start of the next day, which must exist
+            raise ValueError("until must be before 9999-12-31")
+        return self
+
+
 @router.post("/trigger/slack-citations", status_code=202)
 async def trigger_slack_citations(
     background_tasks: BackgroundTasks,
+    body: SlackCitationsRange | None = None,
     token: str = Depends(api_key_auth),
 ):
-    """Run the nightly Slack #legislation citation pull once, now (SYNC-127).
+    """Run the Slack #legislation citation pull once, now (SYNC-127, SYNC-195).
 
-    Uses sync_schedule.yaml's `slack_citations` block as it stands, including its `mode`
-    (report_only by default: logs what it would send, writes nothing). 202 at once; the summary is
-    logged as slack_citations_summary, and in write mode the verification progress is readable at
+    **With no body:** the nightly pull as it stands, using sync_schedule.yaml's `slack_citations` block
+    including its `mode`.
+
+    **With a body** (`since`, `until`, optional `limit`, optional `mode`): a one-off import of the citations
+    posted from `since` through `until` (UTC days), for a gap the nightly window never covered. It reads that
+    range instead of the nightly window, uses its own `limit`, and is **report_only unless the body says
+    `"mode": "write"`**. It works on a copy of the yaml block, so `start_date` and `lookback_days` are never
+    changed. Handled messages are skipped, so repeating the same range continues where a capped run stopped.
+
+    report_only logs what it would send and writes nothing. 202 at once; the summary is logged as
+    slack_citations_summary, and in write mode the verification progress is readable at
     GET /trigger/verify-org-citations/{run_id} under the run id that summary names. Refused (409)
     on a host whose SLACK_CITATIONS_ENABLED is off, so a manual call cannot make a second host read
     Slack and verify the same citations again.
@@ -978,8 +1008,14 @@ async def trigger_slack_citations(
         raise HTTPException(status_code=409, detail="SLACK_CITATIONS_ENABLED is off on this host")
     scheduler = get_scheduler()
     config = scheduler._sync_config.get("slack_citations", {}) if scheduler else {}
-    background_tasks.add_task(run_slack_citations_job, config, trigger="manual")
-    return {"status": "started", "mode": config.get("mode", "report_only")}
+    if body is None:
+        background_tasks.add_task(run_slack_citations_job, config, trigger="manual")
+        return {"status": "started", "mode": config.get("mode", "report_only")}
+    limit = body.limit or config.get("max_citations_per_run", 200)
+    one_off = {**config, "mode": body.mode, "max_citations_per_run": limit}  # a copy: the yaml block stays as it is
+    background_tasks.add_task(run_slack_citations_job, one_off, trigger="manual", window=(body.since, body.until))
+    return {"status": "started", "mode": body.mode, "since": body.since.isoformat(), "until": body.until.isoformat(),
+            "limit": limit}
 
 
 @router.get("/trigger/verify-org-citations/{run_id}")

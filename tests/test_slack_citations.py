@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import tempfile
 import textwrap
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,7 @@ from ddp_sync.api.auth import api_key_auth
 from ddp_sync.api.routes.triggers import router
 from ddp_sync.config import _load_from_env
 from ddp_sync.pipelines.slack_citations import (
+    _range_window,
     _window,
     parse_thread,
     run_slack_citations_job,
@@ -99,9 +101,10 @@ def _echo(outcomes):
 
 
 async def _job(threads, *, mode="report_only", store=None, bill=(_BILL, True), outcomes=(), verify=None,
-               cap=200, token="xoxb-test"):
+               cap=200, token="xoxb-test", window=None, config_extra=None):
     store = store or _store()
-    config = {"mode": mode, "max_citations_per_run": cap, "lookback_days": 100000, "thread_lookback_days": 0}
+    config = {"mode": mode, "max_citations_per_run": cap, "lookback_days": 100000, "thread_lookback_days": 0,
+              **(config_extra or {})}
     verify = verify or AsyncMock(side_effect=_echo(outcomes))
     with patch(f"{_P}.fetch_threads", new=AsyncMock(return_value=threads)), \
             patch(f"{_P}.find_bill", new=AsyncMock(return_value=bill)) as lookup, \
@@ -109,7 +112,7 @@ async def _job(threads, *, mode="report_only", store=None, bill=(_BILL, True), o
             patch(f"{_P}.run_verify_org_citations_in_background", new=verify), \
             patch(f"{_P}.post_alert") as alert, \
             patch.dict("os.environ", {"SLACK_BOT_TOKEN": token}):
-        summary = await run_slack_citations_job(config, trigger="test")
+        summary = await run_slack_citations_job(config, trigger="test", **({} if window is None else {"window": window}))
     return summary, store, verify, lookup, alert
 
 
@@ -297,6 +300,144 @@ def test_the_manual_trigger_runs_one_pass_with_the_configured_mode():
 
 def test_the_manual_trigger_is_refused_on_a_host_that_does_not_run_the_pull():
     resp, job = _post(False)
+    assert resp.status_code == 409
+    job.assert_not_awaited()
+
+
+# ── a one-off range (SYNC-195) ─────────────────────────────────────────────────────────────────
+
+# 2026-10-08 00:00 UTC and 2026-10-19 00:00 UTC, worked out by hand (the end of the 18th is included).
+_OCT_8, _OCT_19 = 1_791_417_600.0, 1_792_368_000.0
+_RANGE = (date(2026, 10, 8), date(2026, 10, 18))
+
+
+def test_a_range_window_covers_the_whole_first_and_last_day_in_utc():
+    start, end, roots_since = _range_window(*_RANGE, {"thread_lookback_days": 14, "start_date": "2030-01-01"})
+    assert start == _OCT_8
+    assert end == _OCT_19
+    assert roots_since == start - 14 * 86400  # threads started before the range still count: citations are late replies
+
+
+@pytest.mark.asyncio
+async def test_a_range_run_reads_only_the_days_asked_for_whatever_the_nightly_settings_say():
+    replies = [
+        _reply("1791417599.9", org="Before"),  # 23:59:59 on the 7th
+        _reply("1791417600.0", org="First"),   # 00:00:00 on the 8th
+        _reply("1791763200.0", org="Inside"),  # the 12th
+        _reply("1792367999.9", org="Last"),    # 23:59:59 on the 18th
+        _reply("1792368000.0", org="After"),   # 00:00:00 on the 19th
+    ]
+    # The nightly settings would find none of these: start_date is in the future and the lookback is a day.
+    summary, _, verify, _, _ = await _job(
+        [[ROOT, *replies]], mode="write", outcomes=["written"] * 3, window=_RANGE,
+        config_extra={"start_date": "2030-01-01", "lookback_days": 1},
+    )
+
+    assert [i["org_name"] for i in verify.await_args.args[0]] == ["First", "Inside", "Last"]
+    assert summary["citations_in_window"] == 3
+    assert summary["window"] == {"since": "2026-10-08", "until": "2026-10-18"}
+
+
+@pytest.mark.asyncio
+async def test_a_range_run_counts_the_distinct_citations_and_bills_it_would_verify():
+    # Every bill has two parent threads, so the same citation arrives twice (different Slack messages).
+    twin = [[ROOT, _reply("1791763200.0", org="FairVote"), _reply("1791763201.0", org="Public Citizen")],
+            [ROOT, _reply("1791763300.0", org="fairvote ")]]
+    summary, _, _, _, _ = await _job(twin, window=_RANGE)
+
+    assert summary["ready"] == 3        # three messages
+    assert summary["distinct_items"] == 2  # but two citations: one organization, any case, is one
+    assert summary["bills"] == 1
+    assert summary["status"] == "reported"
+
+
+@pytest.mark.asyncio
+async def test_a_nightly_pass_has_none_of_the_range_fields():
+    summary, _, _, _, _ = await _job([[ROOT, _reply("1760000100.0")]])
+    assert not {"window", "distinct_items", "bills"} & set(summary)
+
+
+@pytest.mark.asyncio
+async def test_a_range_run_never_raises_the_nightly_age_out_alert():
+    import time as _time
+
+    now = _time.time()
+    old = [_reply(f"{now - 26 * 86400 + i:.1f}", org=f"Old {i}") for i in range(3)]
+    since = datetime.fromtimestamp(now - 27 * 86400, UTC).date()
+    until = datetime.fromtimestamp(now, UTC).date()
+    # The nightly rule would alert here (see the test above); a one-off range has no window to age out of.
+    summary, _, _, _, alert = await _job([[ROOT, *old]], cap=2, window=(since, until),
+                                         config_extra={"lookback_days": 30})
+
+    assert summary["left_for_next_run"] == 1
+    alert.assert_not_called()
+
+
+# The route, with a body.
+
+
+def _post_range(body, *, enabled_on_host=True, block=None):
+    block = block if block is not None else {"mode": "write", "start_date": "2026-10-19", "lookback_days": 30,
+                                             "max_citations_per_run": 200}
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[api_key_auth] = lambda: "test-token"
+    scheduler = MagicMock(_sync_config={"slack_citations": block})
+    with patch("ddp_sync.api.routes.triggers.get_settings",
+               return_value=MagicMock(slack_citations_enabled=enabled_on_host)), \
+            patch("ddp_sync.scheduler.get_scheduler", return_value=scheduler), \
+            patch(f"{_P}.run_slack_citations_job", new=AsyncMock()) as job:
+        resp = TestClient(app).post("/trigger/slack-citations", json=body)
+    return resp, job, block
+
+
+def test_a_range_call_is_report_only_unless_it_asks_to_write_even_when_the_yaml_says_write():
+    resp, job, _ = _post_range({"since": "2026-10-08", "until": "2026-10-18"})
+
+    assert resp.status_code == 202
+    assert resp.json() == {"status": "started", "mode": "report_only", "since": "2026-10-08",
+                           "until": "2026-10-18", "limit": 200}
+    config = job.await_args.args[0]
+    assert config["mode"] == "report_only"
+    assert config["max_citations_per_run"] == 200  # the yaml's own cap when no limit is sent
+    assert job.await_args.kwargs == {"trigger": "manual", "window": (date(2026, 10, 8), date(2026, 10, 18))}
+
+
+def test_a_range_call_takes_its_own_limit_and_writes_only_when_asked():
+    resp, job, _ = _post_range({"since": "2026-10-08", "until": "2026-10-18", "limit": 50, "mode": "write"})
+
+    assert resp.json()["mode"] == "write" and resp.json()["limit"] == 50
+    assert job.await_args.args[0]["mode"] == "write"
+    assert job.await_args.args[0]["max_citations_per_run"] == 50
+
+
+def test_a_range_call_never_changes_the_nightly_settings():
+    block = {"mode": "write", "start_date": "2026-10-19", "lookback_days": 30, "thread_lookback_days": 730,
+             "max_citations_per_run": 200}
+    before = dict(block)
+    _, job, shared = _post_range({"since": "2026-10-08", "until": "2026-10-18", "limit": 5}, block=block)
+
+    assert shared == before            # the yaml block the nightly job reads is untouched
+    assert job.await_args.args[0] is not shared  # the one-off ran on a copy
+
+
+@pytest.mark.parametrize("body", [
+    {"since": "2026-10-18", "until": "2026-10-08"},                      # backwards
+    {"since": "2026-10-08", "until": "2026-10-18", "limit": 0},          # no calls at all
+    {"since": "2026-10-08", "until": "2026-10-18", "limit": 2001},       # more than one run should ever pay for
+    {"since": "2026-10-08", "until": "2026-10-18", "mode": "dry"},       # not a mode
+    {"since": "10/08", "until": "2026-10-18"},                            # not a date
+    {"since": "2026-10-08"},                                              # no end
+    {"since": "2026-10-08", "until": "9999-12-31"},                       # no next day to end the window on
+])
+def test_a_bad_range_call_is_refused_before_anything_runs(body):
+    resp, job, _ = _post_range(body)
+    assert resp.status_code == 422
+    job.assert_not_awaited()
+
+
+def test_a_range_call_is_refused_on_a_host_that_does_not_run_the_pull():
+    resp, job, _ = _post_range({"since": "2026-10-08", "until": "2026-10-18"}, enabled_on_host=False)
     assert resp.status_code == 409
     job.assert_not_awaited()
 
