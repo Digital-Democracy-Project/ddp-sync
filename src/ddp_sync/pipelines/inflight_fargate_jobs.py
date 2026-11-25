@@ -177,6 +177,28 @@ def record_unmatched_voters_started(run_id: str, jurisdiction: str, task_arn: st
         )
 
 
+def record_people_refresh_started(run_id: str, task_arn: str, fargate_cfg: dict, states: list[str]) -> None:
+    """OPEN-882: persist the weekly people refresh's Fargate task the moment it has launched, in the same Hash and with the
+    same rules as `record_unmatched_voters_started`, so a restarted ddp-sync reads the per-state result and still alerts and
+    signals (`people_refresh_task.resume_inflight_people_refresh_job`). `kind: "people_refresh"`; `states` is what was asked
+    for (the result is read for exactly those). Best-effort: if it is not written, a restart in that gap loses this week's
+    result handling (the task still ran; the next Sunday's run covers the data)."""
+    client = _get_client()
+    if client is None:
+        return
+    record = {
+        "kind": "people_refresh",
+        "run_id": run_id,
+        "task_arn": task_arn,
+        "fargate_cfg": fargate_cfg,
+        "states": states,
+    }
+    try:
+        client.hset(INFLIGHT_KEY, run_id, json.dumps(record))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("inflight_fargate_jobs: failed to record the people refresh task", run_id=run_id, error=str(e))
+
+
 def record_hook_done(run_id: str, hook: str) -> None:
     """SYNC-192: note that one of an archive's follow-ups has finished (run, or failed and logged), so a restart during a
     later one does not run it a second time. Best-effort; a missing record is left missing."""

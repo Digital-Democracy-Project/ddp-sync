@@ -1950,7 +1950,7 @@ async def _run_state_pipeline_locked(
         }))
 
 
-async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | None) -> None:
+async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | None, states: list[str] | None = None) -> None:
     """BROKER-541: after a successful weekly people refresh, tell ddp-broker-py once for each state it imported, so a
     roster change (a resignation, a new member) reaches that state's scorecards now, not at its next scrape (up to a
     week out of session; Ramon, 2026-11-18: "make the weekly job refresh too"). The broker route reads the state's
@@ -1959,8 +1959,10 @@ async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | Non
     The states are the manifest's `enrollment.people_refresh`, the same field run-people-refresh.sh imports. Same switch
     as the after-scrape signal (`openstates_scrape.broker_scorecard_signal.enabled`, default off) and the same sending
     rules (`_send_broker_signal`), under its own debounce name: a scrape signal sent minutes before the import finished
-    must not swallow this one. Called only when the script exited 0 (it exits 1 when any state failed, without saying
-    which). One state's failure never stops the others; nothing here raises or changes the job's result.
+    must not swallow this one. The local script path calls it only when the script exited 0 (it exits 1 when any state
+    failed, without saying which). OPEN-882: the Fargate task names each state's result, so `people_refresh_task.finish`
+    passes `states`, the ones that worked, and only those are signalled (even when others failed). One state's failure
+    never stops the others; nothing here raises or changes the job's result.
     """
     try:
         block = (config or {}).get("broker_scorecard_signal") or {}
@@ -1969,7 +1971,7 @@ async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | Non
         from ddp_sync.pipelines.openstates_archive import _archive_jurisdiction_code
         from ddp_sync.services import broker_client
 
-        codes = enrollment.manifest_codes("people_refresh", _get_root(config)) or []
+        codes = states if states is not None else enrollment.manifest_codes("people_refresh", _get_root(config)) or []
         for jurisdiction in codes:
             code = jurisdiction
             try:
@@ -1984,7 +1986,14 @@ async def _maybe_signal_broker_scorecard_refresh_after_people(config: dict | Non
 
 
 async def run_people_refresh_job(config: dict | None = None) -> dict[str, Any]:
-    """Pull the people repo and run os-people to-database for all states."""
+    """Pull the people repo and run os-people to-database for all states.
+
+    OPEN-882: with `people_refresh.on_fargate` true this launches the refresh as a Fargate task instead (default false: the
+    local script below, the one-release rollback); see `people_refresh_task`."""
+    if ((config or {}).get("people_refresh") or {}).get("on_fargate", False):
+        from ddp_sync.pipelines.people_refresh_task import run_on_fargate
+
+        return await run_on_fargate(config)
     openstates_root = _get_root(config)
     script = os.path.join(openstates_root, "run-people-refresh.sh")
     start_time = datetime.now(timezone.utc)

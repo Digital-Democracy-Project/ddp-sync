@@ -719,6 +719,13 @@ openstates_scrape:
     enabled: true
     sync_day: sunday
     sync_time_utc: "10:00"     # after FL and MI (~03:00) and the nightly USA (~09:00) finish
+    # OPEN-882: false = run-people-refresh.sh in this container (today's path, kept for one release as the rollback). true =
+    # ddp-sync launches ddp-open-states' cloud_people_refresh.py as a Fargate task on cloud_path.fargate.task_definition_db,
+    # waits, and reads its per-state JSON from S3; the scorecard signal then fires only for the states that worked. The task
+    # downloads the (public) people repo when it starts: no image rebuild for a people change. Release order: the scrapers
+    # image with cloud_people_refresh.py FIRST (confirm it is live), then this switch; until then true only fails the job
+    # with an alert. Flip back to false to undo.
+    on_fargate: false
 
   # SYNC-102: daily fast-forward of the people checkout only. Off unless the host sets
   # OPENSTATES_PEOPLE_PULL_ENABLED=true (per-host, like the other flags).
