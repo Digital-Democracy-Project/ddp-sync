@@ -1209,7 +1209,8 @@ async def run_legbot_pipeline(
     include_policy_statement (SYNC-183) adds the policy_statement step (policy_statement_dispatch.py) after concept_statements:
     the writer drafts a Policy per statement the broker's work list offers, Jev matches each against the broker's current
     Policy list, and the result is written through the broker's service route. Default False here only so the
-    post-archive hook, which does not send it, is unchanged; the trigger and a caller choose it.
+    post-archive hook, which does not send it, is unchanged; the trigger and a caller choose it. SYNC-193: with it on,
+    artifact_types may be empty (a run of the policy_statement step alone, no artifact generated).
 
     artifact_types, include_org_research, include_concept_statements,
     retry_failed, and limit all have NO default -- the caller must decide
@@ -1255,7 +1256,7 @@ async def run_legbot_pipeline(
 
     Raises:
         ValueError: jurisdiction_iso2/session_code empty, limit <= 0 (None = no limit), or
-            artifact_types empty/contains an unrecognized type -- ordinary
+            artifact_types empty (unless include_policy_statement is true, SYNC-193)/contains an unrecognized type -- ordinary
             function-signature hygiene, checked before any lister/dispatch
             call.
 
@@ -1343,7 +1344,9 @@ async def run_legbot_pipeline(
         raise ValueError("session_code is required")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be a positive integer, or None for no limit")
-    if not artifact_types:
+    # SYNC-193: policy_statement is switched by its own flag, not by an artifact type, so a run that only wants it names
+    # no type. Without the flag an empty list is still refused (the same message as before).
+    if not artifact_types and not include_policy_statement:
         raise ValueError("artifact_types must be non-empty")
     unrecognized = set(artifact_types) - ALL_ARTIFACT_TYPES
     if unrecognized:

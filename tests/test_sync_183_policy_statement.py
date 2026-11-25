@@ -630,6 +630,68 @@ async def test_a_skip_is_not_a_failure_and_a_failure_is_isolated_to_its_bill(pip
     assert summary["bills_processed"] == 2
 
 
+@pytest.fixture
+def run_empty(pipeline, monkeypatch):
+    """SYNC-193: run_legbot_pipeline with artifact_types=[] on the `pipeline` fixture's stand-ins; returns (call, step, artifact mock)."""
+    from ddp_sync.pipelines import session_pipeline_runner as spr
+
+    _, step = pipeline
+    artifact = AsyncMock(return_value={"id": 1, "status": "complete"})
+    monkeypatch.setattr(spr, "generate_and_store_bill_artifact", artifact)
+
+    async def call(**kw):
+        return await run_legbot_pipeline("fl", "2026F", [], False, 10, include_concept_statements=False,
+                                         retry_failed=False, bill_candidates=[_CAND], **kw)
+
+    return call, step, artifact
+
+
+@pytest.mark.asyncio
+async def test_an_empty_artifact_list_runs_the_policy_step_alone_when_it_is_on(run_empty):
+    call, step, artifact = run_empty
+    summary = await call(include_policy_statement=True)
+    step.assert_awaited_once()
+    artifact.assert_not_awaited()
+    r = summary["results"][0]
+    assert (r["policy_statement_dispatched"], r["policy_statement_failed"], r["error"]) == (True, False, None)
+    assert r["artifacts_generated"] == [] and r["artifacts_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_artifact_list_is_still_refused_when_the_policy_step_is_off(run_empty):
+    call, step, artifact = run_empty
+    with pytest.raises(ValueError, match="^artifact_types must be non-empty$"):
+        await call()
+    with pytest.raises(ValueError, match="^artifact_types must be non-empty$"):
+        await call(include_policy_statement=False)
+    step.assert_not_awaited()
+    artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_artifact_list_with_the_step_on_still_checks_the_other_inputs(run_empty):
+    call, _, _ = run_empty
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        await run_legbot_pipeline("fl", "2026F", [], False, 0, include_concept_statements=False, retry_failed=False,
+                                  bill_candidates=[_CAND], include_policy_statement=True)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_artifact_list_dry_run_reports_the_bills_it_would_handle(run_empty):
+    call, step, artifact = run_empty
+    summary = await call(include_policy_statement=True, dry_run=True)
+    assert step.await_args.kwargs["dry_run"] is True and summary["bills_processed"] == 1
+    artifact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_listed_artifact_with_the_step_on_behaves_as_before(pipeline):
+    run, step = pipeline
+    summary = await run(include_policy_statement=True)
+    step.assert_awaited_once()
+    assert summary["results"][0]["artifacts_generated"] == ["bill_summary"]
+
+
 @pytest.mark.asyncio
 async def test_through_run_legbot_pipeline_a_policy_created_for_one_bill_is_matched_by_the_next(pipeline, monkeypatch):
     """The two bills run one after the other (session_pipeline_concurrency 1): bill 1's write lands before bill 2 reads the list."""
@@ -713,6 +775,14 @@ def test_the_trigger_passes_include_policy_statement_and_defaults_it_to_false():
 
     response, mock = _trigger({})  # the post-archive hook sends no such key
     assert response.status_code == 200 and mock.await_args.kwargs["include_policy_statement"] is False
+
+
+def test_the_trigger_accepts_an_empty_artifact_list_and_passes_it_through():
+    """SYNC-193: the request model does not refuse [] (the pipeline decides, and only with the policy step off)."""
+    response, mock = _trigger({"artifact_types": [], "include_policy_statement": True, "dry_run": True,
+                               "bill_candidates": [{"gov_id": "HB 1", "bill_openstates_id": "ocd-bill/x"}]})
+    assert response.status_code == 200
+    assert mock.await_args.kwargs["artifact_types"] == [] and mock.await_args.kwargs["include_policy_statement"] is True
 
 
 # --------------------------------------------------------------------------------------------------------------------

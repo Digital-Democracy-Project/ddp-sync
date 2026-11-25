@@ -137,7 +137,8 @@ class BillArtifactGenerationRequest(BaseModel):
             "BillArtifact types to fill in for this run (from the types "
             "session_pipeline_runner.ALL_ARTIFACT_TYPES supports -- "
             "bill_summary, bill_pros_cons, bill_changelog, etc.). Start "
-            "with a small subset, not all of them at once."
+            "with a small subset, not all of them at once. May be empty only when include_policy_statement is true "
+            "(SYNC-193): a run of that step alone."
         ),
     )
     include_org_research: bool = Field(
