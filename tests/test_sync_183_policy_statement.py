@@ -454,6 +454,43 @@ async def test_a_writer_answer_that_does_not_cover_every_statement_once_writes_n
 
 
 @pytest.mark.asyncio
+async def test_a_failed_legbot_task_is_a_failed_bill_and_writes_nothing(run_step):
+    """LegBot fails the whole task on a malformed answer, on a backend error, and on a bill too big even for Claude."""
+    broker = FakeBroker(_work(["a"]), _policies(1), _concepts())
+    with pytest.raises(LegBotDispatchError, match="ended with status=failed"):
+        await run_step(broker, [LegBotDispatchError("LegBot task t ended with status=failed")], FakeJev())
+    assert broker.writes == [] and broker.policy_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_a_judge_id_longer_than_the_brokers_prompt_hash_fails_the_bill_before_any_write(run_step):
+    # the id LegBot builds for its default MLX model: "policy_statement:" + model + ":p1r1:" + 8 hex characters
+    long_id = "policy_statement:mlx-community/gemma-4-26b-a4b-it-8bit:p1r1:0123abcd"
+    assert len(long_id) == 68
+    broker = FakeBroker(_work(["a", "b"]), _policies(1), _concepts())
+    jev = FakeJev()
+    with pytest.raises(LegBotDispatchError, match="judge_id is 68 characters"):
+        await run_step(broker, _answer([_draft(n=1), _draft(n=2)], judge_id=long_id), jev)
+    assert broker.writes == [] and jev.calls == []
+    ok = "x" * 64
+    result, _ = await run_step(FakeBroker(_work(["a"]), _policies(1), _concepts()), _answer([_draft(n=1)], judge_id=ok), FakeJev())
+    assert result["created"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_label_the_broker_would_refuse_fails_the_bill_before_any_write(run_step):
+    broker = FakeBroker(_work(["a", "b"]), _policies(1), _concepts())
+    drafts = [_draft(n=1), _draft(n=2, label="L" * 201)]
+    with pytest.raises(LegBotDispatchError, match=r"\[2\]"):
+        await run_step(broker, _answer(drafts), FakeJev())
+    assert broker.writes == []
+    # a draft that is not a position carries no label and is not checked
+    ok, _ = await run_step(FakeBroker(_work(["a"]), _policies(1), _concepts()),
+                           _answer([_draft(n=1, not_a_position=True, label="L" * 500)]), FakeJev())
+    assert ok["excluded"] == 1
+
+
+@pytest.mark.asyncio
 async def test_a_work_list_with_another_bills_rows_is_refused(run_step):
     broker = FakeBroker(_work(["a"], gov_id="HB 999"), [], _concepts())
     with pytest.raises(BrokerClientError, match="did not honour gov_id="):

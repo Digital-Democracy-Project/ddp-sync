@@ -46,6 +46,11 @@ logger = structlog.get_logger()
 _QUESTION_TYPE = "policy_statement"
 RUBRIC_VERSION = "policy_statement:v1"
 CHUNK_SIZE = 200  # Policies per Jev call (AGENTS-261)
+# What the broker's draft write keeps (BROKER-598 `_statement` cuts prompt_hash at 64 without saying so, and rejects a Policy
+# label over 200 with a 400). The writer's judge_id is stamped as prompt_hash and its LAST characters are the digest that
+# tells one prompt from another, so a cut would make a changed prompt look unchanged: fail before writing anything instead.
+BROKER_PROMPT_HASH_MAX = 64
+BROKER_LABEL_MAX = 200
 WRITER_BATCH_MAX = 40  # LegBot's _DRAFT_BATCH_MAX: statements per writer call (a bill has far fewer)
 
 
@@ -235,6 +240,19 @@ async def dispatch_and_store_policy_statements(
             answers.append(answer)
         if len({a["judge_id"] for a in answers}) != 1:
             raise LegBotDispatchError("policy_statement batches were judged under different judge ids")
+
+        judge_id = answers[0]["judge_id"]
+        if len(judge_id) > BROKER_PROMPT_HASH_MAX:
+            raise LegBotDispatchError(
+                f"the writer's judge_id is {len(judge_id)} characters and the broker keeps {BROKER_PROMPT_HASH_MAX} "
+                f"(prompt_hash): writing it would cut off its digest. Nothing was written."
+            )
+        too_long = [n for n, d in drafts.items() if not d["not_a_position"] and len(d["label"].strip()) > BROKER_LABEL_MAX]
+        if too_long:
+            raise LegBotDispatchError(
+                f"the writer's label for statement(s) {too_long} is over {BROKER_LABEL_MAX} characters, which the broker "
+                f"refuses. Nothing was written."
+            )
 
         policies = await list_policy_matching_policies(**broker)
         concepts: list[dict] | None = None
