@@ -186,6 +186,7 @@ async def dispatch_bill_question(
     *,
     timeout_seconds: float | None = None,
     topic_list: dict | None = None,
+    statements: list[str] | None = None,
     request_id: str | None = None,
     redo: dict | None = None,
 ) -> dict:
@@ -201,6 +202,8 @@ async def dispatch_bill_question(
         topic_list: bill_topics only (SYNC-134 / AGENTS-181): the broker's live list as
             get_bill_topics_taxonomy returns it. Sent as topics, max_topics and
             topics_version; LegBot fails a bill_topics request without them.
+        statements: policy_statement only (SYNC-183 / AGENTS-262): the bill's concept statements the writer drafts a Policy
+            for, in statement_index order (index 0 is `n` 1). LegBot sees no Policy list.
         request_id (SYNC-140 / AGENTS-201): the caller's id for THIS request. Sent as-is, so a retry
             with the same id is one LegBot run: LegBot answers 200 with the task it already made. The
             id is never made up here, and it belongs to ONE task (LegBot keeps ids per bot, not per
@@ -228,6 +231,8 @@ async def dispatch_bill_question(
         payload["topics"] = list(topic_list["topics"])
         payload["max_topics"] = topic_list["max_topics"]
         payload["topics_version"] = topic_list["version"]
+    if statements is not None:
+        payload["statements"] = list(statements)
     if redo is not None and request_id is None:
         raise ValueError("a redo needs a request_id (the contract refuses one without)")
     if request_id is not None:

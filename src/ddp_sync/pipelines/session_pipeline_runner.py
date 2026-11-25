@@ -72,6 +72,7 @@ from ddp_sync.pipelines.bill_organization_position_research import (
 from ddp_sync.pipelines.concept_statement_dispatch import (
     dispatch_and_store_concept_statements,
 )
+from ddp_sync.pipelines.policy_statement_dispatch import dispatch_and_store_policy_statements
 from ddp_sync.services import activity
 from ddp_sync.services.broker_client import (
     BrokerClientError,
@@ -615,6 +616,7 @@ async def _process_bill_inner(
     broker_api_token: str | None = None,
     request_id: str | None = None,
     redo: dict | None = None,
+    include_policy_statement: bool = False,
 ) -> dict:
     gov_id = candidate["gov_id"]
     bill_openstates_id = candidate["bill_openstates_id"]
@@ -636,6 +638,14 @@ async def _process_bill_inner(
         "concept_statements_skipped_reason": None,
         "concept_statements_duration_seconds": None,
         "concept_statements_failed": False,
+        "policy_statement_dispatched": False,
+        "policy_statement_skipped_reason": None,
+        "policy_statement_duration_seconds": None,
+        "policy_statement_failed": False,
+        "policy_statement_statements": 0,
+        "policy_statement_matched": 0,
+        "policy_statement_created": 0,
+        "policy_statement_excluded": 0,
         "duration_seconds": None,
         "error": None,
     }
@@ -1052,6 +1062,37 @@ async def _process_bill_inner(
                         time.monotonic() - concept_started, 3
                     )
 
+    # SYNC-183: policy_statement, right after concept_statements (its input) and before bill_changelog's own cache key.
+    # The broker's work list says what needs doing, so there is no coverage read here; a failure is isolated to this bill
+    # (policy_statement_failed) the way concept_statements_failed is, and nothing is recorded as "failed" -- the
+    # statements simply have no match row, so the next run offers them again (which is also all retry_failed would do).
+    if include_policy_statement:
+        policy_started = time.monotonic()
+        try:
+            policy_result = await dispatch_and_store_policy_statements(
+                gov_id=gov_id,
+                bill_openstates_id=bill_openstates_id,
+                jurisdiction_iso2=jurisdiction_iso2,
+                session_code=session_code,
+                dry_run=dry_run,
+                broker_api_base=broker_api_base,
+                broker_api_token=broker_api_token,
+            )
+        except Exception as exc:
+            logger.warning(
+                "session_pipeline_policy_statement_failed", run_id=run_id, gov_id=gov_id, error=str(exc),
+            )
+            result["policy_statement_skipped_reason"] = f"dispatch_failed: {exc}"
+            result["policy_statement_failed"] = True
+        else:
+            result["policy_statement_skipped_reason"] = policy_result["skipped_reason"]
+            result["policy_statement_dispatched"] = policy_result["skipped_reason"] is None
+            result["policy_statement_statements"] = policy_result["statements"]
+            for kind in ("matched", "created", "excluded"):
+                result[f"policy_statement_{kind}"] = policy_result[kind]
+        finally:
+            result["policy_statement_duration_seconds"] = round(time.monotonic() - policy_started, 3)
+
     # Phase 2: bill_changelog last, after concept statements have used the
     # cache. Its two-input prompt takes its own key, so running it earlier is
     # what made concept_statements pay a full prefill (SYNC-38).
@@ -1094,6 +1135,7 @@ async def run_legbot_pipeline(
     limit: int | None,
     *,
     include_concept_statements: bool,
+    include_policy_statement: bool = False,
     retry_failed: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
@@ -1163,6 +1205,11 @@ async def run_legbot_pipeline(
             pre-existing jurisdiction_iso2/session_code/limit/artifact_types
             validation below, regardless of which candidate-sourcing mode
             is in play.)
+
+    include_policy_statement (SYNC-183) adds the policy_statement step (policy_statement_dispatch.py) after concept_statements:
+    the writer drafts a Policy per statement the broker's work list offers, Jev matches each against the broker's current
+    Policy list, and the result is written through the broker's service route. Default False here only so the
+    post-archive hook, which does not send it, is unchanged; the trigger and a caller choose it.
 
     artifact_types, include_org_research, include_concept_statements,
     retry_failed, and limit all have NO default -- the caller must decide
@@ -1277,6 +1324,12 @@ async def run_legbot_pipeline(
                                                          # nothing_to_publish) -- lets a caller
                                                          # tell the two apart without parsing
                                                          # concept_statements_skipped_reason.
+                    "policy_statement_dispatched": bool,  # SYNC-183: include_policy_statement only; a dry run
+                    "policy_statement_skipped_reason": str | None,  # reports the work list's size, writes nothing
+                    "policy_statement_duration_seconds": float | None,
+                    "policy_statement_failed": bool,  # an isolated failure of this step, like concept_statements_failed
+                    "policy_statement_statements": int,  # statements the broker's work list offered
+                    "policy_statement_matched": int, "policy_statement_created": int, "policy_statement_excluded": int,
                     "duration_seconds": float,  # this bill's total processing time
                     "error": str | None,
                 },
@@ -1357,6 +1410,7 @@ async def run_legbot_pipeline(
         artifact_types=list(artifact_types),
         include_org_research=include_org_research,
         include_concept_statements=include_concept_statements,
+        include_policy_statement=include_policy_statement,
         limit=limit,
         dry_run=dry_run,
         bill_candidates_count=(len(bill_candidates) if bill_candidates is not None else None),
@@ -1453,6 +1507,7 @@ async def run_legbot_pipeline(
                     artifact_types=artifact_types,
                     include_org_research=include_org_research,
                     include_concept_statements=include_concept_statements,
+                    include_policy_statement=include_policy_statement,
                     dry_run=dry_run,
                     retry_failed=retry_failed,
                     run_id=run_id,
@@ -1530,6 +1585,7 @@ async def run_single_bill_full(
     artifact_types: list[str] | None,
     include_org_research: bool,
     include_concept_statements: bool,
+    include_policy_statement: bool = False,
     retry_failed: bool,
     dry_run: bool = False,
     broker_api_base: str | None = None,
@@ -1623,6 +1679,7 @@ async def run_single_bill_full(
         artifact_types=resolved_artifact_types,
         include_org_research=include_org_research,
         include_concept_statements=include_concept_statements,
+        include_policy_statement=include_policy_statement,
         dry_run=dry_run,
         request_id=request_id,
         redo_reason=(redo or {}).get("reason"),
@@ -1640,6 +1697,7 @@ async def run_single_bill_full(
         artifact_types=resolved_artifact_types,
         include_org_research=include_org_research,
         include_concept_statements=include_concept_statements,
+        include_policy_statement=include_policy_statement,
         dry_run=dry_run,
         retry_failed=retry_failed,
         run_id=run_id,

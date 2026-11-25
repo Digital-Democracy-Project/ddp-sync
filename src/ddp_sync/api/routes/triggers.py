@@ -163,6 +163,16 @@ class BillArtifactGenerationRequest(BaseModel):
             "existing published set (SYNC-31)."
         ),
     )
+    include_policy_statement: bool = Field(
+        False,
+        description=(
+            "Whether to also run the policy_statement step (SYNC-183): LegBot drafts a Policy for each statement of the "
+            "bill's published set that has no current match row, Jev matches it against the broker's Policy list (a "
+            "score of at least POLICY_STATEMENT_MATCH_CUTOFF is a match, else a new Policy under the Concept Jev picks), "
+            "and the result is written to the broker. Default false so a caller that does not send it (the post-archive "
+            "hook) is unchanged; `dry_run` only reports how many statements would be done."
+        ),
+    )
     limit: int | None = Field(
         ...,
         description=(
@@ -360,6 +370,7 @@ async def trigger_bill_artifact_generation(
         include_org_research=body.include_org_research,
         limit=body.limit,
         include_concept_statements=body.include_concept_statements,
+        include_policy_statement=body.include_policy_statement,
         retry_failed=body.retry_failed,
         dry_run=body.dry_run,
         broker_api_base=broker_api_base,
@@ -657,6 +668,10 @@ class LegBotAnalyzeBillFullRequest(BaseModel):
             "if none is already published (SYNC-31)."
         ),
     )
+    include_policy_statement: bool = Field(
+        False,
+        description="Whether to also run the policy_statement step for this bill (SYNC-183); default false.",
+    )
     retry_failed: bool = Field(
         ...,
         description=(
@@ -724,6 +739,7 @@ async def trigger_legbot_analyze_bill_full(
             artifact_types=body.artifact_types,
             include_org_research=body.include_org_research,
             include_concept_statements=body.include_concept_statements,
+            include_policy_statement=body.include_policy_statement,
             retry_failed=body.retry_failed,
             dry_run=body.dry_run,
             broker_api_base=broker_api_base,

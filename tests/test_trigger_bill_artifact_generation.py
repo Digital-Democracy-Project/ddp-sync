@@ -143,7 +143,7 @@ def test_limit_above_former_ceiling_now_passes_through_uncapped():
     assert response.json()["bills_considered"] == 500
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 500,
-        include_concept_statements=False, retry_failed=False, dry_run=False,
+        include_concept_statements=False, include_policy_statement=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
         started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
@@ -164,7 +164,7 @@ def test_null_limit_means_no_limit_and_reaches_the_pipeline_as_none():
     assert response.status_code == 200
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, None,
-        include_concept_statements=False, retry_failed=False, dry_run=False,
+        include_concept_statements=False, include_policy_statement=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
         started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
@@ -216,7 +216,7 @@ def test_valid_payload_returns_200_and_calls_pipeline_with_exact_args():
     assert body["run_id"]
     mock_run.assert_awaited_once_with(
         "fl", "2026F", ["bill_summary", "bill_pros_cons"], False, 10,
-        include_concept_statements=False, retry_failed=False, dry_run=False,
+        include_concept_statements=False, include_policy_statement=False, retry_failed=False, dry_run=False,
         broker_api_base=None, broker_api_token=None, bill_candidates=None,
         started_by="manual trigger",  # SYNC-178: a manual trigger is labelled so in `ddp-sync status`
     )
