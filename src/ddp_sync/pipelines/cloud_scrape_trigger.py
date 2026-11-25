@@ -997,6 +997,21 @@ def reconcile_inflight_fargate_jobs() -> list[asyncio.Task]:
             task.add_done_callback(_log_reconciliation_outcome)
             tasks.append(task)
             continue
+        if record.get("kind") == "people_refresh":
+            # OPEN-882: the weekly people refresh's task; its per-state result is read from S3 on the event loop.
+            from ddp_sync.pipelines.people_refresh_task import resume_inflight_people_refresh_job
+
+            logger.warning(
+                "openstates_people_refresh: resuming a refresh orphaned by a previous restart",
+                run_id=run_id,
+                task_arn=record.get("task_arn"),
+            )
+            task = asyncio.create_task(resume_inflight_people_refresh_job(run_id, record))
+            _reconciliation_tasks.add(task)
+            task.add_done_callback(_reconciliation_tasks.discard)
+            task.add_done_callback(_log_reconciliation_outcome)
+            tasks.append(task)
+            continue
         logger.warning(
             "cloud_scrape: resuming a Fargate job orphaned by a previous restart",
             run_id=run_id,
