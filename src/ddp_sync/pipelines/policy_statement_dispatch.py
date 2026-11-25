@@ -4,7 +4,7 @@ calls right after concept_statements when `include_policy_statement` is set.
 
 Per bill:
 
-1. **Work.** The broker's own list (`GET /api/policy-matching/work/?bill=`, BROKER-573) says which statements of the bill's
+1. **Work.** The broker's own list (`GET /api/policy-matching/work/?jurisdiction=&gov_id=&session=`, BROKER-573 / BROKER-598) says which statements of the bill's
    current published set have no current match row. Nothing here reads sets or keeps a second record of what was done, so a
    statement with a current row is never offered again and a re-run cannot duplicate a row.
 2. **Writer.** LegBot's `policy_statement` question (AGENTS-262) returns one draft Policy per statement. It sees no Policy list.
@@ -193,10 +193,11 @@ async def dispatch_and_store_policy_statements(
     counts = {"matched": 0, "created": 0, "excluded": 0}
 
     work = await list_policy_statement_work(
-        bill_openstates_id=bill_openstates_id, jurisdiction_iso2=jurisdiction_iso2, rubric_version=RUBRIC_VERSION, **broker
+        gov_id=gov_id, jurisdiction_iso2=jurisdiction_iso2, session_code=session_code, rubric_version=RUBRIC_VERSION,
+        **broker
     )
     if any(w.get("gov_id") != gov_id or w.get("session") != session_code for w in work):
-        raise BrokerClientError("the broker's work list holds another bill's statements: it did not honour bill=")
+        raise BrokerClientError("the broker's work list holds another bill's statements: it did not honour gov_id= and session=")
     work.sort(key=lambda w: (w["concept_statement_set_id"], w["statement_index"]))
     result = {"statements": len(work), **counts, "skipped_reason": None}
     if not work:

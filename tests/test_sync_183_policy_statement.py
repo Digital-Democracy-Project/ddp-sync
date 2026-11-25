@@ -239,6 +239,24 @@ async def test_reproduction_notices_a_cutoff_that_moved():
 # The per-bill step with LegBot, the broker and Jev faked
 # --------------------------------------------------------------------------------------------------------------------
 
+def _broker_would_accept(p):
+    """The broker's own checks of a draft write, copied from ddp-broker-py PR #832 `common/policy_matching.write_draft` and
+    `_statement` (so a payload this side builds that the broker would refuse with a 400 fails here)."""
+    assert p["resolution"] in ("matched", "created", "excluded")
+    assert isinstance(p["concept_statement_set_id"], int) and isinstance(p["statement_index"], int)
+    assert isinstance(p["draft"], dict) and isinstance(p["scores"], dict) and isinstance(p.get("reason") or "", str)
+    assert len(p["model_name"]) <= 100 and len(p["prompt_version"]) <= 50 and len(p["prompt_hash"]) <= 64
+    if p["resolution"] == "matched":
+        assert isinstance(p["policy_id"], int) and p["created"] is None
+    elif p["resolution"] == "created":
+        c = p["created"]
+        assert p["policy_id"] is None and isinstance(c, dict) and isinstance(c["concept_id"], int)
+        assert all(isinstance(c[k], str) and c[k].strip() for k in ("label", "canonical_statement", "definition"))
+        assert isinstance(c.get("exclusions") or "", str) and len(c["label"].strip()) <= 200
+    else:
+        assert p["policy_id"] is None and p["created"] is None and p["reason"].strip()
+
+
 class FakeBroker:
     """The three broker reads and the write. A `created` write adds a Policy to the list the next read returns."""
 
@@ -262,12 +280,17 @@ class FakeBroker:
         return list(self.concepts)
 
     async def write(self, payload, **kw):
+        _broker_would_accept(payload)
         self.writes.append(payload)
         if payload["resolution"] == "created":
             self.policies.append({"id": 9000 + len(self.writes), "concept_id": payload["created"]["concept_id"],
                                   "canonical_statement": payload["created"]["canonical_statement"],
                                   **{k: payload["created"][k] for k in ("label", "definition", "exclusions")}})
-        return {"resolution": payload["resolution"], "accepted": True}
+        # the broker's real response shape (BROKER-598 `_response`)
+        return {"match": {"id": len(self.writes), "concept_statement_set_id": payload["concept_statement_set_id"],
+                          "statement_index": payload["statement_index"], "resolution": payload["resolution"],
+                          "policy_id": payload["policy_id"], "accepted": payload["resolution"] != "excluded"},
+                "created": {"concept_id": None, "policy_id": None}, "replayed": False}
 
 
 def _work(texts, gov_id="HB 1", session="2026", set_id=7, indices=None):
@@ -349,6 +372,8 @@ async def test_matched_excluded_and_new_are_written_with_the_scores_and_the_writ
             7, "typesafe:fake", "judge-abc", "v1", "policy_statement:v1")
         assert w["statement_text"] in ("s one", "s two", "s three") and w["draft"]["n"] in (1, 2, 3)
     assert broker.work_kwargs["rubric_version"] == "policy_statement:v1" and "prompt_hash" not in broker.work_kwargs
+    assert (broker.work_kwargs["gov_id"], broker.work_kwargs["jurisdiction_iso2"], broker.work_kwargs["session_code"]) == (
+        "HB 1", "FL", "2026")
 
 
 @pytest.mark.asyncio
@@ -431,7 +456,7 @@ async def test_a_writer_answer_that_does_not_cover_every_statement_once_writes_n
 @pytest.mark.asyncio
 async def test_a_work_list_with_another_bills_rows_is_refused(run_step):
     broker = FakeBroker(_work(["a"], gov_id="HB 999"), [], _concepts())
-    with pytest.raises(BrokerClientError, match="did not honour bill="):
+    with pytest.raises(BrokerClientError, match="did not honour gov_id="):
         await run_step(broker, _answer([_draft(n=1)]), FakeJev())
     assert broker.writes == []
 
@@ -580,9 +605,8 @@ async def test_through_run_legbot_pipeline_a_policy_created_for_one_bill_is_matc
     draft = _draft(n=1, label="New thing", statement="New thing.", definition="It is new.", subject="n")
     jev = FakeJev()
 
-    async def list_work(*, bill_openstates_id, **kw):
-        gov = "HB 1" if bill_openstates_id.endswith("x") else "HB 2"
-        return _work(["s"], gov_id=gov, session="2026F", set_id=7 if gov == "HB 1" else 8)
+    async def list_work(*, gov_id, **kw):
+        return _work(["s"], gov_id=gov_id, session="2026F", set_id=7 if gov_id == "HB 1" else 8)
 
     async def list_policies(**kw):
         events.append(f"read:{len(broker.policies)}")
@@ -756,9 +780,12 @@ async def test_broker_lists_page_until_next_after_is_null_and_send_the_filters(m
     assert seen[0][3] == "Bearer tok" and seen[0][2]["limit"] == "200"
 
     seen.clear()
-    await broker_client.list_policy_statement_work(bill_openstates_id="ocd-bill/x", jurisdiction_iso2="fl", rubric_version="policy_statement:v1")
+    await broker_client.list_policy_statement_work(gov_id="HB 1", jurisdiction_iso2="fl", session_code="2026F", rubric_version="policy_statement:v1")
     assert seen[0][1] == "/api/policy-matching/work/"
-    assert (seen[0][2]["bill"], seen[0][2]["jurisdiction"], seen[0][2]["rubric_version"]) == ("ocd-bill/x", "FL", "policy_statement:v1")
+    # a concept statement set has no Open States id: a bill is jurisdiction + gov_id + session (BROKER-598)
+    assert (seen[0][2]["gov_id"], seen[0][2]["jurisdiction"], seen[0][2]["session"], seen[0][2]["rubric_version"]) == (
+        "HB 1", "FL", "2026F", "policy_statement:v1")
+    assert "bill" not in seen[0][2]
     assert "prompt_hash" not in seen[0][2]
     seen.clear()
     await broker_client.list_policy_matching_concepts()

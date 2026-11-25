@@ -1514,14 +1514,16 @@ async def _policy_matching_pages(path: str, *, what: str, params: dict | None = 
 
 async def list_policy_statement_work(
     *,
-    bill_openstates_id: str,
+    gov_id: str,
     jurisdiction_iso2: str,
+    session_code: str,
     rubric_version: str,
     broker_api_base: str | None = None,
     broker_api_token: str | None = None,
 ) -> list[dict]:
     """The statements of one bill's current published set that have no current match row (SYNC-183): `GET
-    /api/policy-matching/work/?bill=&jurisdiction=&rubric_version=`, every page. Each row is {concept_statement_set_id,
+    /api/policy-matching/work/?jurisdiction=&gov_id=&session=&rubric_version=`, every page (a concept statement set has no Open
+    States id, so a bill is that triple, BROKER-598). Each row is {concept_statement_set_id,
     statement_index, statement_text, jurisdiction, session, gov_id, why}. The broker's own staleness rule decides; this
     side never reads sets or keeps a second record of what was done. No `prompt_hash` is sent: the writer's judge id is
     known only after it has answered, so a re-walk because the prompt moved is not asked for here.
@@ -1532,7 +1534,8 @@ async def list_policy_statement_work(
     return await _policy_matching_pages(
         "work/",
         what="policy-matching work list",
-        params={"bill": bill_openstates_id, "jurisdiction": jurisdiction_iso2.upper(), "rubric_version": rubric_version},
+        params={"jurisdiction": jurisdiction_iso2.upper(), "gov_id": gov_id, "session": session_code,
+                "rubric_version": rubric_version},
         broker_api_base=broker_api_base,
         broker_api_token=broker_api_token,
     )
