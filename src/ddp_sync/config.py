@@ -676,6 +676,24 @@ def _unit_interval(raw: str | None, *, default: float, name: str) -> float:
     return value
 
 
+def _stop_after_failures(raw: str | None) -> int:
+    """POLICY_STATEMENT_STOP_AFTER_FAILURES (SYNC-196): fails safe. Unset, blank, not a whole number or negative uses the
+    default 3 (with a warning), so a typo can neither stop the service starting nor silently switch the protection off;
+    only an explicit 0 turns the stop-early rule off."""
+    default = 3
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning("POLICY_STATEMENT_STOP_AFTER_FAILURES=%r is not a whole number; using %s", raw, default)
+        return default
+    if value < 0:
+        logging.getLogger(__name__).warning("POLICY_STATEMENT_STOP_AFTER_FAILURES=%r is negative; using %s (0 turns it off)", raw, default)
+        return default
+    return value
+
+
 def _parse_trigger_limit(raw: str | None) -> int | None:
     """LEGBOT_SCRAPE_COMPLETION_TRIGGER_LIMIT (SYNC-103): unset or blank = no limit, a positive
     integer = that cap. Anything else raises, so a typo fails at startup instead of quietly
@@ -768,7 +786,7 @@ def _load_from_env() -> dict:
         "policy_statement_match_cutoff": _unit_interval(
             os.getenv("POLICY_STATEMENT_MATCH_CUTOFF"), default=0.7, name="POLICY_STATEMENT_MATCH_CUTOFF"
         ),
-        "policy_statement_stop_after_failures": max(0, int(os.getenv("POLICY_STATEMENT_STOP_AFTER_FAILURES", "3"))),
+        "policy_statement_stop_after_failures": _stop_after_failures(os.getenv("POLICY_STATEMENT_STOP_AFTER_FAILURES")),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),

@@ -363,3 +363,21 @@ def test_ddp_sync_status_shows_failed_bills_and_a_partial_outcome():
                                       "scheduled": {"status": "running", "jobs": []}})
     line = next(row for row in text.splitlines() if "LegBot session pipeline" in row and "partial" in row)
     assert "bills 6/6, 3 failed" in line and "jev failed 3 bills in a row" in line
+
+
+# ── the setting fails safe ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    (None, 3), ("", 3), ("   ", 3), ("abc", 3), ("2.5", 3), ("-2", 3), ("-1", 3),  # a typo or a negative never turns it off
+    ("0", 0),                                                                      # only an explicit 0 does
+    ("1", 1), ("3", 3), (" 5 ", 5),
+])
+def test_the_stop_after_failures_setting_falls_back_to_3_and_only_an_explicit_0_turns_it_off(monkeypatch, raw, expected):
+    from ddp_sync import config
+
+    if raw is None:
+        monkeypatch.delenv("POLICY_STATEMENT_STOP_AFTER_FAILURES", raising=False)
+    else:
+        monkeypatch.setenv("POLICY_STATEMENT_STOP_AFTER_FAILURES", raw)
+    assert config._load_from_env()["policy_statement_stop_after_failures"] == expected  # and loading never raises
