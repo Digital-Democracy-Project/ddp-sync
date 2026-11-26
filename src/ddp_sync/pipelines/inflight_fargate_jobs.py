@@ -30,6 +30,7 @@ plumbing for no real benefit over the sync client the same `redis` package alrea
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import structlog
@@ -256,3 +257,74 @@ def list_inflight() -> dict[str, dict[str, Any]]:
                 "inflight_fargate_jobs: skipping unparseable record", run_id=run_id, error=str(e)
             )
     return records
+
+
+# ---- SYNC-197: records the test suite leaked ------------------------------------------------------------------------------
+#
+# Before SYNC-192's conftest guard, test runs on the Mac wrote archive records into the live Hash (localhost Redis is up there),
+# and every ddp-sync restart then tried to resume archives that never existed. A real Fargate task ARN is
+# `arn:aws:ecs:<region>:<12-digit account>:task/<cluster>/<task id>`, so the task ids the tests use (below) cannot be one.
+# This matches only those exact values, not "any odd record" and not "any record in some state": a real in-flight archive is
+# never touched, and anything else in the Hash is listed and left for a person.
+_LEAKED_TEST_TASK_ARN = re.compile(r"^(arn:task/archive|arn:aws:ecs:us-east-1:1:task/ddp-scrapers/abc(123)?)$")
+_ARCHIVE_RUN_ID = re.compile(r"^[a-z]{2,3}-archive-[0-9a-f]{12}$")  # `_run_archive_fargate`'s `<state>-archive-<12 hex>`
+
+
+def is_leaked_test_archive_record(run_id: str, record: dict[str, Any]) -> bool:
+    """True only for an archive record whose run id has the archive shape and whose task id is one the tests use."""
+    return (
+        record.get("kind") == "archive"
+        and bool(_ARCHIVE_RUN_ID.match(run_id))
+        and bool(_LEAKED_TEST_TASK_ARN.match(str(record.get("task_arn", ""))))
+    )
+
+
+def purge_leaked_test_archive_records(*, apply: bool = False) -> dict[str, Any]:
+    """Look at every record in the in-flight Hash and, with `apply`, delete the leaked test archive records and nothing else.
+
+    A dry run (the default) deletes nothing. Each record is judged on its own content; with `apply`, a leaked record is
+    deleted only if it is still exactly what was judged (re-read right before the delete). Returns
+    `{"error", "records", "leaked": [...], "kept": [...], "deleted": [...], "changed": [...]}`, each list item
+    `{"run_id", "kind", "jurisdiction", "task_arn", "archive_started_at"}`. Redis unreachable: `error` set, nothing touched."""
+    report: dict[str, Any] = {"error": None, "records": 0, "leaked": [], "kept": [], "deleted": [], "changed": []}
+    client = _get_client()
+    if client is None:
+        report["error"] = "redis_unavailable"
+        return report
+    try:
+        raw = client.hgetall(INFLIGHT_KEY)
+    except Exception as e:  # noqa: BLE001
+        report["error"] = f"read_failed: {e}"
+        return report
+    report["records"] = len(raw)
+
+    def summary(run_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        return {key: record.get(key) for key in ("kind", "jurisdiction", "task_arn", "archive_started_at")} | {"run_id": run_id}
+
+    judged: dict[str, str] = {}
+    for run_id, value in sorted(raw.items()):
+        try:
+            record = json.loads(value)
+        except (TypeError, ValueError):
+            record = None
+        if isinstance(record, dict) and is_leaked_test_archive_record(run_id, record):
+            report["leaked"].append(summary(run_id, record))
+            judged[run_id] = value
+        else:
+            report["kept"].append(summary(run_id, record) if isinstance(record, dict) else {"run_id": run_id, "unparseable": True})
+    if not apply:
+        return report
+    for item in report["leaked"]:
+        run_id = item["run_id"]
+        try:
+            if client.hget(INFLIGHT_KEY, run_id) != judged[run_id]:  # changed (or gone) since it was judged: leave it
+                report["changed"].append(item)
+                continue
+            if not client.hdel(INFLIGHT_KEY, run_id):  # nothing was removed (already gone): do not report a delete
+                report["changed"].append(item)
+                continue
+            report["deleted"].append(item)
+        except Exception as e:  # noqa: BLE001
+            report["error"] = f"delete_failed: {e}"
+            break
+    return report
