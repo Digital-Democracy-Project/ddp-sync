@@ -9,11 +9,24 @@ import os
 
 import dotenv
 import pytest
+import redis
 import requests
 
 from ddp_sync import slack_alerts
 
 _REAL_REQUESTS_POST = requests.post
+
+
+def _refuse_real_sync_redis(cls, *args, **kwargs):
+    """Stands in for `redis.Redis.from_url` for the whole test session (SYNC-197). The only code that opens the sync client is
+    `inflight_fargate_jobs._get_client`, and it falls back to None (no store) when this raises. Without this, a test that left
+    the module's `_client` unset, or a worker thread that outlived its test's fixtures (monkeypatch gives `_client` back as None
+    at teardown), reached the real Redis (up on the Mac) and wrote fake archive records that ddp-sync then tried to resume at
+    every restart. A test that needs `from_url` patches it itself."""
+    raise AssertionError("SYNC-197: a test tried to open a real Redis connection; patch inflight_fargate_jobs._client instead")
+
+
+redis.Redis.from_url = classmethod(_refuse_real_sync_redis)
 
 
 class _NoUnreplacedAlertPost:
