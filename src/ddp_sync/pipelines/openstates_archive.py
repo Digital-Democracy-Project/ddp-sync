@@ -587,7 +587,7 @@ async def _wait_for_mac_run(client: httpx.AsyncClient, url: str, headers: dict, 
                                     f"(last: {last_problem})") from e
             continue
         failures = 0
-        if record.get("status") in ("completed", "failed", "lost"):
+        if record.get("status") in ("completed", "partial", "failed", "lost"):  # SYNC-196: "partial" ends the wait too
             return record
     raise _MacRunFailed(f"run {run_id} still not finished after {_MAC_RUN_MAX_WAIT_SECONDS / 3600:g} h")
 

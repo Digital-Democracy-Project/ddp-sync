@@ -306,6 +306,8 @@ def format_text(data: dict[str, Any], now: datetime | None = None) -> str:
     for r in recent[:10]:
         when = _clock(r.get("finished_at")) if r.get("finished_at") else f"started {_clock(r.get('started_at'))}"
         progress = (f", bills {r.get('done')}/{r.get('total')}" if r.get("total") is not None else "")
+        if r.get("failed"):  # SYNC-196: a run with failed bills must not read as a plain "done"
+            progress += f", {r['failed']} failed"
         error = f" ({r['error']})" if r.get("error") else ""
         lines.append(f"  {r.get('outcome', '?'):<20} {r.get('kind')}: {_where(r)}  {when}{progress}{error}")
     for r in sorted(finished_background, key=lambda r: r.get("updated_at") or "", reverse=True)[:5]:

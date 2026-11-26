@@ -139,7 +139,8 @@ def bill_finished(run_id: str, bill: str, outcome: str) -> None:
 
 
 def finish(run_id: str, outcome: str, error: str | None = None) -> None:
-    """A run has ended: `outcome` "done" or "failed". It leaves the register and goes to the recent list."""
+    """A run has ended: `outcome` "done", "partial" (SYNC-196: stopped early or had failed bills) or "failed". It leaves the
+    register and goes to the recent list."""
     entry = _RUNS.pop(run_id, None)
     if entry is None:
         return

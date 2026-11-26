@@ -305,6 +305,10 @@ class SyncSettings:
     # it the draft becomes a new Policy under the Concept Jev picks. 0.7 is the value measured in ddp-agents AGENTS-261
     # (a 0.01 move changes about 1 in 100 decisions, so change it only with a new measurement).
     policy_statement_match_cutoff: float = 0.7
+    # SYNC-196: a policy_statement run stops starting new bills after this many bills in a row failed on the same
+    # dependency (Jev, the broker or LegBot), marks itself partial and alerts once. 0 turns the stop off. A re-run
+    # offers exactly the statements that have no match row.
+    policy_statement_stop_after_failures: int = 3
 
     # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
     # finished. It was a module constant of 5 in legbot_client.py.
@@ -764,6 +768,7 @@ def _load_from_env() -> dict:
         "policy_statement_match_cutoff": _unit_interval(
             os.getenv("POLICY_STATEMENT_MATCH_CUTOFF"), default=0.7, name="POLICY_STATEMENT_MATCH_CUTOFF"
         ),
+        "policy_statement_stop_after_failures": max(0, int(os.getenv("POLICY_STATEMENT_STOP_AFTER_FAILURES", "3"))),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),

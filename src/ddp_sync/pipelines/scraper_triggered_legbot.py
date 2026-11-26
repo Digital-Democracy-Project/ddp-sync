@@ -372,7 +372,7 @@ async def trigger_scraper_session_pipeline(
 
 SESSION_RUN_HEARTBEAT_SECONDS = 60
 SESSION_RUN_LOST_AFTER_SECONDS = 600
-SESSION_RUN_FINAL = ("completed", "failed", "lost")
+SESSION_RUN_FINAL = ("completed", "partial", "failed", "lost")  # SYNC-196: "partial" = a policy_statement run that stopped early or had failed bills
 
 
 def new_session_run_record(run_id: str, jurisdiction_iso2: str, session_code: str) -> dict[str, Any]:
@@ -418,9 +418,13 @@ async def run_session_pipeline_in_background(run_id: str, jurisdiction_iso2: str
         beat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await beat  # stopped before the final write, so a late heartbeat cannot write "running" after it
-    record.update(status="completed" if result.get("success") else "failed",
+    # SYNC-196: a policy_statement run reports its own `status` ("partial" or "failed" when a dependency failed bills)
+    ran = bool(result.get("success"))
+    status = result["status"] if ran and result.get("status") in ("partial", "failed") else ("completed" if ran else "failed")
+    record.update(status=status,
                   finished_at=datetime.now(timezone.utc).isoformat(),
-                  error=None if result.get("success") else result.get("error"),
+                  error=(result.get("stopped_early") or result.get("first_failure")) if ran and status != "completed"
+                  else (None if ran else result.get("error")),
                   result=_summary(result))
     await save()
     logger.info("legbot_session_background_run_end", run_id=run_id, jurisdiction_iso2=jurisdiction_iso2,
