@@ -236,8 +236,8 @@ The `/sync/unified` endpoint accepts optional `target` and `all_sessions` parame
 
 `/trigger/bill-artifact-generation` with `"background": true` (SYNC-162) answers **202** with a `run_id` at once and runs the
 same pass afterwards (same overlap lock, same result); `GET /trigger/bill-artifact-generation/{run_id}` returns its record
-(`queued` / `running` / `completed` / `failed` / `lost`, the wrapper's `error`, and the run's counts; a list in the result is
-kept as its length). `updated_at` moves every minute while the run goes, so a run ddp-sync restarted under reads `lost` after
+(`queued` / `running` / `completed` / `partial` / `failed` / `lost`, the wrapper's `error`, and the run's counts; a list in the result is
+kept as its length). **SYNC-196:** a policy_statement run that stopped early (or had failed bills) reads `partial` (`failed` if no started bill got through), with `bills_failed`, `bills_not_started`, `stopped_early` and `first_failure` in `result` and the stop reason as `error`. `updated_at` moves every minute while the run goes, so a run ddp-sync restarted under reads `lost` after
 10 minutes. A refusal (`already_running`, `trigger_disabled`, `redis_unavailable`) is the record's `error`, not an HTTP
 status. EC2's archive hook (`openstates_archive._trigger_legbot_session_via_mac_wireguard`) uses it: it checks the record
 every minute for up to 6 hours, and a real failure (the Mac unreachable for 10 checks in a row, a failed or lost run, or no

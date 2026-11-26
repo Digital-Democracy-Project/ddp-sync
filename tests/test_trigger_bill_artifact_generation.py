@@ -677,6 +677,24 @@ def test_background_answers_202_with_a_run_id_and_the_run_is_read_back_completed
     assert body["jurisdiction_iso2"] == "fl" and body["finished_at"]
 
 
+def test_a_stopped_policy_statement_run_reads_back_partial_with_its_failure_counts():
+    """SYNC-196: through the real wrapper, a run that stopped early is `partial`, not `completed`, and the status route
+    carries the failure count, the not-started count and the first reason."""
+    client = _make_authed_client()
+    store, _runs = _store_with_runs()
+    summary = {"bills_considered": 6, "bills_processed": 3, "results": [{}] * 6, "status": "partial", "bills_failed": 3,
+               "bills_not_started": 3, "stopped_early": "jev failed 3 bills in a row",
+               "first_failure": "jev: Jev unreachable: refused"}
+    with _patch_redis(store), patch(
+        "ddp_sync.pipelines.session_pipeline_runner.run_legbot_pipeline", new=AsyncMock(return_value=summary)
+    ):
+        response = client.post("/trigger/bill-artifact-generation", json={**_VALID_PAYLOAD, "background": True})
+        body = client.get(f"/trigger/bill-artifact-generation/{response.json()['run_id']}").json()
+    assert body["status"] == "partial" and body["error"] == "jev failed 3 bills in a row"
+    assert (body["result"]["bills_failed"], body["result"]["bills_not_started"]) == (3, 3)
+    assert body["result"]["first_failure"] == "jev: Jev unreachable: refused"
+
+
 def test_a_background_refusal_is_the_records_error_not_an_http_status():
     client = _make_authed_client()
     store, _runs = _store_with_runs()

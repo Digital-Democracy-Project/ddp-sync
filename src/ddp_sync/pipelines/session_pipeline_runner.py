@@ -1544,6 +1544,8 @@ async def run_legbot_pipeline(
         # than holding it through this log call too.
         logger.info("session_pipeline_bill_complete", run_id=run_id, **bill_result)
         activity.bill_finished(run_id, bill_label, _bill_outcome(bill_result))
+        # SYNC-196: nothing here may `await` before the record. The slot was just released, so the next queued bill is already
+        # woken; it runs as soon as this task yields, and must find the run already tripped (a test holds two bills in flight).
         if breaker.record(bill_result):
             logger.warning("session_pipeline_run_stopped_early", run_id=run_id, reason=breaker.reason,
                            first_failure=breaker.first_failure)

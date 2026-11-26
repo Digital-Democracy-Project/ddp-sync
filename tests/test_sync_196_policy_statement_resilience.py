@@ -95,7 +95,7 @@ async def test_other_client_errors_are_not_retried(monkeypatch, reply):
 
 @pytest.mark.asyncio
 async def test_a_429_still_waits_as_told(monkeypatch):
-    jev, calls, sleeps = _jev(monkeypatch, [httpx.Response(429, headers={"retry-after": "5"}), httpx.Response(200, json=_OK)])
+    jev, _calls, sleeps = _jev(monkeypatch, [httpx.Response(429, headers={"retry-after": "5"}), httpx.Response(200, json=_OK)])
     async with jev:
         assert await jev.score("text", ["a"]) == [0.9]
     assert sleeps == [5.0]
@@ -125,14 +125,16 @@ def run_policy(monkeypatch, legbot_stand_in_manifest):
     monkeypatch.setattr(spr, "_polled_bill_ids", AsyncMock(return_value=set()))
     monkeypatch.setattr(spr, "get_bill_artifacts", AsyncMock(return_value=None))
     monkeypatch.setattr(spr, "list_current_session_bill_candidates", AsyncMock(side_effect=AssertionError("no scan")))
-    state = {"stop_after": 3}
+    state = {"stop_after": 3, "concurrency": 1}
     monkeypatch.setattr(spr, "get_settings", lambda: SimpleNamespace(
-        session_pipeline_concurrency=1, replica_freshness_check_enabled=False,
+        session_pipeline_concurrency=state["concurrency"], replica_freshness_check_enabled=False,
         policy_statement_stop_after_failures=state["stop_after"]))
 
-    async def run(replies, n=None, stop_after=3, **kw):
-        state["stop_after"] = stop_after
-        step.side_effect = list(replies)
+    async def run(replies, n=None, stop_after=3, concurrency=1, **kw):
+        """`replies` is a list of answers in order, or an async function (then `n` bills is required)."""
+        state["stop_after"], state["concurrency"] = stop_after, concurrency
+        spr._legbot_line = None  # the line is process-wide: rebuilt so it takes this run's concurrency
+        step.side_effect = replies if callable(replies) else list(replies)
         summary = await run_legbot_pipeline("fl", "2026F", [], False, 10, include_concept_statements=False, retry_failed=False,
                                             bill_candidates=_cands(n or len(replies)), include_policy_statement=True, **kw)
         return summary
@@ -157,6 +159,34 @@ async def test_three_failures_in_a_row_from_one_dependency_stop_the_run(run_poli
 
 
 @pytest.mark.asyncio
+async def test_with_two_bills_in_flight_the_ones_already_running_finish_and_the_queued_ones_never_start(run_policy):
+    """Concurrency 2, six bills. Bills 1 and 2 fail, bills 3 and 4 start together; bill 3 fails (the third in a row: the run
+    trips) while bill 4 is still running. Bill 4 finishes normally; bills 5 and 6 were queued and must never start."""
+    import asyncio
+
+    run, _step, alerts = run_policy
+    started = []
+
+    async def the_step(*args, **kwargs):
+        n = len(started) + 1
+        started.append(n)
+        await asyncio.sleep(0)
+        if n == 4:  # still running when bill 3 trips the run
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return _OK_STEP
+        raise JEV
+
+    summary = await run(the_step, n=6, concurrency=2)
+    assert started == [1, 2, 3, 4]  # bills 5 and 6 never reached the step
+    assert [r.get("not_started") for r in summary["results"]] == [None, None, None, None, True, True]
+    assert (summary["bills_failed"], summary["bills_not_started"], summary["bills_processed"]) == (3, 2, 4)
+    assert summary["status"] == "partial"  # bill 4 got through, so the stopped run is partial, not failed
+    assert summary["stopped_early"] == "jev failed 3 bills in a row"
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_broker_failing_the_coverage_check_counts_as_a_broker_failure(run_policy, monkeypatch):
     run, step, alerts = run_policy
     monkeypatch.setattr(spr, "get_bill_artifacts", AsyncMock(side_effect=BrokerClientError("unreachable")))
@@ -168,7 +198,7 @@ async def test_the_broker_failing_the_coverage_check_counts_as_a_broker_failure(
 
 @pytest.mark.asyncio
 async def test_bills_that_finished_before_the_stop_keep_the_run_partial_not_failed(run_policy):
-    run, step, alerts = run_policy
+    run, step, _alerts = run_policy
     summary = await run([_OK_STEP, JEV, JEV, JEV, _OK_STEP], n=5)
     assert summary["status"] == "partial" and summary["bills_failed"] == 3 and summary["bills_not_started"] == 1
     assert step.await_count == 4
@@ -193,7 +223,7 @@ async def test_a_stop_after_of_zero_turns_the_stop_off(run_policy):
 
 @pytest.mark.asyncio
 async def test_a_clean_run_is_completed_with_zero_failures_and_sends_no_alert(run_policy):
-    run, step, alerts = run_policy
+    run, _step, alerts = run_policy
     summary = await run([_OK_STEP] * 3)
     assert (summary["status"], summary["bills_failed"], summary["bills_not_started"], summary["stopped_early"]) == (
         "completed", 0, 0, None)
@@ -202,7 +232,7 @@ async def test_a_clean_run_is_completed_with_zero_failures_and_sends_no_alert(ru
 
 @pytest.mark.asyncio
 async def test_the_alert_goes_out_once_with_a_state_and_session_dedupe_key(run_policy):
-    run, step, alerts = run_policy
+    run, _step, alerts = run_policy
     await run([JEV] * 3 + [_OK_STEP] * 4, n=7)
     [(text, kw)] = alerts
     assert kw["source"] == "policy_statement.run_stopped"
@@ -212,7 +242,7 @@ async def test_the_alert_goes_out_once_with_a_state_and_session_dedupe_key(run_p
 
 @pytest.mark.asyncio
 async def test_a_failed_alert_never_fails_the_run(run_policy, monkeypatch):
-    run, step, alerts = run_policy
+    run, _step, _alerts = run_policy
 
     def boom(*a, **k):
         raise RuntimeError("slack down")
@@ -236,6 +266,25 @@ async def test_a_run_without_the_policy_step_keeps_its_summary_unchanged(run_pol
     step.assert_not_awaited() and alerts == []
 
 
+def test_the_breaker_trips_once_even_if_bills_already_in_flight_keep_failing():
+    """With more than one bill in flight, bills that were already running finish after the run has tripped and are recorded
+    too: that must not trip it (and so alert) a second time, nor change the reason."""
+    breaker = spr._RunBreaker(3)
+    failing = {"dependency_failure": "jev", "policy_statement_skipped_reason": "dispatch_failed: x"}
+    tripped = [breaker.record(dict(failing)) for _ in range(5)]
+    assert tripped == [False, False, True, False, False]
+    assert breaker.reason == "jev failed 3 bills in a row" and breaker.failed == 5
+
+
+def test_a_bill_that_was_never_started_is_not_a_failure_and_does_not_break_a_streak():
+    breaker = spr._RunBreaker(3)
+    jev = {"dependency_failure": "jev"}
+    assert [breaker.record(dict(jev)), breaker.record(dict(jev))] == [False, False]
+    assert breaker.record({"not_started": True, "dependency_failure": None}) is False
+    assert breaker.record(dict(jev)) is True  # the streak was still 2, so this is the third
+    assert breaker.failed == 3
+
+
 def test_bill_outcome_counts_a_failed_policy_step_as_failed_and_written_statements_as_generated():
     assert spr._bill_outcome({"policy_statement_failed": True}) == "failed"
     assert spr._bill_outcome({"policy_statement_statements": 3}) == "generated"
@@ -256,7 +305,7 @@ class _FakeStore:
 
 
 async def _record_for(monkeypatch, result):
-    import ddp_sync.services.redis_store as redis_store
+    from ddp_sync.services import redis_store
 
     store = _FakeStore()
     monkeypatch.setattr(redis_store, "get_redis_store", lambda: store)
@@ -273,8 +322,10 @@ async def _record_for(monkeypatch, result):
 ])
 async def test_the_run_record_carries_the_runs_own_status(monkeypatch, status, expected_error):
     record = await _record_for(monkeypatch, {"success": True, "status": status, "stopped_early": expected_error,
-                                             "first_failure": "jev: x", "bills_failed": 3, "results": []})
-    assert record["status"] == status and record["error"] == expected_error and record["result"]["bills_failed"] == 3
+                                             "first_failure": "jev: x", "bills_failed": 3, "bills_not_started": 2, "results": []})
+    assert record["status"] == status and record["error"] == expected_error
+    # the count, the not-started count and the first reason are all in the record the status route returns
+    assert (record["result"]["bills_failed"], record["result"]["bills_not_started"], record["result"]["first_failure"]) == (3, 2, "jev: x")
 
 
 @pytest.mark.asyncio
@@ -295,7 +346,7 @@ async def test_the_archive_hooks_poller_stops_waiting_on_a_partial_run(monkeypat
     from ddp_sync.pipelines import openstates_archive as oa
 
     class Client:
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, timeout=None):  # the real poller passes timeout=30.0
             return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
                                    json=lambda: {"run_id": "r", "status": "partial", "updated_at": "now"})
 
