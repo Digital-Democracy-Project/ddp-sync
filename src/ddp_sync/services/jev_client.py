@@ -29,7 +29,16 @@ _QUESTION = (
     "option fits."
 )
 _TIMEOUT_SECONDS = 120.0
-_ATTEMPTS = 4
+# SYNC-196: waits before retry 1, 2 and 3 (so 4 attempts in all, as before for a 429). TypeSafe answered 400 "Unknown model:
+# jev-latest" for about 12 minutes on 2026-11-25 although the model was listed, so that one 400 counts as transient; no other
+# 4xx is retried. These ride out a blip, not an outage: the run's own stop-early rule handles an outage.
+_RETRY_DELAYS = (2.0, 8.0, 30.0)
+_ATTEMPTS = 1 + len(_RETRY_DELAYS)
+
+
+def _transient(resp: httpx.Response) -> bool:
+    """SYNC-196: a response worth asking again: a server error, or the "Unknown model" 400 TypeSafe gave during its outage."""
+    return resp.status_code >= 500 or (resp.status_code == 400 and "Unknown model" in resp.text)
 
 
 class JevError(Exception):
@@ -70,12 +79,19 @@ class JevScorer:
             "questions": {"place": {"type": "choice", "instructions": _QUESTION, "criteria": criteria}},
         }
         for attempt in range(_ATTEMPTS):
+            last = attempt == _ATTEMPTS - 1
             try:
                 resp = await self._client.post(URL, json=body)
             except httpx.RequestError as exc:
-                raise JevError(f"Jev unreachable: {exc}") from exc
-            if resp.status_code == 429 and attempt < _ATTEMPTS - 1:  # rate limit: wait as told (the SDKs do the same)
+                if last:
+                    raise JevError(f"Jev unreachable: {exc}") from exc
+                await asyncio.sleep(_RETRY_DELAYS[attempt])
+                continue
+            if resp.status_code == 429 and not last:  # rate limit: wait as told (the SDKs do the same)
                 await asyncio.sleep(float(resp.headers.get("retry-after") or 2**attempt))
+                continue
+            if not last and _transient(resp):
+                await asyncio.sleep(_RETRY_DELAYS[attempt])
                 continue
             break
         if resp.status_code >= 400:

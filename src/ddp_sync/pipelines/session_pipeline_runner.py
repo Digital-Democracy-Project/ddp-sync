@@ -74,6 +74,9 @@ from ddp_sync.pipelines.concept_statement_dispatch import (
 )
 from ddp_sync.pipelines.policy_statement_dispatch import dispatch_and_store_policy_statements
 from ddp_sync.services import activity
+from ddp_sync.services.jev_client import JevError
+from ddp_sync.services.legbot_client import LegBotDispatchError
+from ddp_sync.slack_alerts import post_alert
 from ddp_sync.services.broker_client import (
     BrokerClientError,
     artifact_counts_as_present,
@@ -646,6 +649,7 @@ async def _process_bill_inner(
         "policy_statement_matched": 0,
         "policy_statement_created": 0,
         "policy_statement_excluded": 0,
+        "dependency_failure": None,  # SYNC-196: "jev", "broker", "legbot" or "other" when a dependency failed this bill
         "duration_seconds": None,
         "error": None,
     }
@@ -726,6 +730,7 @@ async def _process_bill_inner(
         # A coverage-check failure for one bill shouldn't abort the batch --
         # isolated to this bill's own result entry.
         result["error"] = f"coverage_check_failed: {exc}"
+        result["dependency_failure"] = "broker"
         result["duration_seconds"] = time.monotonic() - bill_started
         return result
 
@@ -845,6 +850,7 @@ async def _process_bill_inner(
                     run_id=run_id, gov_id=gov_id, error=str(exc),
                 )
                 result["error"] = f"ensure_failed: {exc}"
+                result["dependency_failure"] = "broker"
                 result["duration_seconds"] = round(time.monotonic() - bill_started, 3)
                 return result
 
@@ -1084,6 +1090,7 @@ async def _process_bill_inner(
             )
             result["policy_statement_skipped_reason"] = f"dispatch_failed: {exc}"
             result["policy_statement_failed"] = True
+            result["dependency_failure"] = _failure_source(exc)
         else:
             result["policy_statement_skipped_reason"] = policy_result["skipped_reason"]
             result["policy_statement_dispatched"] = policy_result["skipped_reason"] is None
@@ -1470,6 +1477,7 @@ async def run_legbot_pipeline(
     # different jurisdiction's own scheduled batch, say) is in flight at
     # the same time.
     line = get_legbot_line()
+    breaker = _RunBreaker(get_settings().policy_statement_stop_after_failures if include_policy_statement else 0)
     polled = await _polled_bill_ids(jurisdiction_iso2, broker_api_base, broker_api_token) if candidates else set()
 
     async def _process_bill_bounded(candidate: dict) -> dict:
@@ -1503,7 +1511,8 @@ async def run_legbot_pipeline(
                     active_holders=_session_pipeline_active_holders,
                     configured_concurrency=get_settings().session_pipeline_concurrency,
                 )
-                bill_result = await _process_bill(
+                bill_result = await _process_or_skip(
+                    breaker,
                     candidate,
                     jurisdiction_iso2=jurisdiction_iso2,
                     session_code=session_code,
@@ -1535,6 +1544,12 @@ async def run_legbot_pipeline(
         # than holding it through this log call too.
         logger.info("session_pipeline_bill_complete", run_id=run_id, **bill_result)
         activity.bill_finished(run_id, bill_label, _bill_outcome(bill_result))
+        # SYNC-196: nothing here may `await` before the record. The slot was just released, so the next queued bill is already
+        # woken; it runs as soon as this task yields, and must find the run already tripped (a test holds two bills in flight).
+        if breaker.record(bill_result):
+            logger.warning("session_pipeline_run_stopped_early", run_id=run_id, reason=breaker.reason,
+                           first_failure=breaker.first_failure)
+            await _alert_run_stopped(breaker, jurisdiction_iso2, session_code, run_id)
         return bill_result
 
     try:
@@ -1542,25 +1557,40 @@ async def run_legbot_pipeline(
     except BaseException as exc:
         activity.finish(run_id, "failed", error=type(exc).__name__)
         raise
-    activity.finish(run_id, "done")
+    # SYNC-196: only a policy_statement run reports failures this way; every other run keeps `status` "completed" as before
+    not_started = sum(1 for r in results if r.get("not_started")) if include_policy_statement else 0
+    failed_bills = breaker.failed if include_policy_statement else 0
+    if not include_policy_statement or (failed_bills == 0 and not_started == 0):
+        status = "completed"
+    elif breaker.tripped and failed_bills >= len(results) - not_started:
+        status = "failed"  # stopped early and not one bill that started got through
+    else:
+        status = "partial"
+    activity.finish(run_id, "done" if status == "completed" else status, error=breaker.reason)
 
     summary = {
         "bills_considered": bills_considered,
-        "bills_processed": len(results),
+        "bills_processed": len(results) - not_started,
         "truncated": truncated,
         "duration_seconds": round(time.monotonic() - run_started, 3),
         "peak_memory_mb": round(_peak_memory_mb(), 1),
         "results": results,
     }
+    if include_policy_statement:  # SYNC-196: the run-level failure report; other runs' summaries are unchanged
+        summary.update(status=status, bills_failed=failed_bills, bills_not_started=not_started,
+                       stopped_early=breaker.reason, first_failure=breaker.first_failure)
     logger.info(
         "session_pipeline_run_end",
         run_id=run_id,
         bills_considered=bills_considered,
-        bills_processed=len(results),
+        bills_processed=len(results) - not_started,
         truncated=truncated,
         duration_seconds=summary["duration_seconds"],
         peak_memory_mb=summary["peak_memory_mb"],
     )
+    if include_policy_statement:
+        logger.info("session_pipeline_policy_statement_run_status", run_id=run_id, status=status, bills_failed=failed_bills,
+                    bills_not_started=not_started, stopped_early=breaker.reason, first_failure=breaker.first_failure)
     return summary
 
 
@@ -1715,11 +1745,85 @@ async def run_single_bill_full(
 
 
 
+def _failure_source(exc: BaseException) -> str:
+    """SYNC-196: which dependency a policy_statement failure came from, for the run's stop-early rule."""
+    if isinstance(exc, JevError):
+        return "jev"
+    if isinstance(exc, BrokerClientError):
+        return "broker"
+    if isinstance(exc, LegBotDispatchError):
+        return "legbot"
+    return "other"
+
+
+class _RunBreaker:
+    """SYNC-196: the stop-early rule of one policy_statement run. A bill that fails on a dependency (`dependency_failure`)
+    extends a streak of the same source; any bill without one resets it; `limit` in a row trips it (0 = never). Once tripped,
+    bills not yet started are not started (`_process_or_skip`); bills already finished stay written, and a re-run offers
+    only statements with no match row, so nothing is repeated or duplicated."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.source: str | None = None
+        self.streak = 0
+        self.failed = 0
+        self.reason: str | None = None
+        self.first_failure: str | None = None
+
+    @property
+    def tripped(self) -> bool:
+        return self.reason is not None
+
+    def record(self, bill_result: dict) -> bool:
+        """Count one finished bill; True when this bill tripped the rule."""
+        if bill_result.get("not_started"):
+            return False
+        source = bill_result.get("dependency_failure")
+        if source is None:
+            self.source, self.streak = None, 0
+            return False
+        self.failed += 1
+        if self.first_failure is None:
+            detail = bill_result.get("policy_statement_skipped_reason") or bill_result.get("error") or ""
+            self.first_failure = f"{source}: {detail}"[:300]
+        self.streak = self.streak + 1 if source == self.source else 1
+        self.source = source
+        if self.limit and self.streak >= self.limit and not self.tripped:
+            self.reason = f"{source} failed {self.streak} bills in a row"
+            return True
+        return False
+
+
+def _not_started_result(candidate: dict, reason: str | None) -> dict:
+    """SYNC-196: the result of a bill the run never started because it had stopped early."""
+    return {"gov_id": candidate.get("gov_id"), "bill_openstates_id": candidate.get("bill_openstates_id"),
+            "not_started": True, "stopped_early": reason, "dependency_failure": None, "error": None}
+
+
+async def _process_or_skip(breaker: _RunBreaker, candidate: dict, **kwargs) -> dict:
+    if breaker.tripped:
+        return _not_started_result(candidate, breaker.reason)
+    return await _process_bill(candidate, **kwargs)
+
+
+async def _alert_run_stopped(breaker: _RunBreaker, jurisdiction_iso2: str, session_code: str, run_id: str) -> None:
+    """SYNC-196: one alert when a run stops early (the dedupe key is the state and session, as for the archive alerts).
+    `post_alert` blocks, so it goes off the event loop; it must never fail the run."""
+    text = (f"A policy_statement run for {jurisdiction_iso2.upper()} {session_code} stopped early: {breaker.reason}. "
+            f"First failure: {breaker.first_failure}. Bills that finished are kept; re-run the same bills when it is back "
+            f"(only statements without a match row are offered). Run {run_id}.")
+    try:
+        await asyncio.to_thread(post_alert, text, source="policy_statement.run_stopped",
+                                dedupe_key=f"policy_statement_run_stopped:{jurisdiction_iso2.upper()}:{session_code}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session_pipeline_run_stopped_alert_failed", run_id=run_id, error=str(exc))
+
+
 def _bill_outcome(bill_result: dict) -> str:
     """SYNC-178: one bill's result as `ddp-sync status` counts it: "failed" (an error or a failed result type),
     "generated" (LegBot wrote at least one result type), else "skipped" (nothing was needed)."""
-    if bill_result.get("error") or bill_result.get("artifacts_failed"):
+    if bill_result.get("error") or bill_result.get("artifacts_failed") or bill_result.get("policy_statement_failed"):
         return "failed"
-    if bill_result.get("artifacts_generated"):
+    if bill_result.get("artifacts_generated") or bill_result.get("policy_statement_statements"):
         return "generated"
     return "skipped"

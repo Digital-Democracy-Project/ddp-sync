@@ -701,7 +701,8 @@ async def test_through_run_legbot_pipeline_a_policy_created_for_one_bill_is_matc
 
     run, _ = pipeline
     monkeypatch.setattr(spr, "dispatch_and_store_policy_statements", psd.dispatch_and_store_policy_statements)
-    monkeypatch.setattr(spr, "get_settings", lambda: SimpleNamespace(session_pipeline_concurrency=1, replica_freshness_check_enabled=False))
+    monkeypatch.setattr(spr, "get_settings", lambda: SimpleNamespace(session_pipeline_concurrency=1, replica_freshness_check_enabled=False,
+                                                                  policy_statement_stop_after_failures=3))
     monkeypatch.setattr(psd, "get_settings", lambda: SyncSettings())
     events: list[str] = []
     broker = FakeBroker([], [], _concepts())
