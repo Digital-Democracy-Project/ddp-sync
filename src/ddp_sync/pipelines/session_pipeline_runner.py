@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import resource
 import sys
 import time
@@ -987,6 +988,7 @@ async def _process_bill_inner(
             result["artifact_durations_seconds"][artifact_type] = round(
                 time.monotonic() - dispatch_started, 3
             )
+            activity.progress(run_id)  # AGENTS-271: the no-progress alert's clock
 
     # Phase 1: everything that shares the bill's prefilled cache.
     for artifact_type in cache_sharing:
@@ -1552,11 +1554,16 @@ async def run_legbot_pipeline(
             await _alert_run_stopped(breaker, jurisdiction_iso2, session_code, run_id)
         return bill_result
 
+    watchdog = asyncio.create_task(_watch_no_progress(run_id, jurisdiction_iso2, session_code))
     try:
         results = list(await asyncio.gather(*(_process_bill_bounded(c) for c in candidates)))
     except BaseException as exc:
         activity.finish(run_id, "failed", error=type(exc).__name__)
         raise
+    finally:
+        watchdog.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog  # gone before the run returns (a test checks no task is left behind)
     # SYNC-196: only a policy_statement run reports failures this way; every other run keeps `status` "completed" as before
     not_started = sum(1 for r in results if r.get("not_started")) if include_policy_statement else 0
     failed_bills = breaker.failed if include_policy_statement else 0
@@ -1817,6 +1824,41 @@ async def _alert_run_stopped(breaker: _RunBreaker, jurisdiction_iso2: str, sessi
                                 dedupe_key=f"policy_statement_run_stopped:{jurisdiction_iso2.upper()}:{session_code}")
     except Exception as exc:  # noqa: BLE001
         logger.warning("session_pipeline_run_stopped_alert_failed", run_id=run_id, error=str(exc))
+
+
+# AGENTS-271: on 2026-11-26 a Colima relink left two CAMS tasks at "running"; both bill slots waited on them, nothing was
+# written for 29 min 43 s, and the run record's `updated_at` kept moving, so nothing looked wrong. Alert only: nothing is
+# cancelled or restarted (ddp-sync's own 1,800 s inference timeout still ends the wait).
+NO_PROGRESS_ALERT_SECONDS = 600
+NO_PROGRESS_CHECK_SECONDS = 60
+
+
+async def _watch_no_progress(run_id: str, jurisdiction_iso2: str, session_code: str, *,
+                             alert_after: float = NO_PROGRESS_ALERT_SECONDS,
+                             interval: float = NO_PROGRESS_CHECK_SECONDS) -> None:
+    """One alert per quiet stretch when a run with bills in flight has finished no artifact and no bill for `alert_after`
+    seconds. A run with nothing in flight (queued behind another run's bills, SYNC-185) is not quiet, it is waiting its turn.
+    A later stretch, after progress resumed, alerts again. Never raises; ends when cancelled."""
+    alerted_at = None  # the `last_progress_ts` the alert was for
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            entry = activity.snapshot(run_id)
+            if entry is None or not entry["current"]:
+                continue
+            quiet = activity.clock() - entry["last_progress_ts"]
+            if quiet < alert_after or alerted_at == entry["last_progress_ts"]:
+                continue
+            text = (f"LegBot run {run_id} for {jurisdiction_iso2.upper()} {session_code} is still running but has written "
+                    f"nothing for {int(quiet // 60)} min. Bills in flight: {', '.join(entry['current'])}. Likely cause: "
+                    f"CAMS tasks stuck at 'running' (AGENTS-271). Nothing was stopped; ddp-sync's own 1,800 s timeout "
+                    f"ends each wait.")
+            logger.warning("session_pipeline_no_progress", run_id=run_id, quiet_seconds=int(quiet), bills=entry["current"])
+            await asyncio.to_thread(post_alert, text, source="legbot.no_progress",
+                                    dedupe_key=f"legbot_no_progress:{run_id}")
+            alerted_at = entry["last_progress_ts"]  # only once it was sent: a failed send is tried again at the next check
+        except Exception as exc:  # noqa: BLE001 -- an alert must never touch the run
+            logger.warning("session_pipeline_no_progress_alert_failed", run_id=run_id, error=str(exc))
 
 
 def _bill_outcome(bill_result: dict) -> str:

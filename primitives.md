@@ -890,4 +890,16 @@ LegBot session runs, sync tasks, LegBot tasks in CAMS, in-flight Fargate jobs, t
 job reports to `activity`, and a new lock is added to `LOCK_PATTERNS`; do not add a second register or a second status
 route.** Tests: `tests/test_sync_178_status.py`.
 
+**No-progress alert for a LegBot session run (AGENTS-271).** Each entry also carries `last_progress_ts` (`activity.clock()`,
+stamped by `start`, `bill_started`, `bill_finished` and `progress(run_id)`, which `_dispatch_artifact` calls whenever one
+artifact finishes, written or failed). `run_legbot_pipeline` starts `_watch_no_progress` next to its bills: every 60 s, a run
+with a bill in flight (`current` not empty; a run waiting for a slot behind another run is not quiet) and no stamp for
+`NO_PROGRESS_ALERT_SECONDS` (600) sends ONE `post_alert(source="legbot.no_progress", dedupe_key="legbot_no_progress:<run id>")`
+naming the run id, state, session, minutes and the bills in flight; after progress resumes, a later quiet stretch alerts again (CAMS may hold that repeat back for a day); a failed send is retried at the next check.
+**Alert only: it never cancels or restarts anything** (the 1,800 s inference timeout still ends each wait). Why: 2026-11-26 a
+Colima relink left two CAMS tasks at "running", both bill slots waited, nothing was written for 29 min 43 s and the run record's
+`updated_at` kept moving. The run id is the pipeline's (`session_pipeline_run_start` log), not the background record's
+`legbot-session-...` id. A constant, not a setting (Ramon can change it). **Do not add a second watcher or a second progress clock.**
+Tests: `tests/test_agents_271_no_progress_alert.py`.
+
 **SYNC-179: start-up also ends the previous process's background LegBot session runs.** `scraper_triggered_legbot.stop_previous_process_session_runs()` (in `app.lifespan` before the scheduler, and on a late Redis connect in `reconnect_until_available`) marks every session-run record still `queued`/`running` as `lost` with error `RESTART_STOPPED_ERROR` ("stopped by a restart") and deletes every `ddp_sync:scraper_triggered_legbot:lock:*`, like SYNC-153's `clear_state_locks` for the pipeline locks: only this process takes those locks and writes those records. Before it, a restart left them "running" (and "Safe to restart: NO") for up to 10 minutes and the lock held until its TTL, so a resend was refused "already running". **A new lock or run record that dies with the process gets the same start-up clean-up, next to these.**

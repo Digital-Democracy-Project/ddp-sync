@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +40,11 @@ _background: set[asyncio.Task] = set()
 # The mirror writes run one at a time, in the order they were asked for (pm-review): a run's finish can never reach Redis
 # before its start, which would leave a stale entry that the next start-up reports as "stopped by a restart".
 _previous_write: asyncio.Task | None = None
+
+
+def clock() -> float:
+    """Seconds, for the no-progress clock (a test replaces it)."""
+    return time.time()
 
 
 def _now() -> str:
@@ -108,7 +114,7 @@ def start(run_id: str, kind: str, *, started_by: str, jurisdiction: str | None =
     entry = {
         "run_id": run_id, "kind": kind, "started_by": started_by, "jurisdiction": jurisdiction, "session": session,
         "detail": detail, "started_at": _now(), "total": total, "done": 0, "generated": 0, "skipped": 0, "failed": 0,
-        "current": [],
+        "current": [], "last_progress_ts": clock(),
     }
     _RUNS[run_id] = entry
     _in_background(_mirror_running(dict(entry)))
@@ -124,6 +130,21 @@ def bill_started(run_id: str, bill: str) -> None:
     entry = _RUNS.get(run_id)
     if entry is not None and bill not in entry["current"]:
         entry["current"].append(bill)
+    if entry is not None:
+        entry["last_progress_ts"] = clock()
+
+
+def progress(run_id: str) -> None:
+    """AGENTS-271: the run just wrote something (one artifact finished, written or failed). The no-progress alert reads it."""
+    entry = _RUNS.get(run_id)
+    if entry is not None:
+        entry["last_progress_ts"] = clock()
+
+
+def snapshot(run_id: str) -> dict[str, Any] | None:
+    """A copy of one run's entry while it is in the register, else None."""
+    entry = _RUNS.get(run_id)
+    return None if entry is None else dict(entry, current=list(entry["current"]))
 
 
 def bill_finished(run_id: str, bill: str, outcome: str) -> None:
@@ -134,6 +155,7 @@ def bill_finished(run_id: str, bill: str, outcome: str) -> None:
     if bill in entry["current"]:
         entry["current"].remove(bill)
     entry["done"] += 1
+    entry["last_progress_ts"] = clock()
     if outcome in ("generated", "skipped", "failed"):
         entry[outcome] += 1
 
