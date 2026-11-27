@@ -18,8 +18,15 @@ Per bill:
 5. **Write.** `POST /api/policy-matching/drafts/` (BROKER-598). The broker creates a new Policy cleared, so the existing
    3-bill rule is the only thing that keeps it off the site.
 
-Not here, on purpose (Ramon, 2026-11-24): no duplicate backstop (no `policy:` documents, no embeddings), no merge step, no
-shadow mode, no second lock, queue, gate or run record. A failure raises; the caller counts it per bill.
+6. **Judge (SYNC-199; PLAN 5.4.12; off with `POLICY_STATEMENT_JUDGE_SHORTLIST=0`).** A draft that is not a match but has Policies
+   scoring at least `policy_statement_judge_floor` (top `policy_statement_judge_shortlist`, taken from the SAME Jev calls) goes
+   to LegBot's `resolve_policy`: "existing" files the draft under that Policy (`matched`), "draft" creates it as above and
+   tells the broker it `replaces` the chosen one, null creates it as above. A new Policy is added to the bill's in-memory list,
+   so the bill's later drafts are judged against it.
+
+Not here, on purpose (Ramon, 2026-11-24, amended 2026-11-26): no duplicate backstop (no `policy:` documents, no embeddings), no
+merge (the broker merges, BROKER-610), no shadow mode, no second lock, queue, gate or run record. A failure raises; the caller
+counts it per bill.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ from ddp_sync.services.broker_client import (
     write_policy_statement_match,
 )
 from ddp_sync.services.jev_client import JevScorer
-from ddp_sync.services.legbot_client import LegBotDispatchError, dispatch_bill_question
+from ddp_sync.services.legbot_client import LegBotDispatchError, dispatch_bill_question, dispatch_resolve_policy
 
 logger = structlog.get_logger()
 
@@ -74,34 +81,91 @@ def concept_text(concept: dict) -> str:
     return f"{text} Does not cover: {concept['exclusions']}" if concept.get("exclusions") else text
 
 
+async def rank_items(jev: JevScorer, query: str, items: list[dict], text_of) -> tuple[int | None, float, list[tuple[float, int]]]:
+    """`best_of`'s answer plus every item's chunk score, best first (ties to the larger id), taken from the same Jev calls:
+    the shortlist for the judge (SYNC-199) costs no extra call. A score is the item's probability within its own chunk."""
+    if not items:
+        return None, 0.0, []
+    chunks = [items[i : i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
+    scores = await asyncio.gather(*(jev.score(query, [text_of(x) for x in chunk]) for chunk in chunks))
+    ranked = sorted(
+        ((s, x["id"]) for sc, chunk in zip(scores, chunks) for s, x in zip(sc, chunk)), reverse=True
+    )
+    winners = [max(zip(sc, [x["id"] for x in chunk])) for sc, chunk in zip(scores, chunks)]
+    if len(winners) == 1:
+        score, ident = winners[0]
+        return ident, score, ranked
+    by_id = {x["id"]: x for x in items}
+    final = await jev.score(query, [text_of(by_id[ident]) for _, ident in winners])
+    score, ident = max(zip(final, [ident for _, ident in winners]))
+    # Chunk scores are not comparable across chunks, so the cross-chunk winner is always first; the rest follow by chunk score.
+    return ident, score, [(score, ident)] + [r for r in ranked if r[1] != ident]
+
+
 async def best_of(jev: JevScorer, query: str, items: list[dict], text_of) -> tuple[int | None, float]:
     """The item Jev likes best for `query` and its score: every `CHUNK_SIZE` items in one call, then the chunk winners
     against each other. One chunk is answered by that one call (a second call would compare a lone winner with "none").
     Ties go to the larger id, as the measured script's `max(zip(scores, ids))` did. An empty list is (None, 0.0)."""
-    if not items:
-        return None, 0.0
-    chunks = [items[i : i + CHUNK_SIZE] for i in range(0, len(items), CHUNK_SIZE)]
-    scores = await asyncio.gather(*(jev.score(query, [text_of(x) for x in chunk]) for chunk in chunks))
-    winners = [max(zip(sc, [x["id"] for x in chunk])) for sc, chunk in zip(scores, chunks)]
-    if len(winners) == 1:
-        score, ident = winners[0]
-        return ident, score
-    by_id = {x["id"]: x for x in items}
-    final = await jev.score(query, [text_of(by_id[ident]) for _, ident in winners])
-    score, ident = max(zip(final, [ident for _, ident in winners]))
-    return ident, score
+    best_id, score, _ = await rank_items(jev, query, items, text_of)
+    return best_id, score
+
+
+async def match_draft_ranked(
+    jev: JevScorer, draft: dict, policies: list[dict], cutoff: float
+) -> tuple[str, int | None, float, list[tuple[float, int]]]:
+    """`match_draft` plus the Policies' scores, best first (empty for an excluded draft)."""
+    if draft["not_a_position"]:
+        return "excluded", None, 0.0, []
+    best_id, score, ranked = await rank_items(jev, draft_query(draft), policies, policy_text)
+    if best_id is not None and score >= cutoff:
+        return "matched", best_id, score, ranked
+    return "created", best_id, score, ranked
 
 
 async def match_draft(jev: JevScorer, draft: dict, policies: list[dict], cutoff: float) -> tuple[str, int | None, float]:
     """The Policy decision for one draft: ("excluded", None, 0.0) for a draft that is not a position, ("matched", id, score)
     when the best Policy scores at or over `cutoff`, else ("created", best id, score), meaning a new Policy (its Concept is
     picked after this)."""
-    if draft["not_a_position"]:
-        return "excluded", None, 0.0
-    best_id, score = await best_of(jev, draft_query(draft), policies, policy_text)
-    if best_id is not None and score >= cutoff:
-        return "matched", best_id, score
-    return "created", best_id, score
+    resolution, best_id, score, _ = await match_draft_ranked(jev, draft, policies, cutoff)
+    return resolution, best_id, score
+
+
+def _judge_candidates(ranked: list[tuple[float, int]], policies: list[dict], shortlist: int, floor: float) -> list[dict]:
+    """The judge's shortlist: the top `shortlist` Policies scoring at least `floor`, in Jev's order (SYNC-199)."""
+    by_id = {p["id"]: p for p in policies}
+    return [
+        {"id": ident, **{k: by_id[ident].get(k) or "" for k in ("label", "canonical_statement", "definition", "exclusions")}}
+        for score, ident in ranked[:shortlist]
+        if score >= floor
+    ]
+
+
+def _judged_answer(reply: dict, candidates: list[dict]) -> dict:
+    """The judge's answer as the broker stores it. An id it was not shown, or `existing`/`draft` missing or unknown with a
+    choice, fails the bill (LegBotDispatchError) rather than being read as "none"."""
+    answer = reply.get("answer") if isinstance(reply, dict) else None
+    if not isinstance(answer, dict):
+        raise LegBotDispatchError(f"resolve_policy returned no answer object: {reply!r}"[:300])
+    choice, survivor = answer.get("choice"), answer.get("survivor")
+    shown = [c["id"] for c in candidates]
+    if choice is not None and (isinstance(choice, bool) or choice not in shown or survivor not in ("existing", "draft")):
+        raise LegBotDispatchError(f"resolve_policy answered choice={choice!r} survivor={survivor!r} for candidates {shown}")
+    return {
+        "choice": choice, "survivor": survivor if choice is not None else None, "reason": answer.get("reason") or "",
+        "judge_id": answer.get("judge_id") or "", "prompt_version": answer.get("prompt_version") or "",
+        "prompt_hash": answer.get("prompt_hash") or "", "model_name": answer.get("model_name") or "",
+        "unusable": bool(answer.get("unusable")), "candidates": [c["id"] for c in candidates],
+    }
+
+
+def _created_policy_id(response: dict | None) -> int | None:
+    """The new Policy's id from a `created` write's answer: `created_policy_id` (BROKER-610) or the BROKER-598 shape's
+    `created.policy_id`; None when neither is there (the in-bill list is then left as it was)."""
+    response = response or {}
+    value = response.get("created_policy_id")
+    if value is None and isinstance(response.get("created"), dict):
+        value = response["created"].get("policy_id")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 async def _write_drafts(
@@ -116,6 +180,8 @@ async def _write_drafts(
     broker_api_base: str | None,
     broker_api_token: str | None,
     counts: dict,
+    judge_shortlist: int = 0,
+    judge_floor: float = 0.30,
 ) -> None:
     for position, item in enumerate(work, start=1):
         draft = drafts[position]
@@ -133,8 +199,24 @@ async def _write_drafts(
             "prompt_hash": answer["judge_id"],
             "rubric_version": RUBRIC_VERSION,
         }
-        resolution, best_id, best_score = await match_draft(jev, draft, policies, cutoff)
+        resolution, best_id, best_score, ranked = await match_draft_ranked(jev, draft, policies, cutoff)
+        judged = None
+        if resolution == "created" and judge_shortlist > 0:
+            shown = _judge_candidates(ranked, policies, judge_shortlist, judge_floor)
+            if shown:
+                # A failed call raises LegBotDispatchError: nothing is written for this draft, the bill's step fails (source
+                # "legbot" for the run's breaker) and the draft is offered again. It is never read as "the judge said none".
+                reply = await dispatch_resolve_policy(
+                    {k: draft.get(k) or "" for k in ("label", "statement", "definition", "exclusions")}, shown
+                )
+                judged = _judged_answer(reply, shown)
+                counts["judged"] += 1
+                if judged["choice"] is None:
+                    counts["judge_none"] += 1
         scores.update(policy=best_score, best_policy_id=best_id)
+        if judged and judged["survivor"] == "existing":
+            counts["judge_filed"] += 1
+            resolution, best_id = "matched", judged["choice"]  # filed under the judge's pick; scores keep Jev's own best
         if resolution == "excluded":
             payload.update(resolution="excluded", policy_id=None, created=None, reason="not a position")
         elif resolution == "matched":
@@ -157,6 +239,11 @@ async def _write_drafts(
                 },
                 reason="",
             )
+        if judged:
+            payload["judge"] = judged
+            if judged["survivor"] == "draft":
+                payload["replaces"] = judged["choice"]
+                counts["judge_replaced"] += 1
         outcome = payload["resolution"]
         logger.info(
             "policy_statement_decided",
@@ -169,9 +256,25 @@ async def _write_drafts(
             concept_score=scores["concept"],
             cutoff=cutoff,
             list_size=len(policies),
+            **({"judge_choice": judged["choice"], "judge_survivor": judged["survivor"], "judge_reason": judged["reason"],
+                "judge_id": judged["judge_id"], "judge_prompt_version": judged["prompt_version"],
+                "judge_unusable": judged["unusable"], "judge_candidates": judged["candidates"]} if judged else {}),
         )
-        await write_policy_statement_match(payload, broker_api_base=broker_api_base, broker_api_token=broker_api_token)
+        response = await write_policy_statement_match(payload, broker_api_base=broker_api_base, broker_api_token=broker_api_token)
         counts[outcome] += 1
+        if outcome == "created" and judge_shortlist > 0:
+            # The bill's later drafts are matched and judged against this Policy too (two near-identical drafts in one bill
+            # must not both create one). Only with the judge on, so the judge-off path is exactly as before.
+            new_id = _created_policy_id(response)
+            if new_id is None:
+                logger.warning("policy_statement_created_id_missing", set_id=item["concept_statement_set_id"],
+                               statement_index=item["statement_index"])
+            else:
+                created = payload["created"]
+                if "replaces" in payload:
+                    policies[:] = [p for p in policies if p["id"] != payload["replaces"]]
+                policies.append({"id": new_id, **{k: created.get(k) or "" for k in ("label", "canonical_statement", "definition", "exclusions")},
+                                 "concept_id": created["concept_id"]})
 
 
 async def dispatch_and_store_policy_statements(
@@ -186,7 +289,8 @@ async def dispatch_and_store_policy_statements(
 ) -> dict:
     """Run the policy_statement step for one bill.
 
-    Returns {"statements": <int that needed work>, "matched": n, "created": n, "excluded": n, "skipped_reason": str | None}.
+    Returns {"statements": <int that needed work>, "matched": n, "created": n, "excluded": n, "skipped_reason": str | None},
+    plus "judged", "judge_filed", "judge_replaced", "judge_none" when the judge is on (SYNC-199).
     `skipped_reason` is "nothing_to_do" (every statement has a current row, or the bill has no published set),
     "no_archived_text" or "insufficient_information" (LegBot could not draft: nothing is written). A `dry_run` reads the work
     list and reports its size; it calls no LegBot, no Jev and writes nothing.
@@ -195,9 +299,13 @@ async def dispatch_and_store_policy_statements(
         BrokerClientError / LegBotDispatchError / JevError: propagate unchanged; the caller counts the bill as failed.
         Statements already written stay written; the rest have no row and are offered again by the next run.
     """
-    cutoff = get_settings().policy_statement_match_cutoff
+    settings = get_settings()
+    cutoff = settings.policy_statement_match_cutoff
+    judge_shortlist = settings.policy_statement_judge_shortlist
     broker = {"broker_api_base": broker_api_base, "broker_api_token": broker_api_token}
     counts = {"matched": 0, "created": 0, "excluded": 0}
+    if judge_shortlist > 0:  # SYNC-199: the judge's counts exist only when it is on, so the judge-off result is unchanged
+        counts.update(judged=0, judge_filed=0, judge_replaced=0, judge_none=0)
 
     work = await list_policy_statement_work(
         gov_id=gov_id, jurisdiction_iso2=jurisdiction_iso2, session_code=session_code, rubric_version=RUBRIC_VERSION,
@@ -269,6 +377,7 @@ async def dispatch_and_store_policy_statements(
             await _write_drafts(
                 work=work, drafts=drafts, answer=answers[0], jev=jev, policies=policies, concepts_loader=concepts_loader,
                 cutoff=cutoff, broker_api_base=broker_api_base, broker_api_token=broker_api_token, counts=counts,
+                judge_shortlist=judge_shortlist, judge_floor=settings.policy_statement_judge_floor,
             )
         finally:
             logger.info(

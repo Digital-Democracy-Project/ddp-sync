@@ -649,6 +649,10 @@ async def _process_bill_inner(
         "policy_statement_matched": 0,
         "policy_statement_created": 0,
         "policy_statement_excluded": 0,
+        "policy_statement_judged": 0,  # SYNC-199: the judge's counts (all 0 with POLICY_STATEMENT_JUDGE_SHORTLIST=0)
+        "policy_statement_judge_filed": 0,
+        "policy_statement_judge_replaced": 0,
+        "policy_statement_judge_none": 0,
         "dependency_failure": None,  # SYNC-196: "jev", "broker", "legbot" or "other" when a dependency failed this bill
         "duration_seconds": None,
         "error": None,
@@ -1095,8 +1099,8 @@ async def _process_bill_inner(
             result["policy_statement_skipped_reason"] = policy_result["skipped_reason"]
             result["policy_statement_dispatched"] = policy_result["skipped_reason"] is None
             result["policy_statement_statements"] = policy_result["statements"]
-            for kind in ("matched", "created", "excluded"):
-                result[f"policy_statement_{kind}"] = policy_result[kind]
+            for kind in ("matched", "created", "excluded", "judged", "judge_filed", "judge_replaced", "judge_none"):
+                result[f"policy_statement_{kind}"] = policy_result.get(kind, 0)
         finally:
             result["policy_statement_duration_seconds"] = round(time.monotonic() - policy_started, 3)
 
@@ -1338,6 +1342,8 @@ async def run_legbot_pipeline(
                     "policy_statement_failed": bool,  # an isolated failure of this step, like concept_statements_failed
                     "policy_statement_statements": int,  # statements the broker's work list offered
                     "policy_statement_matched": int, "policy_statement_created": int, "policy_statement_excluded": int,
+                    "policy_statement_judged": int, "policy_statement_judge_filed": int,  # SYNC-199
+                    "policy_statement_judge_replaced": int, "policy_statement_judge_none": int,
                     "duration_seconds": float,  # this bill's total processing time
                     "error": str | None,
                 },
