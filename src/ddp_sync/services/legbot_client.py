@@ -189,6 +189,7 @@ async def dispatch_bill_question(
     statements: list[str] | None = None,
     request_id: str | None = None,
     redo: dict | None = None,
+    legislature_summary: str | None = None,
 ) -> dict:
     """Dispatch an analyze_bill task to LegBot and return its structured answer.
 
@@ -212,6 +213,10 @@ async def dispatch_bill_question(
         redo: a staff redo of one result: {"reason": one of LegBot's three codes, "note": optional,
             at most 500 characters} (ddp-agents docs/reference/legbot-redo-contract.md). Needs a
             request_id; LegBot refuses a redo without one before any model call.
+        legislature_summary (SYNC-200 / OPEN-896): the plain-language summary the legislature itself wrote for the bill,
+            sent as its own payload key `legislature_summary`, never inside bill_source (which stays the latest version's
+            text). It describes the bill as filed, not as amended. None or blank sends no key, so the payload is exactly
+            what it was before.
 
     Returns:
         See _dispatch_and_await.
@@ -233,6 +238,8 @@ async def dispatch_bill_question(
         payload["topics_version"] = topic_list["version"]
     if statements is not None:
         payload["statements"] = list(statements)
+    if legislature_summary and legislature_summary.strip():
+        payload["legislature_summary"] = legislature_summary.strip()
     if redo is not None and request_id is None:
         raise ValueError("a redo needs a request_id (the contract refuses one without)")
     if request_id is not None:

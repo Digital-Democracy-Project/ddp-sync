@@ -61,6 +61,9 @@ _FEATURES = {
     "scrapebot_fallback": (lambda e: e["waf"]["scrapebot_fallback"], True),  # the scrape spells the federal one "usa"
     "scrapebot_fallback_archive": (lambda e: e["waf"]["scrapebot_fallback"], False),  # the archive spells it "us"
     "broker_bill_event_signal": (lambda e: e["enrollment"]["broker_bill_event_signal"], False),
+    # SYNC-200 / OPEN-929: send the bill's stored legislature summary to LegBot. Optional in the manifest: absent = false
+    # (fail closed), so a manifest from before OPEN-929 answers False for every state, never None.
+    "legbot_send_abstract": (lambda e: e["enrollment"].get("legbot_send_abstract", False) is True, False),
     # BROKER-541: the states ddp-open-states' run-people-refresh.sh imports (it reads the same field), spelled "us".
     "people_refresh": (lambda e: e["enrollment"]["people_refresh"], False),
 }
