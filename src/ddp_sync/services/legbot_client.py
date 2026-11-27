@@ -504,6 +504,34 @@ async def dispatch_resolve_person(
     )
 
 
+async def dispatch_resolve_policy(
+    draft: dict,
+    candidates: list[dict],
+    *,
+    timeout_seconds: float | None = None,
+) -> dict:
+    """Dispatch a resolve_policy task to LegBot and return its reply (SYNC-199; the question type is AGENTS-272).
+
+    `draft` is {label, statement, definition, exclusions} and `candidates` at most 5 of {id, label, canonical_statement,
+    definition, exclusions}: the Policies Jev scored closest to the draft. The reply's "answer" is {"choice": candidate id
+    | None, "survivor": "existing" | "draft" | None, "reason", "prompt_version", "prompt_hash", "judge_id", "model_name",
+    "unusable"}; an unusable model reply comes back as choice None with unusable True.
+
+    Raises:
+        LegBotDispatchError: task failed, timed out, or its result couldn't be read from disk.
+    """
+    return await _dispatch_and_await(
+        {
+            "question_type": "resolve_policy",
+            "caller": "ddp_sync",
+            "draft": draft,
+            "candidates": candidates,
+        },
+        question_type="resolve_policy",
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _dispatch_and_await(
     payload: dict,
     *,

@@ -309,6 +309,12 @@ class SyncSettings:
     # dependency (Jev, the broker or LegBot), marks itself partial and alerts once. 0 turns the stop off. A re-run
     # offers exactly the statements that have no match row.
     policy_statement_stop_after_failures: int = 3
+    # SYNC-199: a draft under the cutoff whose closest Policies score at least the floor goes to LegBot's resolve_policy with
+    # the top `shortlist` of them (at most 5). 0 (the default) = the judge is off and the step is exactly as before: it is
+    # turned on in the production .env at the SYNC-184 rollout, after AGENTS-272 (LegBot) and BROKER-610 (broker) are
+    # deployed. 0.30 is the flag threshold AGENTS-269 measured.
+    policy_statement_judge_shortlist: int = 0
+    policy_statement_judge_floor: float = 0.30
 
     # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
     # finished. It was a module constant of 5 in legbot_client.py.
@@ -676,6 +682,23 @@ def _unit_interval(raw: str | None, *, default: float, name: str) -> float:
     return value
 
 
+def _judge_shortlist(raw: str | None) -> int:
+    """POLICY_STATEMENT_JUDGE_SHORTLIST (SYNC-199): 0 (the default) keeps the judge off, 1 to 5 turns it on and is how many
+    candidates it sees. Unset or blank uses 0; a value that is not a whole number or is negative uses 0 with a warning (a typo
+    never switches the judge on); above 5 is cut to 5 (the question takes at most 5)."""
+    default, top = 0, 5
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        logging.getLogger(__name__).warning("POLICY_STATEMENT_JUDGE_SHORTLIST=%r is not a whole number from 0 to 5; using %s (the judge stays off)", raw, default)
+        return default
+    return min(value, top)
+
+
 def _stop_after_failures(raw: str | None) -> int:
     """POLICY_STATEMENT_STOP_AFTER_FAILURES (SYNC-196): fails safe. Unset, blank, not a whole number or negative uses the
     default 3 (with a warning), so a typo can neither stop the service starting nor silently switch the protection off;
@@ -787,6 +810,10 @@ def _load_from_env() -> dict:
             os.getenv("POLICY_STATEMENT_MATCH_CUTOFF"), default=0.7, name="POLICY_STATEMENT_MATCH_CUTOFF"
         ),
         "policy_statement_stop_after_failures": _stop_after_failures(os.getenv("POLICY_STATEMENT_STOP_AFTER_FAILURES")),
+        "policy_statement_judge_shortlist": _judge_shortlist(os.getenv("POLICY_STATEMENT_JUDGE_SHORTLIST")),
+        "policy_statement_judge_floor": _unit_interval(
+            os.getenv("POLICY_STATEMENT_JUDGE_FLOOR"), default=0.30, name="POLICY_STATEMENT_JUDGE_FLOOR"
+        ),
         "legbot_queue_wait_timeout_seconds": float(
             os.getenv("LEGBOT_QUEUE_WAIT_TIMEOUT_SECONDS", "3600")
         ),
