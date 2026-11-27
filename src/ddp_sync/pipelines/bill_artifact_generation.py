@@ -102,9 +102,13 @@ _ARTIFACT_TYPE_TO_QUESTION_TYPE = {
     "bill_topics": "bill_topics",
 }
 
-# SYNC-200: the seven single-version types that may be handed the legislature's own summary as an extra input. bill_topics
-# is left out on purpose (it shares _resolve_bill_source but was not part of the decision, OPEN-896).
-_LEGISLATURE_SUMMARY_ARTIFACT_TYPES = frozenset(_ARTIFACT_TYPE_TO_QUESTION_TYPE) - {"bill_topics"}
+# SYNC-200: the seven single-version types Ramon decided may be handed the legislature's own summary as an extra input
+# (OPEN-896). An explicit list on purpose: a type added to the map above gets no summary until someone decides it should.
+# bill_topics is left out (it shares _resolve_bill_source but was not part of the decision).
+_LEGISLATURE_SUMMARY_ARTIFACT_TYPES = frozenset({
+    "bill_summary", "bill_impact_analysis", "bill_pros_cons", "bill_vote_yes_frame", "bill_vote_no_frame",
+    "bill_supporting_orgs", "bill_opposing_orgs",
+})
 
 # artifact_types whose answer is already plain text under an answer["text"]
 # key (config/legbot_questions.yaml's output_shape) — flattened identically.

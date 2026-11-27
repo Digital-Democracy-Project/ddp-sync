@@ -91,6 +91,12 @@ def test_the_seven_types_are_exactly_these():
     assert "bill_topics" not in _LEGISLATURE_SUMMARY_ARTIFACT_TYPES
 
 
+def test_a_new_artifact_type_gets_no_summary_until_it_is_added(flag_manifest, monkeypatch):
+    monkeypatch.setitem(gen._ARTIFACT_TYPE_TO_QUESTION_TYPE, "bill_something_new", "something_new")
+    assert gen._sends_legislature_summary("bill_something_new", "OR") is False
+    assert gen._sends_legislature_summary("bill_summary", "OR") is True
+
+
 # ── the payload ───────────────────────────────────────────────────────────────────
 
 
