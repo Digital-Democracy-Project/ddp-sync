@@ -41,9 +41,10 @@ class JudgeBroker(FakeBroker):
     """The BROKER-610 write as the ticket states it: accepts `judge` and, for a created ending, `replaces`; answers with
     `created_policy_id`. `with_id=False` models an answer that lacks it."""
 
-    def __init__(self, *a, with_id=True, **k):
+    def __init__(self, *a, with_id=True, merging=True, **k):
         super().__init__(*a, **k)
         self.with_id = with_id
+        self.merging = merging  # the broker merges a replaced Policy only in act mode
 
     async def write(self, payload, **kw):
         if "replaces" in payload:
@@ -51,6 +52,7 @@ class JudgeBroker(FakeBroker):
             assert isinstance(payload["replaces"], int) and payload["replaces"] == payload["judge"]["choice"]
         response = await super().write(payload, **kw)
         response["created_policy_id"] = self.policies[-1]["id"] if payload["resolution"] == "created" and self.with_id else None
+        response["merged_policy_id"] = payload.get("replaces") if self.merging else None
         return response
 
 
@@ -88,13 +90,29 @@ def _close(draft, scores):
 # ---- judge off -----------------------------------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_with_the_shortlist_at_zero_nothing_is_judged_and_the_write_is_as_before(judged):
+async def test_with_the_default_settings_nothing_is_judged_and_the_write_is_exactly_todays(run_step, monkeypatch):
+    """The settings are SyncSettings() as they come: no judge setting given, so the judge is off (SYNC-199 default 0)."""
     d = _draft(n=1)
-    broker = JudgeBroker(_work(["a"]), [_pol(1), _pol(2)], _concepts())
-    result, resolve = await judged(broker, FakeJev(_close(d, {1: 0.6, 2: 0.5})), [], [d], shortlist=0)
+    pols = [_pol(1), _pol(2)]
+    broker = JudgeBroker(_work(["a"]), pols, _concepts())
+    resolve = AsyncMock()
+    monkeypatch.setattr(psd, "dispatch_resolve_policy", resolve)
+    result, _ = await run_step(broker, _answer([d]), FakeJev(_close(d, {1: 0.6, 2: 0.5})))
     resolve.assert_not_awaited()
     assert result == {"statements": 1, "matched": 0, "created": 1, "excluded": 0, "skipped_reason": None}
-    assert "judge" not in broker.writes[0] and "replaces" not in broker.writes[0]
+    (w,) = broker.writes
+    assert "judge" not in w and "replaces" not in w and w["resolution"] == "created"
+    assert w["scores"] == {"policy": 0.6, "best_policy_id": 1, "concept": 0.0, "cutoff": 0.7, "list_size": 2}
+    assert [p["id"] for p in pols][:2] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_zero_is_off_too(judged):
+    d = _draft(n=1)
+    broker = JudgeBroker(_work(["a"]), [_pol(1)], _concepts())
+    result, resolve = await judged(broker, FakeJev(_close(d, {1: 0.6})), [], [d], shortlist=0)
+    resolve.assert_not_awaited()
+    assert "judged" not in result and "judge" not in broker.writes[0]
 
 
 # ---- the three answers ---------------------------------------------------------------------------------------------
@@ -247,13 +265,14 @@ async def test_two_near_identical_drafts_in_one_bill_do_not_both_create_a_policy
 
 
 @pytest.mark.asyncio
-async def test_a_replacing_draft_takes_the_replaced_policy_out_of_the_bills_list(judged):
+@pytest.mark.parametrize("merging, old_stays", [(True, False), (False, True)])
+async def test_a_policy_leaves_the_bills_list_only_when_the_broker_says_it_merged_it(judged, merging, old_stays):
     d1, d2 = _draft(n=1, label="Same"), _draft(n=2, label="Same")
-    broker = JudgeBroker(_work(["a", "b"]), [_pol(1)], _concepts())
+    broker = JudgeBroker(_work(["a", "b"]), [_pol(1)], _concepts(), merging=merging)
     jev = FakeJev({(psd.draft_query(d1), "P1"): 0.5, (psd.draft_query(d2), "P1"): 0.5})
     _, resolve = await judged(broker, jev, [_reply(1, "draft"), _reply(None, None)], [d1, d2])
-    # d2 sees neither P1 (replaced) nor, with no score for it, the new Policy: nothing at the floor, so no second judge call
-    assert resolve.await_count == 1
+    # d2's own score for the new Policy is 0: it is judged only if P1 (not merged) is still in the list
+    assert (resolve.await_count == 2) is old_stays
 
 
 @pytest.mark.asyncio
@@ -286,9 +305,10 @@ def test_created_policy_id_reads_the_ticket_shape_and_the_existing_one():
 
 def test_the_judge_settings_defaults_and_fail_safe_parsing(monkeypatch):
     s = SyncSettings()
-    assert (s.policy_statement_judge_shortlist, s.policy_statement_judge_floor) == (5, 0.30)
-    assert _judge_shortlist(None) == 5 and _judge_shortlist("") == 5 and _judge_shortlist("0") == 0 and _judge_shortlist("3") == 3
-    assert _judge_shortlist("abc") == 5 and _judge_shortlist("-1") == 5 and _judge_shortlist("9") == 5
+    assert (s.policy_statement_judge_shortlist, s.policy_statement_judge_floor) == (0, 0.30)  # OFF by default
+    assert _judge_shortlist(None) == 0 and _judge_shortlist("") == 0 and _judge_shortlist("0") == 0 and _judge_shortlist("3") == 3
+    # a typo never switches the judge on; above 5 is cut to 5
+    assert _judge_shortlist("abc") == 0 and _judge_shortlist("-1") == 0 and _judge_shortlist("9") == 5
 
 
 @pytest.mark.asyncio

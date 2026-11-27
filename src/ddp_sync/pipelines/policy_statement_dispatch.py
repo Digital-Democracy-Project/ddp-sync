@@ -22,7 +22,8 @@ Per bill:
    scoring at least `policy_statement_judge_floor` (top `policy_statement_judge_shortlist`, taken from the SAME Jev calls) goes
    to LegBot's `resolve_policy`: "existing" files the draft under that Policy (`matched`), "draft" creates it as above and
    tells the broker it `replaces` the chosen one, null creates it as above. A new Policy is added to the bill's in-memory list,
-   so the bill's later drafts are judged against it.
+   so the bill's later drafts are judged against it. The judge is OFF by default (shortlist 0): the production `.env` turns it on at
+   the SYNC-184 rollout, after LegBot's `resolve_policy` (AGENTS-272) and the broker's write (BROKER-610) are deployed.
 
 Not here, on purpose (Ramon, 2026-11-24, amended 2026-11-26): no duplicate backstop (no `policy:` documents, no embeddings), no
 merge (the broker merges, BROKER-610), no shadow mode, no second lock, queue, gate or run record. A failure raises; the caller
@@ -264,15 +265,18 @@ async def _write_drafts(
         counts[outcome] += 1
         if outcome == "created" and judge_shortlist > 0:
             # The bill's later drafts are matched and judged against this Policy too (two near-identical drafts in one bill
-            # must not both create one). Only with the judge on, so the judge-off path is exactly as before.
+            # must not both create one). Only with the judge on, so the judge-off path is exactly as before. The broker
+            # merges a replaced Policy only in act mode and says so with `merged_policy_id` (BROKER-610): only then does it
+            # leave the list; otherwise it is still a real Policy a later draft may be filed under.
+            merged = response.get("merged_policy_id") if isinstance(response, dict) else None
+            if isinstance(merged, int) and not isinstance(merged, bool):
+                policies[:] = [p for p in policies if p["id"] != merged]
             new_id = _created_policy_id(response)
             if new_id is None:
                 logger.warning("policy_statement_created_id_missing", set_id=item["concept_statement_set_id"],
                                statement_index=item["statement_index"])
             else:
                 created = payload["created"]
-                if "replaces" in payload:
-                    policies[:] = [p for p in policies if p["id"] != payload["replaces"]]
                 policies.append({"id": new_id, **{k: created.get(k) or "" for k in ("label", "canonical_statement", "definition", "exclusions")},
                                  "concept_id": created["concept_id"]})
 

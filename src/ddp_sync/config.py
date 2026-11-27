@@ -310,9 +310,10 @@ class SyncSettings:
     # offers exactly the statements that have no match row.
     policy_statement_stop_after_failures: int = 3
     # SYNC-199: a draft under the cutoff whose closest Policies score at least the floor goes to LegBot's resolve_policy with
-    # the top `shortlist` of them (at most 5). 0 = the judge is off and the step is exactly as before. 0.30 is the flag
-    # threshold AGENTS-269 measured.
-    policy_statement_judge_shortlist: int = 5
+    # the top `shortlist` of them (at most 5). 0 (the default) = the judge is off and the step is exactly as before: it is
+    # turned on in the production .env at the SYNC-184 rollout, after AGENTS-272 (LegBot) and BROKER-610 (broker) are
+    # deployed. 0.30 is the flag threshold AGENTS-269 measured.
+    policy_statement_judge_shortlist: int = 0
     policy_statement_judge_floor: float = 0.30
 
     # SYNC-39: how often _dispatch_and_await asks CAMS whether a task has
@@ -682,10 +683,10 @@ def _unit_interval(raw: str | None, *, default: float, name: str) -> float:
 
 
 def _judge_shortlist(raw: str | None) -> int:
-    """POLICY_STATEMENT_JUDGE_SHORTLIST (SYNC-199): 0 turns the judge off, 1 to 5 is how many candidates it sees. Unset or
-    blank uses 5; a value that is not a whole number or is negative uses 5 with a warning; above 5 is cut to 5 (the question
-    takes at most 5)."""
-    default, top = 5, 5
+    """POLICY_STATEMENT_JUDGE_SHORTLIST (SYNC-199): 0 (the default) keeps the judge off, 1 to 5 turns it on and is how many
+    candidates it sees. Unset or blank uses 0; a value that is not a whole number or is negative uses 0 with a warning (a typo
+    never switches the judge on); above 5 is cut to 5 (the question takes at most 5)."""
+    default, top = 0, 5
     if raw is None or not raw.strip():
         return default
     try:
@@ -693,7 +694,7 @@ def _judge_shortlist(raw: str | None) -> int:
     except ValueError:
         value = -1
     if value < 0:
-        logging.getLogger(__name__).warning("POLICY_STATEMENT_JUDGE_SHORTLIST=%r is not a whole number from 0 to 5; using %s", raw, default)
+        logging.getLogger(__name__).warning("POLICY_STATEMENT_JUDGE_SHORTLIST=%r is not a whole number from 0 to 5; using %s (the judge stays off)", raw, default)
         return default
     return min(value, top)
 

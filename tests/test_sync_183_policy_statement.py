@@ -358,9 +358,7 @@ async def test_matched_excluded_and_new_are_written_with_the_scores_and_the_writ
 
     assert dispatch.await_args.kwargs["statements"] == ["s one", "s two", "s three"]
     assert dispatch.await_args.args == ("archived text", "policy_statement")
-    # SYNC-199: the judge is on by default (shortlist 5), so its four counts are in the result; none of these drafts was close
-    assert result == {"statements": 3, "matched": 1, "created": 1, "excluded": 1, "judged": 0, "judge_filed": 0,
-                      "judge_replaced": 0, "judge_none": 0, "skipped_reason": None}
+    assert result == {"statements": 3, "matched": 1, "created": 1, "excluded": 1, "skipped_reason": None}
     w1, w2, w3 = broker.writes
     assert (w1["resolution"], w1["policy_id"], w1["created"], w1["statement_index"]) == ("matched", 5, None, 0)
     assert w1["scores"] == {"policy": 0.9, "best_policy_id": 5, "concept": None, "cutoff": 0.7, "list_size": 1}
@@ -424,8 +422,7 @@ async def test_dry_run_reads_the_work_list_and_calls_nothing_else(run_step):
     broker = FakeBroker(_work(["a", "b"]), _policies(2), _concepts())
     jev = FakeJev()
     result, dispatch = await run_step(broker, _answer([]), jev, dry_run=True)
-    assert result == {"statements": 2, "matched": 0, "created": 0, "excluded": 0, "judged": 0, "judge_filed": 0,
-                      "judge_replaced": 0, "judge_none": 0, "skipped_reason": None}  # SYNC-199: judge on by default
+    assert result == {"statements": 2, "matched": 0, "created": 0, "excluded": 0, "skipped_reason": None}
     dispatch.assert_not_awaited()
     assert jev.calls == [] and broker.writes == [] and broker.policy_reads == 0
 
