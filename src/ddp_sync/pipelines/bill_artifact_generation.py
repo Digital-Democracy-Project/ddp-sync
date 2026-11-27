@@ -72,6 +72,7 @@ from ddp_sync.services.broker_client import (
     get_bill_topics_taxonomy,
     write_bill_artifact,
 )
+from ddp_sync.services.jurisdiction_enrollment import default_root, is_enrolled
 from ddp_sync.services.legbot_client import (
     TERMINAL_STATUSES,
     LegBotDispatchError,
@@ -82,6 +83,7 @@ from ddp_sync.services.legbot_client import (
 )
 from ddp_sync.services.local_openstates_client import (
     get_archived_bill_text,
+    get_archived_bill_text_and_summary,
     get_archived_version_transitions,
 )
 from ddp_sync.services.redis_store import get_redis_store
@@ -99,6 +101,10 @@ _ARTIFACT_TYPE_TO_QUESTION_TYPE = {
     "bill_impact_analysis": "impact_analysis",
     "bill_topics": "bill_topics",
 }
+
+# SYNC-200: the seven single-version types that may be handed the legislature's own summary as an extra input. bill_topics
+# is left out on purpose (it shares _resolve_bill_source but was not part of the decision, OPEN-896).
+_LEGISLATURE_SUMMARY_ARTIFACT_TYPES = frozenset(_ARTIFACT_TYPE_TO_QUESTION_TYPE) - {"bill_topics"}
 
 # artifact_types whose answer is already plain text under an answer["text"]
 # key (config/legbot_questions.yaml's output_shape) — flattened identically.
@@ -353,6 +359,24 @@ async def _resolve_bill_source(bill_openstates_id: str) -> str | None:
     return None
 
 
+async def _resolve_bill_source_and_summary(bill_openstates_id: str) -> tuple[str | None, str | None]:
+    """_resolve_bill_source's text plus the legislature's own summary, from one api-v3 read (SYNC-200). Used only when the
+    manifest says this jurisdiction sends the summary; _resolve_bill_source itself is unchanged for every other caller."""
+    archived_text, summary = await get_archived_bill_text_and_summary(bill_openstates_id)
+    if archived_text:
+        logger.info("Using ddp-open-states' archived bill text", bill_openstates_id=bill_openstates_id,
+                    has_legislature_summary=bool(summary))
+        return archived_text, summary
+    return None, None
+
+
+def _sends_legislature_summary(artifact_type: str, jurisdiction: str) -> bool:
+    """SYNC-200: does this artifact get the legislature's summary? Only the seven single-version types, and only when the
+    manifest's `enrollment.legbot_send_abstract` is true for this jurisdiction (absent or unreadable manifest = no)."""
+    return artifact_type in _LEGISLATURE_SUMMARY_ARTIFACT_TYPES and is_enrolled(
+        "legbot_send_abstract", jurisdiction, default_root())
+
+
 async def generate_and_store_bill_artifact(
     *,
     bill_openstates_id: str,
@@ -432,7 +456,11 @@ async def generate_and_store_bill_artifact(
         raise ValueError(f"Unsupported artifact_type for Phase 8 dispatch: {artifact_type}")
 
     question_type = _ARTIFACT_TYPE_TO_QUESTION_TYPE[artifact_type]
-    resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
+    legislature_summary = None
+    if _sends_legislature_summary(artifact_type, jurisdiction):
+        resolved_bill_source, legislature_summary = await _resolve_bill_source_and_summary(bill_openstates_id)
+    else:
+        resolved_bill_source = await _resolve_bill_source(bill_openstates_id)
     if resolved_bill_source is None:
         # OPEN-297: this used to attempt a `failed` BillArtifact write here,
         # but write_bill_artifact only ever attaches to an EXISTING Bill row
@@ -471,7 +499,9 @@ async def generate_and_store_bill_artifact(
 
     # The answer is checked against the same list LegBot was given (AGENTS-181 takes it from the request).
     redo_args = {"request_id": request_id, "redo": redo} if request_id is not None else {}
-    dispatch_result = await dispatch_bill_question(resolved_bill_source, question_type, topic_list=taxonomy, **redo_args)
+    summary_args = {"legislature_summary": legislature_summary} if legislature_summary else {}
+    dispatch_result = await dispatch_bill_question(
+        resolved_bill_source, question_type, topic_list=taxonomy, **redo_args, **summary_args)
     answer = dispatch_result["answer"]
     model_name = dispatch_result.get("backend")
     if taxonomy is not None and answer.get("topics_version") not in (None, taxonomy["version"]):

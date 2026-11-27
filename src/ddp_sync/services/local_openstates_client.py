@@ -165,6 +165,11 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
     # directly rather than re-deriving order here via a naive (date, note) sort (the
     # naive sort silently agreed with api-v3's own former bug, OPEN-92's own
     # discovery -- neither side had actually verified the other).
+    return _latest_raw_text(data)
+
+
+def _latest_raw_text(data: dict) -> str | None:
+    """The raw_text of the last entry of a bill detail's `versions` (api-v3 orders latest last), else None."""
     versions = data.get("versions") or []
     if not versions:
         return None
@@ -175,6 +180,56 @@ async def get_archived_bill_text(bill_openstates_id: str) -> str | None:
             return raw_text
 
     return None
+
+
+# The abstract the legislature itself wrote for a bill is stored with this note (SYNC-200 / OPEN-896). Other notes
+# (a chamber's own abstract, a digest) are different texts and are never read as it.
+LEGISLATURE_SUMMARY_NOTE = "summary"
+
+
+def _legislature_summary(data: dict) -> str | None:
+    """The text of the bill abstract whose note is exactly `summary`, stripped; None when there is none or it is empty."""
+    for item in data.get("abstracts") or []:
+        if isinstance(item, dict) and item.get("note") == LEGISLATURE_SUMMARY_NOTE:
+            text = item.get("abstract")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return None
+
+
+async def get_archived_bill_text_and_summary(bill_openstates_id: str) -> tuple[str | None, str | None]:
+    """(latest version's archived text, the legislature's own `summary` abstract) from ONE api-v3 read
+    (`include=versions` and `include=abstracts` together; SYNC-200). Same posture as get_archived_bill_text:
+    never raises, any failure answers (None, None). The summary is None when the bill has no abstract with the
+    note `summary`; the text can be None while the summary is not (the caller then has no text and does not
+    dispatch, exactly as today)."""
+    settings = get_settings()
+    if not settings.local_openstates_api_base:
+        return None, None
+
+    params = {"include": ["versions", "abstracts"]}
+    headers = _auth_headers(settings.local_openstates_api_key)
+    url = f"{settings.local_openstates_api_base}/bills/ocd-bill/{bill_openstates_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url, params=params, headers=headers)
+    except httpx.RequestError as exc:
+        logger.warning("Local api-v3 unreachable -- no archived text or summary", bill_openstates_id=bill_openstates_id,
+                       error=str(exc))
+        return None, None
+    if resp.status_code >= 400:
+        if resp.status_code != 404:
+            logger.warning("Local api-v3 rejected the bill-detail read with abstracts", bill_openstates_id=bill_openstates_id,
+                           status_code=resp.status_code)
+        return None, None
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning("Local api-v3 returned a non-JSON response -- no archived text or summary",
+                       bill_openstates_id=bill_openstates_id)
+        return None, None
+    return _latest_raw_text(data), _legislature_summary(data)
 
 
 async def get_bill_version_document_text(
